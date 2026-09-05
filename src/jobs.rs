@@ -165,8 +165,10 @@ pub async fn run(daemon: Arc<Daemon>) {
     let mut task_organizations = HashMap::new();
     loop {
         if state::now().saturating_sub(last_sweep) >= 3600 {
-            let _ = crate::retention::sweep(&daemon.dir, state::now());
-            last_sweep = state::now();
+            if let Ok(Some(_admission)) = admit(&daemon) {
+                let _ = crate::retention::sweep(&daemon.dir, state::now());
+                last_sweep = state::now();
+            }
         }
         while let Some(result) = tasks.try_join_next_with_id() {
             match result {

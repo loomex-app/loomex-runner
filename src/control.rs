@@ -48,6 +48,10 @@ fn negotiate(params: &Value) -> Result<Value> {
         json!({"selectedProtocol":PROTOCOL,"capabilities":available,"maxFrameBytes":MAX_FRAME,"serverVersion":env!("CARGO_PKG_VERSION")}),
     )
 }
+struct MutationKey {
+    digest: String,
+    lock: std::sync::Weak<Mutex<()>>,
+}
 pub struct Daemon {
     pub dir: PathBuf,
     pub api: Api,
@@ -58,8 +62,15 @@ pub struct Daemon {
     pub quiescence: AtomicUsize,
     pub managed: AtomicUsize,
     pub cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
-    mutation: Mutex<()>,
+    mutation_keys: std::sync::Mutex<HashMap<String, MutationKey>>,
+    lifecycle_draining: AtomicBool,
     pub admission: std::sync::Mutex<()>,
+}
+struct ControlWriter<'a>(&'a Daemon);
+impl Drop for ControlWriter<'_> {
+    fn drop(&mut self) {
+        self.0.managed.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 impl Daemon {
     pub fn new(dir: PathBuf, api: Api, auth: Auth) -> Result<Self> {
@@ -76,7 +87,8 @@ impl Daemon {
             quiescence: AtomicUsize::new(0),
             managed: AtomicUsize::new(0),
             cancellations: Mutex::new(HashMap::new()),
-            mutation: Mutex::new(()),
+            mutation_keys: std::sync::Mutex::new(HashMap::new()),
+            lifecycle_draining: AtomicBool::new(draining),
             admission: std::sync::Mutex::new(()),
         })
     }
@@ -116,6 +128,56 @@ impl Daemon {
         let install = self.auth.installation_id().await?;
         self.public.lock().await.require_grant(path, org, &install)
     }
+    fn drain_status(&self) -> Value {
+        let work = self.managed_work();
+        json!({"draining":true,"activeJobs":work,"updateDeferred":work>0})
+    }
+    fn control_writer(&self, method: &str, write: bool) -> Result<Option<ControlWriter<'_>>> {
+        if ["protocol.negotiate", "status.get"].contains(&method) {
+            return Ok(None);
+        }
+        let _admission = self
+            .admission
+            .lock()
+            .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
+        if self.lifecycle_draining.load(Ordering::SeqCst) {
+            if method == "daemon.drain" && self.dir.join("drain.json").exists() {
+                return Ok(None);
+            }
+            if method != "daemon.drain" {
+                if write && !["runs.cancel", "auth.logout"].contains(&method) {
+                    bail!("RUNNER_NOT_READY");
+                }
+                // A cancellation/read may join an existing drain, but cannot reopen
+                // an idle acknowledgement. Incrementing only a nonzero total is atomic.
+                self.managed
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                        count.checked_add(1).filter(|_| count > 0)
+                    })
+                    .map_err(|_| anyhow::anyhow!("RUNNER_NOT_READY"))?;
+                return Ok(Some(ControlWriter(self)));
+            }
+        } else if self.draining.load(Ordering::SeqCst)
+            && write
+            && ![
+                "auth.login",
+                "auth.poll",
+                "auth.logout",
+                "organizations.select",
+                "daemon.drain",
+                "runs.cancel",
+            ]
+            .contains(&method)
+        {
+            bail!("RUNNER_NOT_READY");
+        }
+        self.managed.fetch_add(1, Ordering::SeqCst);
+        if method == "daemon.drain" {
+            self.lifecycle_draining.store(true, Ordering::SeqCst);
+            self.draining.store(true, Ordering::SeqCst);
+        }
+        Ok(Some(ControlWriter(self)))
+    }
     pub async fn dispatch(&self, method: &str, params: Value) -> Result<Value> {
         let catalog: Value =
             serde_json::from_str(include_str!("../contracts/method-catalog.json"))?;
@@ -123,16 +185,13 @@ impl Daemon {
             .as_array()
             .unwrap()
             .iter()
-            .find(|m| m["name"] == method)
+            .find(|entry| entry["name"] == method)
             .context("METHOD_NOT_FOUND")?;
         validate_params(&params, &entry["inputSchema"])?;
         let write = entry["mutating"] == true;
-        let _guard = if write {
-            Some(self.mutation.lock().await)
-        } else {
-            None
-        };
         let key = params.get("idempotencyKey").and_then(Value::as_str);
+        // Capture organization before waiting for any operation. The handler never
+        // substitutes a later active organization into this operation's identity.
         let scope = if method.starts_with("auth.") || method == "daemon.drain" {
             None
         } else {
@@ -145,41 +204,133 @@ impl Daemon {
         };
         let identity =
             state::json_digest(&json!({"method":method,"params":params,"organizationId":scope}));
-        let operation = key.map(|k| self.dir.join("operations").join(format!("{k}.json")));
-        if let Some(path) = &operation {
+        let operation = key.map(|key| self.dir.join("operations").join(format!("{key}.json")));
+        if let Some(path) = operation.as_ref().filter(|path| path.exists()) {
+            let record: Value = state::read_json(path)?;
+            if record["digest"] != identity {
+                bail!("IDEMPOTENCY_CONFLICT");
+            }
+        }
+        let singleflight = if let Some(key) = key {
+            let mut keys = self
+                .mutation_keys
+                .lock()
+                .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
+            keys.retain(|_, entry| entry.lock.strong_count() > 0);
+            let lock = if let Some(existing) = keys.get(key) {
+                if existing.digest != identity {
+                    bail!("IDEMPOTENCY_CONFLICT");
+                }
+                existing
+                    .lock
+                    .upgrade()
+                    .unwrap_or_else(|| Arc::new(Mutex::new(())))
+            } else {
+                Arc::new(Mutex::new(()))
+            };
+            keys.insert(
+                key.to_owned(),
+                MutationKey {
+                    digest: identity.clone(),
+                    lock: Arc::downgrade(&lock),
+                },
+            );
+            Some(lock)
+        } else {
+            None
+        };
+        let writer = self.control_writer(method, write)?;
+        // A repeated drain after its durable acknowledgement is a read; it must
+        // not create another journal writer after an installer observed idle.
+        if method == "daemon.drain" && writer.is_none() {
+            return Ok(self.drain_status());
+        }
+        let _singleflight = match singleflight {
+            Some(lock) => Some(lock.lock_owned().await),
+            None => None,
+        };
+        let cached = if let Some(path) = &operation {
             if path.exists() {
                 let record: Value = state::read_json(path)?;
                 if record["digest"] != identity {
-                    bail!("IDEMPOTENCY_CONFLICT")
+                    bail!("IDEMPOTENCY_CONFLICT");
                 }
                 if record["expired"] == true {
-                    bail!("RESULT_EXPIRED")
+                    bail!("RESULT_EXPIRED");
                 }
-                if let Some(result) = record.get("result") {
-                    return Ok(result.clone());
-                }
+                record.get("result").cloned()
             } else {
                 state::write_json(
                     path,
                     &json!({"digest":identity,"method":method,"status":"pending"}),
-                )?
+                )?;
+                None
             }
-        }
-        let result = normalize_output(
-            self.handle(method, &params).await?,
-            &entry["outputSchema"]["oneOf"][0],
-        )?;
-        if let Some(path) = operation {
-            if !(method == "auth.poll" && result["status"] == "pending") {
-                state::write_json(
-                    &path,
-                    &json!({"digest":identity,"method":method,"cachedAt":state::now(),"executionId":params.get("runId").or_else(||result.get("executionId")).or_else(||result.get("execution").and_then(|v|v.get("id"))),"result":result}),
-                )?
+        } else {
+            None
+        };
+        let result = if let Some(cached) = cached {
+            cached
+        } else {
+            let result = normalize_output(
+                self.handle(method, &params, scope.as_deref()).await?,
+                &entry["outputSchema"]["oneOf"][0],
+            )?;
+            let execution = params
+                .get("runId")
+                .or_else(|| result.get("executionId"))
+                .or_else(|| result.get("execution").and_then(|value| value.get("id")))
+                .cloned();
+            // Spooling remains inside writer coverage; socket delivery below is not
+            // counted once no more local files or backend state can be changed.
+            let result = self.spool_response(&params, result)?;
+            if let Some(path) = operation {
+                if !(method == "auth.poll" && result["status"] == "pending") {
+                    state::write_json(
+                        &path,
+                        &json!({"digest":identity,"method":method,"cachedAt":state::now(),"executionId":execution,"result":result}),
+                    )?;
+                }
             }
+            result
+        };
+        drop(writer);
+        if method == "daemon.drain" {
+            Ok(self.drain_status())
+        } else {
+            Ok(result)
         }
-        Ok(result)
     }
-    async fn handle(&self, method: &str, p: &Value) -> Result<Value> {
+    fn spool_response(&self, params: &Value, result: Value) -> Result<Value> {
+        let bytes = serde_json::to_vec(&result)?;
+        if bytes.len() <= MAX_FRAME - 1024 {
+            return Ok(result);
+        }
+        let reference = Uuid::new_v4();
+        let checksum = state::digest(&bytes);
+        state::atomic_write(
+            &self.dir.join("responses").join(format!("{reference}.json")),
+            &bytes,
+        )?;
+        state::atomic_write(
+            &self
+                .dir
+                .join("responses")
+                .join(format!("{reference}.sha256")),
+            checksum.as_bytes(),
+        )?;
+        state::write_json(
+            &self
+                .dir
+                .join("responses")
+                .join(format!("{reference}.meta.json")),
+            &json!({"executionId":params["runId"],"lastAccessAt":state::now()}),
+        )?;
+        Ok(
+            json!({"responseRef":reference,"sizeBytes":bytes.len(),"encoding":"json","nextOffset":0,"checksumSha256":checksum}),
+        )
+    }
+    async fn handle(&self, method: &str, p: &Value, scope: Option<&str>) -> Result<Value> {
         let key = p.get("idempotencyKey").and_then(Value::as_str);
         match method {
             "protocol.negotiate" => return negotiate(p),
@@ -224,7 +375,7 @@ impl Daemon {
                         .admission
                         .lock()
                         .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
-                    if !self.dir.join("drain.json").exists() {
+                    if !self.lifecycle_draining.load(Ordering::SeqCst) {
                         self.draining.store(false, Ordering::SeqCst);
                     }
                 }
@@ -254,10 +405,7 @@ impl Daemon {
             }
             _ => {}
         }
-        let org = match p["organizationId"].as_str() {
-            Some(x) => x.to_owned(),
-            None => self.selected_org().await?,
-        };
+        let org = scope.context("ORGANIZATION_REQUIRED")?.to_owned();
         match method {
             "workspaces.grant" => {
                 self.auth.credential(&org).await?;
@@ -810,17 +958,46 @@ async fn read_spool(dir: &Path, p: &Value) -> Result<Value> {
     )
 }
 
-pub async fn serve(daemon: Arc<Daemon>) -> Result<()> {
-    let lock_path = daemon.dir.join("daemon.lock");
+fn daemon_lock(dir: &Path) -> Result<std::fs::File> {
+    state::private_dir(dir)?;
     let lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .open(&lock_path)?;
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join("daemon.lock"))?;
+    let metadata = lock.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        bail!("UNSAFE_STATE");
+    }
     lock.try_lock_exclusive()
         .map_err(|_| anyhow::anyhow!("DAEMON_ALREADY_RUNNING"))?;
+    Ok(lock)
+}
+pub async fn offline_logout(dir: &Path) -> Result<Value> {
+    // Acquire ownership before constructing a native auth operation. No socket or
+    // execution service starts in this explicitly selected maintenance command.
+    let lock = daemon_lock(dir)?;
+    let auth = Auth::new(Api::new()?)?;
+    finish_offline_logout(lock, auth).await
+}
+async fn finish_offline_logout(lock: std::fs::File, auth: Auth) -> Result<Value> {
+    // The worker keeps exclusive ownership through native IO even if the caller
+    // stops awaiting it. No later daemon may race protected credential cleanup.
+    tokio::spawn(async move {
+        let _lock = lock;
+        auth.offline_logout().await
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("AUTH_LOGOUT_FAILED"))?
+}
+pub async fn serve(daemon: Arc<Daemon>) -> Result<()> {
+    let lock = daemon_lock(&daemon.dir)?;
     let socket = daemon.dir.join("control.sock");
     if let Ok(metadata) = std::fs::symlink_metadata(&socket) {
         use std::os::unix::fs::FileTypeExt;
@@ -893,36 +1070,9 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
                         )
                         .await
                     {
-                        Ok(mut result) => {
+                        Ok(result) => {
                             if request["method"] == "protocol.negotiate" {
                                 negotiated = true;
-                            }
-                            let bytes = serde_json::to_vec(&result)?;
-                            if bytes.len() > MAX_FRAME - 1024 {
-                                let reference = Uuid::new_v4();
-                                let checksum = state::digest(&bytes);
-                                state::atomic_write(
-                                    &daemon
-                                        .dir
-                                        .join("responses")
-                                        .join(format!("{reference}.json")),
-                                    &bytes,
-                                )?;
-                                state::atomic_write(
-                                    &daemon
-                                        .dir
-                                        .join("responses")
-                                        .join(format!("{reference}.sha256")),
-                                    checksum.as_bytes(),
-                                )?;
-                                state::write_json(
-                                    &daemon
-                                        .dir
-                                        .join("responses")
-                                        .join(format!("{reference}.meta.json")),
-                                    &json!({"executionId":request["params"]["runId"],"lastAccessAt":state::now()}),
-                                )?;
-                                result = json!({"responseRef":reference,"sizeBytes":bytes.len(),"encoding":"json","nextOffset":0,"checksumSha256":checksum});
                             }
                             json!({"protocol":PROTOCOL,"id":id,"result":result})
                         }
@@ -1098,6 +1248,261 @@ mod conformance {
             ),
         )
         .unwrap()
+    }
+    async fn receive_http(listener: &TcpListener) -> (tokio::net::TcpStream, String) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        loop {
+            let mut buffer = [0; 8192];
+            let size = stream.read(&mut buffer).await.unwrap();
+            assert!(size > 0);
+            bytes.extend_from_slice(&buffer[..size]);
+            if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&bytes[..end]).into_owned();
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(|value| value.parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                if bytes.len() >= end + 4 + length {
+                    return (stream, head);
+                }
+            }
+        }
+    }
+    async fn reply_http(mut stream: tokio::net::TcpStream, status: u16, value: Value) {
+        let body = if status == 200 {
+            json!({"data":value,"meta":{}})
+        } else {
+            value
+        }
+        .to_string();
+        stream.write_all(format!("HTTP/1.1 {status} Reply\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
+    }
+    async fn download_fixture() -> (tempfile::TempDir, Arc<Daemon>, TcpListener, Value) {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = Arc::new(fixture(temp.path(), api));
+        daemon.public.lock().await.active_organization =
+            Some("11111111-1111-4111-8111-111111111111".into());
+        let params = json!({"artifactId":Uuid::new_v4(),"idempotencyKey":Uuid::new_v4(),"destinationPath":temp.path().join("download")});
+        (temp, daemon, listener, params)
+    }
+    fn download_page() -> Value {
+        json!({"offset":0,"dataBase64":STANDARD.encode(b"abc"),"nextOffset":null,"sizeBytes":3,"checksumSha256":state::digest(b"abc")})
+    }
+    #[tokio::test]
+    async fn offline_logout_requires_exclusive_daemon_ownership_and_retries_without_service() {
+        let (temp, d, listener, _) = download_fixture().await;
+        let first_lock = daemon_lock(temp.path()).unwrap();
+        assert_eq!(
+            daemon_lock(temp.path()).unwrap_err().to_string(),
+            "DAEMON_ALREADY_RUNNING"
+        );
+        let auth = d.auth.clone();
+        let check_auth = auth.clone();
+        let task = tokio::spawn(finish_offline_logout(first_lock, auth));
+        let (held, head) = receive_http(&listener).await;
+        assert!(head.contains("/v2/device-authorities/logout/"));
+        assert_eq!(
+            daemon_lock(temp.path()).unwrap_err().to_string(),
+            "DAEMON_ALREADY_RUNNING"
+        );
+        // Cancellation of the awaiting caller must not release ownership while
+        // the authorized native-auth worker still has pending durable writes.
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            daemon_lock(temp.path()).unwrap_err().to_string(),
+            "DAEMON_ALREADY_RUNNING"
+        );
+        reply_http(held, 200, json!({"revoked":true})).await;
+        for _ in 0..100 {
+            if !check_auth.status().await.unwrap()["authenticated"]
+                .as_bool()
+                .unwrap()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let retry_lock = daemon_lock(temp.path()).unwrap();
+        let result = finish_offline_logout(retry_lock, check_auth).await.unwrap();
+        assert_eq!(result["revoked"], true);
+        assert_eq!(result["alreadyLoggedOut"], true);
+        assert!(!temp.path().join("control.sock").exists());
+        assert!(!temp.path().join("jobs").exists());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn held_download_allows_drain_and_cancel_and_preserves_singleflight() {
+        let (temp, d, listener, params) = download_fixture().await;
+        let d1 = d.clone();
+        let p1 = params.clone();
+        let first = tokio::spawn(async move { d1.dispatch("artifacts.download", p1).await });
+        let (held, _) = receive_http(&listener).await;
+        let d2 = d.clone();
+        let p2 = params.clone();
+        let duplicate = tokio::spawn(async move { d2.dispatch("artifacts.download", p2).await });
+        for _ in 0..100 {
+            if d.managed_work() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(d.managed_work(), 2);
+        let drain = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            d.dispatch("daemon.drain", json!({"idempotencyKey":Uuid::new_v4()})),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(drain["activeJobs"], 2);
+        assert_eq!(drain["updateDeferred"], true);
+        assert!(temp.path().join("drain.json").exists());
+        let cancel_params = json!({"runId":Uuid::new_v4(),"reason":"user requested","idempotencyKey":Uuid::new_v4()});
+        let dc = d.clone();
+        let pc = cancel_params.clone();
+        let cancel = tokio::spawn(async move { dc.dispatch("runs.cancel", pc).await });
+        let (stream, head) = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            receive_http(&listener),
+        )
+        .await
+        .unwrap();
+        assert!(head.contains("/cancel/"));
+        reply_http(
+            stream,
+            200,
+            json!({"execution":{"id":cancel_params["runId"]},"jobs":[]}),
+        )
+        .await;
+        cancel.await.unwrap().unwrap();
+        assert_eq!(d.managed_work(), 2);
+        reply_http(held, 200, download_page()).await;
+        let first = first.await.unwrap().unwrap();
+        let duplicate = duplicate.await.unwrap().unwrap();
+        assert_eq!(first, duplicate);
+        assert_eq!(std::fs::read(temp.path().join("download")).unwrap(), b"abc");
+        assert_eq!(d.managed_work(), 0);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+        let new_key = Uuid::new_v4();
+        let repeat = d
+            .dispatch("daemon.drain", json!({"idempotencyKey":new_key}))
+            .await
+            .unwrap();
+        assert_eq!(repeat["activeJobs"], 0);
+        assert!(
+            !temp
+                .path()
+                .join("operations")
+                .join(format!("{new_key}.json"))
+                .exists()
+        );
+        let fresh_cancel =
+            json!({"idempotencyKey":Uuid::new_v4(),"runId":Uuid::new_v4(),"reason":"too late"});
+        assert_eq!(
+            d.dispatch("runs.cancel", fresh_cancel)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "RUNNER_NOT_READY"
+        );
+        assert_eq!(d.managed_work(), 0);
+    }
+    #[tokio::test]
+    async fn queued_retry_keeps_organization_captured_before_selection_changes() {
+        let (_temp, d, listener, params) = download_fixture().await;
+        let d1 = d.clone();
+        let p1 = params.clone();
+        let first = tokio::spawn(async move { d1.dispatch("artifacts.download", p1).await });
+        let (held, _) = receive_http(&listener).await;
+        let d2 = d.clone();
+        let p2 = params.clone();
+        let retry = tokio::spawn(async move { d2.dispatch("artifacts.download", p2).await });
+        for _ in 0..100 {
+            if d.managed_work() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(d.managed_work(), 2);
+        // The replacement selection has no credential. A substituted organization
+        // would fail locally, whereas the queued request must retain the original.
+        d.public.lock().await.active_organization = Some(Uuid::new_v4().to_string());
+        reply_http(held, 503, json!({"error":{"code":"BACKEND_UNAVAILABLE"}})).await;
+        assert!(first.await.unwrap().is_err());
+        let (stream, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), receive_http(&listener))
+                .await
+                .unwrap();
+        reply_http(stream, 200, download_page()).await;
+        assert_eq!(retry.await.unwrap().unwrap()["sizeBytes"], 3);
+        assert_eq!(d.managed_work(), 0);
+        assert_eq!(
+            d.dispatch("artifacts.download", params)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "IDEMPOTENCY_CONFLICT"
+        );
+    }
+    #[tokio::test]
+    async fn large_backend_read_keeps_coverage_until_response_spool_is_durable() {
+        let (temp, d, listener, _) = download_fixture().await;
+        let run = Uuid::new_v4();
+        let worker = d.clone();
+        let read =
+            tokio::spawn(async move { worker.dispatch("runs.get", json!({"runId":run})).await });
+        let (held, _) = receive_http(&listener).await;
+        let drain = d
+            .dispatch("daemon.drain", json!({"idempotencyKey":Uuid::new_v4()}))
+            .await
+            .unwrap();
+        assert_eq!(drain["activeJobs"], 1);
+        reply_http(held,200,json!({"execution":{"id":run,"data":"x".repeat(MAX_FRAME+100)},"events":[],"latestSequence":0,"hasMoreEvents":false,"timedOut":false})).await;
+        let reference = read.await.unwrap().unwrap();
+        let id = reference["responseRef"].as_str().unwrap();
+        assert_eq!(d.managed_work(), 0);
+        let bytes =
+            std::fs::read(temp.path().join("responses").join(format!("{id}.json"))).unwrap();
+        assert_eq!(
+            state::digest(&bytes),
+            reference["checksumSha256"].as_str().unwrap()
+        );
+        assert!(
+            temp.path()
+                .join("responses")
+                .join(format!("{id}.meta.json"))
+                .exists()
+        );
+        assert!(
+            temp.path()
+                .join("responses")
+                .join(format!("{id}.sha256"))
+                .exists()
+        );
+        assert_eq!(
+            d.dispatch("runs.get", json!({"runId":run}))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "RUNNER_NOT_READY"
+        );
     }
     #[tokio::test]
     async fn socket_negotiation_rejects_incompatible_mutations_without_effects() {

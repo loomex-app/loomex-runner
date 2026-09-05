@@ -96,3 +96,7 @@ execution from a user's installed LaunchAgent. Those remain explicit release che
 For the local protocol and trust boundaries, read [architecture](docs/architecture.md). For recovery, cancellation, retention and service operation, read [operations](docs/operations.md).
 
 During ordinary operation `activeJobs` counts managed jobs. While draining, it also includes pending session/admission and helper work, so an idle acknowledgement cannot precede a late journal write. The daemon stops admission before acknowledging drain; update activation waits for this count to reach zero.
+
+Control operations capture their organization when admitted and serialize only requests using the same idempotency key. Drain remains responsive during transfers and includes local control writers and response spooling in its pending work count. Once a persistent drain becomes idle, it rejects new work; cancellation and read requests can join a drain only while existing work remains. Repeated drain requests are read-only after the durable drain marker exists.
+
+Uninstall first drains without cancelling active work, waits for idle, and stops the daemon. It then calls `loomex logout --offline`, which takes the same exclusive daemon lock and performs only native credential revocation and cleanup. Failed revocation preserves files and protected retry state; retrying this command does not restart execution or require a socket.

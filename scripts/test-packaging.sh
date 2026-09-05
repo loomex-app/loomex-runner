@@ -8,7 +8,7 @@ base="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]
 make_payload(){
   version="$1"; payload="$2"
   mkdir -p "$payload/bin" "$payload/metadata" "$payload/launchd"
-  printf '%s\n' '#!/bin/bash' "VERSION='$version'" 'case "${1:-}" in' 'status) if [[ -f "${LOOMEX_STATE_DIR}/test-race" && ! -f "${LOOMEX_STATE_DIR}/drain.json" ]]; then touch "${LOOMEX_STATE_DIR}/test-race-triggered"; active=1; else active="$(test -f "${LOOMEX_STATE_DIR}/test-active" && cat "${LOOMEX_STATE_DIR}/test-active" || printf 0)"; fi; reported="$VERSION"; [[ ! -f "${LOOMEX_STATE_DIR}/test-health-bad" ]] || reported=bad; [[ -f "${LOOMEX_STATE_DIR}/drain.json" ]] && draining=true || draining=false; printf '\''{"version":"%s","activeJobs":%s,"draining":%s,"updateDeferred":false}\n'\'' "$reported" "$active" "$draining";;' 'drain) touch "${LOOMEX_STATE_DIR}/drain.json"; printf '\''{"updateDeferred":true}\n'\'';;' 'logout) touch "${LOOMEX_STATE_DIR}/test-revoked";;' '*) exit 0;;' 'esac' > "$payload/bin/loomex"
+  printf '%s\n' '#!/bin/bash' "VERSION='$version'" 'track(){ [[ ! -f "${LOOMEX_STATE_DIR}/test-track-uninstall" ]] || printf '\''%s\n'\'' "$1" >> "${LOOMEX_STATE_DIR}/test-uninstall-order"; }' 'case "${1:-}" in' 'status) track status; if [[ -f "${LOOMEX_STATE_DIR}/test-race" && ! -f "${LOOMEX_STATE_DIR}/drain.json" ]]; then touch "${LOOMEX_STATE_DIR}/test-race-triggered"; active=1; else active="$(test -f "${LOOMEX_STATE_DIR}/test-active" && cat "${LOOMEX_STATE_DIR}/test-active" || printf 0)"; fi; reported="$VERSION"; [[ ! -f "${LOOMEX_STATE_DIR}/test-health-bad" ]] || reported=bad; [[ -f "${LOOMEX_STATE_DIR}/drain.json" ]] && draining=true || draining=false; printf '\''{"version":"%s","activeJobs":%s,"draining":%s,"updateDeferred":false}\n'\'' "$reported" "$active" "$draining";;' 'drain) track drain; touch "${LOOMEX_STATE_DIR}/drain.json"; printf '\''{"updateDeferred":true}\n'\'';;' 'logout) track logout; [[ "${2:-}" == --offline ]] || exit 70; [[ -f "${LOOMEX_STATE_DIR}/uninstall-ready.json" ]] || exit 71; [[ ! -f "${LOOMEX_STATE_DIR}/test-logout-fail" ]] || exit 72; touch "${LOOMEX_STATE_DIR}/test-revoked";;' '*) exit 0;;' 'esac' > "$payload/bin/loomex"
   printf '%s\n' '#!/bin/bash' 'exit 0' > "$payload/bin/loomex-runner"
   chmod 0755 "$payload/bin/loomex" "$payload/bin/loomex-runner"
   python3 - "$version" "$payload/metadata/project.json" <<'PY'
@@ -46,7 +46,14 @@ test ! -e "$retry_state/logs"
 if LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_INSTALL_TEST_MODE=1 LOOMEX_TEST_BOOTSTRAP_FAIL=1 "$repo/scripts/install.sh" "$release" --allow-unsigned-development --install-base "$retry_base" --state-dir "$retry_state" --launch-agents-dir "$retry_agents" >/dev/null 2>&1; then echo "forced initial bootstrap failure succeeded" >&2; exit 1; fi
 test ! -e "$retry_state/logs"; test ! -e "$retry_state/owned-versions.json"; test ! -e "$retry_base/versions/0.1.0"
 LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/install.sh" "$release" --allow-unsigned-development --install-base "$retry_base" --state-dir "$retry_state" --launch-agents-dir "$retry_agents" >/dev/null
+touch "$retry_state/test-track-uninstall" "$retry_state/test-logout-fail"; : > "$retry_state/test-uninstall-order"
+if LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/uninstall.sh" --install-base "$retry_base" --state-dir "$retry_state" --launch-agents-dir "$retry_agents" >/dev/null 2>&1; then echo "offline revocation failure deleted installation" >&2; exit 1; fi
+test -L "$retry_base/current"; test -f "$retry_state/uninstall-ready.json"; test ! -e "$retry_state/test-revoked"
+test "$(paste -sd, "$retry_state/test-uninstall-order")" = "drain,status,logout"
+printf interrupted > "$retry_state/uninstall-ready.json.new"
+rm "$retry_state/test-logout-fail"; : > "$retry_state/test-uninstall-order"
 LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/uninstall.sh" --install-base "$retry_base" --state-dir "$retry_state" --launch-agents-dir "$retry_agents" >/dev/null
+test "$(paste -sd, "$retry_state/test-uninstall-order")" = logout; test ! -e "$retry_state/uninstall-ready.json.new"
 old="$base/versions/0.0.9"; mkdir -p "$old/bin" "$state"; cp "$payload/bin/loomex" "$old/bin/loomex"; ln -s "$old" "$base/current"
 python3 - "$old" "$agents/app.loomex.runner.plist" "$state" <<'PY'
 import json,sys
@@ -58,9 +65,10 @@ PY
 printf 1 > "$state/test-active"
 LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/install.sh" "$release" --allow-unsigned-development --install-base "$base" --state-dir "$state" --launch-agents-dir "$agents"
 test "$(readlink "$base/current")" = "$old"; test -f "$state/pending-update.json"; test -f "$state/drain.json"
+printf '%s\n' '{"schema":"app.loomex.runner.uninstall-ready/v1","versionPath":"'"$old"'"}' > "$state/uninstall-ready.json"; printf interrupted > "$state/uninstall-ready.json.new"
 printf 0 > "$state/test-active"
 LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/install.sh" "$release" --allow-unsigned-development --install-base "$base" --state-dir "$state" --launch-agents-dir "$agents"
-test "$(readlink "$base/current")" = "$base/versions/0.1.0"; test ! -e "$old"; test ! -e "$state/drain.json"
+test "$(readlink "$base/current")" = "$base/versions/0.1.0"; test ! -e "$old"; test ! -e "$state/drain.json"; test ! -e "$state/uninstall-ready.json"; test ! -e "$state/uninstall-ready.json.new"
 grep -Fq "$base/current/bin/loomex-runner" "$agents/app.loomex.runner.plist"
 ! grep -Fq "$old/bin/loomex-runner" "$agents/app.loomex.runner.plist"
 
@@ -82,8 +90,12 @@ data=json.load(open(sys.argv[1])); base=sys.argv[2]
 assert data['paths']==[f'{base}/versions/0.1.0',f'{base}/versions/0.1.1',f'{base}/versions/0.1.2']
 PY
 test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["path"])' "$state/pending-update.json")" = "$base/versions/0.1.2"
-printf 0 > "$state/test-active"; printf preserve > "$state/unrelated-sentinel"
+touch "$state/test-track-uninstall"; : > "$state/test-uninstall-order"
+if LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/uninstall.sh" --install-base "$base" --state-dir "$state" --launch-agents-dir "$agents" >/dev/null 2>&1; then echo "active uninstall removed installation" >&2; exit 1; fi
+test -L "$base/current"; test ! -e "$state/uninstall-ready.json"; test ! -e "$state/test-revoked"; test "$(paste -sd, "$state/test-uninstall-order")" = "drain,status"
+printf 0 > "$state/test-active"; printf preserve > "$state/unrelated-sentinel"; : > "$state/test-uninstall-order"
 LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/uninstall.sh" --install-base "$base" --state-dir "$state" --launch-agents-dir "$agents"
+test "$(paste -sd, "$state/test-uninstall-order")" = "drain,status,logout"
 test "$(cat "$state/unrelated-sentinel")" = preserve; test -f "$state/test-revoked"; test ! -e "$base/current"; test ! -e "$base/versions/0.1.0"; test ! -e "$base/versions/0.1.1"; test ! -e "$base/versions/0.1.2"
 
 victim="$fixture/victim"; mkdir "$victim"; printf preserve > "$victim/sentinel"

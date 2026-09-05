@@ -12,6 +12,9 @@ const ACCOUNT: &str = "installation";
 trait Store: Send + Sync {
     fn load(&self) -> Result<Option<Vec<u8>>>;
     fn save(&self, data: &[u8]) -> Result<()>;
+    fn delete(&self) -> Result<()> {
+        bail!("STORE_UNAVAILABLE")
+    }
 }
 struct NativeStore;
 
@@ -27,6 +30,10 @@ impl Store for MemoryStore {
         *self.0.lock().unwrap() = Some(bytes.to_vec());
         Ok(())
     }
+    fn delete(&self) -> Result<()> {
+        *self.0.lock().unwrap() = None;
+        Ok(())
+    }
 }
 #[cfg(target_os = "macos")]
 impl Store for NativeStore {
@@ -40,6 +47,13 @@ impl Store for NativeStore {
     fn save(&self, data: &[u8]) -> Result<()> {
         security_framework::passwords::set_generic_password(SERVICE, ACCOUNT, data)
             .map_err(|_| anyhow!("STORE_UNAVAILABLE"))
+    }
+    fn delete(&self) -> Result<()> {
+        match security_framework::passwords::delete_generic_password(SERVICE, ACCOUNT) {
+            Ok(()) => Ok(()),
+            Err(error) if error.code() == -25300 => Ok(()),
+            Err(_) => bail!("STORE_UNAVAILABLE"),
+        }
     }
 }
 #[cfg(not(target_os = "macos"))]
@@ -427,6 +441,41 @@ impl Auth {
     }
     pub async fn logout(&self) -> Result<Value> {
         let _guard = self.lock.lock().await;
+        self.logout_locked().await
+    }
+    pub async fn offline_logout(&self) -> Result<Value> {
+        let _guard = self.lock.lock().await;
+        if let Some(mut state) = self.load().await? {
+            if state.device.is_none() && (state.pending.is_some() || !state.children.is_empty()) {
+                // A lost bootstrap reply can represent an active remote authority.
+                // Preserve its only proof and reconcile through the existing one-use
+                // recovery protocol before claiming revocation or deleting anything.
+                state.logout_pending = true;
+                self.save(&state).await?;
+                if !state.pending.as_ref().is_some_and(|pending| {
+                    matches!(pending.target, Target::Bootstrap) && pending.can_recover()
+                }) {
+                    bail!("AUTH_RECONCILIATION_REQUIRED");
+                }
+                self.recover(&mut state)
+                    .await
+                    .map_err(|_| anyhow!("AUTH_RECONCILIATION_REQUIRED"))?;
+                ensure!(state.device.is_some(), "AUTH_RECONCILIATION_REQUIRED");
+            }
+        }
+        let result = self.logout_locked().await?;
+        let store = self.store.clone();
+        let io_guard = self.store_lock.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || {
+            // Cancellation cannot let another native store operation overtake deletion.
+            let _io_guard = io_guard;
+            store.delete()
+        })
+        .await
+        .map_err(|_| anyhow!("STORE_UNAVAILABLE"))??;
+        Ok(result)
+    }
+    async fn logout_locked(&self) -> Result<Value> {
         let Some(mut state) = self.load().await? else {
             return Ok(json!({"revoked":true,"alreadyLoggedOut":true}));
         };
@@ -797,6 +846,201 @@ mod tests {
         assert_eq!(durable.children["org"].refresh, "replacement");
         let status = auth.status().await.unwrap().to_string();
         assert!(!status.contains("replacement") && !status.contains("lmxr_"));
+    }
+    #[tokio::test]
+    async fn offline_bootstrap_cleanup_requires_recovered_revocable_authority() {
+        for outcome in ["recovered", "denied", "exhausted"] {
+            let (auth, store, listener) = test_auth().await;
+            let mut state = ProtectedState::fresh();
+            let original_key = state.private_key;
+            state.pending = Some(Pending {
+                target: Target::Bootstrap,
+                route: "v2/device-authorities/bootstrap/".into(),
+                body: json!({"bootstrapGrant":"original-grant","proof":"original-proof"}),
+                started_at: now(),
+                recovery_used: outcome == "exhausted",
+            });
+            auth.save(&state).await.unwrap();
+            let server_store = store.clone();
+            let server = tokio::spawn(async move {
+                if outcome != "exhausted" {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let request = read_request(&mut stream).await;
+                    assert_eq!(request["recovery"], true);
+                    assert_eq!(request["bootstrapGrant"], "original-grant");
+                    let durable: ProtectedState =
+                        serde_json::from_slice(&server_store.load().unwrap().unwrap()).unwrap();
+                    assert!(durable.logout_pending);
+                    if outcome == "recovered" {
+                        respond(&mut stream,200,json!({"data":{"device":{"deviceId":"00000000-0000-4000-8000-000000000002","accessToken":"lmxda_recovered_secret","refreshToken":"refresh","expiresInSeconds":3600}}})).await;
+                        let (mut stream, _) = listener.accept().await.unwrap();
+                        assert_eq!(read_request(&mut stream).await, json!({}));
+                        respond(&mut stream, 200, json!({"data":{"revoked":true}})).await;
+                    } else {
+                        respond(
+                            &mut stream,
+                            409,
+                            json!({"error":{"code":"RECOVERY_EXHAUSTED"}}),
+                        )
+                        .await;
+                    }
+                }
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            let result = auth.offline_logout().await;
+            if outcome == "recovered" {
+                assert_eq!(result.unwrap()["revoked"], true);
+                assert!(store.load().unwrap().is_none());
+            } else {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "AUTH_RECONCILIATION_REQUIRED"
+                );
+                let durable: ProtectedState =
+                    serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+                assert!(durable.logout_pending && durable.pending.as_ref().unwrap().recovery_used);
+                assert_eq!(durable.private_key, original_key);
+                assert_eq!(durable.pending.unwrap().body["proof"], "original-proof");
+            }
+            server.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn offline_cleanup_preserves_recovery_until_revocation_and_retries_delete_failure() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct DeleteOnce {
+            memory: Arc<MemoryStore>,
+            fail: AtomicBool,
+        }
+        impl Store for DeleteOnce {
+            fn load(&self) -> Result<Option<Vec<u8>>> {
+                self.memory.load()
+            }
+            fn save(&self, data: &[u8]) -> Result<()> {
+                self.memory.save(data)
+            }
+            fn delete(&self) -> Result<()> {
+                let durable: ProtectedState =
+                    serde_json::from_slice(&self.memory.load()?.unwrap())?;
+                ensure!(
+                    durable.device.is_none() && !durable.logout_pending,
+                    "deletion before revocation"
+                );
+                if self.fail.swap(false, Ordering::SeqCst) {
+                    bail!("STORE_UNAVAILABLE");
+                }
+                self.memory.delete()
+            }
+        }
+        let (mut auth, memory, listener) = test_auth().await;
+        auth.store = Arc::new(DeleteOnce {
+            memory: memory.clone(),
+            fail: AtomicBool::new(true),
+        });
+        let mut state = ProtectedState::fresh();
+        state.device = Some(Token {
+            access: "lmxda_prefix_secret".into(),
+            refresh: "refresh".into(),
+            subject: "device".into(),
+            expires_at: 0,
+        });
+        auth.save(&state).await.unwrap();
+        let server = tokio::spawn(async move {
+            for status in [503, 200] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_request(&mut stream).await;
+                respond(
+                    &mut stream,
+                    status,
+                    if status == 200 {
+                        json!({"data":{"revoked":true}})
+                    } else {
+                        json!({"error":{"code":"BACKEND_UNAVAILABLE"}})
+                    },
+                )
+                .await;
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        assert!(auth.offline_logout().await.is_err());
+        let durable: ProtectedState =
+            serde_json::from_slice(&memory.load().unwrap().unwrap()).unwrap();
+        assert!(durable.logout_pending && durable.device.is_some());
+        assert_eq!(
+            auth.offline_logout().await.unwrap_err().to_string(),
+            "STORE_UNAVAILABLE"
+        );
+        let durable: ProtectedState =
+            serde_json::from_slice(&memory.load().unwrap().unwrap()).unwrap();
+        assert!(!durable.logout_pending && durable.device.is_none());
+        assert_eq!(auth.offline_logout().await.unwrap()["revoked"], true);
+        assert!(memory.load().unwrap().is_none());
+        server.await.unwrap();
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn canceled_offline_deletion_cannot_erase_a_later_installation_write() {
+        struct GatedDelete {
+            memory: MemoryStore,
+            entered: tokio::sync::Notify,
+            gate: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        }
+        impl Store for GatedDelete {
+            fn load(&self) -> Result<Option<Vec<u8>>> {
+                self.memory.load()
+            }
+            fn save(&self, data: &[u8]) -> Result<()> {
+                self.memory.save(data)
+            }
+            fn delete(&self) -> Result<()> {
+                self.entered.notify_one();
+                self.gate
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .unwrap();
+                self.memory.delete()
+            }
+        }
+        let (release, gate) = std::sync::mpsc::channel();
+        let store = Arc::new(GatedDelete {
+            memory: MemoryStore::default(),
+            entered: tokio::sync::Notify::new(),
+            gate: std::sync::Mutex::new(Some(gate)),
+        });
+        let auth = Auth {
+            api: Api::for_test_origin("http://127.0.0.1:9").unwrap(),
+            store: store.clone(),
+            lock: Arc::new(Mutex::new(())),
+            store_lock: Arc::new(Mutex::new(())),
+        };
+        let original = auth.installation_id().await.unwrap();
+        let copy = auth.clone();
+        let cleanup = tokio::spawn(async move { copy.offline_logout().await });
+        store.entered.notified().await;
+        cleanup.abort();
+        assert!(cleanup.await.unwrap_err().is_cancelled());
+        let mut later = tokio::spawn(async move { auth.installation_id().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut later)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        let replacement = later.await.unwrap().unwrap();
+        assert_ne!(replacement, original);
+        let durable: ProtectedState =
+            serde_json::from_slice(&store.memory.load().unwrap().unwrap()).unwrap();
+        assert_eq!(durable.installation_id, replacement);
     }
     #[tokio::test]
     async fn logout_failure_retains_protected_retry_and_blocks_execution() {

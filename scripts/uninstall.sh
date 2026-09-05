@@ -19,6 +19,7 @@ agents="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[
 for path in "$base" "$state" "$agents"; do [[ "$path" != / && "$path" != "${HOME:-}" ]] || { echo "unsafe installation directory: $path" >&2; exit 1; }; done
 
 versions="$base/versions"; receipt="$state/install-receipt.json"; owned="$state/owned-versions.json"; current="$base/current"
+ready="$state/uninstall-ready.json"
 [[ ! -L "$versions" ]] || { echo "versions directory may not be a symlink" >&2; exit 1; }
 [[ -d "$versions" && "$(cd "$versions" && pwd -P)" == "$versions" ]] || { echo "invalid versions directory" >&2; exit 1; }
 [[ -f "$receipt" && -f "$owned" ]] || { echo "no complete Loomex-owned installation inventory; refusing broad cleanup" >&2; exit 1; }
@@ -58,16 +59,35 @@ PY
 )"
 [[ -x "$current_path/bin/loomex" ]] || { echo "installed runner executable missing; credentials cannot be revoked safely" >&2; exit 1; }
 
-LOOMEX_STATE_DIR="$state" "$current_path/bin/loomex" drain >/dev/null
-active="$(LOOMEX_STATE_DIR="$state" "$current_path/bin/loomex" status | python3 -c 'import json,sys; data=json.load(sys.stdin); value=data["activeJobs"]; assert isinstance(value,int) and value>=0; print(value)')"
-((active==0)) || { echo "uninstall deferred: $active active jobs; retry after they finish" >&2; exit 1; }
+checkpoint_valid=0
+if [[ -f "$ready" ]]; then
+  python3 - "$ready" "$current_path" <<'PY'
+import json,sys
+data=json.load(open(sys.argv[1]))
+if data != {'schema':'app.loomex.runner.uninstall-ready/v1','versionPath':sys.argv[2]}: raise SystemExit('invalid uninstall checkpoint')
+PY
+  if [[ -f "$state/drain.json" && ! -L "$state/drain.json" ]]; then checkpoint_valid=1; else rm -f "$ready" "$ready.new"; fi
+fi
+if ((checkpoint_valid==0)); then
+  LOOMEX_STATE_DIR="$state" "$current_path/bin/loomex" drain >/dev/null
+  active="$(LOOMEX_STATE_DIR="$state" "$current_path/bin/loomex" status | python3 -c 'import json,sys; data=json.load(sys.stdin); value=data["activeJobs"]; assert isinstance(value,int) and value>=0; print(value)')"
+  ((active==0)) || { echo "uninstall deferred: $active active jobs or lifecycle writers; retry after they finish" >&2; exit 1; }
+  python3 - "$ready" "$current_path" <<'PY'
+import json,os,sys
+from pathlib import Path
+out=Path(sys.argv[1]); tmp=out.with_name(out.name+'.new'); encoded=(json.dumps({'schema':'app.loomex.runner.uninstall-ready/v1','versionPath':sys.argv[2]},sort_keys=True)+'\n').encode()
+with tmp.open('wb') as f: f.write(encoded); f.flush(); os.fsync(f.fileno())
+os.replace(tmp,out); fd=os.open(out.parent,os.O_RDONLY); os.fsync(fd); os.close(fd)
+PY
+fi
 
-# Revocation is deliberately before deletion. Failure leaves launchd and all files intact for a safe retry.
-LOOMEX_STATE_DIR="$state" "$current_path/bin/loomex" logout >/dev/null
 if [[ "${LOOMEX_INSTALL_TEST_MODE:-}" != 1 ]]; then launchctl bootout "gui/$UID/app.loomex.runner" 2>/dev/null || true; fi
+# Offline logout takes the daemon's exclusive lock and performs only native
+# credential revocation/cleanup. Failure leaves the checkpoint and every file intact.
+LOOMEX_STATE_DIR="$state" "$current_path/bin/loomex" logout --offline >/dev/null
 rm -f "$agents/app.loomex.runner.plist" "$current"
 while IFS= read -r version_path; do [[ -z "$version_path" ]] || rm -rf "$version_path"; done < "$paths_file"
-for name in state.json operations preparations jobs tombstones run-bindings preparation-tombstones responses daemon.lock control.sock pending-update.json install-receipt.json owned-versions.json logs drain.json; do
+for name in state.json operations preparations jobs tombstones run-bindings preparation-tombstones responses daemon.lock control.sock pending-update.json uninstall-ready.json uninstall-ready.json.new install-receipt.json owned-versions.json logs drain.json; do
   rm -rf "$state/$name"
 done
 rmdir "$state" "$versions" "$base" 2>/dev/null || true

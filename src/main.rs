@@ -23,6 +23,16 @@ async fn run() -> Result<()> {
         return Ok(());
     }
     let dir = state::state_dir()?;
+    if command == "logout" {
+        match args.next().as_deref() {
+            Some("--offline") if args.next().is_none() => {
+                println!("{}", control::offline_logout(&dir).await?);
+                return Ok(());
+            }
+            None => {}
+            _ => bail!("INVALID_REQUEST"),
+        }
+    }
     let (method, params) = match command.as_str() {
         "status" => ("status.get".into(), json!({})),
         "drain" => (
@@ -45,7 +55,9 @@ async fn run() -> Result<()> {
             (method, params)
         }
         "--help" | "help" => {
-            println!("loomex status | login | logout | drain | rpc METHOD JSON | --version");
+            println!(
+                "loomex status | login | logout [--offline] | drain | rpc METHOD JSON | --version"
+            );
             return Ok(());
         }
         _ => bail!("unknown command"),

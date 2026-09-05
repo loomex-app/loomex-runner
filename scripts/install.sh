@@ -29,7 +29,7 @@ agents="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[
 for path in "$base" "$state" "$agents"; do [[ "$path" != / && "$path" != "${HOME:-}" ]] || { echo "unsafe installation directory: $path" >&2; exit 1; }; done
 versions="$base/versions"
 [[ ! -L "$versions" ]] || { echo "versions directory may not be a symlink" >&2; exit 1; }
-owned_state_names=(state.json operations preparations jobs tombstones run-bindings preparation-tombstones responses daemon.lock control.sock pending-update.json install-receipt.json owned-versions.json logs drain.json)
+owned_state_names=(state.json operations preparations jobs tombstones run-bindings preparation-tombstones responses daemon.lock control.sock pending-update.json uninstall-ready.json uninstall-ready.json.new install-receipt.json owned-versions.json logs drain.json)
 fresh_state=0
 if [[ ! -f "$state/install-receipt.json" && ! -f "$state/owned-versions.json" ]]; then
   fresh_state=1
@@ -147,7 +147,7 @@ fi
 old="$current_path"; plist_backup="$stage/agent.previous"; [[ ! -f "$agent" ]] || cp "$agent" "$plist_backup"
 if [[ "${LOOMEX_INSTALL_TEST_MODE:-}" != 1 ]]; then launchctl bootout "gui/$UID/app.loomex.runner" 2>/dev/null || true; fi
 ln -s "$expected" "$base/.current.new"; mv -fh "$base/.current.new" "$current"; cp "$stage/app.loomex.runner.plist" "$agent"
-rm -f "$state/drain.json"
+rm -f "$state/uninstall-ready.json" "$state/uninstall-ready.json.new" "$state/drain.json"
 activation_failed=0; service_loaded=0
 if [[ "${LOOMEX_TEST_BOOTSTRAP_FAIL:-}" == 1 ]]; then
   activation_failed=1
