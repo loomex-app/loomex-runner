@@ -1,0 +1,5 @@
+/target/
+/dist/
+*.sock
+.DS_Store
+/release/

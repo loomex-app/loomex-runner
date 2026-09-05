@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "loomex.local-control/v2",
+  "title": "Loomex local control v2",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": [
+        "protocol",
+        "id",
+        "method",
+        "params"
+      ],
+      "properties": {
+        "protocol": {
+          "const": "loomex.local-control/v2"
+        },
+        "id": {
+          "type": "string"
+        },
+        "method": {
+          "enum": [
+            "protocol.negotiate",
+            "status.get",
+            "auth.status",
+            "auth.login",
+            "auth.poll",
+            "auth.logout",
+            "organizations.list",
+            "organizations.select",
+            "workspaces.list",
+            "workspaces.grant",
+            "workspaces.revoke",
+            "workflows.list",
+            "workflows.get",
+            "workflows.create",
+            "workflows.update",
+            "workflows.validate",
+            "workflows.publish",
+            "workflows.activate",
+            "builder.catalog",
+            "builder.validate",
+            "builder.prepare",
+            "builder.get",
+            "builder.respond",
+            "builder.finalize",
+            "editor.prepare",
+            "editor.respond",
+            "editor.finalize",
+            "runs.prepare",
+            "runs.commit",
+            "runs.list",
+            "runs.get",
+            "runs.wait",
+            "runs.events",
+            "runs.result",
+            "runs.cancel",
+            "runs.delete",
+            "interactions.list",
+            "interactions.get",
+            "interactions.respond",
+            "interactions.decide",
+            "artifacts.list",
+            "artifacts.read",
+            "artifacts.download",
+            "responses.read",
+            "responses.delete",
+            "daemon.drain",
+            "builder.commit",
+            "editor.commit"
+          ]
+        },
+        "params": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": [
+        "protocol",
+        "id",
+        "result"
+      ],
+      "properties": {
+        "protocol": {
+          "const": "loomex.local-control/v2"
+        },
+        "id": {
+          "type": "string"
+        },
+        "result": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": [
+        "protocol",
+        "id",
+        "error"
+      ],
+      "properties": {
+        "protocol": {
+          "const": "loomex.local-control/v2"
+        },
+        "id": {
+          "type": "string"
+        },
+        "error": {
+          "type": "object",
+          "required": [
+            "code",
+            "message",
+            "correlationId",
+            "retryable"
+          ],
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "correlationId": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "retryable": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

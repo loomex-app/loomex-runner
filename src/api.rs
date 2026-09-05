@@ -1,0 +1,400 @@
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use ed25519_dalek::{Signer, SigningKey};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::{
+    fmt,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use url::Url;
+
+const BASE: &str = "/api/v1/runner-control/runner/";
+#[derive(Clone)]
+pub struct SignedCredential {
+    pub(crate) token: String,
+    pub(crate) subject: String,
+    pub(crate) private_key: [u8; 32],
+}
+#[derive(Clone)]
+pub struct Api {
+    client: reqwest::Client,
+    origin: Url,
+}
+#[derive(Debug)]
+pub struct ApiError {
+    pub code: String,
+    pub retryable: bool,
+}
+impl fmt::Display for ApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.code)
+    }
+}
+impl std::error::Error for ApiError {}
+impl ApiError {
+    fn new(code: &str, retryable: bool) -> Self {
+        Self {
+            code: code.into(),
+            retryable,
+        }
+    }
+}
+pub(crate) fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+pub(crate) fn hash(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+pub(crate) fn sign(key: &[u8; 32], message: &[u8]) -> String {
+    URL_SAFE_NO_PAD.encode(SigningKey::from_bytes(key).sign(message).to_bytes())
+}
+pub(crate) fn key_proof(key: &[u8; 32], purpose: &str, secret: &str) -> String {
+    let nonce = uuid::Uuid::new_v4().to_string();
+    format!(
+        "{}.{}",
+        sign(
+            key,
+            format!("{purpose}:{}:{nonce}", hash(secret.as_bytes())).as_bytes()
+        ),
+        nonce
+    )
+}
+fn request_proof(
+    credential: &SignedCredential,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    timestamp: u64,
+    nonce: &str,
+) -> Result<String, ApiError> {
+    let prefix = credential
+        .token
+        .split('_')
+        .nth(1)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError::new("AUTH_REQUIRED", false))?;
+    let message = format!(
+        "{method}|{path}|{}|{timestamp}|{nonce}|{prefix}|{}",
+        hash(body),
+        credential.subject
+    );
+    Ok(format!(
+        "{timestamp}.{nonce}.{}",
+        sign(&credential.private_key, message.as_bytes())
+    ))
+}
+fn validate_origin(raw: &str, development: bool) -> anyhow::Result<Url> {
+    let origin = Url::parse(raw).map_err(|_| anyhow::anyhow!("INVALID_API_ORIGIN"))?;
+    let loopback = match origin.host() {
+        Some(url::Host::Domain("localhost")) => true,
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        _ => false,
+    };
+    anyhow::ensure!(
+        origin.username().is_empty()
+            && origin.password().is_none()
+            && origin.query().is_none()
+            && origin.fragment().is_none()
+            && origin.path() == "/"
+            && origin.host().is_some(),
+        "INVALID_API_ORIGIN"
+    );
+    anyhow::ensure!(
+        if development {
+            loopback && matches!(origin.scheme(), "http" | "https")
+        } else {
+            origin.scheme() == "https"
+        },
+        "INVALID_API_ORIGIN"
+    );
+    Ok(origin)
+}
+fn request_timeout(method: &str, route: &str) -> Duration {
+    let path = route.split('?').next().unwrap_or(route);
+    let resource_get = method == "GET"
+        && ["v1/executions/", "v1/workflow-builder/sessions/"]
+            .iter()
+            .any(|prefix| {
+                path.strip_prefix(prefix)
+                    .and_then(|tail| tail.strip_suffix('/'))
+                    .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+            });
+    // This is the HTTP transport budget, never a deadline for executing a job.
+    if (method == "POST" && path == "v1/jobs/lease/") || resource_get {
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(12)
+    }
+}
+fn select_origin(
+    compiled_origin: Option<&str>,
+    development_origin: Option<&str>,
+    debug_build: bool,
+) -> anyhow::Result<Url> {
+    if let Some(origin) = compiled_origin {
+        anyhow::ensure!(development_origin.is_none(), "DEV_API_ORIGIN_FORBIDDEN");
+        return validate_origin(origin, false);
+    }
+    anyhow::ensure!(debug_build, "CONFIGURATION_REQUIRED");
+    validate_origin(
+        development_origin.ok_or_else(|| anyhow::anyhow!("CONFIGURATION_REQUIRED"))?,
+        true,
+    )
+}
+impl Api {
+    #[cfg(test)]
+    pub(crate) fn for_test_origin(origin: &str) -> anyhow::Result<Self> {
+        Self::with_origin(validate_origin(origin, true)?)
+    }
+    pub fn new() -> anyhow::Result<Self> {
+        let development_origin = match std::env::var("LOOMEX_DEV_API_ORIGIN") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(_) => anyhow::bail!("INVALID_API_ORIGIN"),
+        };
+        let origin = select_origin(
+            option_env!("LOOMEX_API_ORIGIN"),
+            development_origin.as_deref(),
+            cfg!(debug_assertions),
+        )?;
+        Self::with_origin(origin)
+    }
+    pub(crate) fn with_origin(origin: Url) -> anyhow::Result<Self> {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .timeout(Duration::from_secs(12))
+            .build()
+            .map_err(|_| anyhow::anyhow!("API_CLIENT_UNAVAILABLE"))?;
+        Ok(Self { client, origin })
+    }
+    pub(crate) fn verification_uri(&self, path: &str, user_code: &str) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            path.starts_with('/') && !path.starts_with("//") && !path.contains('\\'),
+            "INVALID_VERIFICATION_URI"
+        );
+        let mut url = self
+            .origin
+            .join(path)
+            .map_err(|_| anyhow::anyhow!("INVALID_VERIFICATION_URI"))?;
+        anyhow::ensure!(
+            url.origin() == self.origin.origin(),
+            "INVALID_VERIFICATION_URI"
+        );
+        url.query_pairs_mut().append_pair("userCode", user_code);
+        Ok(url.into())
+    }
+    pub async fn request(
+        &self,
+        method: &str,
+        route: &str,
+        body: Option<Value>,
+        credential: Option<&SignedCredential>,
+        idempotency_key: Option<&str>,
+    ) -> Result<Value, ApiError> {
+        if !(route.starts_with("v1/") || route.starts_with("v2/"))
+            || route.contains(['\\', '#'])
+            || route
+                .split('?')
+                .next()
+                .unwrap_or("")
+                .split('/')
+                .any(|s| s == ".." || s == "." || s.contains('%'))
+        {
+            return Err(ApiError::new("INVALID_API_ROUTE", false));
+        }
+        let url = self
+            .origin
+            .join(&format!("{BASE}{route}"))
+            .map_err(|_| ApiError::new("INVALID_API_ROUTE", false))?;
+        if url.origin() != self.origin.origin() || !url.path().starts_with(BASE) {
+            return Err(ApiError::new("INVALID_API_ROUTE", false));
+        }
+        let method = reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|_| ApiError::new("INVALID_API_METHOD", false))?;
+        let bytes = body
+            .map(|b| serde_json::to_vec(&b))
+            .transpose()
+            .map_err(|_| ApiError::new("INVALID_REQUEST_BODY", false))?
+            .unwrap_or_default();
+        let mut request = self
+            .client
+            .request(method.clone(), url.clone())
+            .timeout(request_timeout(method.as_str(), route))
+            .header("Accept", "application/json");
+        if let Some(key) = idempotency_key {
+            request = request.header("Idempotency-Key", key);
+        }
+        if let Some(credential) = credential {
+            let path = match url.query() {
+                Some(query) => format!("{}?{query}", url.path()),
+                None => url.path().into(),
+            };
+            request = request.bearer_auth(&credential.token).header(
+                "X-Loomex-Runner-Proof",
+                request_proof(
+                    credential,
+                    method.as_str(),
+                    &path,
+                    &bytes,
+                    now(),
+                    &uuid::Uuid::new_v4().to_string(),
+                )?,
+            );
+        }
+        if !bytes.is_empty() {
+            request = request
+                .header("Content-Type", "application/json")
+                .body(bytes);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|_| ApiError::new("NETWORK_UNAVAILABLE", true))?;
+        let status = response.status().as_u16();
+        if status == 202 {
+            return Ok(json!({"pending":true}));
+        }
+        let payload = response.json::<Value>().await.map_err(|_| {
+            ApiError::new(
+                "INVALID_API_RESPONSE",
+                status >= 500 || (200..300).contains(&status),
+            )
+        })?;
+        parse_envelope(status, payload)
+    }
+}
+fn parse_envelope(status: u16, payload: Value) -> Result<Value, ApiError> {
+    if (200..300).contains(&status) {
+        return payload
+            .get("data")
+            .cloned()
+            .ok_or_else(|| ApiError::new("INVALID_API_RESPONSE", true));
+    }
+    let code = payload
+        .pointer("/error/code")
+        .or_else(|| payload.pointer("/errors/0/code"))
+        .and_then(Value::as_str)
+        .filter(|s| {
+            !s.is_empty()
+                && s.len() <= 100
+                && s.bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        })
+        .unwrap_or("API_REQUEST_FAILED");
+    Err(ApiError::new(
+        code,
+        status >= 500 || status == 429 || status == 408,
+    ))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signature, Verifier};
+    #[test]
+    fn transport_timeout_allows_long_poll_without_extending_auth_recovery() {
+        for (method, route) in [
+            ("POST", "v1/jobs/lease/"),
+            ("GET", "v1/executions/run-id/?timeoutSeconds=45"),
+            (
+                "GET",
+                "v1/workflow-builder/sessions/session-id/?timeoutSeconds=45",
+            ),
+        ] {
+            assert_eq!(request_timeout(method, route), Duration::from_secs(60));
+        }
+        for (method, route) in [
+            ("POST", "v2/device-authorities/bootstrap/"),
+            ("POST", "v2/device-authorities/refresh/"),
+            ("POST", "v1/delegations/refresh/"),
+            ("POST", "v2/organizations/org/enroll/"),
+            ("GET", "v1/jobs/lease/"),
+            ("POST", "v1/executions/run-id/cancel/"),
+            ("GET", "v1/executions/run-id/human-requests/"),
+            ("GET", "v2/executions/"),
+        ] {
+            assert_eq!(request_timeout(method, route), Duration::from_secs(12));
+        }
+    }
+    #[test]
+    fn production_origin_is_pinned_and_development_requires_debug_build() {
+        for debug in [false, true] {
+            let pinned = select_origin(Some("https://api.example.com"), None, debug).unwrap();
+            assert_eq!(pinned.as_str(), "https://api.example.com/");
+            assert_eq!(
+                select_origin(
+                    Some("https://api.example.com"),
+                    Some("http://127.0.0.1:9000"),
+                    debug
+                )
+                .unwrap_err()
+                .to_string(),
+                "DEV_API_ORIGIN_FORBIDDEN"
+            );
+            assert!(select_origin(Some("http://api.example.com"), None, debug).is_err());
+            assert_eq!(
+                select_origin(None, None, debug).unwrap_err().to_string(),
+                "CONFIGURATION_REQUIRED"
+            );
+        }
+        assert_eq!(
+            select_origin(None, Some("http://127.0.0.1:9000"), false)
+                .unwrap_err()
+                .to_string(),
+            "CONFIGURATION_REQUIRED"
+        );
+        assert!(select_origin(None, Some("http://127.0.0.1:9000"), true).is_ok());
+        assert!(select_origin(None, Some("https://external.example.com"), true).is_err());
+    }
+    #[test]
+    fn proof_binds_exact_request() {
+        let credential = SignedCredential {
+            token: "lmxda_PREFIX_SECRET".into(),
+            subject: "device".into(),
+            private_key: [7; 32],
+        };
+        let proof = request_proof(&credential, "POST", "/x/?b=2&a=1", b"{}", 123, "nonce").unwrap();
+        let signature = Signature::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(proof.split('.').nth(2).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let expected = format!("POST|/x/?b=2&a=1|{}|123|nonce|PREFIX|device", hash(b"{}"));
+        let public = SigningKey::from_bytes(&credential.private_key).verifying_key();
+        public.verify(expected.as_bytes(), &signature).unwrap();
+        assert!(
+            public
+                .verify(
+                    expected.replace("b=2&a=1", "a=1&b=2").as_bytes(),
+                    &signature
+                )
+                .is_err()
+        );
+    }
+    #[test]
+    fn origin_restrictions() {
+        assert!(validate_origin("http://example.com", false).is_err());
+        assert!(validate_origin("https://example.com", true).is_err());
+        assert!(validate_origin("http://127.0.0.1:8080", true).is_ok());
+        assert!(validate_origin("https://user:pass@example.com", false).is_err());
+    }
+    #[test]
+    fn envelope_and_safe_error() {
+        assert_eq!(
+            parse_envelope(200, json!({"data":{"a":1},"meta":{}})).unwrap(),
+            json!({"a":1})
+        );
+        assert!(parse_envelope(200, json!({"a":1})).unwrap_err().retryable);
+        assert_eq!(
+            parse_envelope(401, json!({"error":{"code":"secret token"}}))
+                .unwrap_err()
+                .code,
+            "API_REQUEST_FAILED"
+        );
+    }
+}

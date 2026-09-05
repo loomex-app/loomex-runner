@@ -1,0 +1,49 @@
+name: Production release
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-14-xlarge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.0
+          targets: aarch64-apple-darwin
+      - name: Configure production signing and notarization
+        env:
+          CERTIFICATE_P12_BASE64: ${{ secrets.CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          MANIFEST_KEY_BASE64: ${{ secrets.MANIFEST_KEY_BASE64 }}
+        run: |
+          test -n "$CERTIFICATE_P12_BASE64" && test -n "$CERTIFICATE_PASSWORD" && test -n "$KEYCHAIN_PASSWORD"
+          test -n "$APPLE_ID" && test -n "$APPLE_APP_PASSWORD" && test -n "$APPLE_TEAM_ID" && test -n "$MANIFEST_KEY_BASE64"
+          printf '%s' "$CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          printf '%s' "$MANIFEST_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/manifest-private.pem"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/release.keychain-db"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/release.keychain-db"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$RUNNER_TEMP/release.keychain-db" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/release.keychain-db"
+          security list-keychains -d user -s "$RUNNER_TEMP/release.keychain-db"
+          xcrun notarytool store-credentials loomex-ci --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+      - name: Build signed and notarized release
+        env:
+          LOOMEX_CODESIGN_IDENTITY: ${{ secrets.LOOMEX_CODESIGN_IDENTITY }}
+          LOOMEX_NOTARY_PROFILE: loomex-ci
+          LOOMEX_MANIFEST_SIGNING_KEY: ${{ runner.temp }}/manifest-private.pem
+        run: ./scripts/build-release.sh --production --output "$RUNNER_TEMP/release"
+      - name: Verify production installer
+        run: |
+          openssl rsa -in "$RUNNER_TEMP/manifest-private.pem" -pubout -out "$RUNNER_TEMP/manifest-public.pem"
+          LOOMEX_INSTALL_TEST_MODE=1 ./scripts/install.sh "$RUNNER_TEMP/release" --public-key "$RUNNER_TEMP/manifest-public.pem" --install-base "$RUNNER_TEMP/production-install" --state-dir "$RUNNER_TEMP/production-state" --launch-agents-dir "$RUNNER_TEMP/production-agents"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: loomex-runner-darwin-arm64
+          path: ${{ runner.temp }}/release
+          if-no-files-found: error

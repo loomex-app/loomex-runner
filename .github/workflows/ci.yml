@@ -1,0 +1,30 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: macos-14-xlarge
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.0
+          targets: aarch64-apple-darwin
+      - run: cargo test --locked
+      - run: ./scripts/test-packaging.sh
+      - name: Smoke installed development daemon and CLI
+        env:
+          LOOMEX_ALLOW_UNSAFE_DEV_INSTALL: "1"
+        run: |
+          ./scripts/build-release.sh --unsigned-development --output "$RUNNER_TEMP/release"
+          LOOMEX_INSTALL_TEST_MODE=1 ./scripts/install.sh "$RUNNER_TEMP/release" --allow-unsigned-development --install-base "$RUNNER_TEMP/install" --state-dir "$RUNNER_TEMP/state" --launch-agents-dir "$RUNNER_TEMP/agents"
+          LOOMEX_STATE_DIR="$RUNNER_TEMP/state" LOOMEX_DEV_API_ORIGIN="http://127.0.0.1:9" "$RUNNER_TEMP/install/current/bin/loomex-runner" &
+          daemon_pid=$!
+          trap 'kill "$daemon_pid" 2>/dev/null || true' EXIT
+          for attempt in {1..100}; do test -S "$RUNNER_TEMP/state/control.sock" && break; sleep 0.05; done
+          test -S "$RUNNER_TEMP/state/control.sock"
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          LOOMEX_STATE_DIR="$RUNNER_TEMP/state" "$RUNNER_TEMP/install/current/bin/loomex" status | EXPECTED_VERSION="$version" python3 -c 'import json,os,sys; data=json.load(sys.stdin); assert data["version"]==os.environ["EXPECTED_VERSION"] and isinstance(data["activeJobs"],int)'
