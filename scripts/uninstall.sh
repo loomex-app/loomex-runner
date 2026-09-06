@@ -26,8 +26,9 @@ ready="$state/uninstall-ready.json"
 [[ -L "$current" ]] || { echo "installed runner pointer missing; credentials cannot be revoked safely" >&2; exit 1; }
 
 # Validate every future deletion before running credential or launchd operations.
+repo="$(cd "$(dirname "$0")/.." && pwd -P)"
 paths_file="$(mktemp)"; trap 'rm -f "$paths_file"' EXIT
-python3 - "$versions" "$current" "$receipt" "$owned" "$agents/app.loomex.runner.plist" "$paths_file" <<'PY'
+development_origin="$(python3 - "$versions" "$current" "$receipt" "$owned" "$agents/app.loomex.runner.plist" "$paths_file" <<'PY'
 import json,re,sys
 from pathlib import Path
 versions=Path(sys.argv[1]).resolve(strict=True); current=Path(sys.argv[2]); receipt=Path(sys.argv[3]); owned=Path(sys.argv[4]); expected_agent=sys.argv[5]; output=Path(sys.argv[6])
@@ -37,6 +38,14 @@ if link.is_symlink(): raise SystemExit('current points through a symlinked versi
 current_path=link.absolute()
 r=json.loads(receipt.read_text()); data=json.loads(owned.read_text())
 if r.get('schema')!='app.loomex.runner.install-receipt/v1' or r.get('launchAgent')!=expected_agent: raise SystemExit('unexpected installation receipt')
+development=r.get('developmentOnly')
+origin=r.get('developmentApiOrigin')
+if not isinstance(development,bool): raise SystemExit('installation receipt lacks authenticated release class')
+if development:
+ if not isinstance(origin,str) or not origin: raise SystemExit('development installation receipt lacks its API origin')
+ print(origin)
+elif origin is not None: raise SystemExit('production installation receipt contains a development API origin')
+else: print('')
 if data.get('schema')!='app.loomex.runner.owned-versions/v1' or not isinstance(data.get('paths'),list) or not data['paths']: raise SystemExit('unexpected owned versions inventory')
 clean=[]
 for value in data['paths']:
@@ -48,6 +57,11 @@ receipt_path=str(Path(r.get('versionPath','')).absolute())
 if str(current_path) != receipt_path or receipt_path not in clean: raise SystemExit('current runner does not match owned receipt')
 output.write_text('\n'.join(clean)+'\n')
 PY
+ )"
+if [[ -n "$development_origin" ]]; then
+  canonical_origin="$(python3 "$repo/scripts/validate_development_origin.py" "$development_origin")"
+  [[ "$canonical_origin" == "$development_origin" ]] || { echo "development API origin in receipt is not canonical" >&2; exit 1; }
+fi
 current_path="$(python3 - "$versions" "$current" <<'PY'
 import re,sys
 from pathlib import Path
@@ -84,7 +98,9 @@ fi
 if [[ "${LOOMEX_INSTALL_TEST_MODE:-}" != 1 ]]; then launchctl bootout "gui/$UID/app.loomex.runner" 2>/dev/null || true; fi
 # Offline logout takes the daemon's exclusive lock and performs only native
 # credential revocation/cleanup. Failure leaves the checkpoint and every file intact.
-LOOMEX_STATE_DIR="$state" "$current_path/bin/loomex" logout --offline >/dev/null
+offline_env=(env "LOOMEX_STATE_DIR=$state")
+[[ -z "$development_origin" ]] || offline_env+=("LOOMEX_DEV_API_ORIGIN=$development_origin")
+"${offline_env[@]}" "$current_path/bin/loomex" logout --offline >/dev/null
 rm -f "$agents/app.loomex.runner.plist" "$current"
 while IFS= read -r version_path; do [[ -z "$version_path" ]] || rm -rf "$version_path"; done < "$paths_file"
 for name in state.json operations preparations jobs tombstones run-bindings preparation-tombstones responses daemon.lock control.sock pending-update.json uninstall-ready.json uninstall-ready.json.new install-receipt.json owned-versions.json logs drain.json; do

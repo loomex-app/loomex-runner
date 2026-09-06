@@ -1,14 +1,15 @@
 #!/bin/bash
 set -euo pipefail
 
-usage(){ echo "usage: $0 RELEASE_DIR [--public-key FILE | --allow-unsigned-development] [--install-base DIR --state-dir DIR --launch-agents-dir DIR]" >&2; exit 2; }
+usage(){ echo "usage: $0 RELEASE_DIR [--public-key FILE | --allow-unsigned-development --development-api-origin LOOPBACK_URL] [--install-base DIR --state-dir DIR --launch-agents-dir DIR]" >&2; exit 2; }
 [[ $# -ge 1 ]] || usage
 release="$(cd "$1" && pwd -P)"; shift
-public_key=""; allow_dev=0; base=""; state=""; agents=""
+public_key=""; allow_dev=0; development_origin=""; base=""; state=""; agents=""
 while (($#)); do
   case "$1" in
     --public-key) public_key="${2:?}"; shift 2;;
     --allow-unsigned-development) allow_dev=1; shift;;
+    --development-api-origin) development_origin="${2:?}"; shift 2;;
     --install-base) base="${2:?}"; shift 2;;
     --state-dir) state="${2:?}"; shift 2;;
     --launch-agents-dir) agents="${2:?}"; shift 2;;
@@ -58,10 +59,11 @@ PY
 }
 
 write_receipt() {
-  python3 - "$version" "$expected" "$agent" "$state/install-receipt.json" <<'PY'
+  python3 - "$version" "$expected" "$agent" "$development" "$development_origin" "$state/install-receipt.json" <<'PY'
 import json,os,sys
 from pathlib import Path
-version,path,agent,out=sys.argv[1:]; out=Path(out); tmp=out.with_name(out.name+'.new'); data={'schema':'app.loomex.runner.install-receipt/v1','version':version,'versionPath':path,'launchAgent':agent}
+version,path,agent,development,origin,out=sys.argv[1:]; out=Path(out); tmp=out.with_name(out.name+'.new')
+data={'schema':'app.loomex.runner.install-receipt/v1','version':version,'versionPath':path,'launchAgent':agent,'developmentOnly':development=='true','developmentApiOrigin':origin or None}
 with tmp.open('w') as f: json.dump(data,f,sort_keys=True); f.write('\n'); f.flush(); os.fsync(f.fileno())
 os.replace(tmp,out)
 PY
@@ -80,11 +82,20 @@ if [[ -n "$public_key" ]]; then verify+=(--public-key "$public_key"); fi
 if ((allow_dev)); then [[ "${LOOMEX_ALLOW_UNSAFE_DEV_INSTALL:-}" == "1" ]] || { echo "set LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 for isolated development installs" >&2; exit 1; }; verify+=(--allow-unsigned-development); fi
 python3 "$repo/scripts/artifact.py" "${verify[@]}"
 python3 "$repo/scripts/validate_package.py" "$stage/payload" --expected-version "$version"
-python3 "$repo/scripts/render_launch_agent.py" --template "$stage/payload/launchd/app.loomex.runner.template.plist" --binary "$base/current/bin/loomex-runner" --state "$state" --output "$stage/app.loomex.runner.plist"
 development="$(python3 -c 'import json,sys; print(str(json.load(open(sys.argv[1]))["developmentOnly"]).lower())' "$manifest")"
-if [[ "$development" == false ]]; then
+render_args=(--template "$stage/payload/launchd/app.loomex.runner.template.plist" --binary "$base/current/bin/loomex-runner" --state "$state" --output "$stage/app.loomex.runner.plist")
+if [[ "$development" == true ]]; then
+  ((allow_dev)) || { echo "development artifact requires explicit development opt-in" >&2; exit 1; }
+  [[ -n "$development_origin" ]] || { echo "development artifact requires --development-api-origin" >&2; exit 1; }
+  development_origin="$(python3 "$repo/scripts/validate_development_origin.py" "$development_origin")"
+  render_args+=(--development-api-origin "$development_origin")
+elif [[ "$development" == false ]]; then
+  [[ -z "$development_origin" ]] || { echo "production artifacts reject --development-api-origin" >&2; exit 1; }
   for binary in "$stage/payload/bin/loomex" "$stage/payload/bin/loomex-runner"; do codesign --verify --strict --verbose=2 "$binary"; spctl --assess --type execute --verbose=2 "$binary"; done
+else
+  echo "invalid development classification" >&2; exit 1
 fi
+python3 "$repo/scripts/render_launch_agent.py" "${render_args[@]}"
 mkdir -p "$state/logs"
 
 installed_new=0
