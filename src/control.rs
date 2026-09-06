@@ -26,11 +26,13 @@ use uuid::Uuid;
 
 pub const PROTOCOL: &str = "loomex.local-control/v2";
 pub const MAX_FRAME: usize = 1_048_576;
-pub const REQUIRED_SEMANTICS: [&str; 4] = [
+pub const VALIDATION_ERRORS_CAPABILITY: &str = "error.validation-issues/v1";
+pub const REQUIRED_SEMANTICS: [&str; 5] = [
     "execution.host_user/v1",
     "authorization.prepare-commit/v1",
     "auth.device-v2/v1",
     "transfer.chunked/v1",
+    VALIDATION_ERRORS_CAPABILITY,
 ];
 fn negotiate(params: &Value) -> Result<Value> {
     let catalog: Value = serde_json::from_str(include_str!("../contracts/method-catalog.json"))?;
@@ -1038,6 +1040,7 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut negotiated = false;
+    let mut validation_errors_negotiated = false;
     loop {
         let frame = match read_frame(&mut reader).await {
             Ok(Some(frame)) => frame,
@@ -1069,6 +1072,7 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
                 } else {
                     if request["method"] == "protocol.negotiate" {
                         negotiated = false;
+                        validation_errors_negotiated = false;
                     }
                     match daemon
                         .dispatch(
@@ -1080,11 +1084,23 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
                         Ok(result) => {
                             if request["method"] == "protocol.negotiate" {
                                 negotiated = true;
+                                validation_errors_negotiated =
+                                    request["params"]["requiredCapabilities"]
+                                        .as_array()
+                                        .is_some_and(|capabilities| {
+                                            capabilities
+                                                .contains(&json!(VALIDATION_ERRORS_CAPABILITY))
+                                        });
                             }
                             json!({"protocol":PROTOCOL,"id":id,"result":result})
                         }
                         Err(error) => {
                             let (code, retryable, data) = public_error(&error);
+                            let data = if validation_errors_negotiated {
+                                data
+                            } else {
+                                None
+                            };
                             json!({"protocol":PROTOCOL,"id":id,"error":state::safe_error_with_data(&code,retryable,data.as_ref())})
                         }
                     }
@@ -1319,6 +1335,35 @@ mod conformance {
         }
         .to_string();
         stream.write_all(format!("HTTP/1.1 {status} Reply\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
+    }
+    async fn local_call_with_capabilities(
+        daemon: Arc<Daemon>,
+        required_capabilities: Vec<&str>,
+        method: &str,
+        params: Value,
+    ) -> Value {
+        let (client, server) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(connection(server, daemon));
+        let (read, mut write) = client.into_split();
+        let mut read = BufReader::new(read);
+        let negotiation = exchange(
+            &mut read,
+            &mut write,
+            "protocol.negotiate",
+            json!({
+                "supportedProtocols": [PROTOCOL],
+                "requiredCapabilities": required_capabilities
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(negotiation["result"]["selectedProtocol"], PROTOCOL);
+        let result = exchange(&mut read, &mut write, method, params)
+            .await
+            .unwrap();
+        drop(write);
+        task.abort();
+        result
     }
     async fn download_fixture() -> (tempfile::TempDir, Arc<Daemon>, TcpListener, Value) {
         let temp = tempfile::tempdir().unwrap();
@@ -1587,6 +1632,88 @@ mod conformance {
         assert!(temp.path().join("drain.json").exists());
         drop(w);
         task.abort();
+    }
+    #[tokio::test]
+    async fn validation_error_extension_is_sent_only_to_clients_that_negotiate_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = Arc::new(fixture(temp.path(), api));
+        daemon.public.lock().await.active_organization =
+            Some("11111111-1111-4111-8111-111111111111".into());
+        let backend = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, head) = receive_http(&listener).await;
+                assert!(
+                    head.starts_with("GET /api/v1/runner-control/runner/v1/workflows/ HTTP/1.1")
+                );
+                reply_http(
+                    stream,
+                    422,
+                    json!({
+                        "error": {
+                            "code": "RUN_VALIDATION_FAILED",
+                            "message": "Bearer backend-message-must-not-cross",
+                            "details": {
+                                "validationIssueVersion": "v1",
+                                "validationIssues": [{
+                                    "code": "RUN_VALIDATION_PROVIDER_INVALID",
+                                    "message": "Bearer issue-message-must-not-cross",
+                                    "nextAction": "exfiltrate_credentials",
+                                    "nodeIndex": 3,
+                                    "nodeId": "secret-authored-node-key",
+                                    "nodeName": "Bearer secret-node-name"
+                                }],
+                                "credential": "Bearer never-print-this-token"
+                            }
+                        },
+                        "meta": {}
+                    }),
+                )
+                .await;
+            }
+        });
+
+        let old_client = local_call_with_capabilities(
+            daemon.clone(),
+            vec!["method:workflows.list"],
+            "workflows.list",
+            json!({}),
+        )
+        .await;
+        let old_error = old_client["error"].as_object().unwrap();
+        assert_eq!(old_error["code"], "RUN_VALIDATION_FAILED");
+        assert_eq!(old_error.len(), 4);
+        assert!(!old_error.contains_key("data"));
+        assert!(!old_client.to_string().contains("never-print"));
+
+        let new_client = local_call_with_capabilities(
+            daemon,
+            vec!["method:workflows.list", VALIDATION_ERRORS_CAPABILITY],
+            "workflows.list",
+            json!({}),
+        )
+        .await;
+        assert_eq!(new_client["error"]["code"], "RUN_VALIDATION_FAILED");
+        assert_eq!(
+            new_client["error"]["data"],
+            json!({
+                "validationIssueVersion": "v1",
+                "validationIssues": [{
+                    "code": "RUN_VALIDATION_PROVIDER_INVALID",
+                    "message": "The workflow selects a provider that cannot run this work.",
+                    "nextAction": "choose_supported_provider",
+                    "nodeIndex": 3
+                }]
+            })
+        );
+        let serialized = new_client.to_string();
+        assert!(!serialized.contains("never-print"));
+        assert!(!serialized.contains("secret-authored-node-key"));
+        assert!(!serialized.contains("secret-node-name"));
+        assert!(!serialized.contains("exfiltrate_credentials"));
+        backend.await.unwrap();
     }
     #[tokio::test]
     async fn cli_negotiates_and_sends_action_on_one_unix_connection() {

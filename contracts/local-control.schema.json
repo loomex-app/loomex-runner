@@ -7,53 +7,91 @@
       "type": "object",
       "required": ["code", "message", "nextAction"],
       "properties": {
-        "code": {
-          "enum": [
-            "RUN_INPUT_SCHEMA_INVALID",
-            "RUN_VALIDATION_EXECUTION_POLICY_INVALID",
-            "UNSUPPORTED_CAPABILITY",
-            "RUN_VALIDATION_EXECUTION_ROOT_REQUIRED",
-            "RUN_VALIDATION_RUNNER_UNAVAILABLE",
-            "RUN_VALIDATION_PROVIDER_UNSUPPORTED",
-            "RUN_VALIDATION_PROVIDER_INVALID",
-            "RUN_VALIDATION_POLICY_DENIED",
-            "RUN_VALIDATION_POLICY_REQUIRED",
-            "RUN_VALIDATION_FAILED"
-          ]
-        },
-        "message": {
-          "enum": [
-            "Workflow inputs do not match the required schema.",
-            "The workflow execution policy does not support a required capability.",
-            "This workflow requires a prepared local runner execution root.",
-            "The required local runner is not connected.",
-            "The selected provider does not support a required workflow capability.",
-            "The workflow selects a provider that cannot run this work.",
-            "The execution policy does not allow a required workflow capability.",
-            "A required workflow capability policy has not been configured.",
-            "The workflow has a validation issue that must be reviewed."
-          ]
-        },
-        "nextAction": {
-          "enum": [
-            "correct_workflow_inputs",
-            "update_workflow_definition",
-            "prepare_runner_execution",
-            "connect_runner",
-            "choose_supported_provider",
-            "allow_capability",
-            "configure_capability_policy",
-            "review_workflow_validation"
-          ]
-        },
-        "nodeId": {"type": "string", "format": "uuid"},
-        "nodeName": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 80,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9 _.-]*$"
+        "code": {"type": "string"},
+        "message": {"type": "string"},
+        "nextAction": {"type": "string"},
+        "nodeIndex": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000
         }
       },
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "code": {"const": "RUN_INPUT_SCHEMA_INVALID"},
+                "message": {"const": "Workflow inputs do not match the required schema."},
+                "nextAction": {"const": "correct_workflow_inputs"}
+              }
+            },
+            {
+              "properties": {
+                "code": {"const": "RUN_VALIDATION_EXECUTION_POLICY_INVALID"},
+                "message": {"const": "The workflow execution policy does not support a required capability."},
+                "nextAction": {"const": "update_workflow_definition"}
+              }
+            },
+            {
+              "properties": {
+                "code": {"const": "UNSUPPORTED_CAPABILITY"},
+                "message": {"const": "The workflow execution policy does not support a required capability."},
+                "nextAction": {"const": "update_workflow_definition"}
+              }
+            },
+            {
+              "properties": {
+                "code": {"const": "RUN_VALIDATION_EXECUTION_ROOT_REQUIRED"},
+                "message": {"const": "This workflow requires a prepared local runner execution root."},
+                "nextAction": {"const": "prepare_runner_execution"}
+              }
+            },
+            {
+              "properties": {
+                "code": {"const": "RUN_VALIDATION_RUNNER_UNAVAILABLE"},
+                "message": {"const": "The required local runner is not connected."},
+                "nextAction": {"const": "connect_runner"}
+              }
+            },
+            {
+              "properties": {
+                "code": {"const": "RUN_VALIDATION_PROVIDER_UNSUPPORTED"},
+                "message": {"const": "The selected provider does not support a required workflow capability."},
+                "nextAction": {"const": "choose_supported_provider"}
+              }
+            },
+            {
+              "properties": {
+                "code": {"const": "RUN_VALIDATION_PROVIDER_INVALID"},
+                "message": {"const": "The workflow selects a provider that cannot run this work."},
+                "nextAction": {"const": "choose_supported_provider"}
+              }
+            },
+            {
+              "properties": {
+                "code": {"const": "RUN_VALIDATION_POLICY_DENIED"},
+                "message": {"const": "The execution policy does not allow a required workflow capability."},
+                "nextAction": {"const": "allow_capability"}
+              }
+            },
+            {
+              "properties": {
+                "code": {"const": "RUN_VALIDATION_POLICY_REQUIRED"},
+                "message": {"const": "A required workflow capability policy has not been configured."},
+                "nextAction": {"const": "configure_capability_policy"}
+              }
+            },
+            {
+              "properties": {
+                "code": {"const": "RUN_VALIDATION_FAILED"},
+                "message": {"const": "The workflow has a validation issue that must be reviewed."},
+                "nextAction": {"const": "review_workflow_validation"}
+              }
+            }
+          ]
+        }
+      ],
       "additionalProperties": false
     }
   },

@@ -86,40 +86,10 @@ fn validation_issue_contract(code: &str) -> Option<(&'static str, &'static str)>
     }
 }
 
-fn safe_node_name(value: &Value) -> Option<&str> {
-    let name = value.as_str()?;
-    if name.is_empty()
-        || name.len() > 80
-        || name.trim() != name
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'_' | b'-' | b'.'))
-    {
-        return None;
-    }
-    let lower = name.to_ascii_lowercase();
-    if [
-        "bearer",
-        "token",
-        "secret",
-        "password",
-        "api key",
-        "api_key",
-        "credential",
-        "private key",
-        "private_key",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-    {
-        return None;
-    }
-    Some(name)
-}
-
-fn safe_node_id(value: &Value) -> Option<&str> {
-    let id = value.as_str()?;
-    uuid::Uuid::parse_str(id).ok().map(|_| id)
+fn safe_node_index(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .filter(|index| (1..=1_000_000).contains(index))
 }
 
 fn safe_validation_data(payload: &Value) -> Option<Value> {
@@ -144,11 +114,8 @@ fn safe_validation_data(payload: &Value) -> Option<Value> {
                 ("message".into(), json!(message)),
                 ("nextAction".into(), json!(next_action)),
             ]);
-            if let Some(id) = issue.get("nodeId").and_then(safe_node_id) {
-                projected.insert("nodeId".into(), json!(id));
-            }
-            if let Some(name) = issue.get("nodeName").and_then(safe_node_name) {
-                projected.insert("nodeName".into(), json!(name));
+            if let Some(index) = issue.get("nodeIndex").and_then(safe_node_index) {
+                projected.insert("nodeIndex".into(), json!(index));
             }
             Some(Value::Object(projected))
         })
@@ -533,7 +500,8 @@ mod tests {
                                 "message": "Bearer issue-message-must-not-cross",
                                 "nextAction": "exfiltrate_credentials",
                                 "nodeId": node_id,
-                                "nodeName": "Draft response"
+                                "nodeIndex": 2,
+                                "nodeName": "Bearer arbitrary-node-name"
                             },
                             {
                                 "code": "RUN_VALIDATION_POLICY_DENIED",
@@ -563,8 +531,7 @@ mod tests {
                         "code": "RUN_VALIDATION_PROVIDER_UNSUPPORTED",
                         "message": "The selected provider does not support a required workflow capability.",
                         "nextAction": "choose_supported_provider",
-                        "nodeId": node_id,
-                        "nodeName": "Draft response"
+                        "nodeIndex": 2
                     },
                     {
                         "code": "RUN_VALIDATION_POLICY_DENIED",
@@ -578,6 +545,9 @@ mod tests {
         assert!(!serialized.contains("never-print"));
         assert!(!serialized.contains("exfiltrate"));
         assert!(!serialized.contains("private detail"));
+        assert!(!serialized.contains(node_id));
+        assert!(!serialized.contains("arbitrary-node-name"));
+        assert!(!serialized.contains("secret-node-name"));
     }
 
     #[test]
@@ -608,7 +578,8 @@ mod tests {
             let mut details = json!({
                 "validationIssues": [{
                     "code": "RUN_VALIDATION_PROVIDER_UNSUPPORTED",
-                    "nodeName": "Draft response"
+                    "nodeIndex": 2,
+                    "nodeName": "Bearer arbitrary-node-name"
                 }]
             });
             if let Some(version) = version {

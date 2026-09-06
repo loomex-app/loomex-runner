@@ -1,6 +1,6 @@
 {
   "protocol": "loomex.local-control/v2",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "maxFrameBytes": 1048576,
   "methods": [
     {
@@ -4953,6 +4953,7 @@
     "execution.host_user/v1",
     "authorization.prepare-commit/v1",
     "auth.device-v2/v1",
-    "transfer.chunked/v1"
+    "transfer.chunked/v1",
+    "error.validation-issues/v1"
   ]
 }
