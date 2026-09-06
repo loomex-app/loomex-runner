@@ -24,6 +24,7 @@ pub struct Api {
 pub struct ApiError {
     pub code: String,
     pub retryable: bool,
+    pub data: Option<Value>,
 }
 impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -36,8 +37,124 @@ impl ApiError {
         Self {
             code: code.into(),
             retryable,
+            data: None,
         }
     }
+}
+
+const MAX_VALIDATION_ISSUES: usize = 32;
+
+fn validation_issue_contract(code: &str) -> Option<(&'static str, &'static str)> {
+    match code {
+        "RUN_INPUT_SCHEMA_INVALID" => Some((
+            "Workflow inputs do not match the required schema.",
+            "correct_workflow_inputs",
+        )),
+        "RUN_VALIDATION_EXECUTION_POLICY_INVALID" | "UNSUPPORTED_CAPABILITY" => Some((
+            "The workflow execution policy does not support a required capability.",
+            "update_workflow_definition",
+        )),
+        "RUN_VALIDATION_EXECUTION_ROOT_REQUIRED" => Some((
+            "This workflow requires a prepared local runner execution root.",
+            "prepare_runner_execution",
+        )),
+        "RUN_VALIDATION_RUNNER_UNAVAILABLE" => Some((
+            "The required local runner is not connected.",
+            "connect_runner",
+        )),
+        "RUN_VALIDATION_PROVIDER_UNSUPPORTED" => Some((
+            "The selected provider does not support a required workflow capability.",
+            "choose_supported_provider",
+        )),
+        "RUN_VALIDATION_PROVIDER_INVALID" => Some((
+            "The workflow selects a provider that cannot run this work.",
+            "choose_supported_provider",
+        )),
+        "RUN_VALIDATION_POLICY_DENIED" => Some((
+            "The execution policy does not allow a required workflow capability.",
+            "allow_capability",
+        )),
+        "RUN_VALIDATION_POLICY_REQUIRED" => Some((
+            "A required workflow capability policy has not been configured.",
+            "configure_capability_policy",
+        )),
+        "RUN_VALIDATION_FAILED" => Some((
+            "The workflow has a validation issue that must be reviewed.",
+            "review_workflow_validation",
+        )),
+        _ => None,
+    }
+}
+
+fn safe_node_name(value: &Value) -> Option<&str> {
+    let name = value.as_str()?;
+    if name.is_empty()
+        || name.len() > 80
+        || name.trim() != name
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'_' | b'-' | b'.'))
+    {
+        return None;
+    }
+    let lower = name.to_ascii_lowercase();
+    if [
+        "bearer",
+        "token",
+        "secret",
+        "password",
+        "api key",
+        "api_key",
+        "credential",
+        "private key",
+        "private_key",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return None;
+    }
+    Some(name)
+}
+
+fn safe_node_id(value: &Value) -> Option<&str> {
+    let id = value.as_str()?;
+    uuid::Uuid::parse_str(id).ok().map(|_| id)
+}
+
+fn safe_validation_data(payload: &Value) -> Option<Value> {
+    if payload
+        .pointer("/error/details/validationIssueVersion")
+        .and_then(Value::as_str)
+        != Some("v1")
+    {
+        return None;
+    }
+    let raw = payload
+        .pointer("/error/details/validationIssues")?
+        .as_array()?;
+    let issues = raw
+        .iter()
+        .filter_map(|issue| {
+            let issue = issue.as_object()?;
+            let code = issue.get("code")?.as_str()?;
+            let (message, next_action) = validation_issue_contract(code)?;
+            let mut projected = serde_json::Map::from_iter([
+                ("code".into(), json!(code)),
+                ("message".into(), json!(message)),
+                ("nextAction".into(), json!(next_action)),
+            ]);
+            if let Some(id) = issue.get("nodeId").and_then(safe_node_id) {
+                projected.insert("nodeId".into(), json!(id));
+            }
+            if let Some(name) = issue.get("nodeName").and_then(safe_node_name) {
+                projected.insert("nodeName".into(), json!(name));
+            }
+            Some(Value::Object(projected))
+        })
+        .take(MAX_VALIDATION_ISSUES)
+        .collect::<Vec<_>>();
+    (!issues.is_empty()).then(|| json!({"validationIssueVersion":"v1","validationIssues":issues}))
 }
 pub(crate) fn now() -> u64 {
     SystemTime::now()
@@ -286,10 +403,11 @@ fn parse_envelope(status: u16, payload: Value) -> Result<Value, ApiError> {
                     .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
         })
         .unwrap_or("API_REQUEST_FAILED");
-    Err(ApiError::new(
-        code,
-        status >= 500 || status == 429 || status == 408,
-    ))
+    let mut error = ApiError::new(code, status >= 500 || status == 429 || status == 408);
+    if code == "RUN_VALIDATION_FAILED" {
+        error.data = safe_validation_data(&payload);
+    }
+    Err(error)
 }
 #[cfg(test)]
 mod tests {
@@ -396,5 +514,117 @@ mod tests {
                 .code,
             "API_REQUEST_FAILED"
         );
+    }
+
+    #[test]
+    fn run_validation_errors_project_only_allowlisted_actionable_issues() {
+        let node_id = "11111111-1111-4111-8111-111111111111";
+        let error = parse_envelope(
+            422,
+            json!({
+                "error": {
+                    "code": "RUN_VALIDATION_FAILED",
+                    "message": "Bearer backend-message-must-not-cross",
+                    "details": {
+                        "validationIssueVersion": "v1",
+                        "validationIssues": [
+                            {
+                                "code": "RUN_VALIDATION_PROVIDER_UNSUPPORTED",
+                                "message": "Bearer issue-message-must-not-cross",
+                                "nextAction": "exfiltrate_credentials",
+                                "nodeId": node_id,
+                                "nodeName": "Draft response"
+                            },
+                            {
+                                "code": "RUN_VALIDATION_POLICY_DENIED",
+                                "nodeName": "Bearer secret-node-name"
+                            },
+                            {
+                                "code": "BACKEND_PRIVATE_VALIDATION_CODE",
+                                "message": "private detail"
+                            }
+                        ],
+                        "authorization": "Bearer never-print-this-token",
+                        "providerConfig": {"apiKey": "sk-never-print-this"}
+                    }
+                }
+            }),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "RUN_VALIDATION_FAILED");
+        assert!(!error.retryable);
+        assert_eq!(
+            error.data,
+            Some(json!({
+                "validationIssueVersion": "v1",
+                "validationIssues": [
+                    {
+                        "code": "RUN_VALIDATION_PROVIDER_UNSUPPORTED",
+                        "message": "The selected provider does not support a required workflow capability.",
+                        "nextAction": "choose_supported_provider",
+                        "nodeId": node_id,
+                        "nodeName": "Draft response"
+                    },
+                    {
+                        "code": "RUN_VALIDATION_POLICY_DENIED",
+                        "message": "The execution policy does not allow a required workflow capability.",
+                        "nextAction": "allow_capability"
+                    }
+                ]
+            }))
+        );
+        let serialized = serde_json::to_string(&error.data).unwrap();
+        assert!(!serialized.contains("never-print"));
+        assert!(!serialized.contains("exfiltrate"));
+        assert!(!serialized.contains("private detail"));
+    }
+
+    #[test]
+    fn non_validation_errors_never_project_backend_details() {
+        let error = parse_envelope(
+            503,
+            json!({
+                "error": {
+                    "code": "BACKEND_UNAVAILABLE",
+                    "details": {
+                        "validationIssueVersion": "v1",
+                        "validationIssues": [{
+                            "code": "RUN_VALIDATION_PROVIDER_UNSUPPORTED",
+                            "message": "Bearer never-print-this-token"
+                        }],
+                        "credential": "secret-never-print"
+                    }
+                }
+            }),
+        )
+        .unwrap_err();
+        assert!(error.data.is_none());
+    }
+
+    #[test]
+    fn run_validation_issue_projection_requires_the_known_issue_version() {
+        for version in [None, Some("v2")] {
+            let mut details = json!({
+                "validationIssues": [{
+                    "code": "RUN_VALIDATION_PROVIDER_UNSUPPORTED",
+                    "nodeName": "Draft response"
+                }]
+            });
+            if let Some(version) = version {
+                details["validationIssueVersion"] = json!(version);
+            }
+            let error = parse_envelope(
+                422,
+                json!({
+                    "error": {
+                        "code": "RUN_VALIDATION_FAILED",
+                        "details": details
+                    }
+                }),
+            )
+            .unwrap_err();
+            assert!(error.data.is_none());
+        }
     }
 }

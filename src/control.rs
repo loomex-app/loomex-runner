@@ -1043,7 +1043,7 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
             Ok(Some(frame)) => frame,
             Ok(None) => return Ok(()),
             Err(error) => {
-                let (code, retryable) = public_error(&error);
+                let (code, retryable, _) = public_error(&error);
                 let mut response = serde_json::to_vec(
                     &json!({"protocol":PROTOCOL,"id":"","error":state::safe_error(&code,retryable)}),
                 )?;
@@ -1084,8 +1084,8 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
                             json!({"protocol":PROTOCOL,"id":id,"result":result})
                         }
                         Err(error) => {
-                            let (code, retryable) = public_error(&error);
-                            json!({"protocol":PROTOCOL,"id":id,"error":state::safe_error(&code,retryable)})
+                            let (code, retryable, data) = public_error(&error);
+                            json!({"protocol":PROTOCOL,"id":id,"error":state::safe_error_with_data(&code,retryable,data.as_ref())})
                         }
                     }
                 }
@@ -1124,15 +1124,15 @@ pub async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(
         }
     }
 }
-pub fn public_error(error: &anyhow::Error) -> (String, bool) {
+pub fn public_error(error: &anyhow::Error) -> (String, bool, Option<Value>) {
     if let Some(api) = error.downcast_ref::<ApiError>() {
-        return (api.code.clone(), api.retryable);
+        return (api.code.clone(), api.retryable, api.data.clone());
     }
     let text = error.to_string();
     if text.len() < 100 && text.bytes().all(|b| b.is_ascii_uppercase() || b == b'_') {
-        (text, false)
+        (text, false, None)
     } else {
-        ("INTERNAL".into(), false)
+        ("INTERNAL".into(), false, None)
     }
 }
 pub async fn client(dir: &Path, method: &str, params: Value) -> Result<Value> {

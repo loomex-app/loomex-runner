@@ -1,6 +1,6 @@
 {
   "protocol": "loomex.local-control/v2",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "maxFrameBytes": 1048576,
   "methods": [
     {

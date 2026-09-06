@@ -146,6 +146,14 @@ pub fn safe_error(code: &str, retryable: bool) -> Value {
     json!({"code":code,"message":code.replace('_'," ").to_ascii_lowercase(),"correlationId":Uuid::new_v4(),"retryable":retryable})
 }
 
+pub fn safe_error_with_data(code: &str, retryable: bool, data: Option<&Value>) -> Value {
+    let mut error = safe_error(code, retryable);
+    if let (Some(object), Some(data)) = (error.as_object_mut(), data) {
+        object.insert("data".into(), data.clone());
+    }
+    error
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

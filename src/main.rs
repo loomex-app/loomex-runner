@@ -4,7 +4,7 @@ use serde_json::json;
 
 fn main() {
     if let Err(error) = entry() {
-        let (code, retryable) = control::public_error(&error);
+        let (code, retryable, _) = control::public_error(&error);
         eprintln!("{}", state::safe_error(&code, retryable));
         std::process::exit(1)
     }
