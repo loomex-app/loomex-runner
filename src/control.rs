@@ -893,16 +893,18 @@ pub fn backend_route(method: &str, p: &Value) -> Result<(String, String, Option<
     }
 }
 pub fn provider_snapshot() -> Result<Value> {
-    provider_snapshot_with(find_executable)
+    provider_snapshot_with(find_executable_result)
 }
-fn provider_snapshot_with(mut resolve: impl FnMut(&str) -> Option<PathBuf>) -> Result<Value> {
+fn provider_snapshot_with(
+    mut resolve: impl FnMut(&str) -> Result<Option<PathBuf>>,
+) -> Result<Value> {
     let mut providers = serde_json::Map::new();
     for (name, adapter) in [
         ("codex", "codex"),
         ("claude", "claude"),
         ("gemini", "gemini"),
     ] {
-        if let Some(path) = resolve(adapter) {
+        if let Some(path) = resolve(adapter)? {
             let m = std::fs::metadata(&path)?;
             use sha2::{Digest, Sha256};
             use std::io::Read;
@@ -923,12 +925,52 @@ fn provider_snapshot_with(mut resolve: impl FnMut(&str) -> Option<PathBuf>) -> R
     Ok(Value::Object(providers))
 }
 pub fn find_executable(name: &str) -> Option<PathBuf> {
+    find_executable_result(name).ok().flatten()
+}
+fn provider_executable_variable(name: &str) -> Option<&'static str> {
+    match name {
+        "codex" => Some("LOOMEX_CODEX_EXECUTABLE"),
+        "claude" => Some("LOOMEX_CLAUDE_EXECUTABLE"),
+        "gemini" => Some("LOOMEX_GEMINI_EXECUTABLE"),
+        _ => None,
+    }
+}
+fn executable_path(path: &Path, require_canonical: bool) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let canonical = std::fs::canonicalize(path).ok()?;
+    if require_canonical && canonical != path {
+        return None;
+    }
+    let metadata = std::fs::metadata(&canonical).ok()?;
+    (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0).then_some(canonical)
+}
+fn find_executable_result(name: &str) -> Result<Option<PathBuf>> {
+    find_executable_with(
+        name,
+        |variable| std::env::var_os(variable),
+        std::env::var_os("PATH"),
+    )
+}
+fn find_executable_with(
+    name: &str,
+    configured: impl Fn(&str) -> Option<std::ffi::OsString>,
+    search_path: Option<std::ffi::OsString>,
+) -> Result<Option<PathBuf>> {
+    if let Some(variable) = provider_executable_variable(name)
+        && let Some(value) = configured(variable)
+    {
+        return executable_path(Path::new(&value), true)
+            .map(Some)
+            .context("PROVIDER_UNAVAILABLE");
+    }
     let p = Path::new(name);
     if p.is_absolute() {
-        return std::fs::canonicalize(p).ok();
+        return Ok(executable_path(p, false));
     }
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    std::env::split_paths(&path)
+    let path = search_path.unwrap_or_default();
+    Ok(std::env::split_paths(&path)
         .chain([
             PathBuf::from("/opt/homebrew/bin"),
             PathBuf::from("/usr/local/bin"),
@@ -939,7 +981,7 @@ pub fn find_executable(name: &str) -> Option<PathBuf> {
         .find(|p| {
             std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         })
-        .and_then(|p| std::fs::canonicalize(p).ok())
+        .and_then(|p| std::fs::canonicalize(p).ok()))
 }
 async fn read_spool(dir: &Path, p: &Value) -> Result<Value> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -1234,25 +1276,75 @@ mod tests {
             std::fs::write(&path, content).unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let resolve = |name: &str| std::fs::canonicalize(temp.path().join(name)).ok();
+        let resolve = |name: &str| Ok(std::fs::canonicalize(temp.path().join(name)).ok());
         let snapshot = provider_snapshot_with(resolve).unwrap();
         assert_eq!(snapshot["gemini"]["adapter"], "gemini");
         assert_eq!(
             snapshot["gemini"]["path"],
-            json!(resolve("gemini").unwrap())
+            json!(resolve("gemini").unwrap().unwrap())
         );
         assert_eq!(
             snapshot["gemini"]["checksumSha256"],
             state::digest(b"gemini-cli-fixture")
         );
         std::fs::remove_file(temp.path().join("gemini")).unwrap();
-        assert!(resolve("agy").is_some());
+        assert!(resolve("agy").unwrap().is_some());
         assert!(
             provider_snapshot_with(resolve)
                 .unwrap()
                 .get("gemini")
                 .is_none()
         );
+    }
+    #[test]
+    fn configured_provider_path_is_used_without_path_discovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let configured = temp.path().join("configured-codex");
+        let discovered = temp.path().join("codex");
+        for path in [&configured, &discovered] {
+            std::fs::write(path, "fixture").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let configured = std::fs::canonicalize(configured).unwrap();
+        let resolved = find_executable_with(
+            "codex",
+            |variable| {
+                (variable == "LOOMEX_CODEX_EXECUTABLE").then(|| configured.clone().into_os_string())
+            },
+            Some(temp.path().as_os_str().to_owned()),
+        )
+        .unwrap();
+        assert_eq!(resolved, Some(configured));
+    }
+    #[test]
+    fn invalid_configured_provider_fails_closed_without_path_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let discovered = temp.path().join("codex");
+        std::fs::write(&discovered, "fixture").unwrap();
+        std::fs::set_permissions(&discovered, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let missing = temp.path().join("configured-codex-missing");
+        let error = find_executable_with(
+            "codex",
+            |_| Some(missing.clone().into_os_string()),
+            Some(temp.path().as_os_str().to_owned()),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "PROVIDER_UNAVAILABLE");
+    }
+    #[test]
+    fn configured_provider_must_be_canonical_and_executable() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("codex-real");
+        let link = temp.path().join("codex-link");
+        std::fs::write(&target, "fixture").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        for configured in [&target, &link] {
+            assert!(
+                find_executable_with("codex", |_| Some(configured.as_os_str().to_owned()), None,)
+                    .is_err()
+            );
+        }
     }
     #[test]
     fn route_cannot_forward_arbitrary_url() {

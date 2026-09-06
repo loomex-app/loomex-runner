@@ -1,15 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
-usage(){ echo "usage: $0 RELEASE_DIR [--public-key FILE | --allow-unsigned-development --development-api-origin LOOPBACK_URL] [--install-base DIR --state-dir DIR --launch-agents-dir DIR]" >&2; exit 2; }
+usage(){ echo "usage: $0 RELEASE_DIR [--public-key FILE | --allow-unsigned-development --development-api-origin LOOPBACK_URL] [--provider-executable PROVIDER=/absolute/path] [--install-base DIR --state-dir DIR --launch-agents-dir DIR]" >&2; exit 2; }
 [[ $# -ge 1 ]] || usage
 release="$(cd "$1" && pwd -P)"; shift
-public_key=""; allow_dev=0; development_origin=""; base=""; state=""; agents=""
+public_key=""; allow_dev=0; development_origin=""; base=""; state=""; agents=""; provider_specs=(); provider_spec_count=0
 while (($#)); do
   case "$1" in
     --public-key) public_key="${2:?}"; shift 2;;
     --allow-unsigned-development) allow_dev=1; shift;;
     --development-api-origin) development_origin="${2:?}"; shift 2;;
+    --provider-executable) provider_specs+=("${2:?}"); provider_spec_count=$((provider_spec_count+1)); shift 2;;
     --install-base) base="${2:?}"; shift 2;;
     --state-dir) state="${2:?}"; shift 2;;
     --launch-agents-dir) agents="${2:?}"; shift 2;;
@@ -59,11 +60,11 @@ PY
 }
 
 write_receipt() {
-  python3 - "$version" "$expected" "$agent" "$development" "$development_origin" "$state/install-receipt.json" <<'PY'
+  python3 - "$version" "$expected" "$agent" "$development" "$development_origin" "$provider_config" "$state/install-receipt.json" <<'PY'
 import json,os,sys
 from pathlib import Path
-version,path,agent,development,origin,out=sys.argv[1:]; out=Path(out); tmp=out.with_name(out.name+'.new')
-data={'schema':'app.loomex.runner.install-receipt/v1','version':version,'versionPath':path,'launchAgent':agent,'developmentOnly':development=='true','developmentApiOrigin':origin or None}
+version,path,agent,development,origin,providers_file,out=sys.argv[1:]; out=Path(out); tmp=out.with_name(out.name+'.new')
+data={'schema':'app.loomex.runner.install-receipt/v1','version':version,'versionPath':path,'launchAgent':agent,'developmentOnly':development=='true','developmentApiOrigin':origin or None,'providerExecutables':json.load(open(providers_file))}
 with tmp.open('w') as f: json.dump(data,f,sort_keys=True); f.write('\n'); f.flush(); os.fsync(f.fileno())
 os.replace(tmp,out)
 PY
@@ -83,7 +84,44 @@ if ((allow_dev)); then [[ "${LOOMEX_ALLOW_UNSAFE_DEV_INSTALL:-}" == "1" ]] || { 
 python3 "$repo/scripts/artifact.py" "${verify[@]}"
 python3 "$repo/scripts/validate_package.py" "$stage/payload" --expected-version "$version"
 development="$(python3 -c 'import json,sys; print(str(json.load(open(sys.argv[1]))["developmentOnly"]).lower())' "$manifest")"
-render_args=(--template "$stage/payload/launchd/app.loomex.runner.template.plist" --binary "$base/current/bin/loomex-runner" --state "$state" --output "$stage/app.loomex.runner.plist")
+provider_config="$stage/provider-executables.json"
+write_provider_config() {
+python3 - "$state/install-receipt.json" "$state/pending-update.json" "$expected" "$provider_config" "$@" <<'PY'
+import json,os,stat,sys
+from pathlib import Path
+receipt,pending,expected,out=map(Path,sys.argv[1:5]); specs=sys.argv[5:]; allowed={'codex','claude','gemini'}
+providers={}
+if receipt.exists():
+ data=json.loads(receipt.read_text())
+ stored=data.get('providerExecutables',{})
+ if not isinstance(stored,dict) or any(name not in allowed or not isinstance(value,str) for name,value in stored.items()): raise SystemExit('invalid provider executable configuration in installation receipt')
+ providers.update(stored)
+if pending.exists():
+ data=json.loads(pending.read_text())
+ stored=data.get('providerExecutables',{})
+ if data.get('path')==str(expected) and (not isinstance(stored,dict) or any(name not in allowed or not isinstance(value,str) for name,value in stored.items())): raise SystemExit('invalid provider executable configuration in pending update')
+ if data.get('path')==str(expected): providers.update(stored)
+seen=set()
+for spec in specs:
+ name,separator,value=spec.partition('=')
+ if not separator or name not in allowed or not value: raise SystemExit(f'invalid --provider-executable value: {spec}')
+ if name in seen: raise SystemExit(f'duplicate --provider-executable provider: {name}')
+ seen.add(name); path=Path(value)
+ if not path.is_absolute(): raise SystemExit(f'provider executable path must be absolute: {name}')
+ try: canonical=path.resolve(strict=True); mode=canonical.stat().st_mode
+ except OSError as error: raise SystemExit(f'provider executable unavailable: {name}') from error
+ if not stat.S_ISREG(mode) or not os.access(canonical,os.X_OK): raise SystemExit(f'provider executable is not an executable file: {name}')
+ providers[name]=str(canonical)
+for name,value in providers.items():
+ path=Path(value)
+ try: canonical=path.resolve(strict=True); mode=canonical.stat().st_mode
+ except OSError as error: raise SystemExit(f'configured provider executable unavailable: {name}') from error
+ if not path.is_absolute() or path!=canonical or not stat.S_ISREG(mode) or not os.access(canonical,os.X_OK): raise SystemExit(f'configured provider path is not an absolute canonical executable: {name}')
+out.write_text(json.dumps(providers,sort_keys=True)+'\n')
+PY
+}
+if ((provider_spec_count)); then write_provider_config "${provider_specs[@]}"; else write_provider_config; fi
+render_args=(--template "$stage/payload/launchd/app.loomex.runner.template.plist" --binary "$base/current/bin/loomex-runner" --state "$state" --provider-executables-file "$provider_config" --output "$stage/app.loomex.runner.plist")
 if [[ "$development" == true ]]; then
   ((allow_dev)) || { echo "development artifact requires explicit development opt-in" >&2; exit 1; }
   [[ -n "$development_origin" ]] || { echo "development artifact requires --development-api-origin" >&2; exit 1; }
@@ -143,11 +181,11 @@ if [[ -n "$current_path" ]]; then
 fi
 if ((active>0)); then
   digest="$(shasum -a 256 "$manifest" | awk '{print $1}')"
-  python3 - "$version" "$expected" "$digest" "$state/pending-update.json" <<'PY'
+  python3 - "$version" "$expected" "$digest" "$provider_config" "$state/pending-update.json" <<'PY'
 import json,os,sys
 from pathlib import Path
-version,path,digest,out=sys.argv[1:]; out=Path(out); tmp=out.with_name(out.name+'.new')
-encoded=(json.dumps({'schema':'app.loomex.runner.pending-update/v1','version':version,'path':path,'manifestSha256':digest},sort_keys=True)+'\n').encode()
+version,path,digest,providers_file,out=sys.argv[1:]; out=Path(out); tmp=out.with_name(out.name+'.new')
+encoded=(json.dumps({'schema':'app.loomex.runner.pending-update/v1','version':version,'path':path,'manifestSha256':digest,'providerExecutables':json.load(open(providers_file))},sort_keys=True)+'\n').encode()
 with tmp.open('wb') as f: f.write(encoded); f.flush(); os.fsync(f.fileno())
 os.replace(tmp,out); fd=os.open(out.parent,os.O_RDONLY); os.fsync(fd); os.close(fd)
 PY

@@ -5,6 +5,10 @@ dev_origin="http://127.0.0.1:9"
 mkdir "$fixture/existing-output"
 if "$repo/scripts/build-release.sh" --unsigned-development --output "$fixture/existing-output" >/dev/null 2>&1; then echo "build replaced an existing output directory" >&2; exit 1; fi
 base="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve())' "$fixture/install")"; state="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve())' "$fixture/state")"; agents="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve())' "$fixture/agents")"; mkdir -p "$base" "$state" "$agents"
+provider_bin="$fixture/provider-bin"; mkdir "$provider_bin"; provider_bin="$(cd "$provider_bin" && pwd -P)"
+for provider in codex claude gemini; do printf '%s\n' '#!/bin/bash' 'exit 0' > "$provider_bin/$provider"; chmod 0755 "$provider_bin/$provider"; done
+printf '%s\n' '#!/bin/bash' 'exit 0' > "$provider_bin/not-executable"; chmod 0644 "$provider_bin/not-executable"
+ln -s "$provider_bin/codex" "$fixture/codex-link"
 
 make_payload(){
   version="$1"; payload="$2"
@@ -27,15 +31,23 @@ for invalid_origin in 'http://example.com' 'http://user@127.0.0.1:9' 'http://127
 done
 test "$(python3 "$repo/scripts/validate_development_origin.py" 'HTTP://LOCALHOST:8000')" = 'http://localhost:8000/'
 test "$(python3 "$repo/scripts/validate_development_origin.py" 'http://[::1]:8000')" = 'http://[::1]:8000/'
-python3 "$repo/scripts/render_launch_agent.py" --template "$repo/scripts/app.loomex.runner.template.plist" --binary "$fixture/bin/loomex-runner" --state "$fixture/render-state" --development-api-origin 'http://[::1]:8000' --output "$fixture/development.plist"
+python3 - "$provider_bin" "$fixture/provider-executables.json" <<'PY'
+import json,sys
+from pathlib import Path
+root=Path(sys.argv[1]); Path(sys.argv[2]).write_text(json.dumps({name:str((root/name).resolve()) for name in ('codex','claude','gemini')})+'\n')
+PY
+python3 "$repo/scripts/render_launch_agent.py" --template "$repo/scripts/app.loomex.runner.template.plist" --binary "$fixture/bin/loomex-runner" --state "$fixture/render-state" --development-api-origin 'http://[::1]:8000' --provider-executables-file "$fixture/provider-executables.json" --output "$fixture/development.plist"
 python3 "$repo/scripts/render_launch_agent.py" --template "$repo/scripts/app.loomex.runner.template.plist" --binary "$fixture/bin/loomex-runner" --state "$fixture/render-state" --output "$fixture/production.plist"
-python3 - "$fixture/development.plist" "$fixture/production.plist" <<'PY'
+python3 - "$fixture/development.plist" "$fixture/production.plist" "$provider_bin" <<'PY'
 import plistlib,sys
+from pathlib import Path
 development=plistlib.load(open(sys.argv[1],'rb'))['EnvironmentVariables']
 production=plistlib.load(open(sys.argv[2],'rb'))['EnvironmentVariables']
-assert development=={'LOOMEX_STATE_DIR':sys.argv[1].rsplit('/',1)[0]+'/render-state','LOOMEX_DEV_API_ORIGIN':'http://[::1]:8000/'}
+assert development=={'LOOMEX_STATE_DIR':sys.argv[1].rsplit('/',1)[0]+'/render-state','LOOMEX_DEV_API_ORIGIN':'http://[::1]:8000/','LOOMEX_CODEX_EXECUTABLE':str(Path(sys.argv[3],'codex').resolve()),'LOOMEX_CLAUDE_EXECUTABLE':str(Path(sys.argv[3],'claude').resolve()),'LOOMEX_GEMINI_EXECUTABLE':str(Path(sys.argv[3],'gemini').resolve())}
 assert production=={'LOOMEX_STATE_DIR':sys.argv[1].rsplit('/',1)[0]+'/render-state'}
 PY
+printf '%s\n' '{"codex":"/missing/provider"}' > "$fixture/missing-provider.json"
+if python3 "$repo/scripts/render_launch_agent.py" --template "$repo/scripts/app.loomex.runner.template.plist" --binary "$fixture/bin/loomex-runner" --state "$fixture/render-state" --provider-executables-file "$fixture/missing-provider.json" --output "$fixture/invalid-provider.plist" 2>/dev/null; then echo "LaunchAgent renderer accepted a missing configured provider" >&2; exit 1; fi
 touch "$payload/.env"
 if python3 "$repo/scripts/validate_package.py" "$payload" --expected-version 0.1.0 2>/dev/null; then echo "forbidden development file accepted" >&2; exit 1; fi
 rm "$payload/.env"
@@ -62,6 +74,13 @@ for invalid_origin in 'http://example.com' 'http://user@127.0.0.1:9' 'http://127
   if LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/install.sh" "$release" --allow-unsigned-development --development-api-origin "$invalid_origin" --install-base "$fixture/invalid-install-$suffix" --state-dir "$fixture/invalid-state-$suffix" --launch-agents-dir "$fixture/invalid-agents-$suffix" >/dev/null 2>&1; then echo "installer accepted invalid development origin: $invalid_origin" >&2; exit 1; fi
   test ! -e "$fixture/invalid-state-$suffix/logs"
 done
+for invalid_provider in 'unknown=/bin/sh' 'codex=relative/path' 'codex=/missing/provider'; do
+  suffix="$(printf %s "$invalid_provider" | shasum -a 256 | cut -c1-8)"
+  if LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/install.sh" "$release" --allow-unsigned-development --development-api-origin "$dev_origin" --provider-executable "$invalid_provider" --install-base "$fixture/invalid-provider-install-$suffix" --state-dir "$fixture/invalid-provider-state-$suffix" --launch-agents-dir "$fixture/invalid-provider-agents-$suffix" >/dev/null 2>&1; then echo "installer accepted invalid provider executable: $invalid_provider" >&2; exit 1; fi
+  test ! -e "$fixture/invalid-provider-state-$suffix/logs"
+done
+if LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/install.sh" "$release" --allow-unsigned-development --development-api-origin "$dev_origin" --provider-executable "codex=$provider_bin/not-executable" --install-base "$fixture/nonexec-install" --state-dir "$fixture/nonexec-state" --launch-agents-dir "$fixture/nonexec-agents" >/dev/null 2>&1; then echo "installer accepted a non-executable provider file" >&2; exit 1; fi
+test ! -e "$fixture/nonexec-state/logs"
 collision_state="$fixture/collision-state"; mkdir -p "$collision_state/logs"; printf preserve > "$collision_state/logs/preexisting-unrelated"
 if LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/install.sh" "$release" --allow-unsigned-development --development-api-origin "$dev_origin" --install-base "$fixture/collision-install" --state-dir "$collision_state" --launch-agents-dir "$fixture/collision-agents" >/dev/null 2>&1; then echo "initial install claimed a preexisting state namespace" >&2; exit 1; fi
 test "$(cat "$collision_state/logs/preexisting-unrelated")" = preserve
@@ -70,14 +89,16 @@ if "$repo/scripts/install.sh" "$release" --install-base "$retry_base" --state-di
 test ! -e "$retry_state/logs"
 if LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_INSTALL_TEST_MODE=1 LOOMEX_TEST_BOOTSTRAP_FAIL=1 "$repo/scripts/install.sh" "$release" --allow-unsigned-development --development-api-origin "$dev_origin" --install-base "$retry_base" --state-dir "$retry_state" --launch-agents-dir "$retry_agents" >/dev/null 2>&1; then echo "forced initial bootstrap failure succeeded" >&2; exit 1; fi
 test ! -e "$retry_state/logs"; test ! -e "$retry_state/owned-versions.json"; test ! -e "$retry_base/versions/0.1.0"
-LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/install.sh" "$release" --allow-unsigned-development --development-api-origin "$dev_origin" --install-base "$retry_base" --state-dir "$retry_state" --launch-agents-dir "$retry_agents" >/dev/null
-python3 - "$retry_agents/app.loomex.runner.plist" "$retry_state/install-receipt.json" <<'PY'
+LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/install.sh" "$release" --allow-unsigned-development --development-api-origin "$dev_origin" --provider-executable "codex=$fixture/codex-link" --install-base "$retry_base" --state-dir "$retry_state" --launch-agents-dir "$retry_agents" >/dev/null
+python3 - "$retry_agents/app.loomex.runner.plist" "$retry_state/install-receipt.json" "$provider_bin/codex" <<'PY'
 import json,plistlib,sys
 environment=plistlib.load(open(sys.argv[1],'rb'))['EnvironmentVariables']
 receipt=json.load(open(sys.argv[2]))
 assert environment['LOOMEX_DEV_API_ORIGIN']=='http://127.0.0.1:9/'
+assert environment['LOOMEX_CODEX_EXECUTABLE']==sys.argv[3]
 assert receipt['developmentOnly'] is True
 assert receipt['developmentApiOrigin']=='http://127.0.0.1:9/'
+assert receipt['providerExecutables']=={'codex':sys.argv[3]}
 PY
 touch "$retry_state/test-track-uninstall" "$retry_state/test-logout-fail"; : > "$retry_state/test-uninstall-order"
 if LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/uninstall.sh" --install-base "$retry_base" --state-dir "$retry_state" --launch-agents-dir "$retry_agents" >/dev/null 2>&1; then echo "offline revocation failure deleted installation" >&2; exit 1; fi
@@ -96,22 +117,34 @@ old,agent,state=sys.argv[1:]; state=Path(state)
 (state/'install-receipt.json').write_text(json.dumps({'schema':'app.loomex.runner.install-receipt/v1','version':'0.0.9','versionPath':old,'launchAgent':agent},sort_keys=True)+'\n')
 PY
 printf 1 > "$state/test-active"
-LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/install.sh" "$release" --allow-unsigned-development --development-api-origin "$dev_origin" --install-base "$base" --state-dir "$state" --launch-agents-dir "$agents"
+LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/install.sh" "$release" --allow-unsigned-development --development-api-origin "$dev_origin" --provider-executable "codex=$fixture/codex-link" --install-base "$base" --state-dir "$state" --launch-agents-dir "$agents"
 test "$(readlink "$base/current")" = "$old"; test -f "$state/pending-update.json"; test -f "$state/drain.json"
+test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["providerExecutables"]["codex"])' "$state/pending-update.json")" = "$provider_bin/codex"
 printf '%s\n' '{"schema":"app.loomex.runner.uninstall-ready/v1","versionPath":"'"$old"'"}' > "$state/uninstall-ready.json"; printf interrupted > "$state/uninstall-ready.json.new"
 printf 0 > "$state/test-active"
 LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/install.sh" "$release" --allow-unsigned-development --development-api-origin "$dev_origin" --install-base "$base" --state-dir "$state" --launch-agents-dir "$agents"
 test "$(readlink "$base/current")" = "$base/versions/0.1.0"; test ! -e "$old"; test ! -e "$state/drain.json"; test ! -e "$state/uninstall-ready.json"; test ! -e "$state/uninstall-ready.json.new"
 grep -Fq "$base/current/bin/loomex-runner" "$agents/app.loomex.runner.plist"
 ! grep -Fq "$old/bin/loomex-runner" "$agents/app.loomex.runner.plist"
+python3 - "$agents/app.loomex.runner.plist" "$state/install-receipt.json" "$provider_bin/codex" <<'PY'
+import json,plistlib,sys
+environment=plistlib.load(open(sys.argv[1],'rb'))['EnvironmentVariables']; receipt=json.load(open(sys.argv[2]))
+assert environment['LOOMEX_CODEX_EXECUTABLE']==sys.argv[3]
+assert receipt['providerExecutables']=={'codex':sys.argv[3]}
+PY
 
 payload2="$fixture/payload2"; make_payload 0.1.1 "$payload2"; release2="$fixture/release2"; SOURCE_DATE_EPOCH=2 python3 "$repo/scripts/artifact.py" create --payload "$payload2" --output "$release2" --project loomex-runner --version 0.1.1 --platform darwin-arm64 --source-revision test2 --unsigned-development
 touch "$state/test-race"
 launchctl_bin="$fixture/launchctl-bin"; mkdir "$launchctl_bin"; touch "$state/test-launchctl-loaded"; : > "$state/test-launchctl-log"
 printf '%s\n' '#!/bin/bash' "log='$state/test-launchctl-log'; loaded='$state/test-launchctl-loaded'" 'printf '\''%s\n'\'' "$1" >> "$log"' 'case "$1" in bootout) rm -f "$loaded";; bootstrap) [[ ! -e "$loaded" ]] || exit 1; touch "$loaded";; *) exit 1;; esac' > "$launchctl_bin/launchctl"; chmod 0755 "$launchctl_bin/launchctl"
-if PATH="$launchctl_bin:$PATH" LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_TEST_HEALTH_FAIL=1 "$repo/scripts/install.sh" "$release2" --allow-unsigned-development --development-api-origin "$dev_origin" --install-base "$base" --state-dir "$state" --launch-agents-dir "$agents" 2>/dev/null; then echo "unhealthy accepted service was treated as activated" >&2; exit 1; fi
+if PATH="$launchctl_bin:$PATH" LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_TEST_HEALTH_FAIL=1 "$repo/scripts/install.sh" "$release2" --allow-unsigned-development --development-api-origin "$dev_origin" --provider-executable "codex=$provider_bin/claude" --install-base "$base" --state-dir "$state" --launch-agents-dir "$agents" 2>/dev/null; then echo "unhealthy accepted service was treated as activated" >&2; exit 1; fi
 test "$(readlink "$base/current")" = "$base/versions/0.1.0"; test ! -e "$base/versions/0.1.1"; test ! -e "$state/test-race-triggered"
 test "$(paste -sd, "$state/test-launchctl-log")" = "bootout,bootstrap,bootout,bootstrap"
+python3 - "$agents/app.loomex.runner.plist" "$state/install-receipt.json" "$provider_bin/codex" <<'PY'
+import json,plistlib,sys
+assert plistlib.load(open(sys.argv[1],'rb'))['EnvironmentVariables']['LOOMEX_CODEX_EXECUTABLE']==sys.argv[3]
+assert json.load(open(sys.argv[2]))['providerExecutables']=={'codex':sys.argv[3]}
+PY
 payload3="$fixture/payload3"; make_payload 0.1.2 "$payload3"; release3="$fixture/release3"; SOURCE_DATE_EPOCH=3 python3 "$repo/scripts/artifact.py" create --payload "$payload3" --output "$release3" --project loomex-runner --version 0.1.2 --platform darwin-arm64 --source-revision test3 --unsigned-development
 printf 1 > "$state/test-active"
 LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/install.sh" "$release2" --allow-unsigned-development --development-api-origin "$dev_origin" --install-base "$base" --state-dir "$state" --launch-agents-dir "$agents"

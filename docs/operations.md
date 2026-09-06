@@ -26,6 +26,8 @@ Use fresh UUIDs in real requests. Retain each mutation key with its intended ope
 
 The daemon should have exactly one owner per state root. Check that the state directory is owned by the signed-in user and mode `0700`, and that `control.sock` and regular state files are owner-only. Do not relax socket permissions to make another user or service connect.
 
+For provider CLIs installed outside the standard service search paths, pass one option per provider during installation, for example `--provider-executable codex=/absolute/path/to/codex`. The accepted provider names are `codex`, `claude`, and `gemini`. The installer resolves symlinks, requires a regular executable file, stores the canonical path in the installation receipt, and writes the corresponding `LOOMEX_CODEX_EXECUTABLE`, `LOOMEX_CLAUDE_EXECUTABLE`, or `LOOMEX_GEMINI_EXECUTABLE` value into this runner's LaunchAgent. Updates preserve these bindings when the flags are omitted, including a deferred update resumed after active jobs finish. This does not read or copy provider authentication.
+
 ## Authentication and organizations
 
 Loomex credentials live in macOS Keychain service `app.loomex.runner.v1`, account `installation`. The daemon creates one installation identity, obtains device authority through user approval, and enrolls a separate child credential for each selected organization. Neither the CLI nor plugin prints tokens, keys, refresh material, proofs, or bootstrap grants.
@@ -59,7 +61,7 @@ If a provider or command effect may have started and the daemon loses durable ou
 | `AUTH_REQUIRED` / `AUTH_EXPIRED` | Device or organization authority is missing. Inspect `auth.status`; complete login or repair enrollment rather than supplying tokens manually. |
 | `AUTH_RECOVERY_PENDING` / `AUTH_RECOVERY_EXHAUSTED` | A credential mutation has durable uncertain state. Preserve Keychain state and reconcile the backend record; repeated recovery is intentionally blocked. |
 | `WORKSPACE_DENIED` | The canonical path, inode, organization, or installation no longer matches the grant. Inspect and explicitly grant the intended existing directory. |
-| `PROVIDER_UNAVAILABLE` | `argv[0]` cannot be resolved as an executable. Check the daemon's PATH and the provider's installed binary without exposing its auth store. |
+| `PROVIDER_UNAVAILABLE` | `argv[0]` cannot be resolved as an executable, or an explicitly configured provider path is no longer the same canonical executable. Repair the installed path or rerun the installer with the provider's current absolute executable path, without exposing its auth store. |
 | `PROVIDER_CONFIGURATION_CHANGED` / `PRECONDITION_FAILED` | Provider bytes/metadata or a prepared binding changed after review. Prepare and review a new binding. |
 | `EXECUTION_INDETERMINATE` | Restart or host failure left no trustworthy terminal outcome. The command is not replayed. Reconcile effects manually and keep the journal for evidence. |
 | `ARTIFACT_FINALIZATION_FAILED` | Complete local output could not be registered as required artifacts. Inspect backend/storage availability and retained job files; terminal evidence is preserved. |

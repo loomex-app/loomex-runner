@@ -3,7 +3,7 @@
 <plist version="1.0"><dict>
 <key>Label</key><string>app.loomex.runner</string>
 <key>ProgramArguments</key><array><string>__LOOMEX_DAEMON__</string></array>
-<key>EnvironmentVariables</key><dict><key>LOOMEX_STATE_DIR</key><string>__LOOMEX_STATE_DIR__</string>__LOOMEX_DEV_API_ORIGIN_ENTRY__</dict>
+<key>EnvironmentVariables</key><dict><key>LOOMEX_STATE_DIR</key><string>__LOOMEX_STATE_DIR__</string>__LOOMEX_DEV_API_ORIGIN_ENTRY____LOOMEX_PROVIDER_EXECUTABLE_ENTRIES__</dict>
 <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
 <key>StandardOutPath</key><string>__LOOMEX_STATE_DIR__/logs/daemon.log</string>
 <key>StandardErrorPath</key><string>__LOOMEX_STATE_DIR__/logs/daemon-error.log</string>

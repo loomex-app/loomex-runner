@@ -38,6 +38,8 @@ if link.is_symlink(): raise SystemExit('current points through a symlinked versi
 current_path=link.absolute()
 r=json.loads(receipt.read_text()); data=json.loads(owned.read_text())
 if r.get('schema')!='app.loomex.runner.install-receipt/v1' or r.get('launchAgent')!=expected_agent: raise SystemExit('unexpected installation receipt')
+providers=r.get('providerExecutables',{})
+if not isinstance(providers,dict) or any(name not in {'codex','claude','gemini'} or not isinstance(value,str) or not Path(value).is_absolute() for name,value in providers.items()): raise SystemExit('unexpected provider executable ownership metadata')
 development=r.get('developmentOnly')
 origin=r.get('developmentApiOrigin')
 if not isinstance(development,bool): raise SystemExit('installation receipt lacks authenticated release class')

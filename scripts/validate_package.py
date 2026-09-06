@@ -13,4 +13,4 @@ for name in ("loomex","loomex-runner"):
 metadata=json.loads((root/"metadata/project.json").read_text())
 if metadata!={"project":"loomex-runner","version":args.expected_version,"platform":"darwin-arm64","stateSchema":"app.loomex.runner.state/v1"}: raise SystemExit("runner metadata mismatch")
 plist=(root/"launchd/app.loomex.runner.template.plist").read_text()
-if plist.count("__LOOMEX_DAEMON__")!=1 or plist.count("__LOOMEX_STATE_DIR__")!=3 or plist.count("__LOOMEX_DEV_API_ORIGIN_ENTRY__")!=1: raise SystemExit("LaunchAgent template placeholders are invalid")
+if plist.count("__LOOMEX_DAEMON__")!=1 or plist.count("__LOOMEX_STATE_DIR__")!=3 or plist.count("__LOOMEX_DEV_API_ORIGIN_ENTRY__")!=1 or plist.count("__LOOMEX_PROVIDER_EXECUTABLE_ENTRIES__")!=1: raise SystemExit("LaunchAgent template placeholders are invalid")
