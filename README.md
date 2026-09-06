@@ -37,7 +37,7 @@ The daemon alone stores Loomex credentials, using native macOS Keychain service
 enrolls organizations; isolated child credentials sign organization requests.
 Refresh expirations are absolute. Protected pending rotation state is persisted
 before transmission and permits only the backend's explicit recovery protocol.
-Provider login stores remain owned by Codex, Claude, and Gemini (the AGY CLI adapter).
+Provider login stores remain owned by Codex, Claude, and Gemini CLI.
 
 The local newline-JSON socket is `~/.local/share/loomex/runner/control.sock`.
 `LOOMEX_STATE_DIR`, when present, names that exact runner state directory. The

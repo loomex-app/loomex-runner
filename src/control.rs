@@ -891,9 +891,16 @@ pub fn backend_route(method: &str, p: &Value) -> Result<(String, String, Option<
     }
 }
 pub fn provider_snapshot() -> Result<Value> {
+    provider_snapshot_with(find_executable)
+}
+fn provider_snapshot_with(mut resolve: impl FnMut(&str) -> Option<PathBuf>) -> Result<Value> {
     let mut providers = serde_json::Map::new();
-    for (name, adapter) in [("codex", "codex"), ("claude", "claude"), ("gemini", "agy")] {
-        if let Some(path) = find_executable(adapter) {
+    for (name, adapter) in [
+        ("codex", "codex"),
+        ("claude", "claude"),
+        ("gemini", "gemini"),
+    ] {
+        if let Some(path) = resolve(adapter) {
             let m = std::fs::metadata(&path)?;
             use sha2::{Digest, Sha256};
             use std::io::Read;
@@ -1200,6 +1207,37 @@ async fn exchange<R: tokio::io::AsyncBufRead + Unpin, W: tokio::io::AsyncWrite +
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gemini_discovery_snapshots_gemini_cli_and_never_falls_back_to_agy() {
+        let temp = tempfile::tempdir().unwrap();
+        for (name, content) in [
+            ("gemini", "gemini-cli-fixture"),
+            ("agy", "legacy-agy-fixture"),
+        ] {
+            let path = temp.path().join(name);
+            std::fs::write(&path, content).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let resolve = |name: &str| std::fs::canonicalize(temp.path().join(name)).ok();
+        let snapshot = provider_snapshot_with(resolve).unwrap();
+        assert_eq!(snapshot["gemini"]["adapter"], "gemini");
+        assert_eq!(
+            snapshot["gemini"]["path"],
+            json!(resolve("gemini").unwrap())
+        );
+        assert_eq!(
+            snapshot["gemini"]["checksumSha256"],
+            state::digest(b"gemini-cli-fixture")
+        );
+        std::fs::remove_file(temp.path().join("gemini")).unwrap();
+        assert!(resolve("agy").is_some());
+        assert!(
+            provider_snapshot_with(resolve)
+                .unwrap()
+                .get("gemini")
+                .is_none()
+        );
+    }
     #[test]
     fn route_cannot_forward_arbitrary_url() {
         assert!(backend_route("http.request", &json!({"url":"https://example.org"})).is_err());
