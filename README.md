@@ -1,4 +1,4 @@
-# Loomex runner 0.1.0
+# Loomex runner 0.1.1
 
 A fresh macOS per-user execution service. `loomex-runner` is the private daemon;
 `loomex` is the public CLI. This project has no old runner imports, state migration,

@@ -436,6 +436,23 @@ async fn require_execution_authorization(daemon: &Daemon, journal: &Journal) -> 
         )
         .await
 }
+fn verify_payload_digest(job: &Value) -> Result<()> {
+    let mut stable_payload = job["payload"]
+        .as_object()
+        .cloned()
+        .context("BACKEND_PROTOCOL_ERROR")?;
+    // The backend hashes the producer payload before adding this volatile
+    // top-level lease metadata. All other fields, including workspace/cwd,
+    // remain part of the stable payload digest.
+    stable_payload.remove("authorizationEnvelope");
+    if state::json_digest(&Value::Object(stable_payload))
+        != job["payloadDigest"].as_str().unwrap_or("")
+    {
+        bail!("PAYLOAD_DIGEST_MISMATCH")
+    }
+    Ok(())
+}
+
 async fn execute_job(
     daemon: Arc<Daemon>,
     path: &Path,
@@ -456,9 +473,7 @@ async fn execute_job(
     if !["shell.exec", "command.run"].contains(&job["kind"].as_str().unwrap_or("")) {
         bail!("UNSUPPORTED_JOB_KIND")
     }
-    if state::json_digest(payload) != job["payloadDigest"].as_str().unwrap_or("") {
-        bail!("PAYLOAD_DIGEST_MISMATCH")
-    }
+    verify_payload_digest(job)?;
     let workspace = require_execution_authorization(&daemon, &current).await?;
     let mut argv: Vec<String> = if let Some(items) = payload["command"].as_array() {
         items
@@ -1104,6 +1119,64 @@ async fn recover(daemon: Arc<Daemon>, org: &str, session: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn leased_payload_fixture() -> Value {
+        json!({
+            "payloadDigest": "cbab9f708061faba6e1a3bdc5be2cdac766e781a6f8b0e09f86cd512f2983a3b",
+            "payload": {
+                "command": ["/usr/bin/printf", "%s\\n", "LOOMEX_DIGEST_OK"],
+                "cwd": ".", "executionPolicy": "host_user/v1",
+                "workspacePath": "/tmp/loomex-workspace",
+                "preparationId": "11111111-1111-4111-8111-111111111111",
+                "bindingDigest": "bound-inputs", "providerConfiguration": {}, "env": {},
+                "nested": {"authorizationEnvelope": "stable producer value"},
+                "authorizationEnvelope": {
+                    "version": 1, "capability": "shell.exec", "actor": "leased-session",
+                    "inputDigest": "sha256:capability-input", "workspace": "/tmp/loomex-workspace",
+                    "expiresAtEpochMs": 2000000000000u64, "nonce": "lease-nonce",
+                    "approval": {"approved": true, "leaseVersion": 7}
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn leased_payload_digest_matches_backend_stable_projection() {
+        // Digest independently produced by Python json.dumps(sort_keys=True,
+        // separators=(',', ':'), ensure_ascii=False) before lease enrichment.
+        let mut job = leased_payload_fixture();
+        assert_ne!(state::json_digest(&job["payload"]), job["payloadDigest"]);
+        verify_payload_digest(&job).unwrap();
+        job["payload"]["authorizationEnvelope"]["nonce"] = json!("renewed-lease-nonce");
+        verify_payload_digest(&job).unwrap();
+        job["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("authorizationEnvelope");
+        verify_payload_digest(&job).unwrap();
+    }
+
+    #[test]
+    fn leased_payload_digest_rejects_every_stable_field_tamper() {
+        for (pointer, replacement) in [
+            ("/payload/command/2", "TAMPERED"),
+            ("/payload/workspacePath", "/tmp/other-workspace"),
+            ("/payload/cwd", "other-directory"),
+            ("/payload/bindingDigest", "different-binding"),
+            (
+                "/payload/nested/authorizationEnvelope",
+                "tampered nested producer value",
+            ),
+        ] {
+            let mut job = leased_payload_fixture();
+            *job.pointer_mut(pointer).unwrap() = json!(replacement);
+            assert_eq!(
+                verify_payload_digest(&job).unwrap_err().to_string(),
+                "PAYLOAD_DIGEST_MISMATCH",
+                "{pointer}"
+            );
+        }
+    }
+
     #[test]
     fn fence_preserves_exact_lease() {
         let j = Journal {
