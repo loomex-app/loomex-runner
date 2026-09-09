@@ -159,10 +159,10 @@ test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["path"])
 touch "$state/test-track-uninstall"; : > "$state/test-uninstall-order"
 if LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/uninstall.sh" --install-base "$base" --state-dir "$state" --launch-agents-dir "$agents" >/dev/null 2>&1; then echo "active uninstall removed installation" >&2; exit 1; fi
 test -L "$base/current"; test ! -e "$state/uninstall-ready.json"; test ! -e "$state/test-revoked"; test "$(paste -sd, "$state/test-uninstall-order")" = "drain,status"
-printf 0 > "$state/test-active"; printf preserve > "$state/unrelated-sentinel"; : > "$state/test-uninstall-order"
+printf 0 > "$state/test-active"; printf preserve > "$state/unrelated-sentinel"; touch "$state/presentation.sqlite3" "$state/presentation.sqlite3-wal" "$state/presentation.sqlite3-shm"; : > "$state/test-uninstall-order"
 LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/uninstall.sh" --install-base "$base" --state-dir "$state" --launch-agents-dir "$agents"
 test "$(paste -sd, "$state/test-uninstall-order")" = "drain,status,logout"
-test "$(cat "$state/unrelated-sentinel")" = preserve; test -f "$state/test-revoked"; test ! -e "$base/current"; test ! -e "$base/versions/0.1.0"; test ! -e "$base/versions/0.1.1"; test ! -e "$base/versions/0.1.2"
+test "$(cat "$state/unrelated-sentinel")" = preserve; test -f "$state/test-revoked"; test ! -e "$state/presentation.sqlite3"; test ! -e "$state/presentation.sqlite3-wal"; test ! -e "$state/presentation.sqlite3-shm"; test ! -e "$base/current"; test ! -e "$base/versions/0.1.0"; test ! -e "$base/versions/0.1.1"; test ! -e "$base/versions/0.1.2"
 
 victim="$fixture/victim"; mkdir "$victim"; printf preserve > "$victim/sentinel"
 attack_base="$fixture/attack-install"; attack_state="$fixture/attack-state"; attack_agents="$fixture/attack-agents"; mkdir -p "$attack_base/versions" "$attack_state" "$attack_agents"

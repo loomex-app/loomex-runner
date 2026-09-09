@@ -105,7 +105,7 @@ offline_env=(env "LOOMEX_STATE_DIR=$state")
 "${offline_env[@]}" "$current_path/bin/loomex" logout --offline >/dev/null
 rm -f "$agents/app.loomex.runner.plist" "$current"
 while IFS= read -r version_path; do [[ -z "$version_path" ]] || rm -rf "$version_path"; done < "$paths_file"
-for name in state.json operations preparations jobs tombstones run-bindings preparation-tombstones responses daemon.lock control.sock pending-update.json uninstall-ready.json uninstall-ready.json.new install-receipt.json owned-versions.json logs drain.json; do
+for name in state.json operations preparations jobs tombstones run-bindings preparation-tombstones responses presentation.sqlite3 presentation.sqlite3-wal presentation.sqlite3-shm daemon.lock control.sock pending-update.json uninstall-ready.json uninstall-ready.json.new install-receipt.json owned-versions.json logs drain.json; do
   rm -rf "$state/$name"
 done
 rmdir "$state" "$versions" "$base" 2>/dev/null || true

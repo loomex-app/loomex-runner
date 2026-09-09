@@ -160,7 +160,17 @@
             "responses.delete",
             "daemon.drain",
             "builder.commit",
-            "editor.commit"
+            "editor.commit",
+            "preparations.get",
+            "presentation.sessions.create",
+            "presentation.sessions.get",
+            "presentation.sessions.update",
+            "presentation.sessions.delete",
+            "presentation.operations.get",
+            "presentation.operations.settle",
+            "interactions.draft.get",
+            "interactions.draft.update",
+            "interactions.draft.delete"
           ]
         },
         "params": {

@@ -31,7 +31,7 @@ agents="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[
 for path in "$base" "$state" "$agents"; do [[ "$path" != / && "$path" != "${HOME:-}" ]] || { echo "unsafe installation directory: $path" >&2; exit 1; }; done
 versions="$base/versions"
 [[ ! -L "$versions" ]] || { echo "versions directory may not be a symlink" >&2; exit 1; }
-owned_state_names=(state.json operations preparations jobs tombstones run-bindings preparation-tombstones responses daemon.lock control.sock pending-update.json uninstall-ready.json uninstall-ready.json.new install-receipt.json owned-versions.json logs drain.json)
+owned_state_names=(state.json operations preparations jobs tombstones run-bindings preparation-tombstones responses presentation.sqlite3 presentation.sqlite3-wal presentation.sqlite3-shm daemon.lock control.sock pending-update.json uninstall-ready.json uninstall-ready.json.new install-receipt.json owned-versions.json logs drain.json)
 fresh_state=0
 if [[ ! -f "$state/install-receipt.json" && ! -f "$state/owned-versions.json" ]]; then
   fresh_state=1

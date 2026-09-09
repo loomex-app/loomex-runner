@@ -2,6 +2,8 @@
 
 This guide covers the per-user `loomex-runner` daemon and `loomex` CLI. It describes current source behavior; production use still depends on the open release gates.
 
+The daemon creates `presentation.sqlite3` on first startup after durable UI support is installed. No separate migration command is required. The file and its WAL live inside the owner-only runner state directory. Active UI sessions and unresolved operation records are retained across daemon restarts. Inactive and resolved views are swept after 30 days; explicit view deletion removes its journal, and run deletion removes views bound to the deleted execution subtree.
+
 ## Runtime layout and basic checks
 
 The default state root is `~/.local/share/loomex/runner`. A test or development instance may use an absolute `LOOMEX_STATE_DIR`. Never point a test daemon at an installed user's state directory.
@@ -86,7 +88,7 @@ The automatic 30-day policy removes acknowledged job evidence, idle response spo
 
 Activation uses immutable version directories and a stable `current` symlink. The new daemon must report the expected version and healthy status before previous bytes are retired. If activation fails, rollback first confirms no active work and successfully unloads the candidate. If that cannot be established, installation retains the current service and all relevant files for recovery. Follow [release.md](release.md) for exact verification, rollback, development flags, signing, and notarization behavior.
 
-First installation rejects pre-existing runner-owned state namespaces. Uninstall validates receipted direct SemVer paths, drains before checking activity, and completes remote logout before removing the service and exact owned state names. Unrelated children of a custom state directory remain intact. If revocation, unloading, or credential cleanup fails, removal stops while preserving recovery evidence. Backend data, workspaces, provider authentication, unrelated Keychain accounts, and unrelated files remain outside the uninstall scope.
+First installation rejects pre-existing runner-owned state namespaces. Uninstall validates receipted direct SemVer paths, drains before checking activity, and completes remote logout before removing the service and exact owned state names, including `presentation.sqlite3` and its WAL/SHM companions. Unrelated children of a custom state directory remain intact. If revocation, unloading, or credential cleanup fails, removal stops while preserving recovery evidence. Backend data, workspaces, provider authentication, unrelated Keychain accounts, and unrelated files remain outside the uninstall scope.
 
 ## Developer and operator validation
 

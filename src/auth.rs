@@ -439,6 +439,20 @@ impl Auth {
             .ok_or_else(|| anyhow!("AUTH_REQUIRED"))?
             .signed(&state))
     }
+    /// Returns the already-enrolled local child identity without refreshing,
+    /// recovering, persisting, or contacting the backend.
+    pub async fn current_child_identity(&self, org: &str) -> Result<(String, String)> {
+        let _guard = self.lock.lock().await;
+        let state = self.required().await?;
+        Self::allowed(&state)?;
+        ensure!(state.pending.is_none(), "AUTH_RECONCILIATION_REQUIRED");
+        let child = state
+            .children
+            .get(org)
+            .ok_or_else(|| anyhow!("ORGANIZATION_NOT_ENROLLED"))?;
+        ensure!(child.usable(), "AUTH_REQUIRED");
+        Ok((child.subject.clone(), state.installation_id))
+    }
     pub async fn logout(&self) -> Result<Value> {
         let _guard = self.lock.lock().await;
         self.logout_locked().await
@@ -679,6 +693,31 @@ fn login_projection(login: &Login) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn current_child_identity_never_refreshes_or_writes_expired_auth() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let auth = Auth::test_enrolled(api, "organization", "runner");
+        let mut state = auth.required().await.unwrap();
+        state.children.get_mut("organization").unwrap().expires_at = 0;
+        auth.save(&state).await.unwrap();
+        let before = auth.store.load().unwrap();
+
+        assert_eq!(
+            auth.current_child_identity("organization")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "AUTH_REQUIRED"
+        );
+        assert_eq!(auth.store.load().unwrap(), before);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }
     #[tokio::test]
     async fn public_fixtures_use_only_memory() {
         let api = Api::for_test_origin("http://127.0.0.1:9").unwrap();

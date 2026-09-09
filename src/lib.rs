@@ -3,5 +3,7 @@ pub mod auth;
 pub mod control;
 pub mod executor;
 pub mod jobs;
+pub mod presentation;
+pub mod progress;
 pub mod retention;
 pub mod state;

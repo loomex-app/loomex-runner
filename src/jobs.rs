@@ -123,6 +123,16 @@ struct Journal {
     stdout_pending: Option<usize>,
     #[serde(default)]
     stderr_pending: Option<usize>,
+    /// Private parser checkpoint for safe provider progress recognition. Raw
+    /// provider output remains in the local spool and is never sent as progress.
+    #[serde(default)]
+    progress_buffer: Vec<u8>,
+    #[serde(default)]
+    progress_buffer_offset: u64,
+    #[serde(default)]
+    progress_discarding: bool,
+    #[serde(default)]
+    progress_pending: Option<Vec<Value>>,
     stdout_offset: u64,
     stderr_offset: u64,
 }
@@ -286,6 +296,10 @@ async fn session(daemon: Arc<Daemon>, org: String) -> Result<()> {
                     event_sender:Default::default(),
                     stdout_pending: None,
                     stderr_pending: None,
+                    progress_buffer: Vec::new(),
+                    progress_buffer_offset: 0,
+                    progress_discarding: false,
+                    progress_pending: None,
                     stdout_offset: 0,
                     stderr_offset: 0,
                 };
@@ -723,14 +737,35 @@ async fn stream_events(
         if pending.is_none() {
             let mut locked = journal.lock().unwrap();
             if stream == "stdout" {
-                locked.stdout_pending = Some(size)
+                locked.stdout_pending = Some(size);
+                let mut decoder = crate::progress::Decoder::from_state(
+                    std::mem::take(&mut locked.progress_buffer),
+                    locked.progress_buffer_offset,
+                    locked.progress_discarding,
+                );
+                let context = crate::progress::Context::from_job(&locked.job, now_millis());
+                locked.progress_pending = Some(decoder.push(&bytes, offset, &context));
+                (
+                    locked.progress_buffer,
+                    locked.progress_buffer_offset,
+                    locked.progress_discarding,
+                ) = decoder.state();
             } else {
                 locked.stderr_pending = Some(size)
             }
             state::write_json(path, &*locked)?;
         }
-        let mut body = fence(&j);
-        body["events"] = json!([{"eventType":"output","stream":stream,"message":"","payload":{"encoding":"base64","data":STANDARD.encode(&bytes),"offset":offset,"chunkId":format!("{stream}:{offset}")}}]);
+        let current = snapshot(journal)?;
+        let mut events = vec![
+            json!({"eventType":"output","stream":stream,"message":"","payload":{"encoding":"base64","data":STANDARD.encode(&bytes),"offset":offset,"chunkId":format!("{stream}:{offset}")}}),
+        ];
+        if stream == "stdout" {
+            for progress in current.progress_pending.clone().unwrap_or_default() {
+                events.push(json!({"eventType":"ai.progress.v1","stream":"","message":"","payload":progress}));
+            }
+        }
+        let mut body = fence(&current);
+        body["events"] = Value::Array(events);
         daemon
             .backend(
                 &j.organization,
@@ -743,6 +778,7 @@ async fn stream_events(
         let mut locked = journal.lock().unwrap();
         if stream == "stdout" {
             locked.stdout_pending = None;
+            locked.progress_pending = None;
             locked.stdout_offset = offset + size as u64
         } else {
             locked.stderr_pending = None;
@@ -752,6 +788,12 @@ async fn stream_events(
         sent = true;
     }
     Ok(sent)
+}
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 async fn drain_events(daemon: &Daemon, path: &Path, journal: &Arc<Mutex<Journal>>) -> Result<()> {
     while stream_events(daemon, path, journal).await? {}
@@ -1194,6 +1236,10 @@ mod tests {
             event_sender: Default::default(),
             stdout_pending: None,
             stderr_pending: None,
+            progress_buffer: Vec::new(),
+            progress_buffer_offset: 0,
+            progress_discarding: false,
+            progress_pending: None,
             stdout_offset: 0,
             stderr_offset: 0,
         };
@@ -1251,6 +1297,10 @@ mod protocol_tests {
             event_sender: Default::default(),
             stdout_pending: None,
             stderr_pending: None,
+            progress_buffer: Vec::new(),
+            progress_buffer_offset: 0,
+            progress_discarding: false,
+            progress_pending: None,
             stdout_offset: 0,
             stderr_offset: 0,
         }
@@ -1344,6 +1394,65 @@ mod protocol_tests {
         reply(stream, json!({})).await;
         assert!(retry.await.unwrap());
         assert_eq!(snapshot(&recovered).unwrap().stdout_offset, 11);
+    }
+    #[tokio::test]
+    async fn provider_progress_retries_with_its_durable_output_chunk() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let t = tempfile::tempdir().unwrap();
+        let d = daemon(
+            &t.path().join("state"),
+            format!("http://{}", listener.local_addr().unwrap()),
+        );
+        let mut record = journal();
+        record.job["payload"]["provider"] = json!("codex");
+        record.job["createdByNodeExecutionId"] = json!("33333333-3333-4333-8333-333333333333");
+        let j = Arc::new(Mutex::new(record));
+        let path = d
+            .dir
+            .join("jobs")
+            .join(journal().job["id"].as_str().unwrap())
+            .join("journal.json");
+        state::write_json(&path, &snapshot(&j).unwrap()).unwrap();
+        let stdout = path.parent().unwrap().join("stdout");
+        std::fs::write(
+            &stdout,
+            br#"{"type":"item.started","item":{"type":"command_execution","command":"private command"}}
+"#,
+        )
+        .unwrap();
+        let first_daemon = d.clone();
+        let first_path = path.clone();
+        let first_journal = j.clone();
+        let first =
+            tokio::spawn(
+                async move { stream_events(&first_daemon, &first_path, &first_journal).await },
+            );
+        let (stream, original) = receive(&listener).await;
+        assert_eq!(original["events"].as_array().unwrap().len(), 2);
+        assert_eq!(original["events"][1]["eventType"], "ai.progress.v1");
+        assert_eq!(original["events"][1]["payload"]["kind"], "tool.started");
+        assert!(
+            !original["events"][1]
+                .to_string()
+                .contains("private command")
+        );
+        drop(stream);
+        assert!(first.await.unwrap().is_err());
+
+        let recovered = Arc::new(Mutex::new(state::read_json::<Journal>(&path).unwrap()));
+        let retry_daemon = d.clone();
+        let retry_path = path.clone();
+        let retry_journal = recovered.clone();
+        let retry = tokio::spawn(async move {
+            stream_events(&retry_daemon, &retry_path, &retry_journal)
+                .await
+                .unwrap()
+        });
+        let (stream, replay) = receive(&listener).await;
+        assert_eq!(original, replay);
+        reply(stream, json!({})).await;
+        assert!(retry.await.unwrap());
+        assert!(snapshot(&recovered).unwrap().progress_pending.is_none());
     }
     #[tokio::test]
     async fn helper_scope_joins_writers_before_panic_terminal_is_recorded() {
@@ -1624,6 +1733,10 @@ mod authorization_tests {
             event_sender: Default::default(),
             stdout_pending: None,
             stderr_pending: None,
+            progress_buffer: Vec::new(),
+            progress_buffer_offset: 0,
+            progress_discarding: false,
+            progress_pending: None,
             stdout_offset: 0,
             stderr_offset: 0,
         };

@@ -1,4 +1,4 @@
-# Loomex runner 0.1.3
+# Loomex runner 0.2.0
 
 A fresh macOS per-user execution service. `loomex-runner` is the private daemon;
 `loomex` is the public CLI. This project has no old runner imports, state migration,
@@ -29,6 +29,11 @@ cargo run --bin loomex -- login
 plugin uses the same local methods. Organization selection and workspace approval
 are separate explicit steps. See `contracts/method-catalog.json` for exact inputs
 and outputs. `loomex rpc METHOD JSON` makes a credential-free local request.
+
+Optional custom UI resources persist view state in owner-only SQLite under the
+same runner state directory. Sessions use revision compare-and-swap and keep raw
+mutation arguments in a separate exact-operation journal. See
+`contracts/presentation-sessions.md` for the local contract and retention rules.
 
 ## Execution and authority
 

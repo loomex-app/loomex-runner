@@ -2,6 +2,7 @@
 use crate::{
     api::{Api, ApiError},
     auth::Auth,
+    presentation::PresentationStore,
     state::{self, PublicState, WorkspaceGrant},
 };
 use anyhow::{Context, Result, bail};
@@ -58,6 +59,7 @@ pub struct Daemon {
     pub dir: PathBuf,
     pub api: Api,
     pub auth: Auth,
+    pub presentation: PresentationStore,
     pub public: Mutex<PublicState>,
     pub draining: AtomicBool,
     pub active: AtomicUsize,
@@ -78,11 +80,13 @@ impl Daemon {
     pub fn new(dir: PathBuf, api: Api, auth: Auth) -> Result<Self> {
         state::private_dir(&dir)?;
         let public = PublicState::load(&dir)?;
+        let presentation = PresentationStore::open(&dir)?;
         let draining = dir.join("drain.json").exists();
         Ok(Self {
             dir,
             api,
             auth,
+            presentation,
             public: Mutex::new(public),
             draining: AtomicBool::new(draining),
             active: AtomicUsize::new(0),
@@ -204,16 +208,36 @@ impl Daemon {
                 .active_organization
                 .clone())
         };
-        let identity =
-            state::json_digest(&json!({"method":method,"params":params,"organizationId":scope}));
-        let operation = key.map(|key| self.dir.join("operations").join(format!("{key}.json")));
+        let scoped_account = if account_scoped_method(method) {
+            Some(
+                self.auth
+                    .credential(scope.as_deref().context("ORGANIZATION_REQUIRED")?)
+                    .await?
+                    .subject,
+            )
+        } else {
+            None
+        };
+        let identity = state::json_digest(
+            &json!({"method":method,"params":params,"organizationId":scope,"accountSubject":scoped_account}),
+        );
+        let journal_key = key.map(|key| {
+            if account_scoped_method(method) {
+                state::json_digest(&json!({"organizationId":scope,"accountSubject":scoped_account,"idempotencyKey":key}))
+            } else {
+                key.to_owned()
+            }
+        });
+        let operation = journal_key
+            .as_deref()
+            .map(|key| self.dir.join("operations").join(format!("{key}.json")));
         if let Some(path) = operation.as_ref().filter(|path| path.exists()) {
             let record: Value = state::read_json(path)?;
             if record["digest"] != identity {
                 bail!("IDEMPOTENCY_CONFLICT");
             }
         }
-        let singleflight = if let Some(key) = key {
+        let singleflight = if let Some(key) = journal_key.as_deref() {
             let mut keys = self
                 .mutation_keys
                 .lock()
@@ -274,9 +298,9 @@ impl Daemon {
         let result = if let Some(cached) = cached {
             cached
         } else {
-            let result = normalize_output(
+            let result = normalize_catalog_output(
                 self.handle(method, &params, scope.as_deref()).await?,
-                &entry["outputSchema"]["oneOf"][0],
+                &entry["outputSchema"],
             )?;
             let execution = params
                 .get("runId")
@@ -408,6 +432,15 @@ impl Daemon {
             _ => {}
         }
         let org = scope.context("ORGANIZATION_REQUIRED")?.to_owned();
+        if method.starts_with("presentation.") {
+            // The child runner identity is uniquely bound by the backend to one
+            // account and organization. Neither scope component is accepted from UI.
+            let account = self.auth.credential(&org).await?.subject;
+            return self.presentation.dispatch(&org, &account, method, p);
+        }
+        if method == "preparations.get" {
+            return self.preparation_get(&org, p).await;
+        }
         match method {
             "workspaces.grant" => {
                 self.auth.credential(&org).await?;
@@ -428,10 +461,12 @@ impl Daemon {
             }
             "workspaces.revoke" => {
                 let path = PathBuf::from(required(p, "workspacePath")?);
+                let canonical = std::fs::canonicalize(&path).ok();
                 let mut public = self.public.lock().await;
-                public
-                    .grants
-                    .retain(|g| !(g.organization_id == org && g.path == path));
+                public.grants.retain(|g| {
+                    !(g.organization_id == org
+                        && (g.path == path || canonical.as_ref() == Some(&g.path)))
+                });
                 public.save(&self.dir)?;
                 return Ok(json!({"revoked":true}));
             }
@@ -448,11 +483,30 @@ impl Daemon {
             }
             _ => {}
         }
+        let projection_account = if method == "runs.delete"
+            || matches!(method, "interactions.respond" | "interactions.decide")
+        {
+            Some(self.auth.credential(&org).await?.subject)
+        } else {
+            None
+        };
         let (verb, route, body) = backend_route(method, p)?;
         let mut result = self.backend(&org, &verb, &route, body, key).await?;
         if method == "runs.delete" {
             let run = required(p, "runId")?;
             crate::retention::mark_deleted_tree(&self.dir, run, &result)?;
+            let deleted = result["deletedExecutionIds"]
+                .as_array()
+                .context("BACKEND_PROTOCOL_ERROR")?
+                .iter()
+                .map(|value| value.as_str().context("BACKEND_PROTOCOL_ERROR"))
+                .collect::<Result<Vec<_>>>()?;
+            self.presentation.delete_entities(
+                &org,
+                projection_account.as_deref().unwrap(),
+                "execution",
+                &deleted,
+            )?;
             for field in [
                 "preparationId",
                 "preparationRootExecutionId",
@@ -475,6 +529,14 @@ impl Daemon {
                 }
             }
         }
+        if matches!(method, "interactions.respond" | "interactions.decide") {
+            self.presentation.delete_entities(
+                &org,
+                projection_account.as_deref().unwrap(),
+                "request",
+                &[required(p, "requestId")?],
+            )?;
+        }
         Ok(result)
     }
     async fn prepare(&self, method: &str, org: &str, p: &Value) -> Result<Value> {
@@ -485,6 +547,7 @@ impl Daemon {
             .granted(Path::new(required(p, "workspacePath")?), org)
             .await?;
         let install = self.auth.installation_id().await?;
+        let account = self.auth.credential(org).await?.subject;
         let providers = provider_snapshot()?;
         let mut body = p.clone();
         let map = body.as_object_mut().unwrap();
@@ -523,11 +586,112 @@ impl Daemon {
             Uuid::new_v4().to_string()
         };
         result["confirmationKey"] = json!(confirmation);
+        let catalog: Value =
+            serde_json::from_str(include_str!("../contracts/method-catalog.json"))?;
+        let output_schema = &catalog["methods"]
+            .as_array()
+            .context("INTERNAL")?
+            .iter()
+            .find(|entry| entry["name"] == method)
+            .context("INTERNAL")?["outputSchema"];
+        let sealed = normalize_catalog_output(result, output_schema)?;
         state::write_json(
             &record_path,
-            &json!({"operation":method,"organizationId":org,"installationId":install,"workspacePath":workspace,"bindingDigest":result["bindingDigest"],"binding":result["binding"],"confirmationKey":confirmation,"providers":providers}),
+            &json!({"operation":method,"organizationId":org,"accountSubject":account,"installationId":install,"workspacePath":workspace,"bindingDigest":sealed["bindingDigest"],"binding":sealed["binding"],"confirmationKey":confirmation,"providers":providers,"review":sealed}),
         )?;
-        Ok(result)
+        Ok(sealed)
+    }
+    async fn preparation_get(&self, org: &str, p: &Value) -> Result<Value> {
+        let preparation = required(p, "preparationId")?;
+        Uuid::parse_str(preparation).map_err(|_| anyhow::anyhow!("INVALID_REQUEST"))?;
+        let path = self
+            .dir
+            .join("preparations")
+            .join(format!("{preparation}.json"));
+        let record: Value =
+            state::read_json(&path).map_err(|_| anyhow::anyhow!("PREPARATION_NOT_FOUND"))?;
+        let (account, install) = self.auth.current_child_identity(org).await?;
+        if record["organizationId"] != org
+            || record["accountSubject"] != account
+            || record["installationId"] != install
+        {
+            bail!("PREPARATION_NOT_FOUND")
+        }
+        let operation = record["operation"]
+            .as_str()
+            .filter(|operation| {
+                ["runs.prepare", "builder.prepare", "editor.prepare"].contains(operation)
+            })
+            .context("PREPARATION_INVALID")?;
+        let stale = |reason: &str, next_action: &str| json!({"status":"stale","operation":operation,"preparationId":preparation,"reason":reason,"nextAction":next_action});
+        if record.get("commitAuthorization").is_some() {
+            return Ok(stale("commit_started", "reconcile_operation"));
+        }
+        let review = record["review"]
+            .as_object()
+            .map(|_| record["review"].clone())
+            .unwrap_or(Value::Null);
+        if review.is_null()
+            || review["preparationId"] != preparation
+            || review["bindingDigest"] != record["bindingDigest"]
+            || review["binding"] != record["binding"]
+            || review["confirmationKey"] != record["confirmationKey"]
+        {
+            return Ok(stale("record_invalid", "prepare_again"));
+        }
+        if review["expiresAt"]
+            .as_u64()
+            .is_some_and(|expires| expires <= state::now())
+            || (!review["expiresAt"].is_null() && review["expiresAt"].as_u64().is_none())
+        {
+            return Ok(stale("expired", "prepare_again"));
+        }
+        let catalog: Value =
+            serde_json::from_str(include_str!("../contracts/method-catalog.json"))?;
+        let schema = &catalog["methods"]
+            .as_array()
+            .context("INTERNAL")?
+            .iter()
+            .find(|entry| entry["name"] == operation)
+            .context("INTERNAL")?["outputSchema"]["oneOf"][0];
+        if validate_params(&review, schema).is_err() {
+            return Ok(stale("record_invalid", "prepare_again"));
+        }
+        let Some(workspace) = record["workspacePath"]
+            .as_str()
+            .filter(|workspace| !workspace.is_empty())
+        else {
+            return Ok(stale("record_invalid", "prepare_again"));
+        };
+        let binding = &review["binding"];
+        if binding["organizationId"] != org
+            || binding["runnerId"] != account
+            || binding["installationId"] != install
+            || binding["workspacePath"] != workspace
+            || ["workflowId", "versionId"].iter().any(|field| {
+                binding[*field]
+                    .as_str()
+                    .is_none_or(|id| Uuid::parse_str(id).is_err())
+            })
+        {
+            return Ok(stale("record_invalid", "prepare_again"));
+        }
+        if !record["providers"].is_object() {
+            return Ok(stale("record_invalid", "prepare_again"));
+        }
+        if self
+            .public
+            .lock()
+            .await
+            .require_grant(Path::new(workspace), org, &install)
+            .is_err()
+        {
+            return Ok(stale("workspace_changed", "prepare_again"));
+        }
+        if !provider_snapshot().is_ok_and(|providers| providers == record["providers"]) {
+            return Ok(stale("provider_changed", "prepare_again"));
+        }
+        Ok(json!({"status":"valid","operation":operation,"preparation":review}))
     }
     async fn commit(&self, method: &str, org: &str, p: &Value) -> Result<Value> {
         if self.draining.load(Ordering::SeqCst) {
@@ -542,6 +706,7 @@ impl Daemon {
             state::read_json(&record_path).map_err(|_| anyhow::anyhow!("PRECONDITION_FAILED"))?;
         if record["operation"] != method.replace(".commit", ".prepare")
             || record["organizationId"] != org
+            || record["accountSubject"] != self.auth.credential(org).await?.subject
             || record["bindingDigest"] != p["bindingDigest"]
             || record["confirmationKey"] != p["confirmationKey"]
             || record["installationId"] != self.auth.installation_id().await?
@@ -684,11 +849,59 @@ fn normalize_output(mut value: Value, schema: &Value) -> Result<Value> {
     }
     Ok(value)
 }
+fn normalize_catalog_output(value: Value, output_schema: &Value) -> Result<Value> {
+    let object = value.as_object().context("BACKEND_PROTOCOL_ERROR")?;
+    let schemas = output_schema["oneOf"]
+        .as_array()
+        .context("BACKEND_PROTOCOL_ERROR")?;
+    let schema = schemas
+        .iter()
+        .find(|schema| {
+            schema["required"].as_array().is_some_and(|required| {
+                required
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .all(|key| object.contains_key(key))
+            }) && schema["properties"].as_object().is_some_and(|properties| {
+                properties.iter().all(|(key, property)| {
+                    object.get(key).is_none_or(|field| {
+                        property
+                            .get("const")
+                            .is_none_or(|expected| field == expected)
+                            && property["enum"]
+                                .as_array()
+                                .is_none_or(|options| options.contains(field))
+                    })
+                })
+            })
+        })
+        .context("BACKEND_PROTOCOL_ERROR")?;
+    normalize_output(value, schema)
+}
 fn required<'a>(p: &'a Value, key: &str) -> Result<&'a str> {
     p[key]
         .as_str()
         .filter(|v| !v.is_empty())
         .context("INVALID_REQUEST")
+}
+fn account_scoped_method(method: &str) -> bool {
+    method.starts_with("presentation.")
+        || method.starts_with("interactions.draft.")
+        || matches!(
+            method,
+            "runs.prepare"
+                | "runs.commit"
+                | "builder.prepare"
+                | "builder.commit"
+                | "builder.respond"
+                | "builder.finalize"
+                | "editor.prepare"
+                | "editor.commit"
+                | "editor.respond"
+                | "editor.finalize"
+                | "interactions.respond"
+                | "interactions.decide"
+        )
 }
 fn validate_params(p: &Value, schema: &Value) -> Result<()> {
     let map = p.as_object().context("INVALID_REQUEST")?;
@@ -702,12 +915,13 @@ fn validate_params(p: &Value, schema: &Value) -> Result<()> {
         if s.is_null() {
             bail!("INVALID_REQUEST")
         };
-        let valid = match s["type"].as_str() {
-            Some("string") => value.is_string(),
-            Some("object") => value.is_object(),
-            Some("integer") => value.as_u64().is_some(),
-            Some("boolean") => value.is_boolean(),
-            Some("array") => value.as_array().is_some_and(|items| {
+        let type_matches = |kind: &str| match kind {
+            "string" => value.is_string(),
+            "object" => value.is_object(),
+            "integer" => value.as_u64().is_some(),
+            "boolean" => value.is_boolean(),
+            "null" => value.is_null(),
+            "array" => value.as_array().is_some_and(|items| {
                 items.len() >= s["minItems"].as_u64().unwrap_or(0) as usize
                     && items.iter().all(|item| {
                         item.as_str()
@@ -721,6 +935,15 @@ fn validate_params(p: &Value, schema: &Value) -> Result<()> {
             }),
             _ => false,
         };
+        let valid = s["type"]
+            .as_str()
+            .map(&type_matches)
+            .or_else(|| {
+                s["type"]
+                    .as_array()
+                    .map(|types| types.iter().filter_map(Value::as_str).any(type_matches))
+            })
+            .unwrap_or(false);
         if !valid {
             bail!("INVALID_REQUEST")
         };
@@ -729,7 +952,7 @@ fn validate_params(p: &Value, schema: &Value) -> Result<()> {
                 bail!("INVALID_REQUEST")
             }
         }
-        if s["format"] == "uuid" {
+        if s["format"] == "uuid" && value.is_string() {
             Uuid::parse_str(value.as_str().unwrap())
                 .map_err(|_| anyhow::anyhow!("INVALID_REQUEST"))?;
         }
@@ -848,6 +1071,18 @@ pub fn backend_route(method: &str, p: &Value) -> Result<(String, String, Option<
         "interactions.get" => (
             "GET",
             format!("v1/human-requests/{}/", required(p, "requestId")?),
+        ),
+        "interactions.draft.get" => (
+            "GET",
+            format!("v1/human-requests/{}/draft/", required(p, "requestId")?),
+        ),
+        "interactions.draft.update" => (
+            "PUT",
+            format!("v1/human-requests/{}/draft/", required(p, "requestId")?),
+        ),
+        "interactions.draft.delete" => (
+            "DELETE",
+            format!("v1/human-requests/{}/draft/", required(p, "requestId")?),
         ),
         "interactions.respond" | "interactions.decide" => (
             "POST",
@@ -1357,6 +1592,40 @@ mod tests {
         assert!(validate_params(&json!({"runId":Uuid::new_v4(),"url":"x"}), &schema).is_err());
     }
     #[test]
+    fn output_normalizer_selects_the_matching_discriminated_variant() {
+        let schema = json!({"oneOf":[
+            {"properties":{"status":{"const":"valid"},"value":{"type":"object"}},"required":["status","value"]},
+            {"properties":{"status":{"const":"stale"},"reason":{"enum":["expired"]}},"required":["status","reason"]}
+        ]});
+        assert_eq!(
+            normalize_catalog_output(json!({"status":"stale","reason":"expired"}), &schema)
+                .unwrap(),
+            json!({"status":"stale","reason":"expired"})
+        );
+        assert!(normalize_catalog_output(json!({"status":"unknown"}), &schema).is_err());
+    }
+    #[test]
+    fn ui_replay_mutations_are_account_scoped() {
+        for method in [
+            "runs.prepare",
+            "runs.commit",
+            "builder.prepare",
+            "builder.commit",
+            "builder.respond",
+            "builder.finalize",
+            "editor.prepare",
+            "editor.commit",
+            "editor.respond",
+            "editor.finalize",
+            "interactions.respond",
+            "interactions.decide",
+        ] {
+            assert!(account_scoped_method(method), "{method}");
+        }
+        assert!(!account_scoped_method("auth.login"));
+        assert!(!account_scoped_method("organizations.select"));
+    }
+    #[test]
     fn route_queries_are_encoded() {
         let (_, path, _) =
             backend_route("workflows.list", &json!({"query":"x&scope=admin"})).unwrap();
@@ -1394,6 +1663,90 @@ mod conformance {
             ),
         )
         .unwrap()
+    }
+    #[tokio::test]
+    async fn presentation_dispatch_reloads_and_scopes_idempotency_to_account() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = Api::for_test_origin("http://127.0.0.1:9").unwrap();
+        let org = "11111111-1111-4111-8111-111111111111";
+        let key = Uuid::new_v4();
+        let params = json!({"kind":"browser","entityType":"catalog","entityId":"00000000-0000-0000-0000-000000000000","state":{"query":"active"},"idempotencyKey":key});
+        let first = fixture(temp.path(), api.clone());
+        first.public.lock().await.active_organization = Some(org.into());
+        let first_result = first
+            .dispatch("presentation.sessions.create", params.clone())
+            .await
+            .unwrap();
+        drop(first);
+
+        let other = Daemon::new(
+            temp.path().into(),
+            api.clone(),
+            Auth::test_enrolled(api.clone(), org, "33333333-3333-4333-8333-333333333333"),
+        )
+        .unwrap();
+        other.public.lock().await.active_organization = Some(org.into());
+        let other_result = other
+            .dispatch("presentation.sessions.create", params.clone())
+            .await
+            .unwrap();
+        assert_ne!(first_result["viewSessionId"], other_result["viewSessionId"]);
+        drop(other);
+
+        let reopened = fixture(temp.path(), api);
+        reopened.public.lock().await.active_organization = Some(org.into());
+        assert_eq!(
+            reopened
+                .dispatch("presentation.sessions.create", params)
+                .await
+                .unwrap(),
+            first_result
+        );
+    }
+    #[tokio::test]
+    async fn draft_mutation_cache_is_scoped_to_authenticated_account() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let request = Uuid::new_v4();
+        let request_for_server = request;
+        let backend = tokio::spawn(async move {
+            for revision in [1, 2] {
+                let (stream, head) = receive_http(&listener).await;
+                assert!(head.starts_with(&format!(
+                    "PUT /api/v1/runner-control/runner/v1/human-requests/{request_for_server}/draft/ HTTP/1.1"
+                )));
+                reply_http(
+                    stream,
+                    200,
+                    json!({"draft":{"requestId":request_for_server,"schemaDigest":"a".repeat(64),"answers":{"q":"answer"},"currentQuestionId":null,"phase":"review","revision":revision,"createdAt":1,"updatedAt":revision}}),
+                )
+                .await;
+            }
+        });
+        let org = "11111111-1111-4111-8111-111111111111";
+        let params = json!({"requestId":request,"expectedRevision":0,"answers":{"q":"answer"},"currentQuestionId":null,"phase":"review","expectedSchemaDigest":"a".repeat(64),"idempotencyKey":Uuid::new_v4()});
+        for (runner, revision) in [
+            ("22222222-2222-4222-8222-222222222222", 1),
+            ("33333333-3333-4333-8333-333333333333", 2),
+        ] {
+            let daemon = Daemon::new(
+                temp.path().into(),
+                api.clone(),
+                Auth::test_enrolled(api.clone(), org, runner),
+            )
+            .unwrap();
+            daemon.public.lock().await.active_organization = Some(org.into());
+            assert_eq!(
+                daemon
+                    .dispatch("interactions.draft.update", params.clone())
+                    .await
+                    .unwrap()["draft"]["revision"],
+                revision
+            );
+        }
+        backend.await.unwrap();
     }
     async fn receive_http(listener: &TcpListener) -> (tokio::net::TcpStream, String) {
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -1919,7 +2272,11 @@ mod conformance {
                                     "POST /api/v1/runner-control/runner/v2/executions/prepare/"
                                 ));
                                 assert_eq!(body["executionPolicy"], "host_user/v1");
-                                json!({"preparationId":prep_server,"bindingDigest":"digest","binding":body,"limits":{},"expiresAt":null})
+                                let mut binding = body;
+                                binding["organizationId"] =
+                                    json!("11111111-1111-4111-8111-111111111111");
+                                binding["runnerId"] = json!("22222222-2222-4222-8222-222222222222");
+                                json!({"preparationId":prep_server,"bindingDigest":"digest","binding":binding,"limits":{},"expiresAt":null})
                             } else {
                                 assert_eq!(body["preparationId"], prep_server);
                                 json!({"execution":{"id":run},"preparationId":prep_server,"executionPolicy":"host_user/v1"})
@@ -1936,7 +2293,8 @@ mod conformance {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
-        let d = fixture(&temp.path().join("state"), api);
+        let state_dir = temp.path().join("state");
+        let d = fixture(&state_dir, api.clone());
         let org = "11111111-1111-4111-8111-111111111111";
         d.public.lock().await.active_organization = Some(org.into());
         let p = json!({"workflowId":Uuid::new_v4(),"versionId":Uuid::new_v4(),"workspacePath":workspace,"idempotencyKey":Uuid::new_v4()});
@@ -1954,8 +2312,111 @@ mod conformance {
         )
         .await
         .unwrap();
-        let prepared = d.dispatch("runs.prepare", p).await.unwrap();
+        let prepared = d.dispatch("runs.prepare", p.clone()).await.unwrap();
         assert!(prepared["confirmationKey"].is_string());
+        let restored = d
+            .dispatch("preparations.get", json!({"preparationId":prep}))
+            .await
+            .unwrap();
+        assert_eq!(restored["status"], "valid");
+        assert_eq!(restored["operation"], "runs.prepare");
+        assert_eq!(restored["preparation"], prepared);
+        let run_record_path = state_dir.join("preparations").join(format!("{prep}.json"));
+        let run_record: Value = state::read_json(&run_record_path).unwrap();
+        for operation in ["builder.prepare", "editor.prepare"] {
+            let id = Uuid::new_v4().to_string();
+            let mut record = run_record.clone();
+            record["operation"] = json!(operation);
+            record["review"]["preparationId"] = json!(id);
+            state::write_json(
+                &state_dir.join("preparations").join(format!("{id}.json")),
+                &record,
+            )
+            .unwrap();
+            let restored = d
+                .dispatch("preparations.get", json!({"preparationId":id}))
+                .await
+                .unwrap();
+            assert_eq!(restored["status"], "valid");
+            assert_eq!(restored["operation"], operation);
+            assert_eq!(restored["preparation"], record["review"]);
+        }
+        drop(d);
+
+        let other = Daemon::new(
+            state_dir.clone(),
+            api.clone(),
+            Auth::test_enrolled(api.clone(), org, "33333333-3333-4333-8333-333333333333"),
+        )
+        .unwrap();
+        assert_eq!(
+            other
+                .dispatch("preparations.get", json!({"preparationId":prep}))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "PREPARATION_NOT_FOUND"
+        );
+        other.public.lock().await.grants.clear();
+        assert_eq!(
+            other
+                .dispatch("runs.prepare", p)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "WORKSPACE_DENIED"
+        );
+        drop(other);
+
+        let d = fixture(&state_dir, api.clone());
+        let record_path = state_dir.join("preparations").join(format!("{prep}.json"));
+        let record: Value = state::read_json(&record_path).unwrap();
+        let mut changed = record.clone();
+        changed["review"]["expiresAt"] = json!(0);
+        state::write_json(&record_path, &changed).unwrap();
+        assert_eq!(
+            d.dispatch("preparations.get", json!({"preparationId":prep}))
+                .await
+                .unwrap()["reason"],
+            "expired"
+        );
+        changed = record.clone();
+        changed["providers"] = json!({"notInstalled":{}});
+        state::write_json(&record_path, &changed).unwrap();
+        assert_eq!(
+            d.dispatch("preparations.get", json!({"preparationId":prep}))
+                .await
+                .unwrap()["reason"],
+            "provider_changed"
+        );
+        changed = record.clone();
+        changed["review"]["bindingDigest"] = json!("tampered");
+        state::write_json(&record_path, &changed).unwrap();
+        assert_eq!(
+            d.dispatch("preparations.get", json!({"preparationId":prep}))
+                .await
+                .unwrap()["reason"],
+            "record_invalid"
+        );
+        state::write_json(&record_path, &record).unwrap();
+        d.dispatch(
+            "workspaces.revoke",
+            json!({"workspacePath":workspace,"idempotencyKey":Uuid::new_v4()}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            d.dispatch("preparations.get", json!({"preparationId":prep}))
+                .await
+                .unwrap()["reason"],
+            "workspace_changed"
+        );
+        d.dispatch(
+            "workspaces.grant",
+            json!({"workspacePath":workspace,"idempotencyKey":Uuid::new_v4()}),
+        )
+        .await
+        .unwrap();
         let mut commit = json!({"preparationId":prep,"bindingDigest":"digest","confirmationKey":Uuid::new_v4(),"idempotencyKey":Uuid::new_v4()});
         assert!(
             d.dispatch("runs.commit", commit.clone())
@@ -1967,6 +2428,14 @@ mod conformance {
         commit["confirmationKey"] = prepared["confirmationKey"].clone();
         commit["idempotencyKey"] = json!(Uuid::new_v4());
         let result = d.dispatch("runs.commit", commit.clone()).await.unwrap();
+        let authorized_commit = commit.clone();
+        let stale = d
+            .dispatch("preparations.get", json!({"preparationId":prep}))
+            .await
+            .unwrap();
+        assert_eq!(stale["reason"], "commit_started");
+        assert_eq!(stale["nextAction"], "reconcile_operation");
+        assert!(stale.get("preparation").is_none());
         assert_eq!(
             d.dispatch("runs.commit", commit.clone()).await.unwrap(),
             result
@@ -1981,6 +2450,21 @@ mod conformance {
         );
         backend.await.unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        drop(d);
+        let other = Daemon::new(
+            state_dir,
+            api.clone(),
+            Auth::test_enrolled(api, org, "33333333-3333-4333-8333-333333333333"),
+        )
+        .unwrap();
+        assert_eq!(
+            other
+                .dispatch("runs.commit", authorized_commit)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "PRECONDITION_FAILED"
+        );
     }
     #[tokio::test]
     async fn large_response_spool_pages_are_complete() {
@@ -2056,6 +2540,18 @@ mod lifecycle_tests {
             backend_route("runs.list", &json!({"workflowId":id,"status":"failed"})).unwrap();
         assert!(route.contains("workflowId="));
         assert!(route.contains("status=failed"));
+        let request = Uuid::new_v4();
+        let (_, route, body) = backend_route(
+            "interactions.draft.update",
+            &json!({"requestId":request,"expectedRevision":2,"answers":{"q":"answer"},"currentQuestionId":null,"phase":"review","expectedSchemaDigest":"a".repeat(64),"idempotencyKey":Uuid::new_v4()}),
+        )
+        .unwrap();
+        assert!(route.ends_with(&format!("human-requests/{request}/draft/")));
+        let body = body.unwrap();
+        assert_eq!(body["expectedRevision"], 2);
+        assert_eq!(body["currentQuestionId"], Value::Null);
+        assert!(body.get("requestId").is_none());
+        assert!(body.get("idempotencyKey").is_none());
     }
     #[test]
     fn backend_float_representation_is_preserved_in_payload_digest() {

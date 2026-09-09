@@ -1,6 +1,6 @@
 {
   "protocol": "loomex.local-control/v2",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "maxFrameBytes": 1048576,
   "methods": [
     {
@@ -1932,6 +1932,10 @@
               "details": {
                 "type": "object",
                 "additionalProperties": true
+              },
+              "progress": {
+                "type": "object",
+                "additionalProperties": true
               }
             },
             "required": [
@@ -2756,6 +2760,10 @@
               "details": {
                 "type": "object",
                 "additionalProperties": true
+              },
+              "progress": {
+                "type": "object",
+                "additionalProperties": true
               }
             },
             "required": [
@@ -2960,6 +2968,10 @@
                 "type": "object",
                 "additionalProperties": true
               },
+              "progress": {
+                "type": "object",
+                "additionalProperties": true
+              },
               "events": {
                 "type": "array",
                 "items": {
@@ -3112,6 +3124,10 @@
                 "additionalProperties": true
               },
               "runner": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "progress": {
                 "type": "object",
                 "additionalProperties": true
               },
@@ -3270,6 +3286,10 @@
                 "type": "object",
                 "additionalProperties": true
               },
+              "progress": {
+                "type": "object",
+                "additionalProperties": true
+              },
               "events": {
                 "type": "array",
                 "items": {
@@ -3422,6 +3442,10 @@
                 "additionalProperties": true
               },
               "runner": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "progress": {
                 "type": "object",
                 "additionalProperties": true
               },
@@ -3916,6 +3940,9 @@
             "additionalProperties": true
           },
           "requestType": {
+            "type": "string"
+          },
+          "expectedSchemaDigest": {
             "type": "string"
           },
           "idempotencyKey": {
@@ -4900,6 +4927,1186 @@
         ]
       },
       "transportRetry": "never_after_send"
+    },
+    {
+      "name": "preparations.get",
+      "mutating": false,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "preparationId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "preparationId"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "const": "valid"
+              },
+              "operation": {
+                "type": "string",
+                "enum": [
+                  "runs.prepare",
+                  "builder.prepare",
+                  "editor.prepare"
+                ]
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "preparation": {
+                "type": "object",
+                "properties": {
+                  "preparationId": {
+                    "type": "string"
+                  },
+                  "bindingDigest": {
+                    "type": "string"
+                  },
+                  "binding": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "limits": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "expiresAt": {
+                    "type": "null"
+                  },
+                  "confirmationKey": {
+                    "type": "string"
+                  },
+                  "details": {
+                    "type": "object",
+                    "additionalProperties": true
+                  }
+                },
+                "required": [
+                  "preparationId",
+                  "bindingDigest",
+                  "binding",
+                  "limits",
+                  "expiresAt",
+                  "confirmationKey"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "status",
+              "operation",
+              "preparation"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "const": "stale"
+              },
+              "operation": {
+                "type": "string",
+                "enum": [
+                  "runs.prepare",
+                  "builder.prepare",
+                  "editor.prepare"
+                ]
+              },
+              "preparationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "reason": {
+                "type": "string",
+                "enum": [
+                  "workspace_changed",
+                  "provider_changed",
+                  "expired",
+                  "commit_started",
+                  "record_invalid"
+                ]
+              },
+              "nextAction": {
+                "type": "string",
+                "enum": [
+                  "prepare_again",
+                  "reconcile_operation"
+                ]
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "status",
+              "operation",
+              "preparationId",
+              "reason",
+              "nextAction"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "transportRetry": "before_response_once"
+    },
+    {
+      "name": "presentation.sessions.create",
+      "mutating": true,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "browser",
+              "authoring",
+              "prepare",
+              "monitor",
+              "interaction"
+            ]
+          },
+          "entityType": {
+            "type": "string",
+            "enum": [
+              "catalog",
+              "workflow",
+              "request",
+              "execution",
+              "builderSession",
+              "preparation"
+            ]
+          },
+          "entityId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "state": {
+            "type": "object"
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "kind",
+          "entityType",
+          "entityId",
+          "state",
+          "idempotencyKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "viewSessionId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "entityType": {
+                "type": "string"
+              },
+              "entityId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "revision": {
+                "type": "integer"
+              },
+              "state": {
+                "type": "object"
+              },
+              "status": {
+                "type": "string"
+              },
+              "createdAt": {
+                "type": "integer"
+              },
+              "updatedAt": {
+                "type": "integer"
+              },
+              "expiresAt": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "operation": {
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "viewSessionId",
+              "kind",
+              "entityType",
+              "entityId",
+              "revision",
+              "state",
+              "status",
+              "createdAt",
+              "updatedAt",
+              "expiresAt",
+              "operation"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "transportRetry": "never_after_send"
+    },
+    {
+      "name": "presentation.sessions.get",
+      "mutating": false,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "viewSessionId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "viewSessionId"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "viewSessionId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "entityType": {
+                "type": "string"
+              },
+              "entityId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "revision": {
+                "type": "integer"
+              },
+              "state": {
+                "type": "object"
+              },
+              "status": {
+                "type": "string"
+              },
+              "createdAt": {
+                "type": "integer"
+              },
+              "updatedAt": {
+                "type": "integer"
+              },
+              "expiresAt": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "operation": {
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "viewSessionId",
+              "kind",
+              "entityType",
+              "entityId",
+              "revision",
+              "state",
+              "status",
+              "createdAt",
+              "updatedAt",
+              "expiresAt",
+              "operation"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "presentation.sessions.update",
+      "mutating": true,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "viewSessionId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "expectedRevision": {
+            "type": "integer"
+          },
+          "state": {
+            "type": "object"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "inactive",
+              "resolved"
+            ]
+          },
+          "operation": {
+            "type": "object"
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "viewSessionId",
+          "expectedRevision",
+          "state",
+          "idempotencyKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "viewSessionId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "entityType": {
+                "type": "string"
+              },
+              "entityId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "revision": {
+                "type": "integer"
+              },
+              "state": {
+                "type": "object"
+              },
+              "status": {
+                "type": "string"
+              },
+              "createdAt": {
+                "type": "integer"
+              },
+              "updatedAt": {
+                "type": "integer"
+              },
+              "expiresAt": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "operation": {
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "viewSessionId",
+              "kind",
+              "entityType",
+              "entityId",
+              "revision",
+              "state",
+              "status",
+              "createdAt",
+              "updatedAt",
+              "expiresAt",
+              "operation"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "transportRetry": "never_after_send"
+    },
+    {
+      "name": "presentation.sessions.delete",
+      "mutating": true,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "viewSessionId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "viewSessionId",
+          "idempotencyKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "viewSessionId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "deleted": {
+                "type": "boolean"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "viewSessionId",
+              "deleted"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "transportRetry": "never_after_send"
+    },
+    {
+      "name": "presentation.operations.get",
+      "mutating": false,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "viewSessionId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "operationId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "viewSessionId",
+          "operationId"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "operationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "viewSessionId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "method": {
+                "type": "string"
+              },
+              "params": {
+                "type": "object"
+              },
+              "idempotencyKey": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "reconciliation": {
+                "type": "object"
+              },
+              "status": {
+                "type": "string"
+              },
+              "createdAt": {
+                "type": "integer"
+              },
+              "updatedAt": {
+                "type": "integer"
+              },
+              "resultReference": {
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "operationId",
+              "viewSessionId",
+              "method",
+              "params",
+              "idempotencyKey",
+              "reconciliation",
+              "status",
+              "createdAt",
+              "updatedAt",
+              "resultReference"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "presentation.operations.settle",
+      "mutating": true,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "viewSessionId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "operationId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "completed",
+              "ambiguous"
+            ]
+          },
+          "resultReference": {
+            "type": "object"
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "viewSessionId",
+          "operationId",
+          "status",
+          "idempotencyKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "operationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "viewSessionId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "status": {
+                "type": "string"
+              },
+              "updatedAt": {
+                "type": "integer"
+              },
+              "resultReference": {
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "operationId",
+              "viewSessionId",
+              "status",
+              "updatedAt",
+              "resultReference"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "transportRetry": "never_after_send"
+    },
+    {
+      "name": "interactions.draft.get",
+      "mutating": false,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "requestId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "requestId"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "draft": {
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "draft"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "interactions.draft.update",
+      "mutating": true,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "requestId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "expectedRevision": {
+            "type": "integer"
+          },
+          "answers": {
+            "type": "object"
+          },
+          "currentQuestionId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "phase": {
+            "type": "string",
+            "enum": [
+              "answer",
+              "review"
+            ]
+          },
+          "expectedSchemaDigest": {
+            "type": "string"
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "requestId",
+          "expectedRevision",
+          "answers",
+          "currentQuestionId",
+          "phase",
+          "idempotencyKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "draft": {
+                "type": "object"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "draft"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "transportRetry": "never_after_send"
+    },
+    {
+      "name": "interactions.draft.delete",
+      "mutating": true,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "requestId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "expectedRevision": {
+            "type": "integer"
+          },
+          "expectedSchemaDigest": {
+            "type": "string"
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "requestId",
+          "expectedRevision",
+          "idempotencyKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "requestId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "deleted": {
+                "type": "boolean"
+              },
+              "revision": {
+                "type": "integer"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "requestId",
+              "deleted",
+              "revision"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "transportRetry": "never_after_send"
     }
   ],
   "capabilities": [
@@ -4950,10 +6157,22 @@
     "method:daemon.drain",
     "method:builder.commit",
     "method:editor.commit",
+    "method:preparations.get",
+    "method:presentation.sessions.create",
+    "method:presentation.sessions.get",
+    "method:presentation.sessions.update",
+    "method:presentation.sessions.delete",
+    "method:presentation.operations.get",
+    "method:presentation.operations.settle",
+    "method:interactions.draft.get",
+    "method:interactions.draft.update",
+    "method:interactions.draft.delete",
     "execution.host_user/v1",
     "authorization.prepare-commit/v1",
     "auth.device-v2/v1",
     "transfer.chunked/v1",
-    "error.validation-issues/v1"
+    "error.validation-issues/v1",
+    "presentation.sessions/v1",
+    "interactions.drafts/v1"
   ]
 }
