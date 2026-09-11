@@ -9,6 +9,35 @@ the local-control protocol (`loomex.local-control/v2`) and the method-catalog
 contract version (`0.3.0`); those compatibility identifiers change
 independently of the product release version.
 
+`contracts/compatibility-manifest.json` is the deterministic compatibility
+export. It is generated from the local method catalog and the explicit runner
+backend-route descriptor, so it records every local method's classification,
+schema digests, and allowed backend endpoint templates without scraping source.
+Regenerate it with `./scripts/export-compatibility.py`; CI and release builds
+use `--check` to reject stale exports. Release payloads retain the generated
+manifest at `metadata/compatibility-manifest.json` for cached-package review.
+
+For a source-integration check, export the backend's registered route surface
+and the plugin's evaluated package components, then compare the three
+components without invoking a daemon or changing application data:
+
+```sh
+LOOMEX_PLUGIN_NODE="$HOME/Library/Application Support/Loomex/plugin/current/plugin/runtime/bin/node" \
+  ./scripts/run-integration-compatibility-gate.sh \
+  --plugin-root ../plugin --backend-root ../backend \
+  --backend-python ../backend/.venv/bin/python
+```
+
+`./scripts/run-integration-compatibility-gate.sh` performs the same comparison
+when passed those two artifact paths, or explicit `--plugin-root` and
+`--backend-root` checkouts. It reports a skip when neither pair is supplied;
+CI exposes the same optional inputs through its `LOOMEX_*` variables and does
+not fetch or assume sibling repositories.
+
+The result is `loomex/compatibility-manifest/v1`. It proves declared method,
+capability, and route compatibility only; it is not a deployment, credentials,
+or installed-host acceptance claim.
+
 ## Build and test
 
 Rust 1.85+ is required. Dependency resolution is pinned by `Cargo.lock`.

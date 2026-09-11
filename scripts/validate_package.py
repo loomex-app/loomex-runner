@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse,json
+import argparse,json,subprocess,sys
 from pathlib import Path
 
 parser=argparse.ArgumentParser(); parser.add_argument("root"); parser.add_argument("--expected-version",required=True); args=parser.parse_args()
@@ -12,5 +12,12 @@ for name in ("loomex","loomex-runner"):
     if not binary.is_file() or not (binary.stat().st_mode & 0o111): raise SystemExit(f"runner executable missing: {name}")
 metadata=json.loads((root/"metadata/project.json").read_text())
 if metadata!={"project":"loomex-runner","version":args.expected_version,"platform":"darwin-arm64","stateSchema":"app.loomex.runner.state/v1"}: raise SystemExit("runner metadata mismatch")
+compatibility=root/"metadata/compatibility-manifest.json"
+if not compatibility.is_file(): raise SystemExit("runner compatibility manifest missing")
+source_root=Path(__file__).resolve().parent.parent
+exporter=source_root/"scripts"/"export-compatibility.py"
+if not exporter.is_file(): raise SystemExit("runner compatibility verifier missing")
+checked=subprocess.run([sys.executable,str(exporter),"--check-package-root",str(root)],text=True,capture_output=True)
+if checked.returncode: raise SystemExit(f"runner compatibility manifest mismatch: {checked.stderr.strip() or checked.stdout.strip()}")
 plist=(root/"launchd/app.loomex.runner.template.plist").read_text()
 if plist.count("__LOOMEX_DAEMON__")!=1 or plist.count("__LOOMEX_STATE_DIR__")!=3 or plist.count("__LOOMEX_DEV_API_ORIGIN_ENTRY__")!=1 or plist.count("__LOOMEX_PROVIDER_EXECUTABLE_ENTRIES__")!=1: raise SystemExit("LaunchAgent template placeholders are invalid")

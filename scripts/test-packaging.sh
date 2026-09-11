@@ -21,11 +21,17 @@ import json,sys
 from pathlib import Path
 v,o=sys.argv[1:]; Path(o).write_text(json.dumps({'project':'loomex-runner','version':v,'platform':'darwin-arm64','stateSchema':'app.loomex.runner.state/v1'},indent=2,sort_keys=True)+'\n')
 PY
+  cp "$repo/contracts/compatibility-manifest.json" "$payload/metadata/compatibility-manifest.json"
   cp "$repo/scripts/app.loomex.runner.template.plist" "$payload/launchd/app.loomex.runner.template.plist"
   python3 "$repo/scripts/validate_package.py" "$payload" --expected-version "$version"
 }
 
 payload="$fixture/payload"; make_payload 0.1.0 "$payload"
+compatibility="$payload/metadata/compatibility-manifest.json"; mv "$compatibility" "$compatibility.saved"
+if python3 "$repo/scripts/validate_package.py" "$payload" --expected-version 0.1.0 >/dev/null 2>&1; then echo "package without compatibility manifest accepted" >&2; exit 1; fi
+mv "$compatibility.saved" "$compatibility"; printf '\n' >> "$compatibility"
+if python3 "$repo/scripts/validate_package.py" "$payload" --expected-version 0.1.0 >/dev/null 2>&1; then echo "stale compatibility manifest accepted" >&2; exit 1; fi
+cp "$repo/contracts/compatibility-manifest.json" "$compatibility"
 for invalid_origin in 'http://example.com' 'http://user@127.0.0.1:9' 'http://127.0.0.1:9/path' 'http://127.0.0.1:9?query' 'http://127.0.0.1:9#fragment' 'http://[::1%lo0]:9' 'http://[::1%25lo0]:9'; do
   if python3 "$repo/scripts/validate_development_origin.py" "$invalid_origin" >/dev/null 2>&1; then echo "invalid development origin accepted: $invalid_origin" >&2; exit 1; fi
 done
@@ -137,6 +143,8 @@ old,agent,state=sys.argv[1:]; state=Path(state)
 PY
 printf 1 > "$state/test-active"
 LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/install.sh" "$release" --allow-unsigned-development --development-api-origin "$dev_origin" --provider-executable "codex=$fixture/codex-link" --install-base "$base" --state-dir "$state" --launch-agents-dir "$agents"
+test -f "$base/current/metadata/compatibility-manifest.json"
+python3 "$repo/scripts/export-compatibility.py" --check-package-root "$base/current"
 test "$(readlink "$base/current")" = "$old"; test -f "$state/pending-update.json"; test -f "$state/drain.json"
 test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["providerExecutables"]["codex"])' "$state/pending-update.json")" = "$provider_bin/codex"
 printf '%s\n' '{"schema":"app.loomex.runner.uninstall-ready/v1","versionPath":"'"$old"'"}' > "$state/uninstall-ready.json"; printf interrupted > "$state/uninstall-ready.json.new"

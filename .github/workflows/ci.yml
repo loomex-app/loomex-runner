@@ -16,6 +16,18 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      - run: python3 scripts/test_compatibility_export.py
+      - run: python3 scripts/test_integration_compatibility.py
+      - run: python3 scripts/test_integration_gate.py
+      - run: python3 scripts/export-compatibility.py --check
+      - name: Cross-component compatibility gate (when component artifacts are supplied)
+        env:
+          LOOMEX_PLUGIN_COMPONENTS: ${{ vars.LOOMEX_PLUGIN_COMPONENTS }}
+          LOOMEX_BACKEND_ROUTES: ${{ vars.LOOMEX_BACKEND_ROUTES }}
+          LOOMEX_PLUGIN_ROOT: ${{ vars.LOOMEX_PLUGIN_ROOT }}
+          LOOMEX_BACKEND_ROOT: ${{ vars.LOOMEX_BACKEND_ROOT }}
+          LOOMEX_BACKEND_PYTHON: ${{ vars.LOOMEX_BACKEND_PYTHON }}
+        run: ./scripts/run-integration-compatibility-gate.sh
       - run: ./scripts/test-packaging.sh
       - name: Smoke installed development daemon and CLI
         env:
@@ -30,5 +42,6 @@ jobs:
           trap 'kill "$daemon_pid" 2>/dev/null || true' EXIT
           for attempt in {1..100}; do test -S "$RUNNER_TEMP/state/control.sock" && break; sleep 0.05; done
           test -S "$RUNNER_TEMP/state/control.sock"
+          python3 scripts/export-compatibility.py --check-package-root "$RUNNER_TEMP/install/current"
           version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
           LOOMEX_STATE_DIR="$RUNNER_TEMP/state" "$RUNNER_TEMP/install/current/bin/loomex" status | EXPECTED_VERSION="$version" python3 -c 'import json,os,sys; data=json.load(sys.stdin); assert data["version"]==os.environ["EXPECTED_VERSION"] and isinstance(data["activeJobs"],int)'

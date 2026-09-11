@@ -28,6 +28,7 @@ fi
 remap_flags="${RUSTFLAGS:-} --remap-path-prefix=$build_root=/loomex/src --remap-path-prefix=${HOME:?}=/loomex/home"
 remap_cflags="${CFLAGS:-} -ffile-prefix-map=$build_root=/loomex/src -ffile-prefix-map=${HOME:?}=/loomex/home"
 (cd "$build_root" && CARGO_TARGET_DIR="$temporary/target" RUSTFLAGS="$remap_flags" CFLAGS="$remap_cflags" cargo test --locked)
+python3 "$build_root/scripts/export-compatibility.py" --check
 if [[ "$mode" == "--production" ]]; then
   (cd "$build_root" && CARGO_TARGET_DIR="$temporary/target" RUSTFLAGS="$remap_flags" CFLAGS="$remap_cflags" cargo build --locked --release --target aarch64-apple-darwin)
   binary_root="$temporary/target/aarch64-apple-darwin/release"
@@ -46,6 +47,7 @@ import json,sys
 from pathlib import Path
 version,out=sys.argv[1:]; Path(out).write_text(json.dumps({"project":"loomex-runner","version":version,"platform":"darwin-arm64","stateSchema":"app.loomex.runner.state/v1"},sort_keys=True,indent=2)+"\n")
 PY
+cp "$build_root/contracts/compatibility-manifest.json" "$payload/metadata/compatibility-manifest.json"
 cp "$build_root/scripts/app.loomex.runner.template.plist" "$payload/launchd/app.loomex.runner.template.plist"
 python3 "$build_root/scripts/validate_package.py" "$payload" --expected-version "$version"
 if [[ "$mode" == "--production" ]]; then
