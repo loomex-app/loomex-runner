@@ -75,6 +75,14 @@ async fn run() -> Result<()> {
         std::process::exit(1)
     }
     if command == "login" && response["result"]["status"] == "pending" {
+        // Bind each poll to the exact public flow the runner persisted. This
+        // attaches a restarted CLI to an existing login without permitting a
+        // stale poll to act on a later flow.
+        let connection = control::client(&dir, "connection.get", json!({})).await?;
+        let flow_id = connection["result"]["login"]["flowId"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("LOGIN_FLOW_UNAVAILABLE"))?
+            .to_owned();
         if let Some(uri) = response["result"]["verificationUri"].as_str() {
             #[cfg(target_os = "macos")]
             {
@@ -99,7 +107,7 @@ async fn run() -> Result<()> {
             let poll = control::client(
                 &dir,
                 "auth.poll",
-                json!({"idempotencyKey":uuid::Uuid::new_v4()}),
+                json!({"idempotencyKey":uuid::Uuid::new_v4(),"flowId":flow_id}),
             )
             .await?;
             if poll.get("error").is_some() {

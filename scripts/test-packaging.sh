@@ -6,7 +6,7 @@ mkdir "$fixture/existing-output"
 if "$repo/scripts/build-release.sh" --unsigned-development --output "$fixture/existing-output" >/dev/null 2>&1; then echo "build replaced an existing output directory" >&2; exit 1; fi
 base="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve())' "$fixture/install")"; state="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve())' "$fixture/state")"; agents="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve())' "$fixture/agents")"; mkdir -p "$base" "$state" "$agents"
 provider_bin="$fixture/provider-bin"; mkdir "$provider_bin"; provider_bin="$(cd "$provider_bin" && pwd -P)"
-for provider in codex claude gemini; do printf '%s\n' '#!/bin/bash' 'exit 0' > "$provider_bin/$provider"; chmod 0755 "$provider_bin/$provider"; done
+for provider in codex claude gemini antigravity; do printf '%s\n' '#!/bin/bash' 'exit 0' > "$provider_bin/$provider"; chmod 0755 "$provider_bin/$provider"; done
 printf '%s\n' '#!/bin/bash' 'exit 0' > "$provider_bin/not-executable"; chmod 0644 "$provider_bin/not-executable"
 ln -s "$provider_bin/codex" "$fixture/codex-link"
 
@@ -34,7 +34,7 @@ test "$(python3 "$repo/scripts/validate_development_origin.py" 'http://[::1]:800
 python3 - "$provider_bin" "$fixture/provider-executables.json" <<'PY'
 import json,sys
 from pathlib import Path
-root=Path(sys.argv[1]); Path(sys.argv[2]).write_text(json.dumps({name:str((root/name).resolve()) for name in ('codex','claude','gemini')})+'\n')
+root=Path(sys.argv[1]); Path(sys.argv[2]).write_text(json.dumps({name:str((root/name).resolve()) for name in ('codex','claude','gemini','antigravity')})+'\n')
 PY
 python3 "$repo/scripts/render_launch_agent.py" --template "$repo/scripts/app.loomex.runner.template.plist" --binary "$fixture/bin/loomex-runner" --state "$fixture/render-state" --development-api-origin 'http://[::1]:8000' --provider-executables-file "$fixture/provider-executables.json" --output "$fixture/development.plist"
 python3 "$repo/scripts/render_launch_agent.py" --template "$repo/scripts/app.loomex.runner.template.plist" --binary "$fixture/bin/loomex-runner" --state "$fixture/render-state" --output "$fixture/production.plist"
@@ -43,7 +43,7 @@ import plistlib,sys
 from pathlib import Path
 development=plistlib.load(open(sys.argv[1],'rb'))['EnvironmentVariables']
 production=plistlib.load(open(sys.argv[2],'rb'))['EnvironmentVariables']
-assert development=={'LOOMEX_STATE_DIR':sys.argv[1].rsplit('/',1)[0]+'/render-state','LOOMEX_DEV_API_ORIGIN':'http://[::1]:8000/','LOOMEX_CODEX_EXECUTABLE':str(Path(sys.argv[3],'codex').resolve()),'LOOMEX_CLAUDE_EXECUTABLE':str(Path(sys.argv[3],'claude').resolve()),'LOOMEX_GEMINI_EXECUTABLE':str(Path(sys.argv[3],'gemini').resolve())}
+assert development=={'LOOMEX_STATE_DIR':sys.argv[1].rsplit('/',1)[0]+'/render-state','LOOMEX_DEV_API_ORIGIN':'http://[::1]:8000/','LOOMEX_CODEX_EXECUTABLE':str(Path(sys.argv[3],'codex').resolve()),'LOOMEX_CLAUDE_EXECUTABLE':str(Path(sys.argv[3],'claude').resolve()),'LOOMEX_GEMINI_EXECUTABLE':str(Path(sys.argv[3],'gemini').resolve()),'LOOMEX_ANTIGRAVITY_EXECUTABLE':str(Path(sys.argv[3],'antigravity').resolve())}
 assert production=={'LOOMEX_STATE_DIR':sys.argv[1].rsplit('/',1)[0]+'/render-state'}
 PY
 printf '%s\n' '{"codex":"/missing/provider"}' > "$fixture/missing-provider.json"
@@ -108,6 +108,25 @@ printf interrupted > "$retry_state/uninstall-ready.json.new"
 rm "$retry_state/test-logout-fail"; : > "$retry_state/test-uninstall-order"
 LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/uninstall.sh" --install-base "$retry_base" --state-dir "$retry_state" --launch-agents-dir "$retry_agents" >/dev/null
 test "$(paste -sd, "$retry_state/test-uninstall-order")" = logout; test ! -e "$retry_state/uninstall-ready.json.new"
+
+# Both lifecycle scripts leave a sealed transaction record at their irreversible
+# boundaries.  A fresh invocation must reconcile that exact record instead of
+# treating the partially-mutated namespace as unowned or requiring a current
+# symlink after credential revocation.
+resume_base="$fixture/resume-install"; resume_state="$fixture/resume-state"; resume_agents="$fixture/resume-agents"
+if LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_INSTALL_TEST_MODE=1 LOOMEX_TEST_INSTALL_INTERRUPT_AFTER_OWNERSHIP=1 "$repo/scripts/install.sh" "$release" --allow-unsigned-development --development-api-origin "$dev_origin" --install-base "$resume_base" --state-dir "$resume_state" --launch-agents-dir "$resume_agents" >/dev/null 2>&1; then echo "forced ownership-journal interruption succeeded" >&2; exit 1; fi
+test -f "$resume_state/install-operation.json"; test -f "$resume_state/owned-versions.json"; test ! -e "$resume_state/install-receipt.json"
+LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/install.sh" "$release" --allow-unsigned-development --development-api-origin "$dev_origin" --install-base "$resume_base" --state-dir "$resume_state" --launch-agents-dir "$resume_agents" >/dev/null
+test -L "$resume_base/current"; test ! -e "$resume_state/install-operation.json"
+if LOOMEX_INSTALL_TEST_MODE=1 LOOMEX_TEST_UNINSTALL_INTERRUPT_AFTER_REVOCATION=1 "$repo/scripts/uninstall.sh" --install-base "$resume_base" --state-dir "$resume_state" --launch-agents-dir "$resume_agents" >/dev/null 2>&1; then echo "forced revocation-journal interruption succeeded" >&2; exit 1; fi
+test -L "$resume_base/current"; test -f "$resume_state/install-receipt.json"; test -f "$resume_state/owned-versions.json"
+python3 - "$resume_state/uninstall-operation.json" <<'PY'
+import json,sys
+assert json.load(open(sys.argv[1]))['phase']=='revoked'
+PY
+LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/uninstall.sh" --install-base "$resume_base" --state-dir "$resume_state" --launch-agents-dir "$resume_agents" >/dev/null
+test ! -e "$resume_base/current"; test ! -e "$resume_state/uninstall-operation.json"
+
 old="$base/versions/0.0.9"; mkdir -p "$old/bin" "$state"; cp "$payload/bin/loomex" "$old/bin/loomex"; ln -s "$old" "$base/current"
 python3 - "$old" "$agents/app.loomex.runner.plist" "$state" <<'PY'
 import json,sys
@@ -136,10 +155,10 @@ PY
 payload2="$fixture/payload2"; make_payload 0.1.1 "$payload2"; release2="$fixture/release2"; SOURCE_DATE_EPOCH=2 python3 "$repo/scripts/artifact.py" create --payload "$payload2" --output "$release2" --project loomex-runner --version 0.1.1 --platform darwin-arm64 --source-revision test2 --unsigned-development
 touch "$state/test-race"
 launchctl_bin="$fixture/launchctl-bin"; mkdir "$launchctl_bin"; touch "$state/test-launchctl-loaded"; : > "$state/test-launchctl-log"
-printf '%s\n' '#!/bin/bash' "log='$state/test-launchctl-log'; loaded='$state/test-launchctl-loaded'" 'printf '\''%s\n'\'' "$1" >> "$log"' 'case "$1" in bootout) rm -f "$loaded";; bootstrap) [[ ! -e "$loaded" ]] || exit 1; touch "$loaded";; *) exit 1;; esac' > "$launchctl_bin/launchctl"; chmod 0755 "$launchctl_bin/launchctl"
+printf '%s\n' '#!/bin/bash' "log='$state/test-launchctl-log'; loaded='$state/test-launchctl-loaded'" 'printf '\''%s\n'\'' "$1" >> "$log"' 'case "$1" in bootout) rm -f "$loaded";; bootstrap) [[ ! -e "$loaded" ]] || exit 1; touch "$loaded";; print) [[ -e "$loaded" ]];; *) exit 1;; esac' > "$launchctl_bin/launchctl"; chmod 0755 "$launchctl_bin/launchctl"
 if PATH="$launchctl_bin:$PATH" LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_TEST_HEALTH_FAIL=1 "$repo/scripts/install.sh" "$release2" --allow-unsigned-development --development-api-origin "$dev_origin" --provider-executable "codex=$provider_bin/claude" --install-base "$base" --state-dir "$state" --launch-agents-dir "$agents" 2>/dev/null; then echo "unhealthy accepted service was treated as activated" >&2; exit 1; fi
 test "$(readlink "$base/current")" = "$base/versions/0.1.0"; test ! -e "$base/versions/0.1.1"; test ! -e "$state/test-race-triggered"
-test "$(paste -sd, "$state/test-launchctl-log")" = "bootout,bootstrap,bootout,bootstrap"
+test "$(paste -sd, "$state/test-launchctl-log")" = "bootout,print,bootstrap,bootout,bootstrap"
 python3 - "$agents/app.loomex.runner.plist" "$state/install-receipt.json" "$provider_bin/codex" <<'PY'
 import json,plistlib,sys
 assert plistlib.load(open(sys.argv[1],'rb'))['EnvironmentVariables']['LOOMEX_CODEX_EXECUTABLE']==sys.argv[3]
@@ -159,10 +178,10 @@ test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["path"])
 touch "$state/test-track-uninstall"; : > "$state/test-uninstall-order"
 if LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/uninstall.sh" --install-base "$base" --state-dir "$state" --launch-agents-dir "$agents" >/dev/null 2>&1; then echo "active uninstall removed installation" >&2; exit 1; fi
 test -L "$base/current"; test ! -e "$state/uninstall-ready.json"; test ! -e "$state/test-revoked"; test "$(paste -sd, "$state/test-uninstall-order")" = "drain,status"
-printf 0 > "$state/test-active"; printf preserve > "$state/unrelated-sentinel"; touch "$state/presentation.sqlite3" "$state/presentation.sqlite3-wal" "$state/presentation.sqlite3-shm"; : > "$state/test-uninstall-order"
+printf 0 > "$state/test-active"; printf preserve > "$state/unrelated-sentinel"; touch "$state/presentation.sqlite3" "$state/presentation.sqlite3-wal" "$state/presentation.sqlite3-shm" "$state/follow.sqlite3" "$state/follow.sqlite3-wal" "$state/follow.sqlite3-shm" "$state/recovery.sqlite3" "$state/recovery.sqlite3-wal" "$state/recovery.sqlite3-shm"; : > "$state/test-uninstall-order"
 LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/uninstall.sh" --install-base "$base" --state-dir "$state" --launch-agents-dir "$agents"
 test "$(paste -sd, "$state/test-uninstall-order")" = "drain,status,logout"
-test "$(cat "$state/unrelated-sentinel")" = preserve; test -f "$state/test-revoked"; test ! -e "$state/presentation.sqlite3"; test ! -e "$state/presentation.sqlite3-wal"; test ! -e "$state/presentation.sqlite3-shm"; test ! -e "$base/current"; test ! -e "$base/versions/0.1.0"; test ! -e "$base/versions/0.1.1"; test ! -e "$base/versions/0.1.2"
+test "$(cat "$state/unrelated-sentinel")" = preserve; test -f "$state/test-revoked"; test ! -e "$state/presentation.sqlite3"; test ! -e "$state/presentation.sqlite3-wal"; test ! -e "$state/presentation.sqlite3-shm"; test ! -e "$state/follow.sqlite3"; test ! -e "$state/follow.sqlite3-wal"; test ! -e "$state/follow.sqlite3-shm"; test ! -e "$state/recovery.sqlite3"; test ! -e "$state/recovery.sqlite3-wal"; test ! -e "$state/recovery.sqlite3-shm"; test ! -e "$base/current"; test ! -e "$base/versions/0.1.0"; test ! -e "$base/versions/0.1.1"; test ! -e "$base/versions/0.1.2"
 
 victim="$fixture/victim"; mkdir "$victim"; printf preserve > "$victim/sentinel"
 attack_base="$fixture/attack-install"; attack_state="$fixture/attack-state"; attack_agents="$fixture/attack-agents"; mkdir -p "$attack_base/versions" "$attack_state" "$attack_agents"

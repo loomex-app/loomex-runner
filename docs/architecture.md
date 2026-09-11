@@ -35,11 +35,36 @@ Credential creation and rotation persist the exact pending operation before tran
 
 ## Protocol ownership and versioning
 
-The runner owns `contracts/local-control.schema.json` and `contracts/method-catalog.json`. The local protocol remains `loomex.local-control/v2`. Fixed-text `validationIssueVersion: "v1"` issues are behind the negotiated `error.validation-issues/v1` capability. Durable UI sessions and backend interaction drafts are separately negotiated through `presentation.sessions/v1` and `interactions.drafts/v1`; older runners therefore fail compatibility checks before a new UI can write. `protocol.negotiate` establishes the selected protocol and required capabilities on the same socket before actions; incompatible peers cannot mutate state. `daemon.drain` is internal lifecycle control. The plugin vendors a pinned catalog copy and exposes only its intended model/app surface.
+The product version is `0.3.9`, sourced from `Cargo.toml`. The runner owns `contracts/local-control.schema.json` and `contracts/method-catalog.json`; the method catalog's contract version is independently `0.3.0`, and the local protocol remains `loomex.local-control/v2`. These protocol and catalog identifiers are compatibility versions, not product release numbers. Fixed-text `validationIssueVersion: "v1"` issues are behind the negotiated `error.validation-issues/v1` capability. Durable UI sessions and backend interaction drafts are separately negotiated through `presentation.sessions/v1` and `interactions.drafts/v1`; older runners therefore fail compatibility checks before a new UI can write. `protocol.negotiate` establishes the selected protocol and required capabilities on the same socket before actions; incompatible peers cannot mutate state. `daemon.drain` is internal lifecycle control. The plugin vendors a pinned catalog copy and exposes only its intended model/app surface.
 
 Presentation state is stored in `presentation.sqlite3` inside the existing mode-0700 daemon directory; the database is mode 0600. Rows carry both the selected organization and authenticated child runner subject. The backend binds that subject to one user, organization, and installation, so a later login by another account cannot restore the first account's views while the same owner tuple remains stable across credential rotation. Session state and exact operation arguments use separate tables. SQLite immediate transactions serialize revision updates and atomically journal a UI mutation before its session revision becomes visible. This store is presentation only and is never consulted by workspace, preparation, commit, job admission, or human-request authorization paths.
 
 Protocol input and output changes require synchronized plugin schemas, new digests in the plugin pin, compatibility review, and cross-product validation. Backend response fields outside a local method's declared result are folded into `details`; required local fields must still be present. A local result too large for one frame becomes a checksummed response reference that can be read in 262,144-byte pages.
+
+## Follow lifecycle and recovery coordination
+
+`follow.sqlite3` is the one durable controller for a live follow. It has no
+internal scheduler. The hook envelope contains a stable event UUID, session
+identity, and either a v1 continuation (`runId`, `bare_command` or
+`generated_markdown`) or a v1 normalized tool association. Generated markdown
+requires an opaque continuation receipt minted by the runner after an
+authoritative commit or accepted interaction; it is bound to owner,
+installation, run, trigger, and expiry. A run-tool association has one run UUID
+repeated in its documented request and response projections. Interaction get/view
+have the documented request-only input projection (`requestId`) and a response
+projection containing `runId` and `requestId`; the top-level, request, response,
+and authenticated pending interaction UUIDs must agree. Only the exact Loomex
+read, wait, event, interaction, and result methods are relevant;
+other tools cannot satisfy a required action. A fresh authenticated run read is
+the state authority. A handoff receipt is written only after its response and
+pending request identity agree, and a terminal receipt only after drained events,
+the terminal result response, and the run identity agree.
+
+Live hooks retain the session-scoped `unverified` task sentinel because Codex
+does not expose a verified task ID. `recovery.sqlite3` never accepts that value:
+host automation records require a separately verified task binding. It journals
+create/update/pause/remove before a host mutation, treats replay or uncertainty
+as reconciliation, and never makes scheduling itself.
 
 ## Workspace and prepared authority
 
@@ -54,7 +79,7 @@ Each leased job must carry that preparation ID and exact binding. The runner che
 
 ## Provider and execution policy
 
-Provider discovery is limited to executable `codex`, `claude`, and `gemini` files. An installed service can bind canonical executable paths through `LOOMEX_CODEX_EXECUTABLE`, `LOOMEX_CLAUDE_EXECUTABLE`, and `LOOMEX_GEMINI_EXECUTABLE`; an explicit binding takes precedence and fails closed if its file becomes missing, non-executable, or non-canonical. Providers without an explicit binding retain discovery through the daemon `PATH` plus `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, and `/bin`. The snapshot binds canonical path, SHA-256, size, modification time, and `host_user/v1`. Jobs support `shell.exec` and `command.run`; the backend supplies explicit argv. The runner resolves argv element zero to an executable and never invokes an implicit shell. An explicitly authored scalar shell command must already have been converted into reviewed `[/bin/sh, -c, ...]` argv by the backend.
+Provider discovery is limited to executable `codex`, `claude`, `gemini`, and `agy` files. The `antigravity` provider binds `agy` and remains distinct from historic `gemini` records, which continue to bind the Gemini CLI. An installed service can bind canonical executable paths through `LOOMEX_CODEX_EXECUTABLE`, `LOOMEX_CLAUDE_EXECUTABLE`, `LOOMEX_GEMINI_EXECUTABLE`, and `LOOMEX_ANTIGRAVITY_EXECUTABLE`; an explicit binding takes precedence and fails closed if its file becomes missing, non-executable, or non-canonical. Providers without an explicit binding retain discovery through the daemon `PATH` plus `/opt/homebrew/bin`, `/usr/local/bin`, and `/usr/bin`, and `/bin`. The snapshot binds canonical path, SHA-256, size, modification time, and `host_user/v1`. Jobs support `shell.exec`, `command.run`, and `http.request`. The latter accepts only a `loomex.http-request/v1` payload resolved exclusively to loopback, private, or link-local addresses; it disables redirects, proxies, and local retries.
 
 For a Codex structured-output job, the runner writes the bound JSON schema to the private job directory and requires exactly one `{loomex:provider-schema}` argv placeholder. It substitutes the private file path after verifying the schema digest. Provider-model, effort, resume, and permission-bypass arguments are backend-owned prepared data; the runner enforces their bound payload and executable snapshot rather than reconstructing provider policy.
 
@@ -91,3 +116,7 @@ Backend-confirmed run deletion writes local run and preparation tombstones, canc
 The controlling documents are the [clean-slate baseline](../../planning/plugin-runner-clean-slate/README.md), [runtime contract](../../planning/plugin-runner-clean-slate/runtime-contract.md), [authentication contract](../../planning/plugin-runner-clean-slate/auth-contract.md), [backend contract](../../planning/plugin-runner-clean-slate/backend-contract.md), [requirements matrix](../../planning/plugin-runner-clean-slate/requirements-capability-acceptance.md), and [superseded decision index](../../planning/plugin-runner-clean-slate/superseded-decisions-index.md).
 
 Current unit and fake-backend tests verify many enforcement and recovery paths but do not prove a production release. Apple signing/notarization, an actually signed clean-host LaunchAgent, deployed backend migrations and compatibility, real account flows, real Desktop UI use, real Codex/Claude/Gemini executions, and confirmation of historical remote credential revocation remain open in the [release gates](../../planning/plugin-runner-clean-slate/release-gates.md).
+
+### Connection presentation
+
+`connection.views.create/get/update` provide owner-local pre-authentication navigation persistence, using a fixed scope distinct from organization-bound presentation records. The Unix socket owner check remains the trust boundary; these records contain no credentials and authorize no backend actions. Restoring a record requires fresh connection/list reads. Revisions and idempotent writes prevent silent concurrent overwrites. `connection.get.webAppUrl` is an optional validated HTTPS destination set with the build-time `LOOMEX_WEB_APP_ORIGIN`; no frontend URL is guessed from the API origin.

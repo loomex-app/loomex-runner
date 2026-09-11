@@ -1,8 +1,13 @@
-# Loomex runner 0.2.0
+# Loomex runner 0.3.9
 
 A fresh macOS per-user execution service. `loomex-runner` is the private daemon;
 `loomex` is the public CLI. This project has no old runner imports, state migration,
 or legacy command aliases.
+
+The product version is `0.3.9`, sourced from `Cargo.toml`. It is separate from
+the local-control protocol (`loomex.local-control/v2`) and the method-catalog
+contract version (`0.3.0`); those compatibility identifiers change
+independently of the product release version.
 
 ## Build and test
 
@@ -10,8 +15,8 @@ Rust 1.85+ is required. Dependency resolution is pinned by `Cargo.lock`.
 
 ```sh
 cargo test --locked
-cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
+cargo clippy --locked --all-targets -- -D warnings
 ```
 
 Production artifacts must compile with `LOOMEX_API_ORIGIN` set to the deployment's
@@ -103,5 +108,29 @@ For the local protocol and trust boundaries, read [architecture](docs/architectu
 During ordinary operation `activeJobs` counts managed jobs. While draining, it also includes pending session/admission and helper work, so an idle acknowledgement cannot precede a late journal write. The daemon stops admission before acknowledging drain; update activation waits for this count to reach zero.
 
 Control operations capture their organization when admitted and serialize only requests using the same idempotency key. Drain remains responsive during transfers and includes local control writers and response spooling in its pending work count. Once a persistent drain becomes idle, it rejects new work; cancellation and read requests can join a drain only while existing work remains. Repeated drain requests are read-only after the durable drain marker exists.
+
+`follow.session.lifecycle` is a strict hook bridge. Every callback carries an
+event UUID, a compact session identity, and either a
+`loomex.follow-session.continuation/v1` record or a
+`loomex.follow-session.tool-association/v1` record. Continuations carry only
+the exact run UUID and `bare_command` or `generated_markdown` source. Generated
+markdown also carries an opaque runner-minted receipt, emitted in commit or
+accepted-interaction result details and verified against owner, installation,
+run, trigger, and expiry. Run-tool associations carry matching run IDs from the
+documented request and response. `loomex_interaction_get` and
+`loomex_interaction_view` instead carry the request UUID alone in their request
+projection and carry run plus request UUIDs in their response projection; all
+three request UUIDs must match the current authenticated pending interaction.
+Unknown tools, missing associations, and mismatched identities are inert. The runner records
+handoff and terminal receipts only after the matching tool response and a fresh
+authenticated run projection agree on the run identity. A live follow may use
+the session-scoped `unverified` task sentinel; recovery scheduling rejects that
+sentinel and needs a separately verified host task ID.
+
+An MCP App handoff is activated by the runner before the app calls `ui/message`.
+That host request is not assumed to trigger `UserPromptSubmit`. Its follow record
+is recoverable by a Stop hook only for the same canonical workspace and only
+when exactly one UI-originated follow is active there; ambiguous matches never
+block an unrelated conversation.
 
 Uninstall first drains without cancelling active work, waits for idle, and stops the daemon. It then calls `loomex logout --offline`, which takes the same exclusive daemon lock and performs only native credential revocation and cleanup. Failed revocation preserves files and protected retry state; retrying this command does not restart execution or require a socket.

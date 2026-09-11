@@ -6,18 +6,23 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
+use reqwest::{Client, Method, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     io::Read,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::time::Instant as TokioInstant;
+use url::Url;
 use uuid::Uuid;
 
 struct ActiveJob(Arc<Daemon>);
@@ -215,7 +220,7 @@ async fn session(daemon: Arc<Daemon>, org: String) -> Result<()> {
     let Some(_session_admission) = admit(&daemon)? else {
         return Ok(());
     };
-    let manifest = json!({"version":env!("CARGO_PKG_VERSION"),"executionPolicies":["host_user/v1"],"jobKinds":["shell.exec","command.run"],"capabilities":{"shell.exec":true,"command.run":true},"concurrency":null,"executionSeconds":null,"outputBytes":null,"artifactBytes":null});
+    let manifest = runner_manifest();
     let response = daemon
         .backend(
             &org,
@@ -359,6 +364,10 @@ async fn session(daemon: Arc<Daemon>, org: String) -> Result<()> {
         .await;
     result
 }
+
+fn runner_manifest() -> Value {
+    json!({"version":env!("CARGO_PKG_VERSION"),"executionPolicies":["host_user/v1"],"jobKinds":["shell.exec","command.run","http.request"],"capabilities":{"shell.exec":true,"command.run":true,"http.request":true},"concurrency":null,"executionSeconds":null,"outputBytes":null,"artifactBytes":null})
+}
 async fn apply_cancellations(daemon: &Daemon, response: &Value) {
     if let Some(jobs) = response["cancellations"].as_array() {
         let tokens = daemon.cancellations.lock().await;
@@ -397,7 +406,7 @@ async fn work(
                 "EXECUTION_INDETERMINATE".into()
             };
             j.error = Some(
-                json!({"code":code,"message":"Local execution could not be confirmed","indeterminate":j.identity.is_some()}),
+                json!({"code":code,"message":"Local execution could not be confirmed","indeterminate":j.identity.is_some() || code == "HTTP_REQUEST_INDETERMINATE"}),
             );
             j.phase = "terminal_pending".into();
             state::write_json(&path, &*j)?;
@@ -467,6 +476,327 @@ fn verify_payload_digest(job: &Value) -> Result<()> {
     Ok(())
 }
 
+const HTTP_REQUEST_SCHEMA: &str = "loomex.http-request/v1";
+const MAX_HTTP_RESPONSE_BYTES: usize = 1_048_576;
+
+#[derive(Debug)]
+enum HttpBody {
+    Utf8(String),
+    Json(Value),
+}
+
+#[derive(Debug)]
+struct HttpRequest {
+    method: Method,
+    url: Url,
+    headers: reqwest::header::HeaderMap,
+    body: Option<HttpBody>,
+    timeout: Duration,
+}
+
+fn validate_job_kind(kind: &str) -> Result<()> {
+    match kind {
+        "shell.exec" | "command.run" | "http.request" => Ok(()),
+        // Reserve an explicit compatibility result for callers that try to
+        // advance the HTTP payload version before this runner supports it.
+        "http.request/v1" => bail!("HTTP_REQUEST_SCHEMA_UNSUPPORTED"),
+        _ => bail!("UNSUPPORTED_JOB_KIND"),
+    }
+}
+
+fn validate_provider_adapter(payload: &Value, argv: &[String]) -> Result<()> {
+    let Some(adapter) = payload.get("providerAdapter") else {
+        return Ok(());
+    };
+    if adapter["schemaVersion"] != "loomex.provider-adapter/v1"
+        || adapter["provider"] != payload["provider"]
+        || adapter["adapter"] != payload["provider"]
+        || adapter["executable"].as_str().is_none()
+        || argv
+            .first()
+            .is_none_or(|arg| arg != adapter["executable"].as_str().unwrap())
+    {
+        bail!("PROVIDER_ADAPTER_INVALID")
+    }
+    let provider = payload["provider"].as_str().unwrap_or_default();
+    let executable = adapter["executable"].as_str().unwrap();
+    let transport = adapter["outputTransport"].as_str();
+    match provider {
+        "codex" if executable == "codex" && transport.is_none() => Ok(()),
+        "claude"
+            if executable == "claude"
+                && matches!(transport, None | Some("claude.stream-json/v1")) =>
+        {
+            Ok(())
+        }
+        "gemini"
+            if executable == "gemini"
+                && matches!(transport, None | Some("gemini.stream-json/v1")) =>
+        {
+            Ok(())
+        }
+        "antigravity"
+            if executable == "agy" && matches!(transport, None | Some("antigravity.json/v1")) =>
+        {
+            Ok(())
+        }
+        _ => bail!("PROVIDER_ADAPTER_INVALID"),
+    }
+}
+
+fn http_request(payload: &Value) -> Result<HttpRequest> {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+    if payload["schemaVersion"] != HTTP_REQUEST_SCHEMA {
+        bail!("HTTP_REQUEST_SCHEMA_UNSUPPORTED")
+    }
+    let method = payload["method"]
+        .as_str()
+        .and_then(|method| Method::from_bytes(method.as_bytes()).ok())
+        .filter(|method| {
+            matches!(
+                *method,
+                Method::GET | Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+            )
+        })
+        .context("HTTP_REQUEST_INVALID")?;
+    let url = Url::parse(payload["url"].as_str().context("HTTP_REQUEST_INVALID")?)
+        .map_err(|_| anyhow::anyhow!("HTTP_REQUEST_INVALID"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        bail!("HTTP_REQUEST_INVALID")
+    }
+    let mut headers = HeaderMap::new();
+    for (name, value) in payload["headers"]
+        .as_object()
+        .context("HTTP_REQUEST_INVALID")?
+    {
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| anyhow::anyhow!("HTTP_REQUEST_INVALID"))?;
+        let value = HeaderValue::from_str(value.as_str().context("HTTP_REQUEST_INVALID")?)
+            .map_err(|_| anyhow::anyhow!("HTTP_REQUEST_INVALID"))?;
+        headers.append(name, value);
+    }
+    if let Some(key) = payload["idempotencyKey"]
+        .as_str()
+        .filter(|key| !key.is_empty())
+        && !headers.contains_key("idempotency-key")
+    {
+        headers.insert(
+            "idempotency-key",
+            HeaderValue::from_str(key).map_err(|_| anyhow::anyhow!("HTTP_REQUEST_INVALID"))?,
+        );
+    }
+    let body = match payload.get("body").filter(|body| !body.is_null()) {
+        None => None,
+        Some(body) => match body["encoding"].as_str() {
+            Some("utf8") => Some(HttpBody::Utf8(
+                body["value"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .context("HTTP_REQUEST_INVALID")?,
+            )),
+            Some("json") if body.get("value").is_some() => {
+                Some(HttpBody::Json(body["value"].clone()))
+            }
+            _ => bail!("HTTP_REQUEST_INVALID"),
+        },
+    };
+    let timeout_seconds = payload["timeoutSeconds"].as_u64().unwrap_or(10);
+    if !(1..=60).contains(&timeout_seconds) {
+        bail!("HTTP_REQUEST_INVALID")
+    }
+    if let Some(statuses) = payload.get("expectedStatusCodes") {
+        let statuses = statuses.as_array().context("HTTP_REQUEST_INVALID")?;
+        if statuses.is_empty()
+            || statuses
+                .iter()
+                .any(|status| !matches!(status.as_u64(), Some(100..=599)))
+        {
+            bail!("HTTP_REQUEST_INVALID")
+        }
+    }
+    Ok(HttpRequest {
+        method,
+        url,
+        headers,
+        body,
+        timeout: Duration::from_secs(timeout_seconds),
+    })
+}
+
+fn local_or_private(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            address.is_private() || address.is_loopback() || address.is_link_local()
+        }
+        IpAddr::V6(address) => {
+            address.is_loopback() || address.is_unique_local() || address.is_unicast_link_local()
+        }
+    }
+}
+
+async fn resolve_private_http_addresses(
+    request: &HttpRequest,
+    cancel: Arc<AtomicBool>,
+    deadline: TokioInstant,
+) -> Result<Vec<SocketAddr>> {
+    let host = request.url.host_str().context("HTTP_REQUEST_INVALID")?;
+    let port = request
+        .url
+        .port_or_known_default()
+        .context("HTTP_REQUEST_INVALID")?;
+    let resolved: Vec<SocketAddr> = tokio::select! {
+        // A cancellation observed before send is known not to have reached the
+        // target, so it is a cancellation rather than an indeterminate request.
+        biased;
+        _ = wait_for_cancellation(cancel) => bail!("JOB_CANCELED"),
+        _ = tokio::time::sleep_until(deadline) => bail!("HTTP_REQUEST_INDETERMINATE"),
+        result = tokio::net::lookup_host((host, port)) => result
+            .map_err(|_| anyhow::anyhow!("HTTP_REQUEST_URL_DENIED"))?
+            .collect(),
+    };
+    if resolved.is_empty()
+        || resolved
+            .iter()
+            .any(|address| !local_or_private(address.ip()))
+    {
+        bail!("HTTP_REQUEST_URL_DENIED")
+    }
+    Ok(resolved)
+}
+
+fn private_http_client(
+    request: &HttpRequest,
+    resolved: Vec<SocketAddr>,
+    deadline: TokioInstant,
+) -> Result<Client> {
+    let remaining = deadline.saturating_duration_since(TokioInstant::now());
+    if remaining.is_zero() {
+        bail!("HTTP_REQUEST_INDETERMINATE")
+    }
+    let host = request.url.host_str().context("HTTP_REQUEST_INVALID")?;
+    let mut client = Client::builder()
+        .redirect(Policy::none())
+        .no_proxy()
+        // The client timeout is only a backstop; the same absolute deadline is
+        // also selected below while sending and reading the response.
+        .timeout(remaining);
+    for address in resolved {
+        client = client.resolve(host, address);
+    }
+    client
+        .build()
+        .map_err(|_| anyhow::anyhow!("HTTP_REQUEST_INVALID"))
+}
+
+async fn wait_for_cancellation(cancel: Arc<AtomicBool>) {
+    while !cancel.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn sensitive_http_header(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase().replace('-', "_");
+    matches!(
+        normalized.as_str(),
+        "authorization" | "cookie" | "proxy_authorization" | "set_cookie" | "x_api_key"
+    ) || [
+        "authorization",
+        "password",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "access_key",
+    ]
+    .iter()
+    .any(|part| normalized.contains(part))
+}
+
+fn safe_http_headers(headers: &reqwest::header::HeaderMap) -> Value {
+    let mut safe = serde_json::Map::new();
+    for (name, value) in headers.iter().take(100) {
+        if !sensitive_http_header(name.as_str()) {
+            if let Ok(value) = value.to_str() {
+                safe.insert(name.as_str().to_owned(), json!(value));
+            }
+        }
+    }
+    Value::Object(safe)
+}
+
+async fn execute_http_request(payload: &Value, cancel: Arc<AtomicBool>) -> Result<Value> {
+    let request = http_request(payload)?;
+    if cancel.load(Ordering::SeqCst) {
+        bail!("JOB_CANCELED")
+    }
+    let deadline = TokioInstant::now() + request.timeout;
+    let resolved = resolve_private_http_addresses(&request, cancel.clone(), deadline).await?;
+    // Resolution establishes the pin set, but cancellation may arrive while it
+    // is in progress.  Check again before constructing a sendable request.
+    if cancel.load(Ordering::SeqCst) {
+        bail!("JOB_CANCELED")
+    }
+    let client = private_http_client(&request, resolved, deadline)?;
+    let mut outbound = client
+        .request(request.method, request.url)
+        .headers(request.headers);
+    if let Some(body) = request.body {
+        outbound = match body {
+            HttpBody::Utf8(body) => outbound.body(body),
+            HttpBody::Json(body) => outbound.json(&body),
+        };
+    }
+    // Do not poll reqwest's send future after a cancellation that was observed
+    // before dispatch.  Once it has been polled, cancellation remains
+    // indeterminate because the target may have received the request.
+    if cancel.load(Ordering::SeqCst) {
+        bail!("JOB_CANCELED")
+    }
+    let started = Instant::now();
+    let mut response = tokio::select! {
+        biased;
+        _ = wait_for_cancellation(cancel.clone()) => bail!("HTTP_REQUEST_INDETERMINATE"),
+        _ = tokio::time::sleep_until(deadline) => bail!("HTTP_REQUEST_INDETERMINATE"),
+        response = outbound.send() => response.map_err(|_| anyhow::anyhow!("HTTP_REQUEST_INDETERMINATE"))?,
+    };
+    let status = response.status().as_u16();
+    let headers = safe_http_headers(response.headers());
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mut bytes = Vec::new();
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            _ = wait_for_cancellation(cancel.clone()) => bail!("HTTP_REQUEST_INDETERMINATE"),
+            _ = tokio::time::sleep_until(deadline) => bail!("HTTP_REQUEST_INDETERMINATE"),
+            chunk = response.chunk() => chunk.map_err(|_| anyhow::anyhow!("HTTP_REQUEST_INDETERMINATE"))?,
+        };
+        let Some(chunk) = chunk else { break };
+        if bytes.len().saturating_add(chunk.len()) > MAX_HTTP_RESPONSE_BYTES {
+            bail!("HTTP_RESPONSE_TOO_LARGE")
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let body = if content_type.contains("json") || text.trim_start().starts_with(['{', '[']) {
+        serde_json::from_str(&text).unwrap_or_else(|_| json!(text))
+    } else {
+        json!(text)
+    };
+    Ok(
+        json!({"statusCode":status,"headers":headers,"body":body,"durationMs":started.elapsed().as_millis() as u64}),
+    )
+}
+
 async fn execute_job(
     daemon: Arc<Daemon>,
     path: &Path,
@@ -484,12 +814,18 @@ async fn execute_job(
     if payload["executionPolicy"] != "host_user/v1" {
         bail!("UNSUPPORTED_EXECUTION_POLICY")
     }
-    if !["shell.exec", "command.run"].contains(&job["kind"].as_str().unwrap_or("")) {
-        bail!("UNSUPPORTED_JOB_KIND")
-    }
+    let is_http = job["kind"] == "http.request";
+    validate_job_kind(job["kind"].as_str().unwrap_or(""))?;
     verify_payload_digest(job)?;
     let workspace = require_execution_authorization(&daemon, &current).await?;
-    let mut argv: Vec<String> = if let Some(items) = payload["command"].as_array() {
+    if is_http {
+        // Validate the complete, bound HTTP payload before the durable start
+        // transition. It cannot be translated through a shell command.
+        http_request(payload)?;
+    }
+    let mut argv: Vec<String> = if is_http {
+        vec!["/usr/bin/true".into()]
+    } else if let Some(items) = payload["command"].as_array() {
         items
             .iter()
             .map(|v| v.as_str().map(String::from).context("INVALID_COMMAND"))
@@ -500,7 +836,7 @@ async fn execute_job(
     if argv.is_empty() {
         bail!("INVALID_COMMAND")
     };
-    if let Some(provider) = payload["provider"].as_str() {
+    if !is_http && let Some(provider) = payload["provider"].as_str() {
         let input = payload["providerInput"]
             .as_str()
             .context("PROVIDER_INPUT_MISSING")?;
@@ -509,7 +845,7 @@ async fn execute_job(
         }
         let exact = match provider {
             "codex" => argv.last().is_some_and(|arg| arg == input),
-            "claude" | "gemini" => argv
+            "claude" | "gemini" | "antigravity" => argv
                 .windows(2)
                 .any(|args| args[0] == "-p" && args[1] == input),
             _ => false,
@@ -517,6 +853,7 @@ async fn execute_job(
         if !exact {
             bail!("PROVIDER_INPUT_ARGV_MISMATCH")
         }
+        validate_provider_adapter(payload, &argv)?;
     }
 
     argv[0] = find_executable(&argv[0])
@@ -524,7 +861,7 @@ async fn execute_job(
         .to_string_lossy()
         .into_owned();
     let output_dir = path.parent().context("journal parent")?.to_path_buf();
-    if let Some(schema) = payload.get("providerOutputSchema") {
+    if !is_http && let Some(schema) = payload.get("providerOutputSchema") {
         if !schema.is_object()
             || payload["providerOutputSchemaDigest"] != state::json_digest(schema)
         {
@@ -667,7 +1004,26 @@ async fn execute_job(
         }
     });
     scope.register(authority_watch);
-    let outcome = executor::execute(request, cancel).await;
+    let outcome = if is_http {
+        {
+            let mut record = journal.lock().unwrap();
+            record.phase = "running".into();
+            state::write_json(path, &*record)?;
+        }
+        let result = execute_http_request(payload, cancel.clone()).await?;
+        {
+            let mut record = journal.lock().unwrap();
+            record.phase = "exited".into();
+            record.result = Some(result);
+            state::write_json(path, &*record)?;
+        }
+        drain_events(&daemon, path, &journal).await?;
+        materialize_terminal(&daemon, path, &journal).await?;
+        scope.stop().await;
+        return Ok(());
+    } else {
+        executor::execute(request, cancel).await
+    };
     let terminal: Result<()> = async {
         let outcome = outcome?;
         if outcome.error.is_some() {
@@ -812,6 +1168,12 @@ async fn materialize_terminal(
         return Ok(());
     };
     if j.phase == "terminal_pending" {
+        return Ok(());
+    }
+    if j.job["kind"] == "http.request" {
+        let mut locked = journal.lock().unwrap();
+        locked.phase = "terminal_pending".into();
+        state::write_json(path, &*locked)?;
         return Ok(());
     }
     for stream in ["stdout", "stderr"] {
@@ -1217,6 +1579,124 @@ mod tests {
                 "{pointer}"
             );
         }
+    }
+
+    #[test]
+    fn typed_http_payload_requires_private_url_and_explicit_body_encoding() {
+        let payload = json!({
+            "schemaVersion": HTTP_REQUEST_SCHEMA,
+            "method": "POST",
+            "url": "http://127.0.0.1:8080/path",
+            "headers": {"content-type": "application/json"},
+            "body": {"encoding": "json", "value": {"safe": true}},
+            "timeoutSeconds": 10,
+            "expectedStatusCodes": [200]
+        });
+        assert!(http_request(&payload).is_ok());
+        let mut invalid = payload.clone();
+        invalid["body"]["encoding"] = json!("base64");
+        assert_eq!(
+            http_request(&invalid).unwrap_err().to_string(),
+            "HTTP_REQUEST_INVALID"
+        );
+        assert!(local_or_private("127.0.0.1".parse().unwrap()));
+        assert!(!local_or_private("8.8.8.8".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn local_http_execution_pins_local_target_and_redacts_response_headers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let size = stream.read(&mut request).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&request[..size])
+                    .to_ascii_lowercase()
+                    .contains("idempotency-key: exact-key")
+            );
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Trace: visible\r\nSet-Cookie: private\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}").await.unwrap();
+        });
+        let payload = json!({
+            "schemaVersion": HTTP_REQUEST_SCHEMA,
+            "method": "GET",
+            "url": format!("http://{address}/"),
+            "headers": {},
+            "idempotencyKey": "exact-key",
+            "timeoutSeconds": 10
+        });
+        let result = execute_http_request(&payload, Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(result["statusCode"], 200);
+        assert_eq!(result["body"], json!({"ok":true}));
+        assert_eq!(result["headers"]["x-trace"], "visible");
+        assert!(result["headers"].get("set-cookie").is_none());
+    }
+
+    #[tokio::test]
+    async fn canceled_http_request_is_not_dispatched() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let payload = json!({
+            "schemaVersion": HTTP_REQUEST_SCHEMA,
+            "method": "GET",
+            "url": format!("http://{}/", listener.local_addr().unwrap()),
+            "headers": {}, "timeoutSeconds": 1
+        });
+        let cancel = Arc::new(AtomicBool::new(true));
+        assert_eq!(
+            execute_http_request(&payload, cancel)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "JOB_CANCELED"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn http_deadline_covers_waiting_for_a_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let payload = json!({
+            "schemaVersion": HTTP_REQUEST_SCHEMA,
+            "method": "GET",
+            "url": format!("http://{}/", listener.local_addr().unwrap()),
+            "headers": {}, "timeoutSeconds": 1
+        });
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        assert_eq!(
+            execute_http_request(&payload, Arc::new(AtomicBool::new(false)))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "HTTP_REQUEST_INDETERMINATE"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn provider_adapter_binds_antigravity_to_agy_without_rewriting_gemini() {
+        let antigravity = json!({"provider":"antigravity","providerAdapter":{"schemaVersion":"loomex.provider-adapter/v1","provider":"antigravity","adapter":"antigravity","executable":"agy","outputTransport":"antigravity.json/v1"}});
+        validate_provider_adapter(&antigravity, &["agy".into(), "-p".into(), "prompt".into()])
+            .unwrap();
+        let mut mismatch = antigravity.clone();
+        mismatch["provider"] = json!("gemini");
+        assert_eq!(
+            validate_provider_adapter(&mismatch, &["agy".into()])
+                .unwrap_err()
+                .to_string(),
+            "PROVIDER_ADAPTER_INVALID"
+        );
     }
 
     #[test]

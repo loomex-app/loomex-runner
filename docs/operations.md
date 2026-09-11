@@ -28,7 +28,7 @@ Use fresh UUIDs in real requests. Retain each mutation key with its intended ope
 
 The daemon should have exactly one owner per state root. Check that the state directory is owned by the signed-in user and mode `0700`, and that `control.sock` and regular state files are owner-only. Do not relax socket permissions to make another user or service connect.
 
-For provider CLIs installed outside the standard service search paths, pass one option per provider during installation, for example `--provider-executable codex=/absolute/path/to/codex`. The accepted provider names are `codex`, `claude`, and `gemini`. The installer resolves symlinks, requires a regular executable file, stores the canonical path in the installation receipt, and writes the corresponding `LOOMEX_CODEX_EXECUTABLE`, `LOOMEX_CLAUDE_EXECUTABLE`, or `LOOMEX_GEMINI_EXECUTABLE` value into this runner's LaunchAgent. Updates preserve these bindings when the flags are omitted, including a deferred update resumed after active jobs finish. This does not read or copy provider authentication.
+For provider CLIs installed outside the standard service search paths, pass one option per provider during installation, for example `--provider-executable codex=/absolute/path/to/codex`. The accepted provider names are `codex`, `claude`, `gemini`, and `antigravity`; `antigravity` binds the `agy` executable and does not replace the Gemini CLI adapter. The installer resolves symlinks, requires a regular executable file, stores the canonical path in the installation receipt, and writes the corresponding `LOOMEX_CODEX_EXECUTABLE`, `LOOMEX_CLAUDE_EXECUTABLE`, `LOOMEX_GEMINI_EXECUTABLE`, or `LOOMEX_ANTIGRAVITY_EXECUTABLE` value into this runner's LaunchAgent. Updates preserve these bindings when the flags are omitted, including a deferred update resumed after active jobs finish. This does not read or copy provider authentication.
 
 ## Authentication and organizations
 
@@ -90,13 +90,19 @@ Activation uses immutable version directories and a stable `current` symlink. Th
 
 First installation rejects pre-existing runner-owned state namespaces. Uninstall validates receipted direct SemVer paths, drains before checking activity, and completes remote logout before removing the service and exact owned state names, including `presentation.sqlite3` and its WAL/SHM companions. Unrelated children of a custom state directory remain intact. If revocation, unloading, or credential cleanup fails, removal stops while preserving recovery evidence. Backend data, workspaces, provider authentication, unrelated Keychain accounts, and unrelated files remain outside the uninstall scope.
 
+Follow and recovery state are also owned state: `follow.sqlite3` and
+`recovery.sqlite3`, including WAL/SHM sidecars. Uninstall removes them only
+after the same completed drain and revocation sequence. A live Stop continues
+while its exact event drain, handoff, or terminal-result delivery remains due;
+it allows the host to stop once the durable response receipt is present.
+
 ## Developer and operator validation
 
 From the runner source tree:
 
 ```sh
 cargo fmt --all --check
-cargo clippy --all-targets -- -D warnings
+cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ./scripts/test-packaging.sh
 ```

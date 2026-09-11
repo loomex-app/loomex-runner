@@ -230,6 +230,13 @@ fn select_origin(
     )
 }
 impl Api {
+    /// Explicit product destination; an API origin does not imply a web UI.
+    pub fn web_app_url(&self) -> Option<String> {
+        option_env!("LOOMEX_WEB_APP_ORIGIN")
+            .and_then(|value| validate_origin(value, false).ok())
+            .map(|url| url.to_string())
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test_origin(origin: &str) -> anyhow::Result<Self> {
         Self::with_origin(validate_origin(origin, true)?)

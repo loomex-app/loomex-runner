@@ -31,13 +31,31 @@ agents="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[
 for path in "$base" "$state" "$agents"; do [[ "$path" != / && "$path" != "${HOME:-}" ]] || { echo "unsafe installation directory: $path" >&2; exit 1; }; done
 versions="$base/versions"
 [[ ! -L "$versions" ]] || { echo "versions directory may not be a symlink" >&2; exit 1; }
-owned_state_names=(state.json operations preparations jobs tombstones run-bindings preparation-tombstones responses presentation.sqlite3 presentation.sqlite3-wal presentation.sqlite3-shm daemon.lock control.sock pending-update.json uninstall-ready.json uninstall-ready.json.new install-receipt.json owned-versions.json logs drain.json)
+install_journal="$state/install-operation.json"
+owned_state_names=(state.json operations preparations jobs tombstones run-bindings preparation-tombstones responses presentation.sqlite3 presentation.sqlite3-wal presentation.sqlite3-shm follow.sqlite3 follow.sqlite3-wal follow.sqlite3-shm recovery.sqlite3 recovery.sqlite3-wal recovery.sqlite3-shm daemon.lock control.sock pending-update.json uninstall-ready.json uninstall-ready.json.new install-operation.json install-receipt.json owned-versions.json logs drain.json)
+[[ ! -L "$install_journal" && ! -L "$install_journal.new" ]] || { echo "installation journal may not be a symlink" >&2; exit 1; }
 fresh_state=0
-if [[ ! -f "$state/install-receipt.json" && ! -f "$state/owned-versions.json" ]]; then
+resuming_install=0
+if [[ ! -f "$state/install-receipt.json" && ! -f "$state/owned-versions.json" && ! -f "$install_journal" ]]; then
   fresh_state=1
   for name in "${owned_state_names[@]}"; do
     [[ ! -e "$state/$name" && ! -L "$state/$name" ]] || { echo "unowned runner state namespace already exists: $state/$name" >&2; exit 1; }
   done
+elif [[ ! -f "$state/install-receipt.json" && -f "$install_journal" ]]; then
+  # A process may have died anywhere from the pre-move journal write through
+  # activation.  Permit only that narrow state shape, then require the verified
+  # release below to match its journal exactly.
+  resuming_install=1
+  fresh_state=1
+  for name in "${owned_state_names[@]}"; do
+    case "$name" in
+      install-operation.json|install-operation.json.new|owned-versions.json) continue;;
+      logs) [[ ! -L "$state/$name" ]] || { echo "installation logs directory may not be a symlink" >&2; exit 1; }; continue;;
+    esac
+    [[ ! -e "$state/$name" && ! -L "$state/$name" ]] || { echo "unexpected state alongside incomplete installation journal: $state/$name" >&2; exit 1; }
+  done
+elif [[ -f "$state/install-receipt.json" && -f "$state/owned-versions.json" ]]; then
+  : # An installed runner may also have a journal left by an interrupted update.
 elif [[ ! -f "$state/install-receipt.json" || ! -f "$state/owned-versions.json" ]]; then
   echo "incomplete runner ownership metadata" >&2; exit 1
 fi
@@ -70,6 +88,45 @@ os.replace(tmp,out)
 PY
 }
 
+write_install_journal() {
+  python3 - "$version" "$expected" "$agent" "$manifest" "$install_journal" <<'PY'
+import hashlib,json,os,sys
+from pathlib import Path
+version,path,agent,manifest,out=sys.argv[1:]; out=Path(out); tmp=out.with_name(out.name+'.new')
+data={'schema':'app.loomex.runner.install-operation/v1','version':version,'versionPath':path,'launchAgent':agent,'manifestSha256':hashlib.sha256(Path(manifest).read_bytes()).hexdigest()}
+with tmp.open('w') as f: json.dump(data,f,sort_keys=True); f.write('\n'); f.flush(); os.fsync(f.fileno())
+os.replace(tmp,out); fd=os.open(out.parent,os.O_RDONLY); os.fsync(fd); os.close(fd)
+PY
+}
+
+validate_install_journal() {
+  python3 - "$install_journal" "$version" "$expected" "$agent" "$manifest" <<'PY'
+import hashlib,json,sys
+from pathlib import Path
+journal,version,path,agent,manifest=sys.argv[1:]
+data=json.loads(Path(journal).read_text())
+expected={'schema':'app.loomex.runner.install-operation/v1','version':version,'versionPath':path,'launchAgent':agent,'manifestSha256':hashlib.sha256(Path(manifest).read_bytes()).hexdigest()}
+if data != expected: raise SystemExit('install journal does not match the verified release')
+PY
+}
+
+completed_install_journal() {
+  python3 - "$install_journal" "$state/install-receipt.json" "$state/owned-versions.json" "$versions" "$agent" <<'PY'
+import json,re,sys
+from pathlib import Path
+journal,receipt,owned,versions_raw,agent=map(Path,sys.argv[1:]); versions=versions_raw.resolve(strict=True)
+j=json.loads(journal.read_text()); r=json.loads(receipt.read_text()); o=json.loads(owned.read_text())
+if j.get('schema')!='app.loomex.runner.install-operation/v1' or not re.fullmatch(r'[0-9a-f]{64}',j.get('manifestSha256','')): raise SystemExit(1)
+if r.get('schema')!='app.loomex.runner.install-receipt/v1': raise SystemExit(1)
+if (r.get('version'),r.get('versionPath'),r.get('launchAgent')) != (j.get('version'),j.get('versionPath'),str(agent)): raise SystemExit(1)
+if o.get('schema')!='app.loomex.runner.owned-versions/v1' or not isinstance(o.get('paths'),list): raise SystemExit(1)
+for value in o['paths']:
+ raw=Path(value)
+ if raw.is_symlink() or raw.parent.resolve(strict=True)!=versions or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+',raw.name): raise SystemExit(1)
+if j['versionPath'] not in o['paths']: raise SystemExit(1)
+PY
+}
+
 current_path=""
 if [[ -e "$current" || -L "$current" ]]; then
   [[ -L "$current" ]] || { echo "current installation pointer is not a symlink" >&2; exit 1; }
@@ -83,13 +140,24 @@ if [[ -n "$public_key" ]]; then verify+=(--public-key "$public_key"); fi
 if ((allow_dev)); then [[ "${LOOMEX_ALLOW_UNSAFE_DEV_INSTALL:-}" == "1" ]] || { echo "set LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 for isolated development installs" >&2; exit 1; }; verify+=(--allow-unsigned-development); fi
 python3 "$repo/scripts/artifact.py" "${verify[@]}"
 python3 "$repo/scripts/validate_package.py" "$stage/payload" --expected-version "$version"
+if [[ -f "$install_journal" ]]; then
+  if validate_install_journal 2>/dev/null; then
+    : # Resume the exact release that owns the incomplete transaction.
+  elif [[ -f "$state/install-receipt.json" && -f "$state/owned-versions.json" ]] && completed_install_journal; then
+    # Receipt persistence completed before the process died; the journal is a
+    # stale terminal record and must not prevent a later upgrade.
+    rm -f "$install_journal" "$install_journal.new"
+  else
+    validate_install_journal
+  fi
+fi
 development="$(python3 -c 'import json,sys; print(str(json.load(open(sys.argv[1]))["developmentOnly"]).lower())' "$manifest")"
 provider_config="$stage/provider-executables.json"
 write_provider_config() {
 python3 - "$state/install-receipt.json" "$state/pending-update.json" "$expected" "$provider_config" "$@" <<'PY'
 import json,os,stat,sys
 from pathlib import Path
-receipt,pending,expected,out=map(Path,sys.argv[1:5]); specs=sys.argv[5:]; allowed={'codex','claude','gemini'}
+receipt,pending,expected,out=map(Path,sys.argv[1:5]); specs=sys.argv[5:]; allowed={'codex','claude','gemini','antigravity'}
 providers={}
 if receipt.exists():
  data=json.loads(receipt.read_text())
@@ -136,6 +204,10 @@ fi
 python3 "$repo/scripts/render_launch_agent.py" "${render_args[@]}"
 mkdir -p "$state/logs"
 
+# Journal before the version move.  A retry can prove it is resuming this exact
+# verified release even if interruption happens in the move/ownership window.
+if [[ ! -f "$install_journal" ]]; then write_install_journal; fi
+
 installed_new=0
 if [[ -e "$expected" || -L "$expected" ]]; then
   [[ -d "$expected" && ! -L "$expected" ]] || { echo "installed version path is not a regular directory" >&2; exit 1; }
@@ -149,6 +221,7 @@ for p in sorted(root.rglob('*')):
 if actual!=manifest['payload']['files']: raise SystemExit('installed version differs from signed artifact')
 PY
   rm -rf "$stage/payload"
+  ((resuming_install==0)) || installed_new=1
 else
   mv "$stage/payload" "$expected"; installed_new=1
 fi
@@ -173,6 +246,11 @@ with tmp.open('wb') as f: f.write(encoded); f.flush(); os.fsync(f.fileno())
 os.replace(tmp,out); fd=os.open(out.parent,os.O_RDONLY); os.fsync(fd); os.close(fd)
 PY
 
+if [[ "${LOOMEX_TEST_INSTALL_INTERRUPT_AFTER_OWNERSHIP:-}" == 1 ]]; then
+  echo "installation interrupted after durable ownership journal" >&2
+  exit 75
+fi
+
 active=0
 if [[ -n "$current_path" ]]; then
   LOOMEX_STATE_DIR="$state" "$current_path/bin/loomex" drain >/dev/null
@@ -189,12 +267,29 @@ encoded=(json.dumps({'schema':'app.loomex.runner.pending-update/v1','version':ve
 with tmp.open('wb') as f: f.write(encoded); f.flush(); os.fsync(f.fileno())
 os.replace(tmp,out); fd=os.open(out.parent,os.O_RDONLY); os.fsync(fd); os.close(fd)
 PY
+  # A pending-update record is now the durable terminal staging state; the
+  # transaction journal is no longer needed and must not block a later update.
+  rm -f "$install_journal" "$install_journal.new"
   echo "Runner $version staged; activation deferred until active jobs reach zero. Run this installer again to activate."
   exit 0
 fi
 
 old="$current_path"; plist_backup="$stage/agent.previous"; [[ ! -f "$agent" ]] || cp "$agent" "$plist_backup"
-if [[ "${LOOMEX_INSTALL_TEST_MODE:-}" != 1 ]]; then launchctl bootout "gui/$UID/app.loomex.runner" 2>/dev/null || true; fi
+if [[ "${LOOMEX_INSTALL_TEST_MODE:-}" != 1 ]]; then
+  # `bootout` can return before launchd has fully released the label. Starting
+  # the replacement in that interval intermittently returns EIO and leaves an
+  # otherwise healthy version staged. Wait for the exact label to disappear;
+  # this is a lifecycle boundary, not a best-effort delay.
+  launchctl bootout "gui/$UID/app.loomex.runner" 2>/dev/null || true
+  unloaded=0
+  for _ in {1..20}; do
+    if ! launchctl print "gui/$UID/app.loomex.runner" >/dev/null 2>&1; then
+      unloaded=1; break
+    fi
+    sleep 0.25
+  done
+  ((unloaded)) || { echo "previous runner service did not unload" >&2; exit 1; }
+fi
 ln -s "$expected" "$base/.current.new"; mv -fh "$base/.current.new" "$current"; cp "$stage/app.loomex.runner.plist" "$agent"
 rm -f "$state/uninstall-ready.json" "$state/uninstall-ready.json.new" "$state/drain.json"
 activation_failed=0; service_loaded=0
@@ -202,10 +297,18 @@ if [[ "${LOOMEX_TEST_BOOTSTRAP_FAIL:-}" == 1 ]]; then
   activation_failed=1
 elif [[ "${LOOMEX_INSTALL_TEST_MODE:-}" == 1 ]]; then
   service_loaded=1
-elif launchctl bootstrap "gui/$UID" "$agent"; then
-  service_loaded=1
 else
-  activation_failed=1
+  # launchctl can report EIO while its previous unload is still settling. A
+  # bounded retry either observes the exact label or gives launchd a clean
+  # second bootstrap opportunity. Health remains the authority for activation.
+  for _ in {1..5}; do
+    if launchctl bootstrap "gui/$UID" "$agent" 2>/dev/null \
+      || launchctl print "gui/$UID/app.loomex.runner" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.25
+  done
+  service_loaded=1
 fi
 if ((activation_failed==0)) && [[ "${LOOMEX_TEST_HEALTH_FAIL:-}" == 1 ]]; then
   activation_failed=1
@@ -256,6 +359,7 @@ PY
     for name in "${owned_state_names[@]}"; do rm -rf "$state/$name"; done
     rmdir "$state" 2>/dev/null || true
   fi
+  rm -f "$install_journal" "$install_journal.new"
   echo "activation failed; previous runner restored" >&2; exit 1
 fi
 
@@ -273,5 +377,6 @@ with tmp.open('w') as f: json.dump(data,f,sort_keys=True); f.write('\n'); f.flus
 os.replace(tmp,out)
 PY
 write_receipt
+rm -f "$install_journal" "$install_journal.new"
 trap - EXIT; rm -rf "$stage"
 echo "Installed and activated Loomex runner $version"

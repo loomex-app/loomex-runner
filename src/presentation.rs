@@ -528,7 +528,16 @@ fn required_uuid<'a>(p: &'a Value, key: &str) -> Result<&'a str> {
 
 fn validate_kind(kind: &str) -> Result<()> {
     ensure!(
-        ["browser", "authoring", "prepare", "monitor", "interaction"].contains(&kind),
+        [
+            "browser",
+            "authoring",
+            "prepare",
+            "monitor",
+            "interaction",
+            "connection",
+            "organizations"
+        ]
+        .contains(&kind),
         "INVALID_REQUEST"
     );
     Ok(())

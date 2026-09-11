@@ -2,10 +2,12 @@
 use crate::{
     api::{Api, ApiError},
     auth::Auth,
+    follow::FollowStore,
     presentation::PresentationStore,
+    recovery::RecoveryStore,
     state::{self, PublicState, WorkspaceGrant},
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use fs2::FileExt;
 use serde_json::{Value, json};
@@ -60,6 +62,8 @@ pub struct Daemon {
     pub api: Api,
     pub auth: Auth,
     pub presentation: PresentationStore,
+    pub recovery: RecoveryStore,
+    pub follow: FollowStore,
     pub public: Mutex<PublicState>,
     pub draining: AtomicBool,
     pub active: AtomicUsize,
@@ -81,12 +85,16 @@ impl Daemon {
         state::private_dir(&dir)?;
         let public = PublicState::load(&dir)?;
         let presentation = PresentationStore::open(&dir)?;
+        let recovery = RecoveryStore::open(&dir)?;
+        let follow = FollowStore::open(&dir)?;
         let draining = dir.join("drain.json").exists();
         Ok(Self {
             dir,
             api,
             auth,
             presentation,
+            recovery,
+            follow,
             public: Mutex::new(public),
             draining: AtomicBool::new(draining),
             active: AtomicUsize::new(0),
@@ -100,6 +108,14 @@ impl Daemon {
     }
     pub fn managed_work(&self) -> usize {
         self.managed.load(Ordering::SeqCst)
+    }
+    /// Work that owns or is about to own a provider process. Ordinary control
+    /// RPCs are deliberately excluded: they must not make a connected account
+    /// appear to have running workflow work or indefinitely block logout.
+    pub fn execution_work(&self) -> usize {
+        self.active
+            .load(Ordering::SeqCst)
+            .saturating_add(self.quiescence.load(Ordering::SeqCst))
     }
     fn reported_work(&self) -> usize {
         if self.draining.load(Ordering::SeqCst) {
@@ -139,7 +155,7 @@ impl Daemon {
         json!({"draining":true,"activeJobs":work,"updateDeferred":work>0})
     }
     fn control_writer(&self, method: &str, write: bool) -> Result<Option<ControlWriter<'_>>> {
-        if ["protocol.negotiate", "status.get"].contains(&method) {
+        if ["protocol.negotiate", "status.get", "connection.get"].contains(&method) {
             return Ok(None);
         }
         let _admission = self
@@ -198,7 +214,10 @@ impl Daemon {
         let key = params.get("idempotencyKey").and_then(Value::as_str);
         // Capture organization before waiting for any operation. The handler never
         // substitutes a later active organization into this operation's identity.
-        let scope = if method.starts_with("auth.") || method == "daemon.drain" {
+        let scope = if method.starts_with("auth.")
+            || method.starts_with("connection.")
+            || method == "daemon.drain"
+        {
             None
         } else {
             params["organizationId"].as_str().map(String::from).or(self
@@ -228,9 +247,19 @@ impl Daemon {
                 key.to_owned()
             }
         });
-        let operation = journal_key
-            .as_deref()
-            .map(|key| self.dir.join("operations").join(format!("{key}.json")));
+        // Recovery mutations own a stricter, transactional receipt journal in
+        // `RecoveryStore`.  Returning this generic operation cache after a
+        // lost response would replay the creator's `attemptPermitted: true`
+        // result and could authorize a second host scheduling mutation.  Keep
+        // the generic cache for other operations, but always route recovery
+        // methods through their durable, safe replay projection.
+        let operation = (!method.starts_with("recovery."))
+            .then(|| {
+                journal_key
+                    .as_deref()
+                    .map(|key| self.dir.join("operations").join(format!("{key}.json")))
+            })
+            .flatten();
         if let Some(path) = operation.as_ref().filter(|path| path.exists()) {
             let record: Value = state::read_json(path)?;
             if record["digest"] != identity {
@@ -296,7 +325,25 @@ impl Daemon {
             None
         };
         let result = if let Some(cached) = cached {
-            cached
+            // A process can finish a durable commit while its response is lost
+            // or normalized incorrectly by an older daemon. Rehydrate only a
+            // receipt that this exact runner identity already issued for this
+            // exact mutation; never mint a continuation on cache replay.
+            let result = self
+                .restore_cached_follow_continuation(scope.as_deref(), method, &params, cached)
+                .await?;
+            if let Some(path) = operation.as_ref() {
+                let execution = params
+                    .get("runId")
+                    .or_else(|| result.get("executionId"))
+                    .or_else(|| result.get("execution").and_then(|value| value.get("id")))
+                    .cloned();
+                state::write_json(
+                    path,
+                    &json!({"digest":identity,"method":method,"cachedAt":state::now(),"executionId":execution,"result":result}),
+                )?;
+            }
+            result
         } else {
             let result = normalize_catalog_output(
                 self.handle(method, &params, scope.as_deref()).await?,
@@ -310,10 +357,10 @@ impl Daemon {
             // Spooling remains inside writer coverage; socket delivery below is not
             // counted once no more local files or backend state can be changed.
             let result = self.spool_response(&params, result)?;
-            if let Some(path) = operation {
+            if let Some(path) = operation.as_ref() {
                 if !(method == "auth.poll" && result["status"] == "pending") {
                     state::write_json(
-                        &path,
+                        path,
                         &json!({"digest":identity,"method":method,"cachedAt":state::now(),"executionId":execution,"result":result}),
                     )?;
                 }
@@ -365,6 +412,12 @@ impl Daemon {
                     json!({"version":env!("CARGO_PKG_VERSION"),"protocol":PROTOCOL,"activeJobs":self.reported_work(),"draining":self.draining.load(Ordering::SeqCst),"updateDeferred":self.dir.join("pending-update.json").exists()}),
                 );
             }
+            "connection.get" => {
+                let selected = self.public.lock().await.active_organization.clone();
+                let mut projection = self.auth.connection(selected, self.execution_work()).await;
+                projection["webAppUrl"] = json!(self.api.web_app_url());
+                return Ok(projection);
+            }
             "auth.login" => {
                 return self
                     .auth
@@ -374,7 +427,7 @@ impl Daemon {
                     )
                     .await;
             }
-            "auth.poll" => return self.auth.poll(key.unwrap()).await,
+            "auth.poll" => return self.auth.poll(key.unwrap(), required(p, "flowId")?).await,
             "auth.status" => return self.auth.status().await,
             "auth.logout" => {
                 {
@@ -382,12 +435,18 @@ impl Daemon {
                         .admission
                         .lock()
                         .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
-                    self.draining.store(true, Ordering::SeqCst);
+                    // Refuse before changing a cancellation token when a
+                    // provider execution is live or in its fenced admission
+                    // window. Ordinary control reads do not count as work.
+                    if self.execution_work() > 0 {
+                        bail!("ACTIVE_WORK_REQUIRES_DRAIN");
+                    }
                 }
-                for token in self.cancellations.lock().await.values() {
-                    token.store(true, Ordering::SeqCst);
-                }
-                return self.auth.logout().await;
+                let result = self.auth.logout().await?;
+                let mut public = self.public.lock().await;
+                public.active_organization = None;
+                public.save(&self.dir)?;
+                return Ok(result);
             }
             "organizations.list" => return self.auth.organizations().await,
             "organizations.select" => {
@@ -431,12 +490,68 @@ impl Daemon {
             }
             _ => {}
         }
+        if let Some(operation) = method.strip_prefix("connection.views.") {
+            // Owner-checked socket plus local installation storage. No account
+            // authority is needed for disposable connection navigation.
+            ensure!(
+                ["create", "get", "update"].contains(&operation),
+                "METHOD_NOT_FOUND"
+            );
+            return self.presentation.dispatch(
+                "local-connection",
+                "host-user",
+                &format!("presentation.sessions.{operation}"),
+                p,
+            );
+        }
         let org = scope.context("ORGANIZATION_REQUIRED")?.to_owned();
         if method.starts_with("presentation.") {
             // The child runner identity is uniquely bound by the backend to one
             // account and organization. Neither scope component is accepted from UI.
             let account = self.auth.credential(&org).await?.subject;
             return self.presentation.dispatch(&org, &account, method, p);
+        }
+        if method.starts_with("recovery.") {
+            let account = self.auth.credential(&org).await?.subject;
+            let installation = self.auth.installation_id().await?;
+            return self
+                .recovery
+                .dispatch(&org, &account, &installation, method, p);
+        }
+        if method.starts_with("follow.session.") {
+            let account = self.auth.credential(&org).await?.subject;
+            let installation = self.auth.installation_id().await?;
+            let observation = if let Some(target) =
+                self.follow
+                    .lifecycle_target(&org, &account, &installation, p)?
+            {
+                let mut read = json!({"runId":target.run_id});
+                if let Some(cursor) = target.event_cursor {
+                    read["afterSequence"] = json!(cursor);
+                }
+                let (verb, route, body) = backend_route("runs.get", &read)?;
+                let snapshot = self.backend(&org, &verb, &route, body, None).await?;
+                // A terminal status is only a candidate. Read the terminal
+                // result projection after event pages are exhausted before the
+                // store records an allow-to-stop receipt.
+                if crate::follow::FollowStore::terminal_snapshot(&snapshot) {
+                    let (verb, route, body) = backend_route("runs.result", &read)?;
+                    let terminal_result = self.backend(&org, &verb, &route, body, None).await?;
+                    Some(json!({"snapshot":snapshot,"terminalResult":terminal_result}))
+                } else {
+                    Some(json!({"snapshot":snapshot}))
+                }
+            } else {
+                None
+            };
+            return self.follow.dispatch_observed(
+                &org,
+                &account,
+                &installation,
+                method,
+                p,
+                observation.as_ref(),
+            );
         }
         if method == "preparations.get" {
             return self.preparation_get(&org, p).await;
@@ -474,7 +589,13 @@ impl Daemon {
                 return self.prepare(method, &org, p).await;
             }
             "runs.commit" | "builder.commit" | "editor.commit" => {
-                return self.commit(method, &org, p).await;
+                let mut result = self.commit(method, &org, p).await?;
+                if method == "runs.commit" {
+                    self.attach_follow_continuation(&org, "run_commit", None, &mut result)
+                        .await?;
+                    self.activate_ui_follow(&org, &result).await?;
+                }
+                return Ok(result);
             }
             "artifacts.download" => return self.download(&org, p).await,
             "builder.create" | "editor.create" => {
@@ -530,6 +651,18 @@ impl Daemon {
             }
         }
         if matches!(method, "interactions.respond" | "interactions.decide") {
+            // Both branches of an approval are accepted human responses. A
+            // rejection commonly leads to revision feedback, so withholding a
+            // continuation there strands the same run just as surely as a
+            // missing continuation after an ordinary answer.
+            self.attach_follow_continuation(
+                &org,
+                "accepted_interaction",
+                Some(required(p, "requestId")?),
+                &mut result,
+            )
+            .await?;
+            self.activate_ui_follow(&org, &result).await?;
             self.presentation.delete_entities(
                 &org,
                 projection_account.as_deref().unwrap(),
@@ -537,6 +670,167 @@ impl Daemon {
                 &[required(p, "requestId")?],
             )?;
         }
+        Ok(result)
+    }
+
+    async fn attach_follow_continuation(
+        &self,
+        org: &str,
+        trigger: &str,
+        request_id: Option<&str>,
+        result: &mut Value,
+    ) -> Result<()> {
+        let run = result
+            .pointer("/execution/id")
+            .and_then(Value::as_str)
+            .or_else(|| result.get("executionId").and_then(Value::as_str))
+            .or_else(|| result.get("runId").and_then(Value::as_str))
+            .map(str::to_owned);
+        let Some(run) = run else { return Ok(()) };
+        if trigger == "accepted_interaction" && !accepted_interaction_result(result) {
+            return Ok(());
+        }
+        let account = self.auth.credential(org).await?.subject;
+        let installation = self.auth.installation_id().await?;
+        let receipt = self.follow.issue_continuation(
+            org,
+            &account,
+            &installation,
+            &run,
+            trigger,
+            request_id,
+        )?;
+        let details = result
+            .as_object_mut()
+            .context("BACKEND_PROTOCOL_ERROR")?
+            .entry("details")
+            .or_insert_with(|| json!({}));
+        let details = details.as_object_mut().context("BACKEND_PROTOCOL_ERROR")?;
+        details.insert(
+            "followContinuation".into(),
+            json!({
+                "schemaVersion":"loomex.follow-session.continuation/v1",
+                "runId":run,
+                "source":"generated_markdown",
+                "receipt":receipt,
+                "trigger":trigger,
+                "requestId":request_id,
+            }),
+        );
+        Ok(())
+    }
+
+    /// Bind a runner-issued app handoff before returning it to the UI.  The
+    /// caller cannot select its workspace or identity: both come from the
+    /// sealed run binding created at commit time.  This closes the gap where
+    /// an app-originated `ui/message` did not produce a UserPromptSubmit hook,
+    /// leaving a later Stop callback with nothing to protect.
+    async fn activate_ui_follow(&self, org: &str, result: &Value) -> Result<()> {
+        let run = result
+            .pointer("/execution/id")
+            .and_then(Value::as_str)
+            .or_else(|| result.get("executionId").and_then(Value::as_str))
+            .or_else(|| result.get("runId").and_then(Value::as_str))
+            .context("BACKEND_PROTOCOL_ERROR")?;
+        let receipt = result
+            .pointer("/details/followContinuation/receipt")
+            .and_then(Value::as_str)
+            .context("BACKEND_PROTOCOL_ERROR")?;
+        let binding: Value =
+            state::read_json(&self.dir.join("run-bindings").join(format!("{run}.json")))
+                .map_err(|_| anyhow::anyhow!("BACKEND_PROTOCOL_ERROR"))?;
+        let workspace = required(&binding, "workspacePath")?;
+        let account = self.auth.credential(org).await?.subject;
+        let installation = self.auth.installation_id().await?;
+        self.follow
+            .activate_ui_handoff(org, &account, &installation, run, workspace, receipt)
+    }
+
+    async fn restore_cached_follow_continuation(
+        &self,
+        org: Option<&str>,
+        method: &str,
+        params: &Value,
+        mut result: Value,
+    ) -> Result<Value> {
+        let trigger = match method {
+            "runs.commit" => "run_commit",
+            "interactions.respond" => "accepted_interaction",
+            "interactions.decide" => "accepted_interaction",
+            _ => return Ok(result),
+        };
+        let run = result
+            .pointer("/execution/id")
+            .and_then(Value::as_str)
+            .or_else(|| result.get("executionId").and_then(Value::as_str))
+            .or_else(|| result.get("runId").and_then(Value::as_str))
+            .map(str::to_owned);
+        let Some(run) = run else { return Ok(result) };
+        let existing = result
+            .pointer("/details/followContinuation/receipt")
+            .and_then(Value::as_str);
+        if existing.is_some() {
+            return Ok(result);
+        }
+        let org = org.context("ORGANIZATION_REQUIRED")?;
+        let account = self.auth.credential(org).await?.subject;
+        let installation = self.auth.installation_id().await?;
+        let request_id = (trigger == "accepted_interaction")
+            .then(|| params.get("requestId").and_then(Value::as_str))
+            .flatten();
+        if trigger == "accepted_interaction"
+            && (!accepted_interaction_result(&result)
+                || result.get("requestId").and_then(Value::as_str) != request_id)
+        {
+            return Ok(result);
+        }
+        if trigger == "run_commit"
+            && (result.get("preparationId").and_then(Value::as_str)
+                != params.get("preparationId").and_then(Value::as_str)
+                || Uuid::parse_str(&run).is_err())
+        {
+            return Ok(result);
+        }
+        let receipt = if let Some(receipt) = self.follow.issued_continuation(
+            org,
+            &account,
+            &installation,
+            &run,
+            trigger,
+            request_id,
+        )? {
+            receipt
+        } else {
+            // The durable idempotency record proves this exact mutation was
+            // accepted. A previous runner might have lost the response before
+            // it wrote the receipt, so repair that one local delivery fact;
+            // do not reissue the backend mutation or execute any workflow.
+            self.follow.issue_continuation(
+                org,
+                &account,
+                &installation,
+                &run,
+                trigger,
+                request_id,
+            )?
+        };
+        let details = result
+            .as_object_mut()
+            .context("BACKEND_PROTOCOL_ERROR")?
+            .entry("details")
+            .or_insert_with(|| json!({}));
+        let details = details.as_object_mut().context("BACKEND_PROTOCOL_ERROR")?;
+        details.insert(
+            "followContinuation".into(),
+            json!({
+                "schemaVersion":"loomex.follow-session.continuation/v1",
+                "runId":run,
+                "source":"generated_markdown",
+                "receipt":receipt,
+                "trigger":trigger,
+                "requestId":request_id,
+            }),
+        );
         Ok(result)
     }
     async fn prepare(&self, method: &str, org: &str, p: &Value) -> Result<Value> {
@@ -625,7 +919,21 @@ impl Daemon {
             .context("PREPARATION_INVALID")?;
         let stale = |reason: &str, next_action: &str| json!({"status":"stale","operation":operation,"preparationId":preparation,"reason":reason,"nextAction":next_action});
         if record.get("commitAuthorization").is_some() {
-            return Ok(stale("commit_started", "reconcile_operation"));
+            // A sealed preparation is never usable for another commit.  Once the
+            // original commit response is durable, however, its execution is a
+            // safe recovery destination for a restored presentation session.
+            // Keep this projection deliberately narrow: the execution still has
+            // to be read authoritatively by the caller before it is displayed.
+            let mut stale = stale("commit_started", "reconcile_operation");
+            if let Some(execution_id) = record["commitResult"]["execution"]["id"]
+                .as_str()
+                .or_else(|| record["commitResult"]["executionId"].as_str())
+            {
+                if Uuid::parse_str(execution_id).is_ok() {
+                    stale["executionId"] = json!(execution_id);
+                }
+            }
+            return Ok(stale);
         }
         let review = record["review"]
             .as_object()
@@ -746,6 +1054,11 @@ impl Daemon {
                 &record,
             )?;
         }
+        // This is written before returning the commit result. It lets a closed
+        // custom UI recover the one execution created by its already-authorized
+        // commit without treating the sealed preparation as reusable.
+        record["commitResult"] = result.clone();
+        state::write_json(&record_path, &record)?;
         Ok(result)
     }
     async fn download(&self, org: &str, p: &Value) -> Result<Value> {
@@ -840,7 +1153,27 @@ fn normalize_output(mut value: Value, schema: &Value) -> Result<Value> {
         extra.insert(key.clone(), object.remove(&key).unwrap());
     }
     if !extra.is_empty() {
-        object.insert("details".into(), Value::Object(extra));
+        // `details` is the schema-sanctioned envelope for backend fields that
+        // have not yet been promoted into the public result shape. Callers may
+        // also have attached runner-owned facts before normalization (for
+        // example, the receipt that authorizes a chat follow-up). Replacing an
+        // existing envelope here silently loses those facts. Merge only when
+        // the keys are disjoint: accepting a collision would make one side's
+        // meaning depend on ordering and could weaken a protocol boundary.
+        match object.get_mut("details") {
+            Some(Value::Object(details)) => {
+                for (key, field) in extra {
+                    if details.contains_key(&key) {
+                        bail!("BACKEND_PROTOCOL_ERROR")
+                    }
+                    details.insert(key, field);
+                }
+            }
+            Some(_) => bail!("BACKEND_PROTOCOL_ERROR"),
+            None => {
+                object.insert("details".into(), Value::Object(extra));
+            }
+        }
     }
     for key in schema["required"].as_array().unwrap() {
         if !object.contains_key(key.as_str().unwrap()) {
@@ -848,6 +1181,18 @@ fn normalize_output(mut value: Value, schema: &Value) -> Result<Value> {
         }
     }
     Ok(value)
+}
+
+/// The backend represents a successfully stored human response as `resolved`.
+/// Provider and compatibility paths can additionally surface the older, more
+/// specific labels below. These are response outcomes, not the approval value:
+/// a rejected approval is still a successfully accepted response that must let
+/// the workflow continue to its revision path.
+fn accepted_interaction_result(result: &Value) -> bool {
+    matches!(
+        result.get("requestStatus").and_then(Value::as_str),
+        Some("resolved" | "completed" | "answered" | "accepted" | "approved" | "rejected")
+    ) && result.get("error").is_none_or(Value::is_null)
 }
 fn normalize_catalog_output(value: Value, output_schema: &Value) -> Result<Value> {
     let object = value.as_object().context("BACKEND_PROTOCOL_ERROR")?;
@@ -886,6 +1231,8 @@ fn required<'a>(p: &'a Value, key: &str) -> Result<&'a str> {
 }
 fn account_scoped_method(method: &str) -> bool {
     method.starts_with("presentation.")
+        || method.starts_with("recovery.")
+        || method.starts_with("follow.session.")
         || method.starts_with("interactions.draft.")
         || matches!(
             method,
@@ -1137,7 +1484,9 @@ fn provider_snapshot_with(
     for (name, adapter) in [
         ("codex", "codex"),
         ("claude", "claude"),
+        // Keep historic Gemini records bound to the official Gemini CLI.
         ("gemini", "gemini"),
+        ("antigravity", "agy"),
     ] {
         if let Some(path) = resolve(adapter)? {
             let m = std::fs::metadata(&path)?;
@@ -1167,6 +1516,7 @@ fn provider_executable_variable(name: &str) -> Option<&'static str> {
         "codex" => Some("LOOMEX_CODEX_EXECUTABLE"),
         "claude" => Some("LOOMEX_CLAUDE_EXECUTABLE"),
         "gemini" => Some("LOOMEX_GEMINI_EXECUTABLE"),
+        "agy" => Some("LOOMEX_ANTIGRAVITY_EXECUTABLE"),
         _ => None,
     }
 }
@@ -1322,26 +1672,30 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
         let frame = match read_frame(&mut reader).await {
             Ok(Some(frame)) => frame,
             Ok(None) => return Ok(()),
-            Err(error) => {
-                let (code, retryable, _) = public_error(&error);
-                let mut response = serde_json::to_vec(
-                    &json!({"protocol":PROTOCOL,"id":"","error":state::safe_error(&code,retryable)}),
-                )?;
-                response.push(b'\n');
-                writer.write_all(&response).await?;
-                return Ok(());
-            }
+            // A truncated or oversized frame has no trustworthy request ID.
+            // Sending an error with a synthetic/empty ID makes it look like a
+            // protocol reply even though no client can correlate it. Close the
+            // connection so the caller treats the request as indeterminate.
+            Err(_) => return Ok(()),
         };
         let parsed = serde_json::from_slice::<Value>(&frame);
         let response = match parsed {
             Ok(request) => {
-                let id = request["id"].as_str().unwrap_or("").to_owned();
+                // Only a request carrying a valid correlation ID may receive a
+                // response. JSON parse failures and malformed IDs are
+                // uncorrelatable, so they terminate the connection below.
+                let Some(id) = request
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty() && id.len() <= 256)
+                else {
+                    return Ok(());
+                };
+                let id = id.to_owned();
                 if request["protocol"] != PROTOCOL {
                     json!({"protocol":PROTOCOL,"id":id,"error":state::safe_error("PROTOCOL_MISMATCH",false)})
                 } else if request.as_object().is_none_or(|m| m.len() != 4)
                     || !request["id"].is_string()
-                    || id.is_empty()
-                    || id.len() > 256
                 {
                     json!({"protocol":PROTOCOL,"id":id,"error":state::safe_error("INVALID_REQUEST",false)})
                 } else if !negotiated && request["method"] != "protocol.negotiate" {
@@ -1383,9 +1737,9 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
                     }
                 }
             }
-            Err(_) => {
-                json!({"protocol":PROTOCOL,"id":"","error":state::safe_error("INVALID_REQUEST",false)})
-            }
+            // There is no authoritative request ID in malformed JSON, so a
+            // reply would violate the correlation contract.
+            Err(_) => return Ok(()),
         };
         let mut bytes = serde_json::to_vec(&response)?;
         bytes.push(b'\n');
@@ -1530,6 +1884,12 @@ mod tests {
                 .get("gemini")
                 .is_none()
         );
+        let snapshot = provider_snapshot_with(resolve).unwrap();
+        assert_eq!(snapshot["antigravity"]["adapter"], "agy");
+        assert_eq!(
+            snapshot["antigravity"]["path"],
+            json!(resolve("agy").unwrap().unwrap())
+        );
     }
     #[test]
     fn configured_provider_path_is_used_without_path_discovery() {
@@ -1605,6 +1965,55 @@ mod tests {
         assert!(normalize_catalog_output(json!({"status":"unknown"}), &schema).is_err());
     }
     #[test]
+    fn output_normalizer_preserves_runner_details_when_lifting_backend_fields() {
+        let schema = json!({"oneOf":[{
+            "properties":{"execution":{"type":"object"},"details":{"type":"object"}},
+            "required":["execution"]
+        }]});
+        let normalized = normalize_catalog_output(
+            json!({
+                "execution":{"id":Uuid::new_v4()},
+                "executionId":Uuid::new_v4(),
+                "details":{"followContinuation":{"receipt":"runner-issued"}}
+            }),
+            &schema,
+        )
+        .unwrap();
+        assert_eq!(
+            normalized["details"]["followContinuation"]["receipt"],
+            "runner-issued"
+        );
+        assert!(normalized["details"]["executionId"].is_string());
+    }
+    #[test]
+    fn output_normalizer_rejects_ambiguous_detail_key_collisions() {
+        let schema = json!({"oneOf":[{
+            "properties":{"details":{"type":"object"}},
+            "required":[]
+        }]});
+        assert!(
+            normalize_catalog_output(
+                json!({"details":{"executionId":"runner"},"executionId":"backend"}),
+                &schema,
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn resolved_and_rejected_human_responses_authorize_followup() {
+        for status in ["resolved", "rejected", "approved", "answered"] {
+            assert!(accepted_interaction_result(
+                &json!({"requestStatus":status,"error":null})
+            ));
+        }
+        assert!(!accepted_interaction_result(
+            &json!({"requestStatus":"pending","error":null})
+        ));
+        assert!(!accepted_interaction_result(
+            &json!({"requestStatus":"resolved","error":{"code":"failed"}})
+        ));
+    }
+    #[test]
     fn ui_replay_mutations_are_account_scoped() {
         for method in [
             "runs.prepare",
@@ -1665,6 +2074,157 @@ mod conformance {
         .unwrap()
     }
     #[tokio::test]
+    async fn connection_get_is_advertised_and_reports_local_active_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = Api::for_test_origin("http://127.0.0.1:9").unwrap();
+        let daemon = fixture(temp.path(), api);
+        assert!(
+            negotiate(&json!({
+                "supportedProtocols":[PROTOCOL],
+                "requiredCapabilities":["method:connection.get", "connection.projection/v1"]
+            }))
+            .is_ok()
+        );
+        daemon.public.lock().await.active_organization =
+            Some("11111111-1111-4111-8111-111111111111".into());
+        daemon.active.store(4, Ordering::SeqCst);
+        let result = daemon.dispatch("connection.get", json!({})).await.unwrap();
+        assert_eq!(result["state"], "authenticated");
+        assert_eq!(result["organization"]["status"], "connected");
+        assert_eq!(result["activeWork"], 4);
+    }
+    #[tokio::test]
+    async fn connection_navigation_is_local_and_revision_checked() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = fixture(
+            temp.path(),
+            Api::for_test_origin("http://127.0.0.1:9").unwrap(),
+        );
+        let created = daemon.dispatch("connection.views.create", json!({"kind":"connection","entityType":"catalog","entityId":"00000000-0000-0000-0000-000000000000","state":{},"idempotencyKey":Uuid::new_v4()})).await.unwrap();
+        let update = json!({"viewSessionId":created["viewSessionId"],"expectedRevision":created["revision"],"state":{"page":"organizations"},"idempotencyKey":Uuid::new_v4()});
+        let saved = daemon
+            .dispatch("connection.views.update", update.clone())
+            .await
+            .unwrap();
+        assert_eq!(saved["state"]["page"], "organizations");
+        assert_eq!(
+            daemon
+                .dispatch("connection.views.update", update)
+                .await
+                .unwrap(),
+            saved
+        );
+        assert_eq!(
+            daemon
+                .dispatch(
+                    "connection.views.get",
+                    json!({"viewSessionId":created["viewSessionId"]})
+                )
+                .await
+                .unwrap()["state"]["page"],
+            "organizations"
+        );
+        assert!(daemon.public.lock().await.active_organization.is_none());
+    }
+
+    #[tokio::test]
+    async fn logout_with_active_work_has_no_drain_or_cancellation_side_effects() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = Api::for_test_origin("http://127.0.0.1:9").unwrap();
+        let daemon = fixture(temp.path(), api);
+        let org = "11111111-1111-4111-8111-111111111111";
+        daemon.public.lock().await.active_organization = Some(org.into());
+        let token = Arc::new(AtomicBool::new(false));
+        daemon
+            .cancellations
+            .lock()
+            .await
+            .insert("active-work".into(), token.clone());
+        daemon.active.fetch_add(1, Ordering::SeqCst);
+
+        assert_eq!(
+            daemon
+                .dispatch("auth.logout", json!({"idempotencyKey":Uuid::new_v4()}))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "ACTIVE_WORK_REQUIRES_DRAIN"
+        );
+        assert!(!daemon.draining.load(Ordering::SeqCst));
+        assert!(!token.load(Ordering::SeqCst));
+        assert_eq!(
+            daemon.public.lock().await.active_organization.as_deref(),
+            Some(org)
+        );
+        assert_eq!(daemon.auth.status().await.unwrap()["code"], "AUTHENTICATED");
+    }
+    #[tokio::test]
+    async fn idle_logout_clears_the_public_organization_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = fixture(temp.path(), api);
+        daemon.public.lock().await.active_organization =
+            Some("11111111-1111-4111-8111-111111111111".into());
+        let server = tokio::spawn(async move {
+            let (stream, head) = receive_http(&listener).await;
+            assert!(head.starts_with(
+                "POST /api/v1/runner-control/runner/v2/device-authorities/logout/ HTTP/1.1"
+            ));
+            reply_http(stream, 200, json!({"revoked":true})).await;
+        });
+        assert_eq!(
+            daemon
+                .dispatch("auth.logout", json!({"idempotencyKey":Uuid::new_v4()}))
+                .await
+                .unwrap()["revoked"],
+            true
+        );
+        server.await.unwrap();
+        assert!(!daemon.draining.load(Ordering::SeqCst));
+        assert!(daemon.public.lock().await.active_organization.is_none());
+        assert!(
+            state::read_json::<PublicState>(&temp.path().join("state.json"))
+                .unwrap()
+                .active_organization
+                .is_none()
+        );
+    }
+    #[tokio::test]
+    async fn accepted_human_responses_always_receive_a_follow_continuation() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = Api::for_test_origin("http://127.0.0.1:9").unwrap();
+        let daemon = fixture(temp.path(), api);
+        let org = "11111111-1111-4111-8111-111111111111";
+        for status in ["resolved", "rejected"] {
+            let run = Uuid::new_v4().to_string();
+            let request = Uuid::new_v4().to_string();
+            let mut result = json!({
+                "requestId":request,
+                "requestStatus":status,
+                "executionId":run,
+                "executionStatus":"running",
+                "error":null,
+            });
+            daemon
+                .attach_follow_continuation(
+                    org,
+                    "accepted_interaction",
+                    Some(&request),
+                    &mut result,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result["details"]["followContinuation"]["runId"], run);
+            assert!(
+                result["details"]["followContinuation"]["receipt"]
+                    .as_str()
+                    .is_some_and(|receipt| !receipt.is_empty())
+            );
+        }
+    }
+    #[tokio::test]
     async fn presentation_dispatch_reloads_and_scopes_idempotency_to_account() {
         let temp = tempfile::tempdir().unwrap();
         let api = Api::for_test_origin("http://127.0.0.1:9").unwrap();
@@ -1702,6 +2262,53 @@ mod conformance {
                 .unwrap(),
             first_result
         );
+    }
+    #[tokio::test]
+    async fn recovery_dispatch_is_account_scoped_and_advertised() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = Api::for_test_origin("http://127.0.0.1:9").unwrap();
+        let org = "11111111-1111-4111-8111-111111111111";
+        let daemon = fixture(temp.path(), api);
+        daemon.public.lock().await.active_organization = Some(org.into());
+        let binding = json!({"hostId":"local","hostTaskId":"task-1","runId":Uuid::new_v4()});
+        let created = daemon
+            .dispatch(
+                "recovery.update",
+                json!({"binding":binding,"expectedRevision":0,"initialization":"run_started","idempotencyKey":Uuid::new_v4()}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created["recovery"]["registrationState"], "not_attempted");
+        let current = daemon
+            .dispatch("recovery.get", json!({"binding":binding}))
+            .await
+            .unwrap();
+        assert!(current["found"].as_bool().unwrap());
+        assert!(negotiate(&json!({"supportedProtocols":[PROTOCOL],"requiredCapabilities":["recovery.coordination/v1","method:recovery.operations.begin"]})).is_ok());
+
+        // The generic daemon idempotency cache must not replay the one-time
+        // scheduling permit after a client loses the first response.
+        let begin = json!({
+            "binding": binding,
+            "expectedRevision": 1,
+            "operation": {
+                "kind": "create",
+                "arguments": {"marker": "loomex-follow-recovery:task-1"},
+                "idempotencyKey": Uuid::new_v4(),
+            },
+            "idempotencyKey": Uuid::new_v4(),
+        });
+        let first = daemon
+            .dispatch("recovery.operations.begin", begin.clone())
+            .await
+            .unwrap();
+        assert_eq!(first["attemptPermitted"], true);
+        let replay = daemon
+            .dispatch("recovery.operations.begin", begin)
+            .await
+            .unwrap();
+        assert_eq!(replay["attemptPermitted"], false);
+        assert_eq!(replay["reconciliationRequired"], true);
     }
     #[tokio::test]
     async fn draft_mutation_cache_is_scoped_to_authenticated_account() {
@@ -2228,8 +2835,68 @@ mod conformance {
         let response: Value =
             serde_json::from_slice(&read_frame(&mut r).await.unwrap().unwrap()).unwrap();
         assert_eq!(response["error"]["code"], "PROTOCOL_MISMATCH");
+        assert_eq!(response["id"], "b");
         assert!(response["error"]["correlationId"].is_string());
         drop(w);
+        task.abort();
+    }
+    #[tokio::test]
+    async fn uncorrelatable_frames_close_without_a_response() {
+        for frame in [
+            b"not-json\n".as_slice(),
+            b"{\"protocol\":\"loomex.local-control/v2\",\"method\":\"status.get\",\"params\":{}}\n"
+                .as_slice(),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let api = Api::for_test_origin("http://127.0.0.1:9").unwrap();
+            let daemon = Arc::new(fixture(temp.path(), api));
+            let (client, server) = UnixStream::pair().unwrap();
+            let task = tokio::spawn(connection(server, daemon));
+            let (mut read, mut write) = client.into_split();
+            write.write_all(frame).await.unwrap();
+            write.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            read.read_to_end(&mut response).await.unwrap();
+            assert!(response.is_empty());
+            task.await.unwrap().unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn oversized_frame_closes_without_a_response() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = Api::for_test_origin("http://127.0.0.1:9").unwrap();
+        let daemon = Arc::new(fixture(temp.path(), api));
+        let (client, server) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(connection(server, daemon));
+        let (mut read, mut write) = client.into_split();
+        let frame = vec![b'x'; MAX_FRAME + 1];
+        let _ = write.write_all(&frame).await;
+        let _ = write.shutdown().await;
+        let mut response = Vec::new();
+        read.read_to_end(&mut response).await.unwrap();
+        assert!(response.is_empty());
+        task.await.unwrap().unwrap();
+    }
+    #[tokio::test]
+    async fn correlatable_invalid_envelope_returns_the_request_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = Api::for_test_origin("http://127.0.0.1:9").unwrap();
+        let daemon = Arc::new(fixture(temp.path(), api));
+        let (client, server) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(connection(server, daemon));
+        let (reader, mut writer) = client.into_split();
+        let mut reader = BufReader::new(reader);
+        writer
+            .write_all(
+                b"{\"protocol\":\"loomex.local-control/v2\",\"id\":\"known-id\",\"method\":\"status.get\"}\n",
+            )
+            .await
+            .unwrap();
+        let response: Value =
+            serde_json::from_slice(&read_frame(&mut reader).await.unwrap().unwrap()).unwrap();
+        assert_eq!(response["id"], "known-id");
+        assert_eq!(response["error"]["code"], "INVALID_REQUEST");
+        drop(writer);
         task.abort();
     }
     #[tokio::test]
@@ -2242,6 +2909,7 @@ mod conformance {
         let prep = Uuid::new_v4().to_string();
         let prep_server = prep.clone();
         let run = Uuid::new_v4().to_string();
+        let run_server = run.clone();
         let backend = tokio::spawn(async move {
             for index in 0..2 {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -2279,7 +2947,11 @@ mod conformance {
                                 json!({"preparationId":prep_server,"bindingDigest":"digest","binding":binding,"limits":{},"expiresAt":null})
                             } else {
                                 assert_eq!(body["preparationId"], prep_server);
-                                json!({"execution":{"id":run},"preparationId":prep_server,"executionPolicy":"host_user/v1"})
+                                // The backend currently returns this legacy
+                                // top-level alias with its richer execution
+                                // projection. It exercises normalization after
+                                // the runner adds its follow continuation.
+                                json!({"execution":{"id":run_server},"executionId":run_server,"preparationId":prep_server,"executionPolicy":"host_user/v1"})
                             };
                             let text = json!({"data":data,"meta":{}}).to_string();
                             stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",text.len(),text).as_bytes()).await.unwrap();
@@ -2428,6 +3100,20 @@ mod conformance {
         commit["confirmationKey"] = prepared["confirmationKey"].clone();
         commit["idempotencyKey"] = json!(Uuid::new_v4());
         let result = d.dispatch("runs.commit", commit.clone()).await.unwrap();
+        assert_eq!(
+            result["details"]["followContinuation"]["schemaVersion"],
+            "loomex.follow-session.continuation/v1"
+        );
+        assert_eq!(result["details"]["followContinuation"]["runId"], run);
+        assert_eq!(
+            result["details"]["followContinuation"]["source"],
+            "generated_markdown"
+        );
+        assert!(
+            result["details"]["followContinuation"]["receipt"]
+                .as_str()
+                .is_some_and(|receipt| !receipt.is_empty())
+        );
         let authorized_commit = commit.clone();
         let stale = d
             .dispatch("preparations.get", json!({"preparationId":prep}))
@@ -2435,6 +3121,7 @@ mod conformance {
             .unwrap();
         assert_eq!(stale["reason"], "commit_started");
         assert_eq!(stale["nextAction"], "reconcile_operation");
+        assert_eq!(stale["executionId"], run);
         assert!(stale.get("preparation").is_none());
         assert_eq!(
             d.dispatch("runs.commit", commit.clone()).await.unwrap(),

@@ -1,4 +1,7 @@
-use crate::api::{Api, SignedCredential, key_proof, now};
+use crate::{
+    api::{Api, SignedCredential, key_proof, now},
+    state as runner_state,
+};
 use anyhow::{Result, anyhow, bail, ensure};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::SigningKey;
@@ -88,12 +91,20 @@ impl Token {
 struct Login {
     key: String,
     runner_name: String,
+    #[serde(default)]
+    flow_id: String,
     device_code: Option<String>,
     user_code: Option<String>,
     verification_uri: Option<String>,
     expires_at: u64,
     interval_seconds: u64,
     next_poll_at: u64,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct OrganizationProfile {
+    name: Option<String>,
+    slug: Option<String>,
+    enrolled: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 enum Target {
@@ -125,6 +136,8 @@ struct ProtectedState {
     private_key: [u8; 32],
     device: Option<Token>,
     children: BTreeMap<String, Token>,
+    #[serde(default)]
+    organization_profiles: BTreeMap<String, OrganizationProfile>,
     active_organization: Option<String>,
     login: Option<Login>,
     pending: Option<Pending>,
@@ -137,6 +150,7 @@ impl ProtectedState {
             private_key: SigningKey::generate(&mut rand::rngs::OsRng).to_bytes(),
             device: None,
             children: BTreeMap::new(),
+            organization_profiles: BTreeMap::new(),
             active_organization: None,
             login: None,
             pending: None,
@@ -260,6 +274,105 @@ impl Auth {
             ),
         }
     }
+    /// A credential-free, local snapshot for clients that need to resume an
+    /// existing device flow. This deliberately reads only the runner store: a
+    /// connection check must never start a new flow or turn a failed
+    /// organization listing into an authentication failure.
+    pub async fn connection(
+        &self,
+        selected_organization: Option<String>,
+        active_work: usize,
+    ) -> Value {
+        let _guard = self.lock.lock().await;
+        let unavailable = || {
+            json!({
+                "schemaVersion":"loomex.runner.connection/v1",
+                "state":"credential_store_unavailable",
+                "organization":{"status":"organization_required","selected":Value::Null},
+                "organizations":[],
+                "activeWork":active_work,
+                "actions":[],
+                "login":Value::Null,
+            })
+        };
+        let Ok(stored) = self.load().await else {
+            return unavailable();
+        };
+        let Some(state) = stored else {
+            return json!({
+                "schemaVersion":"loomex.runner.connection/v1",
+                "state":"signed_out",
+                "organization":{"status":"organization_required","selected":Value::Null},
+                "organizations":[],
+                "activeWork":active_work,
+                "actions":["auth.login"],
+                "login":Value::Null,
+            });
+        };
+        let mut organizations = state
+            .organization_profiles
+            .iter()
+            .map(|(id, profile)| json!({"id":id,"name":profile.name,"enrolled":profile.enrolled}))
+            .collect::<Vec<_>>();
+        // Older stores do not contain the cache. Enrolled organizations still
+        // remain available to a local connection projection after upgrading.
+        for id in state.children.keys() {
+            if !state.organization_profiles.contains_key(id) {
+                organizations.push(json!({"id":id,"name":Value::Null,"enrolled":true}));
+            }
+        }
+        let selected = selected_organization
+            .filter(|id| state.children.contains_key(id))
+            .map(|id| json!({"id":id,"name":state.organization_profiles.get(&id).and_then(|profile| profile.name.clone())}));
+        let (state_name, actions, login) = if state.logout_pending {
+            ("logout_pending", vec!["auth.logout"], Value::Null)
+        } else if state.pending.is_some() {
+            ("recovery_pending", vec!["auth.logout"], Value::Null)
+        } else if state.device.is_some() {
+            (
+                "authenticated",
+                vec!["organizations.list", "organizations.select", "auth.logout"],
+                Value::Null,
+            )
+        } else if let Some(login) = state.login.as_ref() {
+            let status = if login.expires_at > now() {
+                "verification_pending"
+            } else {
+                "verification_expired"
+            };
+            let actions = if status == "verification_pending" {
+                vec!["auth.poll", "auth.logout"]
+            } else {
+                vec!["auth.login", "auth.logout"]
+            };
+            (
+                status,
+                actions,
+                json!({
+                    // Existing protected records predate `flow_id`. Derive a
+                    // stable, opaque fallback without exposing their original
+                    // idempotency key or device code.
+                    "flowId":flow_identity(&state, login),
+                    "verificationUri":login.verification_uri,
+                    "userCode":login.user_code,
+                    "expiresAt":login.expires_at,
+                    "intervalSeconds":login.interval_seconds,
+                    "retryAfterSeconds":login.next_poll_at.saturating_sub(now()),
+                }),
+            )
+        } else {
+            ("signed_out", vec!["auth.login"], Value::Null)
+        };
+        json!({
+            "schemaVersion":"loomex.runner.connection/v1",
+            "state":state_name,
+            "organization":{"status":if selected.is_some(){"connected"}else{"organization_required"},"selected":selected},
+            "organizations":organizations,
+            "activeWork":active_work,
+            "actions":actions,
+            "login":login,
+        })
+    }
     pub async fn login(&self, runner_name: &str, key: &str) -> Result<Value> {
         ensure!((16..=256).contains(&key.len()), "INVALID_IDEMPOTENCY_KEY");
         ensure!(!runner_name.trim().is_empty(), "RUNNER_NAME_REQUIRED");
@@ -288,6 +401,7 @@ impl Auth {
         state.login = Some(Login {
             key: key.into(),
             runner_name: runner_name.into(),
+            flow_id: uuid::Uuid::new_v4().to_string(),
             device_code: None,
             user_code: None,
             verification_uri: None,
@@ -309,6 +423,11 @@ impl Auth {
         state.login = Some(Login {
             key: key.into(),
             runner_name: runner_name.into(),
+            flow_id: state
+                .login
+                .as_ref()
+                .map(|login| login.flow_id.clone())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             device_code: Some(field(&data, "deviceCode")?),
             user_code: Some(user_code),
             verification_uri: Some(uri),
@@ -319,8 +438,12 @@ impl Auth {
         self.save(&state).await?;
         Ok(login_projection(state.login.as_ref().unwrap()))
     }
-    pub async fn poll(&self, key: &str) -> Result<Value> {
+    pub async fn poll(&self, key: &str, flow_id: &str) -> Result<Value> {
         ensure!((16..=256).contains(&key.len()), "INVALID_IDEMPOTENCY_KEY");
+        ensure!(
+            !flow_id.is_empty() && flow_id.len() <= 160,
+            "INVALID_LOGIN_FLOW"
+        );
         let _guard = self.lock.lock().await;
         let mut state = self.required().await?;
         Self::allowed(&state)?;
@@ -330,6 +453,14 @@ impl Auth {
         if state.device.is_some() {
             return Ok(json!({"status":"authenticated","authenticated":true}));
         }
+        let current_login = state
+            .login
+            .as_ref()
+            .ok_or_else(|| anyhow!("LOGIN_REQUIRED"))?;
+        ensure!(
+            flow_identity(&state, current_login) == flow_id,
+            "LOGIN_FLOW_MISMATCH"
+        );
         let login = state
             .login
             .as_mut()
@@ -379,7 +510,30 @@ impl Auth {
             .api
             .request("GET", "v2/organizations/", None, Some(&credential), None)
             .await?;
-        let orgs = data["organizations"].as_array().ok_or_else(|| anyhow!("INVALID_API_RESPONSE"))?.iter().map(|org| json!({"id":org["id"],"name":org["name"],"slug":org["slug"],"enrolled":org["enrolled"],"runner":org.get("runner").filter(|r|!r.is_null()).map(|r|json!({"id":r["id"],"name":r["name"]}))})).collect::<Vec<_>>();
+        let mut profiles = BTreeMap::new();
+        let orgs = data["organizations"]
+            .as_array()
+            .ok_or_else(|| anyhow!("INVALID_API_RESPONSE"))?
+            .iter()
+            .map(|org| {
+                let id = field(org, "id")?;
+                let name = org["name"]
+                    .as_str()
+                    .filter(|name| !name.is_empty() && name.len() <= 512)
+                    .map(str::to_owned);
+                let slug = org["slug"]
+                    .as_str()
+                    .filter(|slug| !slug.is_empty() && slug.len() <= 512)
+                    .map(str::to_owned);
+                let enrolled = org["enrolled"].as_bool().unwrap_or(false);
+                profiles.insert(id.clone(), OrganizationProfile { name, slug, enrolled });
+                Ok(json!({"id":id,"name":org["name"],"slug":org["slug"],"enrolled":org["enrolled"],"runner":org.get("runner").filter(|r|!r.is_null()).map(|r|json!({"id":r["id"],"name":r["name"]}))}))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Replace only after parsing a complete, successful response. A list
+        // failure therefore leaves the existing local auth projection intact.
+        state.organization_profiles = profiles;
+        self.save(&state).await?;
         Ok(json!({"organizations":orgs}))
     }
     pub async fn select(&self, org: &str, key: &str) -> Result<Value> {
@@ -407,6 +561,15 @@ impl Auth {
             state.children.contains_key(org),
             "ENROLLMENT_CREDENTIALS_UNAVAILABLE"
         );
+        state
+            .organization_profiles
+            .entry(org.into())
+            .and_modify(|profile| profile.enrolled = true)
+            .or_insert(OrganizationProfile {
+                name: None,
+                slug: None,
+                enrolled: true,
+            });
         state.active_organization = Some(org.into());
         self.save(&state).await?;
         Ok(json!({"organizationId":org,"selected":true,"enrolled":true}))
@@ -511,6 +674,7 @@ impl Auth {
         }
         state.device = None;
         state.children.clear();
+        state.organization_profiles.clear();
         state.pending = None;
         state.login = None;
         state.logout_pending = false;
@@ -687,7 +851,20 @@ fn parse_token(value: &Value, subject: String) -> Result<Token> {
     })
 }
 fn login_projection(login: &Login) -> Value {
-    json!({"status":"pending","pending":true,"userCode":login.user_code,"verificationUri":login.verification_uri,"expiresAt":login.expires_at,"intervalSeconds":login.interval_seconds})
+    json!({"status":"pending","pending":true,"flowId":login.flow_id,"userCode":login.user_code,"verificationUri":login.verification_uri,"expiresAt":login.expires_at,"intervalSeconds":login.interval_seconds})
+}
+fn flow_identity(state: &ProtectedState, login: &Login) -> String {
+    if login.flow_id.is_empty() {
+        // Legacy protected records did not persist an explicit flow identifier.
+        // Salt the stable fallback with the private key so it cannot reveal the
+        // historical idempotency key or device code.
+        format!(
+            "legacy-{}",
+            runner_state::digest(&[state.private_key.as_slice(), login.key.as_bytes()].concat())
+        )
+    } else {
+        login.flow_id.clone()
+    }
 }
 
 #[cfg(test)]
@@ -779,6 +956,7 @@ mod tests {
         let login = Login {
             key: "key".into(),
             runner_name: "runner".into(),
+            flow_id: "flow-id".into(),
             device_code: Some("SECRET".into()),
             user_code: Some("CODE".into()),
             verification_uri: Some("https://example.com".into()),
@@ -786,7 +964,251 @@ mod tests {
             interval_seconds: 5,
             next_poll_at: 0,
         };
-        assert!(!login_projection(&login).to_string().contains("SECRET"));
+        let projection = login_projection(&login);
+        assert!(!projection.to_string().contains("SECRET"));
+        assert_eq!(projection["flowId"], "flow-id");
+    }
+    #[tokio::test]
+    async fn connection_projection_reports_resumable_states_without_credentials() {
+        let api = Api::for_test_origin("http://127.0.0.1:9").unwrap();
+        let auth = Auth::test_unauthed(api);
+        assert_eq!(auth.connection(None, 3).await["state"], "signed_out");
+
+        let mut state = ProtectedState::fresh();
+        state.login = Some(Login {
+            key: "idempotency-key".into(),
+            runner_name: "runner".into(),
+            flow_id: "opaque-flow".into(),
+            device_code: Some("DEVICE_SECRET".into()),
+            user_code: Some("PUBLIC-CODE".into()),
+            verification_uri: Some("https://example.test/verify".into()),
+            expires_at: now() + 60,
+            interval_seconds: 5,
+            next_poll_at: now() + 4,
+        });
+        auth.save(&state).await.unwrap();
+        let pending = auth.connection(None, 1).await;
+        assert_eq!(pending["state"], "verification_pending");
+        assert_eq!(pending["login"]["flowId"], "opaque-flow");
+        assert_eq!(pending["login"]["userCode"], "PUBLIC-CODE");
+        assert!(!pending.to_string().contains("DEVICE_SECRET"));
+        assert!(!pending.to_string().contains("idempotency-key"));
+
+        state.login.as_mut().unwrap().expires_at = 0;
+        auth.save(&state).await.unwrap();
+        assert_eq!(
+            auth.connection(None, 0).await["state"],
+            "verification_expired"
+        );
+
+        state.login = None;
+        state.device = Some(Token {
+            access: "device-secret".into(),
+            refresh: "device-refresh".into(),
+            subject: "device".into(),
+            expires_at: now() + 3600,
+        });
+        state.children.insert(
+            "org".into(),
+            Token {
+                access: "child-secret".into(),
+                refresh: "child-refresh".into(),
+                subject: "runner".into(),
+                expires_at: now() + 3600,
+            },
+        );
+        auth.save(&state).await.unwrap();
+        let required = auth.connection(None, 0).await;
+        assert_eq!(required["state"], "authenticated");
+        assert_eq!(required["organization"]["status"], "organization_required");
+        let connected = auth.connection(Some("org".into()), 0).await;
+        assert_eq!(connected["organization"]["status"], "connected");
+        assert_eq!(connected["organizations"][0]["id"], "org");
+        assert!(!connected.to_string().contains("child-secret"));
+
+        state.pending = Some(Pending {
+            target: Target::DeviceRefresh,
+            route: "v2/device-authorities/refresh/".into(),
+            body: json!({"refreshToken":"secret"}),
+            started_at: now(),
+            recovery_used: false,
+        });
+        auth.save(&state).await.unwrap();
+        assert_eq!(auth.connection(None, 0).await["state"], "recovery_pending");
+        state.pending = None;
+        state.logout_pending = true;
+        auth.save(&state).await.unwrap();
+        assert_eq!(auth.connection(None, 0).await["state"], "logout_pending");
+    }
+    #[tokio::test]
+    async fn connection_projection_handles_an_unavailable_credential_store() {
+        struct Unavailable;
+        impl Store for Unavailable {
+            fn load(&self) -> Result<Option<Vec<u8>>> {
+                bail!("STORE_UNAVAILABLE")
+            }
+            fn save(&self, _: &[u8]) -> Result<()> {
+                bail!("STORE_UNAVAILABLE")
+            }
+        }
+        let auth = Auth {
+            api: Api::for_test_origin("http://127.0.0.1:9").unwrap(),
+            store: Arc::new(Unavailable),
+            lock: Arc::new(Mutex::new(())),
+            store_lock: Arc::new(Mutex::new(())),
+        };
+        let projection = auth.connection(None, 0).await;
+        assert_eq!(projection["state"], "credential_store_unavailable");
+        assert_eq!(projection["actions"], json!([]));
+    }
+    #[tokio::test]
+    async fn concurrent_polls_share_the_persisted_poll_interval() {
+        let (auth, _, listener) = test_auth().await;
+        let mut state = ProtectedState::fresh();
+        state.login = Some(Login {
+            key: "initial-login-key".into(),
+            runner_name: "runner".into(),
+            flow_id: "opaque-flow".into(),
+            device_code: Some("device-code".into()),
+            user_code: Some("public-code".into()),
+            verification_uri: Some("https://example.test/verify".into()),
+            expires_at: now() + 60,
+            interval_seconds: 30,
+            next_poll_at: 0,
+        });
+        auth.save(&state).await.unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            assert_eq!(request["deviceCode"], "device-code");
+            respond(&mut stream, 200, json!({"data":{"pending":true}})).await;
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(80), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let first = auth.poll("first-poll-idempotency-key", "opaque-flow");
+        let second = auth.poll("second-poll-idempotency-key", "opaque-flow");
+        let (first, second) = tokio::join!(first, second);
+        let results = [first.unwrap(), second.unwrap()];
+        assert!(
+            results
+                .iter()
+                .any(|value| value.get("retryAfterSeconds").is_some())
+        );
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn stale_poll_flow_is_rejected_before_any_token_request() {
+        let (auth, _, listener) = test_auth().await;
+        let mut state = ProtectedState::fresh();
+        state.login = Some(Login {
+            key: "initial-login-key".into(),
+            runner_name: "runner".into(),
+            flow_id: "current-flow".into(),
+            device_code: Some("device-code".into()),
+            user_code: Some("public-code".into()),
+            verification_uri: Some("https://example.test/verify".into()),
+            expires_at: now() + 60,
+            interval_seconds: 5,
+            next_poll_at: 0,
+        });
+        auth.save(&state).await.unwrap();
+        assert_eq!(
+            auth.poll("stale-poll-idempotency-key", "stale-flow")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "LOGIN_FLOW_MISMATCH"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn organization_cache_is_local_and_survives_a_list_failure() {
+        let (auth, _, listener) = test_auth().await;
+        let mut state = ProtectedState::fresh();
+        state.device = Some(Token {
+            access: "lmxda_device-access".into(),
+            refresh: "device-refresh".into(),
+            subject: "device".into(),
+            expires_at: now() + 3600,
+        });
+        state.children.insert(
+            "org-a".into(),
+            Token {
+                access: "child-access".into(),
+                refresh: "child-refresh".into(),
+                subject: "runner".into(),
+                expires_at: now() + 3600,
+            },
+        );
+        auth.save(&state).await.unwrap();
+        let before = auth.status().await.unwrap();
+        assert_eq!(before["code"], "AUTHENTICATED", "{before}");
+        assert!(auth.required().await.unwrap().device.unwrap().usable());
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            respond(
+                &mut first,
+                200,
+                json!({"data":{"organizations":[
+                    {"id":"org-a","name":"Alpha","slug":"alpha","enrolled":true,"runner":null},
+                    {"id":"org-b","name":"Beta","slug":"beta","enrolled":false,"runner":null}
+                ]}}),
+            )
+            .await;
+            let (mut second, _) = listener.accept().await.unwrap();
+            respond(
+                &mut second,
+                503,
+                json!({"error":{"code":"BACKEND_UNAVAILABLE"}}),
+            )
+            .await;
+        });
+        assert_eq!(
+            auth.organizations().await.unwrap()["organizations"][0]["name"],
+            "Alpha"
+        );
+        let cached = auth.connection(Some("org-a".into()), 0).await;
+        assert_eq!(cached["organization"]["selected"]["name"], "Alpha");
+        assert_eq!(cached["organizations"].as_array().unwrap().len(), 2);
+        assert_eq!(cached["organizations"][1]["name"], "Beta");
+        assert!(auth.organizations().await.is_err());
+        let after_failure = auth.connection(Some("org-a".into()), 0).await;
+        assert_eq!(after_failure["state"], "authenticated");
+        assert_eq!(after_failure["organization"]["selected"]["name"], "Alpha");
+        server.await.unwrap();
+    }
+    #[test]
+    fn legacy_protected_state_loads_with_a_stable_opaque_flow_and_empty_profile_cache() {
+        let mut state = ProtectedState::fresh();
+        state.login = Some(Login {
+            key: "historic-key".into(),
+            runner_name: "runner".into(),
+            flow_id: "new-flow".into(),
+            device_code: Some("device-code".into()),
+            user_code: Some("public-code".into()),
+            verification_uri: Some("https://example.test/verify".into()),
+            expires_at: now() + 60,
+            interval_seconds: 5,
+            next_poll_at: 0,
+        });
+        let mut legacy = serde_json::to_value(&state).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("organization_profiles");
+        legacy["login"].as_object_mut().unwrap().remove("flow_id");
+        let restored: ProtectedState = serde_json::from_value(legacy).unwrap();
+        assert!(restored.organization_profiles.is_empty());
+        let identity = flow_identity(&restored, restored.login.as_ref().unwrap());
+        assert!(identity.starts_with("legacy-"));
+        assert_ne!(identity, "historic-key");
     }
     async fn read_request(stream: &mut tokio::net::TcpStream) -> Value {
         use tokio::io::AsyncReadExt;

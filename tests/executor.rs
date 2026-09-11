@@ -5,13 +5,21 @@ use loomex_runner::executor::{
 use std::{
     collections::BTreeMap,
     fs,
+    io::{Read, Seek, SeekFrom},
     os::unix::fs::{PermissionsExt, symlink},
     path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::{Duration, Instant},
 };
+use tokio::task::JoinHandle;
+
+const CHILD_PID: &str = "fixture-child.pid";
+const READINESS_TIMEOUT: Duration = Duration::from_secs(3);
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_DIAGNOSTIC_BYTES: usize = 4096;
 
 #[derive(Default)]
 struct Observer {
@@ -50,6 +58,23 @@ async fn run(request: ExecutionRequest, cancel: Arc<AtomicBool>) -> Result<Execu
         Path::new(env!("CARGO_BIN_EXE_loomex-runner")),
     )
     .await
+}
+
+fn fixture_request(root: &Path, fixture_name: &str) -> ExecutionRequest {
+    let mut request = request(root, "unused");
+    request.argv = vec![
+        std::env::current_exe()
+            .unwrap()
+            .into_os_string()
+            .into_string()
+            .expect("test executable path must be UTF-8"),
+        "--exact".into(),
+        fixture_name.into(),
+        "--nocapture".into(),
+        "--test-threads=1".into(),
+        "--ignored".into(),
+    ];
+    request
 }
 
 #[tokio::test]
@@ -143,26 +168,222 @@ async fn cwd_symlink_escape_is_rejected_before_intent() {
     assert!(!observer.intent.load(Ordering::SeqCst));
 }
 
-async fn wait_file(path: &Path) {
-    for _ in 0..200 {
-        if fs::read_to_string(path).is_ok_and(|value| !value.trim().is_empty()) {
-            return;
+fn ready(path: &Path) -> bool {
+    fs::read_to_string(path).is_ok_and(|value| !value.trim().is_empty())
+}
+
+fn bounded_contents(path: &Path) -> String {
+    match fs::File::open(path) {
+        Ok(mut file) => {
+            let total = match file.metadata() {
+                Ok(metadata) => metadata.len(),
+                Err(error) => return format!("{}: {error}", path.display()),
+            };
+            let start = total.saturating_sub(MAX_DIAGNOSTIC_BYTES as u64);
+            if let Err(error) = file.seek(SeekFrom::Start(start)) {
+                return format!("{}: {error}", path.display());
+            }
+            let mut contents = Vec::with_capacity(MAX_DIAGNOSTIC_BYTES);
+            if let Err(error) = file
+                .take(MAX_DIAGNOSTIC_BYTES as u64)
+                .read_to_end(&mut contents)
+            {
+                return format!("{}: {error}", path.display());
+            }
+            format!(
+                "{} ({} bytes, last {}): {:?}",
+                path.display(),
+                total,
+                contents.len(),
+                String::from_utf8_lossy(&contents)
+            )
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        Err(error) => format!("{}: {error}", path.display()),
     }
-    panic!("fixture did not start: {}", path.display());
+}
+
+fn readiness_diagnostics(root: &Path) -> String {
+    format!(
+        "stdout {}; stderr {}",
+        bounded_contents(&root.join("spool/stdout")),
+        bounded_contents(&root.join("spool/stderr")),
+    )
+}
+
+async fn cancel_and_reap(
+    task: &mut JoinHandle<Result<ExecutionOutcome>>,
+    cancel: &AtomicBool,
+) -> String {
+    cancel.store(true, Ordering::SeqCst);
+    match tokio::time::timeout(CLEANUP_TIMEOUT, task).await {
+        Ok(Ok(Ok(outcome))) => format!(
+            "cleanup outcome canceled={}, group_stopped={}, error={:?}",
+            outcome.canceled, outcome.managed_group_stopped, outcome.error
+        ),
+        Ok(Ok(Err(error))) => format!("cleanup execution error: {error:#}"),
+        Ok(Err(error)) => format!("cleanup task join error: {error}"),
+        Err(_) => "cleanup timed out".into(),
+    }
+}
+
+async fn wait_for_readiness(
+    task: &mut JoinHandle<Result<ExecutionOutcome>>,
+    cancel: &AtomicBool,
+    root: &Path,
+    paths: &[&Path],
+) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        if paths.iter().all(|path| ready(path)) {
+            return Ok(());
+        }
+        if task.is_finished() {
+            let outcome = match task.await {
+                Ok(Ok(outcome)) => format!(
+                    "exit_code={:?}, canceled={}, group_stopped={}, error={:?}",
+                    outcome.exit_code,
+                    outcome.canceled,
+                    outcome.managed_group_stopped,
+                    outcome.error
+                ),
+                Ok(Err(error)) => format!("execution error: {error:#}"),
+                Err(error) => format!("execution task join error: {error}"),
+            };
+            anyhow::bail!(
+                "execution ended before readiness [{}]: {outcome}; {}",
+                paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                readiness_diagnostics(root),
+            );
+        }
+        if started.elapsed() >= READINESS_TIMEOUT {
+            let cleanup = cancel_and_reap(task, cancel).await;
+            anyhow::bail!(
+                "timed out waiting for readiness [{}]; {cleanup}; {}",
+                paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                readiness_diagnostics(root),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn readiness_reports_early_execution_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut task = tokio::spawn(run(request(root.path(), "exit 47"), cancel.clone()));
+    let error = wait_for_readiness(
+        &mut task,
+        &cancel,
+        root.path(),
+        &[&root.path().join("never-ready")],
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("execution ended before readiness")
+    );
+    assert!(error.to_string().contains("exit_code=Some(47)"));
+}
+
+#[test]
+#[ignore = "execution fixture invoked by cancellation tests"]
+fn execution_fixture_child_survives_parent() {
+    fixture_child_survives_parent(Path::new("fixture-ready"));
+}
+
+#[test]
+#[ignore = "execution fixture invoked by cancellation tests"]
+fn execution_fixture_ignores_term() {
+    fixture_ignores_term(Path::new("fixture-ready"));
+}
+
+fn fixture_child_survives_parent(ready_path: &Path) {
+    let mut pipe = [-1; 2];
+    assert_eq!(
+        unsafe { libc::pipe(pipe.as_mut_ptr()) },
+        0,
+        "create fixture pipe"
+    );
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0, "fork fixture child");
+    if child == 0 {
+        unsafe {
+            libc::close(pipe[0]);
+        }
+        fs::write(ready_path, "ready\n").expect("write fixture readiness");
+        let signal = b"R";
+        assert_eq!(
+            unsafe { libc::write(pipe[1], signal.as_ptr().cast(), signal.len()) },
+            signal.len() as isize,
+            "notify fixture parent"
+        );
+        unsafe {
+            libc::close(pipe[1]);
+        }
+        loop {
+            unsafe {
+                libc::pause();
+            }
+        }
+    }
+    unsafe {
+        libc::close(pipe[1]);
+    }
+    fs::write(ready_path.with_file_name(CHILD_PID), child.to_string())
+        .expect("write fixture child identity");
+    let mut signal = [0_u8; 1];
+    assert_eq!(
+        unsafe { libc::read(pipe[0], signal.as_mut_ptr().cast(), signal.len()) },
+        1,
+        "wait for fixture child readiness"
+    );
+    unsafe {
+        libc::close(pipe[0]);
+    }
+}
+
+fn fixture_ignores_term(ready_path: &Path) {
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+    }
+    fs::write(ready_path, "ready\n").expect("write fixture readiness");
+    loop {
+        unsafe {
+            libc::pause();
+        }
+    }
 }
 
 #[tokio::test]
 async fn cancellation_reaches_child_after_target_leader_exits() {
     let root = tempfile::tempdir().unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
-    let task = tokio::spawn(run(
-        request(root.path(), "sleep 1000 & echo $! > child.pid; exit 0"),
+    let mut task = tokio::spawn(run(
+        fixture_request(root.path(), "execution_fixture_child_survives_parent"),
         cancel.clone(),
     ));
-    wait_file(&root.path().join("child.pid")).await;
-    wait_file(&root.path().join("spool/target-status.json")).await;
+    let child_pid = root.path().join(CHILD_PID);
+    let child_ready = root.path().join("fixture-ready");
+    let target_status = root.path().join("spool/target-status.json");
+    wait_for_readiness(
+        &mut task,
+        &cancel,
+        root.path(),
+        &[&child_pid, &child_ready, &target_status],
+    )
+    .await
+    .unwrap();
     assert!(
         !task.is_finished(),
         "target exit must not imply process group completion"
@@ -172,7 +393,7 @@ async fn cancellation_reaches_child_after_target_leader_exits() {
     assert!(result.canceled);
     assert!(result.managed_group_stopped);
     assert!(result.descendant_cleanup.contains("indeterminate"));
-    let pid = fs::read_to_string(root.path().join("child.pid")).unwrap();
+    let pid = fs::read_to_string(&child_pid).unwrap();
     let status = std::process::Command::new("/bin/ps")
         .args(["-p", pid.trim(), "-o", "stat="])
         .output()
@@ -189,14 +410,14 @@ async fn cancellation_reaches_child_after_target_leader_exits() {
 async fn term_ignoring_group_is_killed_after_cancellation_grace() {
     let root = tempfile::tempdir().unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
-    let task = tokio::spawn(run(
-        request(
-            root.path(),
-            "trap '' TERM; echo ready > ready; while :; do sleep 1; done",
-        ),
+    let mut task = tokio::spawn(run(
+        fixture_request(root.path(), "execution_fixture_ignores_term"),
         cancel.clone(),
     ));
-    wait_file(&root.path().join("ready")).await;
+    let ready_path = root.path().join("fixture-ready");
+    wait_for_readiness(&mut task, &cancel, root.path(), &[&ready_path])
+        .await
+        .unwrap();
     cancel.store(true, Ordering::SeqCst);
     let result = tokio::time::timeout(std::time::Duration::from_secs(6), task)
         .await

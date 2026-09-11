@@ -101,6 +101,7 @@ fn parse_line(line: &[u8], offset: u64, context: &Context) -> Option<Value> {
         "codex" => codex_activity(&value),
         "claude" => claude_activity(&value),
         "gemini" => gemini_activity(&value),
+        "antigravity" => antigravity_activity(&value),
         _ => None,
     }?;
     // Offset plus the parsed envelope is stable across a lost response and
@@ -250,6 +251,23 @@ fn gemini_activity(value: &Value) -> Option<(&'static str, &'static str)> {
     }
 }
 
+/// AGY's legacy response envelope is distinct from Gemini CLI JSONL. Keeping
+/// the parser separate prevents historic Gemini journals from changing meaning.
+fn antigravity_activity(value: &Value) -> Option<(&'static str, &'static str)> {
+    if value.get("error").is_some_and(|error| !error.is_null()) {
+        return Some(("activity.failed", "Provider reported a failure"));
+    }
+    if value
+        .get("conversation_id")
+        .and_then(Value::as_str)
+        .is_some()
+        && (value.get("response").is_some() || value.get("structured_output").is_some())
+    {
+        return Some(("activity.completed", "Provider completed work"));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +299,11 @@ mod tests {
                 "gemini",
                 r#"{"type":"tool_use","tool_name":"private command","parameters":{"secret":"nope"}}"#,
                 "tool.started",
+            ),
+            (
+                "antigravity",
+                r#"{"conversation_id":"private-session","response":{"structured_output":{"secret":"nope"}}}"#,
+                "activity.completed",
             ),
         ];
         for (provider, line, kind) in cases {
@@ -343,6 +366,20 @@ mod tests {
         assert!(
             decoder
                 .push(stream.as_bytes(), 0, &context("gemini"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn antigravity_does_not_reinterpret_gemini_stream_events() {
+        let mut decoder = Decoder::default();
+        assert!(
+            decoder
+                .push(
+                    b"{\"type\":\"init\",\"session_id\":\"gemini-session\"}\n",
+                    0,
+                    &context("antigravity")
+                )
                 .is_empty()
         );
     }

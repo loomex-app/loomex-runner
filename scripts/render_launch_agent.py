@@ -15,10 +15,10 @@ if args.development_api_origin:
 provider_entries=""
 if args.provider_executables_file:
     providers=json.loads(Path(args.provider_executables_file).read_text())
-    if not isinstance(providers,dict) or any(name not in {'codex','claude','gemini'} for name in providers): raise SystemExit("invalid provider executable configuration")
-    environment={'codex':'LOOMEX_CODEX_EXECUTABLE','claude':'LOOMEX_CLAUDE_EXECUTABLE','gemini':'LOOMEX_GEMINI_EXECUTABLE'}
+    if not isinstance(providers,dict) or any(name not in {'codex','claude','gemini','antigravity'} for name in providers): raise SystemExit("invalid provider executable configuration")
+    environment={'codex':'LOOMEX_CODEX_EXECUTABLE','claude':'LOOMEX_CLAUDE_EXECUTABLE','gemini':'LOOMEX_GEMINI_EXECUTABLE','antigravity':'LOOMEX_ANTIGRAVITY_EXECUTABLE'}
     entries=[]
-    for name in ('codex','claude','gemini'):
+    for name in ('codex','claude','gemini','antigravity'):
         if name not in providers: continue
         value=providers[name]
         if not isinstance(value,str): raise SystemExit("invalid provider executable path")
