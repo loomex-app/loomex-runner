@@ -24,15 +24,29 @@ components without invoking a daemon or changing application data:
 ```sh
 LOOMEX_PLUGIN_NODE="$HOME/Library/Application Support/Loomex/plugin/current/plugin/runtime/bin/node" \
   ./scripts/run-integration-compatibility-gate.sh \
+  --required \
   --plugin-root ../plugin --backend-root ../backend \
   --backend-python ../backend/.venv/bin/python
 ```
 
 `./scripts/run-integration-compatibility-gate.sh` performs the same comparison
 when passed those two artifact paths, or explicit `--plugin-root` and
-`--backend-root` checkouts. It reports a skip when neither pair is supplied;
-CI exposes the same optional inputs through its `LOOMEX_*` variables and does
-not fetch or assume sibling repositories.
+`--backend-root` checkouts. It reports a skip when neither pair is supplied.
+Pass `--required` for a release or cross-repository gate: it fails without a
+complete input pair, accepts only clean Git checkout roots, and requires both
+exports to record a full immutable `source.headRevision` and
+`source.workingTree: "clean"`. Root exports must match the supplied checkout
+revision. Runner-only CI tests this required behavior but does not claim an
+integration result because it does not check out the plugin and backend.
+
+The production release workflow makes this check a required job. It accepts
+full commit SHAs for the plugin and backend repositories, checks out those
+exact commits, builds the plugin with the supported Node runtime, exports the
+backend route contract with the supported Python environment, and runs the
+gate in `--required` mode before signing or publishing the runner. Private
+repositories under the `loomex-app` organization require the explicitly
+configured `LOOMEX_COMPONENT_READ_TOKEN` secret with read-only access. The
+workflow retains the compatibility result as release evidence.
 
 The result is `loomex/compatibility-manifest/v1`. It proves declared method,
 capability, and route compatibility only; it is not a deployment, credentials,

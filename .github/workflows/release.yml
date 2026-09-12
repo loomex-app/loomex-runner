@@ -1,11 +1,124 @@
 name: Production release
 on:
   workflow_dispatch:
+    inputs:
+      plugin_repository:
+        description: "Full GitHub repository name for the plugin (owner/name)"
+        required: true
+        type: string
+      plugin_ref:
+        description: "Plugin commit SHA to qualify (full 40 character SHA)"
+        required: true
+        type: string
+      backend_repository:
+        description: "Full GitHub repository name for the backend (owner/name)"
+        required: true
+        type: string
+      backend_ref:
+        description: "Backend commit SHA to qualify (full 40 character SHA)"
+        required: true
+        type: string
 permissions:
   contents: read
 jobs:
+  compatibility:
+    name: Required plugin/backend compatibility gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout runner release source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Verify runner checkout identity
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Validate immutable component references
+        env:
+          PLUGIN_REPOSITORY: ${{ inputs.plugin_repository }}
+          PLUGIN_REF: ${{ inputs.plugin_ref }}
+          BACKEND_REPOSITORY: ${{ inputs.backend_repository }}
+          BACKEND_REF: ${{ inputs.backend_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$PLUGIN_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          [[ "$BACKEND_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          test "${PLUGIN_REPOSITORY%%/*}" = "loomex-app"
+          test "${BACKEND_REPOSITORY%%/*}" = "loomex-app"
+          [[ "$PLUGIN_REF" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BACKEND_REF" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Checkout plugin qualification source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.plugin_repository }}
+          ref: ${{ inputs.plugin_ref }}
+          path: component-inputs/plugin
+          token: ${{ secrets.LOOMEX_COMPONENT_READ_TOKEN || github.token }}
+          fetch-depth: 1
+
+      - name: Checkout backend qualification source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.backend_repository }}
+          ref: ${{ inputs.backend_ref }}
+          path: component-inputs/backend
+          token: ${{ secrets.LOOMEX_COMPONENT_READ_TOKEN || github.token }}
+          fetch-depth: 1
+
+      - name: Set up supported component runtimes
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.20.0
+          cache: npm
+          cache-dependency-path: component-inputs/plugin/package-lock.json
+
+      - name: Install and build plugin qualification source
+        working-directory: component-inputs/plugin
+        run: |
+          npm ci
+          npm run build
+
+      - name: Set up backend Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: component-inputs/backend/requirements.lock
+
+      - name: Install backend qualification dependencies
+        working-directory: component-inputs/backend
+        run: python -m pip install --requirement requirements.lock
+
+      - name: Run required compatibility gate
+        env:
+          DJANGO_SETTINGS_MODULE: config.settings.test
+          DJANGO_ENV_FILE: /dev/null
+          HOME: ${{ runner.temp }}/loomex-home
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          mkdir -p "$HOME"
+          ./scripts/run-integration-compatibility-gate.sh \
+            --required \
+            --plugin-root component-inputs/plugin \
+            --backend-root component-inputs/backend \
+            --plugin-node node \
+            --backend-python python \
+            --output "$RUNNER_TEMP/compatibility-result.json"
+      - name: Publish compatibility evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-release-compatibility-${{ github.sha }}
+          path: ${{ runner.temp }}/compatibility-result.json
+          if-no-files-found: error
+
   build:
     runs-on: macos-14-xlarge
+    needs: compatibility
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

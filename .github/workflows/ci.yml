@@ -19,15 +19,8 @@ jobs:
       - run: python3 scripts/test_compatibility_export.py
       - run: python3 scripts/test_integration_compatibility.py
       - run: python3 scripts/test_integration_gate.py
+      - run: python3 scripts/test_release_workflow_contract.py
       - run: python3 scripts/export-compatibility.py --check
-      - name: Cross-component compatibility gate (when component artifacts are supplied)
-        env:
-          LOOMEX_PLUGIN_COMPONENTS: ${{ vars.LOOMEX_PLUGIN_COMPONENTS }}
-          LOOMEX_BACKEND_ROUTES: ${{ vars.LOOMEX_BACKEND_ROUTES }}
-          LOOMEX_PLUGIN_ROOT: ${{ vars.LOOMEX_PLUGIN_ROOT }}
-          LOOMEX_BACKEND_ROOT: ${{ vars.LOOMEX_BACKEND_ROOT }}
-          LOOMEX_BACKEND_PYTHON: ${{ vars.LOOMEX_BACKEND_PYTHON }}
-        run: ./scripts/run-integration-compatibility-gate.sh
       - run: ./scripts/test-packaging.sh
       - name: Smoke installed development daemon and CLI
         env:

@@ -17,13 +17,18 @@ if [[ "$mode" == "--production" ]]; then
   revision="$(git -C "$repo" rev-parse --verify HEAD)"
 fi
 temporary="$(mktemp -d)"; trap 'rm -rf "$temporary"' EXIT
-build_root="$repo"
+revision="${revision:-$(git -C "$repo" rev-parse --verify HEAD 2>/dev/null || printf unknown)}"
+source_manifest="$temporary/source-content-manifest.json"
+build_root="$temporary/source"
 if [[ "$mode" == "--production" ]]; then
-  mkdir "$temporary/source"
+  python3 "$repo/scripts/artifact.py" source-manifest --source-root "$repo" --source-revision "$revision" --output "$source_manifest"
+  mkdir "$build_root"
   git -C "$repo" archive "$revision" | tar -x -C "$temporary/source"
-  build_root="$temporary/source"
+  python3 "$repo/scripts/artifact.py" verify-source --source-root "$build_root" --manifest "$source_manifest"
   snapshot_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$build_root/Cargo.toml" | head -1)"
   [[ "$snapshot_version" == "$version" ]] || { echo "snapshot version changed during build" >&2; exit 1; }
+else
+  python3 "$repo/scripts/artifact.py" source-manifest --source-root "$repo" --source-revision "$revision" --output "$source_manifest" --snapshot "$build_root"
 fi
 remap_flags="${RUSTFLAGS:-} --remap-path-prefix=$build_root=/loomex/src --remap-path-prefix=${HOME:?}=/loomex/home"
 remap_cflags="${CFLAGS:-} -ffile-prefix-map=$build_root=/loomex/src -ffile-prefix-map=${HOME:?}=/loomex/home"
@@ -48,8 +53,9 @@ from pathlib import Path
 version,out=sys.argv[1:]; Path(out).write_text(json.dumps({"project":"loomex-runner","version":version,"platform":"darwin-arm64","stateSchema":"app.loomex.runner.state/v1"},sort_keys=True,indent=2)+"\n")
 PY
 cp "$build_root/contracts/compatibility-manifest.json" "$payload/metadata/compatibility-manifest.json"
+cp "$source_manifest" "$payload/metadata/source-content-manifest.json"
 cp "$build_root/scripts/app.loomex.runner.template.plist" "$payload/launchd/app.loomex.runner.template.plist"
-python3 "$build_root/scripts/validate_package.py" "$payload" --expected-version "$version"
+python3 "$build_root/scripts/validate_package.py" "$payload" --expected-version "$version" --source-root "$build_root"
 if [[ "$mode" == "--production" ]]; then
   codesign --force --timestamp --options runtime --sign "$LOOMEX_CODESIGN_IDENTITY" "$payload/bin/loomex"
   codesign --force --timestamp --options runtime --sign "$LOOMEX_CODESIGN_IDENTITY" "$payload/bin/loomex-runner"
@@ -64,7 +70,7 @@ root=Path(sys.argv[1]); needle=sys.argv[2].encode()
 for path in root.rglob('*'):
  if path.is_file() and needle in path.read_bytes(): raise SystemExit(f'payload embeds build home path: {path.relative_to(root)}')
 PY
-revision="${revision:-$(git -C "$repo" rev-parse HEAD 2>/dev/null || printf unknown)}"; release_stage="$temporary/release"
+release_stage="$temporary/release"
 arguments=(create --payload "$payload" --output "$release_stage" --project loomex-runner --version "$version" --platform darwin-arm64 --source-revision "$revision")
 if [[ "$mode" == "--production" ]]; then arguments+=(--signing-key "$LOOMEX_MANIFEST_SIGNING_KEY"); else arguments+=(--unsigned-development); fi
 python3 "$build_root/scripts/artifact.py" "${arguments[@]}"

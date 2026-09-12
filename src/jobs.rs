@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    future::Future,
     io::Read,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
@@ -20,7 +21,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::time::Instant as TokioInstant;
 use url::Url;
 use uuid::Uuid;
@@ -366,7 +367,7 @@ async fn session(daemon: Arc<Daemon>, org: String) -> Result<()> {
 }
 
 fn runner_manifest() -> Value {
-    json!({"version":env!("CARGO_PKG_VERSION"),"executionPolicies":["host_user/v1"],"jobKinds":["shell.exec","command.run","http.request"],"capabilities":{"shell.exec":true,"command.run":true,"http.request":true},"concurrency":null,"executionSeconds":null,"outputBytes":null,"artifactBytes":null})
+    json!({"version":env!("CARGO_PKG_VERSION"),"executionPolicies":["host_user/v1"],"jobKinds":["shell.exec","command.run","http.request"],"capabilities":{"shell.exec":true,"command.run":true,"http.request":true},"httpResultContracts":[HTTP_RESULT_SCHEMA],"concurrency":null,"executionSeconds":null,"outputBytes":null,"artifactBytes":null})
 }
 async fn apply_cancellations(daemon: &Daemon, response: &Value) {
     if let Some(jobs) = response["cancellations"].as_array() {
@@ -391,6 +392,9 @@ async fn work(
     let shared = Arc::new(Mutex::new(journal));
     let result = execute_job(daemon.clone(), &path, shared.clone(), cancel, scope).await;
     if let Err(error) = result {
+        let typed_http_failure = error
+            .downcast_ref::<HttpFailure>()
+            .map(|failure| (failure.code, failure.stage, failure.dispatched));
         let mut j = shared.lock().map_err(|_| anyhow::anyhow!("journal lock"))?;
         if j.error.is_none()
             && (j.result.is_none() || error.downcast_ref::<crate::api::ApiError>().is_none())
@@ -406,7 +410,25 @@ async fn work(
                 "EXECUTION_INDETERMINATE".into()
             };
             j.error = Some(
-                json!({"code":code,"message":"Local execution could not be confirmed","indeterminate":j.identity.is_some() || code == "HTTP_REQUEST_INDETERMINATE"}),
+                if let Some((code, stage, dispatched)) = typed_http_failure {
+                    json!({
+                        "code": code,
+                        "message": "HTTP request did not reach a confirmed terminal response",
+                        "indeterminate": dispatched,
+                        "stage": stage,
+                        "dispatchState": if dispatched { "indeterminate" } else { "known_not_dispatched" },
+                    })
+                } else if j.job["kind"] == "http.request" {
+                    json!({
+                        "code": code,
+                        "message": "HTTP request was rejected before dispatch",
+                        "indeterminate": false,
+                        "stage": "validate",
+                        "dispatchState": "known_not_dispatched",
+                    })
+                } else {
+                    json!({"code":code,"message":"Local execution could not be confirmed","indeterminate":j.identity.is_some() || code == "HTTP_REQUEST_INDETERMINATE"})
+                },
             );
             j.phase = "terminal_pending".into();
             state::write_json(&path, &*j)?;
@@ -415,6 +437,14 @@ async fn work(
     deliver(daemon, &path, shared).await
 }
 async fn require_execution_authorization(daemon: &Daemon, journal: &Journal) -> Result<PathBuf> {
+    require_execution_authorization_with(daemon, journal, provider_snapshot).await
+}
+
+async fn require_execution_authorization_with(
+    daemon: &Daemon,
+    journal: &Journal,
+    snapshot: impl FnOnce() -> Result<Value>,
+) -> Result<PathBuf> {
     let payload = &journal.job["payload"];
     let preparation = payload["preparationId"]
         .as_str()
@@ -445,7 +475,7 @@ async fn require_execution_authorization(daemon: &Daemon, journal: &Journal) -> 
     {
         bail!("LOCAL_EXECUTION_AUTHORIZATION_REQUIRED")
     }
-    if record["providers"] != provider_snapshot()? {
+    if record["providers"] != snapshot()? {
         bail!("PROVIDER_CONFIGURATION_CHANGED")
     }
     daemon
@@ -477,7 +507,36 @@ fn verify_payload_digest(job: &Value) -> Result<()> {
 }
 
 const HTTP_REQUEST_SCHEMA: &str = "loomex.http-request/v1";
-const MAX_HTTP_RESPONSE_BYTES: usize = 1_048_576;
+/// The terminal result is carried in a runner-control frame. Keep a margin
+/// below the 1 MiB transport limit and make the inline-versus-artifact choice
+/// from the serialized result, rather than an untrusted Content-Length.
+const MAX_INLINE_HTTP_RESULT_BYTES: usize = 256 * 1024;
+const HTTP_RESULT_SCHEMA: &str = "loomex.http-result/v1";
+const HTTP_BODY_REF_SCHEMA: &str = "loomex.http-response-artifact/v1";
+
+#[derive(Debug)]
+struct HttpFailure {
+    code: &'static str,
+    stage: &'static str,
+    dispatched: bool,
+}
+
+impl std::fmt::Display for HttpFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.code)
+    }
+}
+
+impl std::error::Error for HttpFailure {}
+
+fn http_failure(code: &'static str, stage: &'static str, dispatched: bool) -> anyhow::Error {
+    HttpFailure {
+        code,
+        stage,
+        dispatched,
+    }
+    .into()
+}
 
 #[derive(Debug)]
 enum HttpBody {
@@ -504,50 +563,156 @@ fn validate_job_kind(kind: &str) -> Result<()> {
     }
 }
 
+const PROVIDER_ADAPTER_SCHEMA: &str = "loomex.provider-adapter/v1";
+const CODEX_OUTPUT_TRANSPORTS: &[&str] = &["codex.native-json/v2", "codex.json-tree/v2"];
+
+/// The runner admits only the exact, prepared host-provider identities.  The
+/// command arguments themselves remain backend-owned bound data; this checks
+/// the provider adapter and output transport that select their local meaning.
+fn canonical_provider_adapter(provider: &str) -> Option<Value> {
+    Some(match provider {
+        "codex" => json!({
+            "schemaVersion": PROVIDER_ADAPTER_SCHEMA,
+            "provider": "codex",
+            "adapter": "codex",
+            "executable": "codex",
+        }),
+        "claude" => json!({
+            "schemaVersion": PROVIDER_ADAPTER_SCHEMA,
+            "provider": "claude",
+            "adapter": "claude",
+            "executable": "claude",
+            "outputTransport": "claude.stream-json/v1",
+        }),
+        // Historic Gemini records remain bound to the official Gemini CLI.
+        // Antigravity is a separate provider bound to the agy executable.
+        "gemini" => json!({
+            "schemaVersion": PROVIDER_ADAPTER_SCHEMA,
+            "provider": "gemini",
+            "adapter": "gemini",
+            "executable": "gemini",
+            "outputTransport": "gemini.stream-json/v1",
+        }),
+        "antigravity" => json!({
+            "schemaVersion": PROVIDER_ADAPTER_SCHEMA,
+            "provider": "antigravity",
+            "adapter": "antigravity",
+            "executable": "agy",
+            "outputTransport": "antigravity.json/v1",
+        }),
+        _ => return None,
+    })
+}
+
 fn validate_provider_adapter(payload: &Value, argv: &[String]) -> Result<()> {
-    let Some(adapter) = payload.get("providerAdapter") else {
-        return Ok(());
-    };
-    if adapter["schemaVersion"] != "loomex.provider-adapter/v1"
-        || adapter["provider"] != payload["provider"]
-        || adapter["adapter"] != payload["provider"]
-        || adapter["executable"].as_str().is_none()
-        || argv
-            .first()
-            .is_none_or(|arg| arg != adapter["executable"].as_str().unwrap())
-    {
+    let provider = payload["provider"]
+        .as_str()
+        .context("PROVIDER_ADAPTER_INVALID")?;
+    let expected = canonical_provider_adapter(provider).context("PROVIDER_ADAPTER_INVALID")?;
+    let adapter = payload
+        .get("providerAdapter")
+        .context("PROVIDER_ADAPTER_INVALID")?;
+    let executable = expected["executable"].as_str().unwrap();
+    if adapter != &expected || argv.first().is_none_or(|arg| arg != executable) {
         bail!("PROVIDER_ADAPTER_INVALID")
     }
-    let provider = payload["provider"].as_str().unwrap_or_default();
-    let executable = adapter["executable"].as_str().unwrap();
-    let transport = adapter["outputTransport"].as_str();
-    match provider {
-        "codex" if executable == "codex" && transport.is_none() => Ok(()),
-        "claude"
-            if executable == "claude"
-                && matches!(transport, None | Some("claude.stream-json/v1")) =>
-        {
-            Ok(())
-        }
-        "gemini"
-            if executable == "gemini"
-                && matches!(transport, None | Some("gemini.stream-json/v1")) =>
-        {
-            Ok(())
-        }
-        "antigravity"
-            if executable == "agy" && matches!(transport, None | Some("antigravity.json/v1")) =>
-        {
-            Ok(())
-        }
-        _ => bail!("PROVIDER_ADAPTER_INVALID"),
+    let transport = payload["providerOutputTransport"]
+        .as_str()
+        .context("PROVIDER_ADAPTER_INVALID")?;
+    let valid_transport = match provider {
+        "codex" => CODEX_OUTPUT_TRANSPORTS.contains(&transport),
+        "claude" => transport == "claude.stream-json/v1",
+        "gemini" => transport == "gemini.stream-json/v1",
+        "antigravity" => transport == "antigravity.json/v1",
+        _ => false,
+    };
+    if !valid_transport {
+        bail!("PROVIDER_ADAPTER_INVALID")
     }
+    Ok(())
+}
+
+fn provider_contract_fields(payload: &Value) -> bool {
+    [
+        "providerAdapter",
+        "providerInput",
+        "providerInputDigest",
+        "providerOutputTransport",
+        "providerOutputSchema",
+        "providerOutputSchemaDigest",
+    ]
+    .iter()
+    .any(|field| payload.get(*field).is_some())
+}
+
+fn validate_provider_input(payload: &Value, argv: &[String]) -> Result<()> {
+    let provider = payload["provider"]
+        .as_str()
+        .context("PROVIDER_ADAPTER_INVALID")?;
+    let input = payload["providerInput"]
+        .as_str()
+        .context("PROVIDER_INPUT_MISSING")?;
+    if payload["providerInputDigest"] != state::digest(input.as_bytes()) {
+        bail!("PROVIDER_INPUT_DIGEST_MISMATCH")
+    }
+    let exact = match provider {
+        "codex" => argv.last().is_some_and(|arg| arg == input),
+        "claude" | "gemini" | "antigravity" => argv
+            .windows(2)
+            .any(|args| args[0] == "-p" && args[1] == input),
+        _ => false,
+    };
+    if !exact {
+        bail!("PROVIDER_INPUT_ARGV_MISMATCH")
+    }
+    validate_provider_adapter(payload, argv)
+}
+
+fn materialize_provider_output_schema(
+    payload: &Value,
+    argv: &mut [String],
+    output_dir: &Path,
+) -> Result<()> {
+    let has_schema = payload.get("providerOutputSchema").is_some()
+        || payload.get("providerOutputSchemaDigest").is_some()
+        || argv.iter().any(|arg| arg == "{loomex:provider-schema}");
+    if payload["provider"] != "codex" {
+        if has_schema {
+            bail!("PROVIDER_SCHEMA_INVALID")
+        }
+        return Ok(());
+    }
+    let schema = payload
+        .get("providerOutputSchema")
+        .filter(|schema| schema.is_object())
+        .context("PROVIDER_SCHEMA_INVALID")?;
+    if payload["providerOutputSchemaDigest"] != state::json_digest(schema) {
+        bail!("PROVIDER_SCHEMA_INVALID")
+    }
+    let mut placeholders = argv
+        .iter_mut()
+        .filter(|arg| arg.as_str() == "{loomex:provider-schema}");
+    let Some(placeholder) = placeholders.next() else {
+        bail!("PROVIDER_SCHEMA_INVALID")
+    };
+    if placeholders.next().is_some() {
+        bail!("PROVIDER_SCHEMA_INVALID")
+    }
+    let schema_path = output_dir.join("provider-schema.json");
+    state::write_json(&schema_path, schema)?;
+    *placeholder = schema_path.to_string_lossy().into_owned();
+    Ok(())
 }
 
 fn http_request(payload: &Value) -> Result<HttpRequest> {
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
     if payload["schemaVersion"] != HTTP_REQUEST_SCHEMA {
         bail!("HTTP_REQUEST_SCHEMA_UNSUPPORTED")
+    }
+    if payload["resultContract"]
+        != json!({"schemaVersion":HTTP_RESULT_SCHEMA,"artifactRefSchemaVersion":HTTP_BODY_REF_SCHEMA})
+    {
+        bail!("HTTP_RESULT_SCHEMA_UNSUPPORTED")
     }
     let method = payload["method"]
         .as_str()
@@ -644,21 +809,25 @@ async fn resolve_private_http_addresses(
     cancel: Arc<AtomicBool>,
     deadline: TokioInstant,
 ) -> Result<Vec<SocketAddr>> {
-    let host = request.url.host_str().context("HTTP_REQUEST_INVALID")?;
+    let host = request
+        .url
+        .host_str()
+        .context("HTTP_REQUEST_INVALID")?
+        .to_owned();
     let port = request
         .url
         .port_or_known_default()
         .context("HTTP_REQUEST_INVALID")?;
-    let resolved: Vec<SocketAddr> = tokio::select! {
-        // A cancellation observed before send is known not to have reached the
-        // target, so it is a cancellation rather than an indeterminate request.
-        biased;
-        _ = wait_for_cancellation(cancel) => bail!("JOB_CANCELED"),
-        _ = tokio::time::sleep_until(deadline) => bail!("HTTP_REQUEST_INDETERMINATE"),
-        result = tokio::net::lookup_host((host, port)) => result
-            .map_err(|_| anyhow::anyhow!("HTTP_REQUEST_URL_DENIED"))?
-            .collect(),
-    };
+    resolve_private_http_addresses_with(cancel, deadline, async move {
+        tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .map_err(|_| anyhow::anyhow!("HTTP_REQUEST_URL_DENIED"))
+            .map(|addresses| addresses.collect())
+    })
+    .await
+}
+
+fn validate_private_http_addresses(resolved: Vec<SocketAddr>) -> Result<Vec<SocketAddr>> {
     if resolved.is_empty()
         || resolved
             .iter()
@@ -669,6 +838,30 @@ async fn resolve_private_http_addresses(
     Ok(resolved)
 }
 
+// Keeping resolution as an injected future makes the phase boundary explicit:
+// cancellation and the absolute deadline can settle before any request future
+// is created or polled. The production caller supplies Tokio DNS resolution.
+async fn resolve_private_http_addresses_with<F>(
+    cancel: Arc<AtomicBool>,
+    deadline: TokioInstant,
+    resolver: F,
+) -> Result<Vec<SocketAddr>>
+where
+    F: Future<Output = Result<Vec<SocketAddr>>>,
+{
+    let resolved: Vec<SocketAddr> = tokio::select! {
+        // A cancellation observed before send is known not to have reached the
+        // target, so it is a cancellation rather than an indeterminate request.
+        biased;
+        _ = wait_for_cancellation(cancel) => bail!("JOB_CANCELED"),
+        // Nothing capable of writing to the target has been constructed or
+        // polled while resolving. A deadline here is a known non-dispatch.
+        _ = tokio::time::sleep_until(deadline) => return Err(http_failure("HTTP_REQUEST_TIMEOUT", "resolve", false)),
+        result = resolver => result?,
+    };
+    validate_private_http_addresses(resolved)
+}
+
 fn private_http_client(
     request: &HttpRequest,
     resolved: Vec<SocketAddr>,
@@ -676,12 +869,15 @@ fn private_http_client(
 ) -> Result<Client> {
     let remaining = deadline.saturating_duration_since(TokioInstant::now());
     if remaining.is_zero() {
-        bail!("HTTP_REQUEST_INDETERMINATE")
+        return Err(http_failure("HTTP_REQUEST_TIMEOUT", "prepare", false));
     }
     let host = request.url.host_str().context("HTTP_REQUEST_INVALID")?;
     let mut client = Client::builder()
         .redirect(Policy::none())
         .no_proxy()
+        // A send may have reached the target even when its result is an
+        // error, so the runner must never let the HTTP client replay it.
+        .retry(reqwest::retry::never())
         // The client timeout is only a backstop; the same absolute deadline is
         // also selected below while sending and reading the response.
         .timeout(remaining);
@@ -697,6 +893,44 @@ async fn wait_for_cancellation(cancel: Arc<AtomicBool>) {
     while !cancel.load(Ordering::SeqCst) {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+fn inline_http_content_type(content_type: &str) -> bool {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    media_type.starts_with("text/")
+        || media_type.contains("json")
+        || media_type.ends_with("+json")
+        || matches!(
+            media_type.as_str(),
+            "application/xml"
+                | "text/xml"
+                | "application/javascript"
+                | "application/x-www-form-urlencoded"
+        )
+        // Historic responses without a Content-Type remain inline when they
+        // are valid UTF-8 and fit. Invalid UTF-8 is always retained as bytes.
+        || media_type.is_empty()
+}
+
+fn http_body_value(bytes: Vec<u8>, content_type: &str) -> Option<Value> {
+    if !inline_http_content_type(content_type) {
+        return None;
+    }
+    let text = String::from_utf8(bytes).ok()?;
+    Some(
+        if content_type.to_ascii_lowercase().contains("json")
+            || text.trim_start().starts_with(['{', '['])
+        {
+            serde_json::from_str(&text).unwrap_or_else(|_| json!(text))
+        } else {
+            json!(text)
+        },
+    )
 }
 
 fn sensitive_http_header(name: &str) -> bool {
@@ -719,9 +953,18 @@ fn sensitive_http_header(name: &str) -> bool {
 
 fn safe_http_headers(headers: &reqwest::header::HeaderMap) -> Value {
     let mut safe = serde_json::Map::new();
+    let mut size = 0usize;
     for (name, value) in headers.iter().take(100) {
         if !sensitive_http_header(name.as_str()) {
             if let Ok(value) = value.to_str() {
+                let entry_size = name.as_str().len().saturating_add(value.len());
+                // Header values are remote-controlled too. Preserve a useful
+                // bounded projection so a large header cannot force an
+                // otherwise artifact-backed terminal result over its frame.
+                if entry_size > 4096 || size.saturating_add(entry_size) > 16 * 1024 {
+                    continue;
+                }
+                size = size.saturating_add(entry_size);
                 safe.insert(name.as_str().to_owned(), json!(value));
             }
         }
@@ -729,19 +972,36 @@ fn safe_http_headers(headers: &reqwest::header::HeaderMap) -> Value {
     Value::Object(safe)
 }
 
-async fn execute_http_request(payload: &Value, cancel: Arc<AtomicBool>) -> Result<Value> {
-    let request = http_request(payload)?;
+async fn execute_http_request(
+    payload: &Value,
+    cancel: Arc<AtomicBool>,
+    body_path: &Path,
+) -> Result<Value> {
+    let request = http_request(payload)
+        .map_err(|_| http_failure("HTTP_REQUEST_INVALID", "validate", false))?;
     if cancel.load(Ordering::SeqCst) {
-        bail!("JOB_CANCELED")
+        return Err(http_failure("JOB_CANCELED", "prepare", false));
     }
     let deadline = TokioInstant::now() + request.timeout;
-    let resolved = resolve_private_http_addresses(&request, cancel.clone(), deadline).await?;
+    let resolved = resolve_private_http_addresses(&request, cancel.clone(), deadline)
+        .await
+        .map_err(|error| match error.to_string().as_str() {
+            "JOB_CANCELED" => http_failure("JOB_CANCELED", "resolve", false),
+            "HTTP_REQUEST_URL_DENIED" => http_failure("HTTP_REQUEST_URL_DENIED", "resolve", false),
+            _ => error,
+        })?;
     // Resolution establishes the pin set, but cancellation may arrive while it
     // is in progress.  Check again before constructing a sendable request.
     if cancel.load(Ordering::SeqCst) {
-        bail!("JOB_CANCELED")
+        return Err(http_failure("JOB_CANCELED", "prepare", false));
     }
-    let client = private_http_client(&request, resolved, deadline)?;
+    let client = private_http_client(&request, resolved, deadline).map_err(|error| {
+        if error.downcast_ref::<HttpFailure>().is_some() {
+            error
+        } else {
+            http_failure("HTTP_REQUEST_INVALID", "prepare", false)
+        }
+    })?;
     let mut outbound = client
         .request(request.method, request.url)
         .headers(request.headers);
@@ -755,14 +1015,22 @@ async fn execute_http_request(payload: &Value, cancel: Arc<AtomicBool>) -> Resul
     // before dispatch.  Once it has been polled, cancellation remains
     // indeterminate because the target may have received the request.
     if cancel.load(Ordering::SeqCst) {
-        bail!("JOB_CANCELED")
+        return Err(http_failure("JOB_CANCELED", "prepare", false));
     }
     let started = Instant::now();
+    let dispatched = Arc::new(AtomicBool::new(false));
+    let send_dispatched = dispatched.clone();
     let mut response = tokio::select! {
         biased;
-        _ = wait_for_cancellation(cancel.clone()) => bail!("HTTP_REQUEST_INDETERMINATE"),
-        _ = tokio::time::sleep_until(deadline) => bail!("HTTP_REQUEST_INDETERMINATE"),
-        response = outbound.send() => response.map_err(|_| anyhow::anyhow!("HTTP_REQUEST_INDETERMINATE"))?,
+        _ = wait_for_cancellation(cancel.clone()) => return Err(if dispatched.load(Ordering::SeqCst) { http_failure("HTTP_REQUEST_INDETERMINATE", "send", true) } else { http_failure("JOB_CANCELED", "prepare", false) }),
+        _ = tokio::time::sleep_until(deadline) => return Err(if dispatched.load(Ordering::SeqCst) { http_failure("HTTP_REQUEST_INDETERMINATE", "send", true) } else { http_failure("HTTP_REQUEST_TIMEOUT", "prepare", false) }),
+        // Setting this flag is the first operation performed when this future
+        // is polled. From that precise point a target might have received the
+        // request, including when reqwest returns an error.
+        response = async move {
+            send_dispatched.store(true, Ordering::SeqCst);
+            outbound.send().await
+        } => response.map_err(|_| http_failure("HTTP_REQUEST_INDETERMINATE", "send", true))?,
     };
     let status = response.status().as_u16();
     let headers = safe_http_headers(response.headers());
@@ -771,30 +1039,69 @@ async fn execute_http_request(payload: &Value, cancel: Arc<AtomicBool>) -> Resul
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
-        .to_ascii_lowercase();
-    let mut bytes = Vec::new();
+        .to_owned();
+    let output = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(body_path)
+        .map_err(|_| http_failure("HTTP_REQUEST_INDETERMINATE", "response", true))?;
+    let mut output = tokio::fs::File::from_std(output);
+    let mut body_size = 0u64;
     loop {
         let chunk = tokio::select! {
             biased;
-            _ = wait_for_cancellation(cancel.clone()) => bail!("HTTP_REQUEST_INDETERMINATE"),
-            _ = tokio::time::sleep_until(deadline) => bail!("HTTP_REQUEST_INDETERMINATE"),
-            chunk = response.chunk() => chunk.map_err(|_| anyhow::anyhow!("HTTP_REQUEST_INDETERMINATE"))?,
+            _ = wait_for_cancellation(cancel.clone()) => return Err(http_failure("HTTP_REQUEST_INDETERMINATE", "response", dispatched.load(Ordering::SeqCst))),
+            _ = tokio::time::sleep_until(deadline) => return Err(http_failure("HTTP_REQUEST_INDETERMINATE", "response", dispatched.load(Ordering::SeqCst))),
+            chunk = response.chunk() => chunk.map_err(|_| http_failure("HTTP_REQUEST_INDETERMINATE", "response", dispatched.load(Ordering::SeqCst)))?,
         };
         let Some(chunk) = chunk else { break };
-        if bytes.len().saturating_add(chunk.len()) > MAX_HTTP_RESPONSE_BYTES {
-            bail!("HTTP_RESPONSE_TOO_LARGE")
-        }
-        bytes.extend_from_slice(&chunk);
+        output
+            .write_all(&chunk)
+            .await
+            .map_err(|_| http_failure("HTTP_REQUEST_INDETERMINATE", "response", true))?;
+        body_size = body_size.saturating_add(chunk.len() as u64);
     }
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-    let body = if content_type.contains("json") || text.trim_start().starts_with(['{', '[']) {
-        serde_json::from_str(&text).unwrap_or_else(|_| json!(text))
-    } else {
-        json!(text)
-    };
-    Ok(
-        json!({"statusCode":status,"headers":headers,"body":body,"durationMs":started.elapsed().as_millis() as u64}),
-    )
+    output
+        .sync_all()
+        .await
+        .map_err(|_| http_failure("HTTP_REQUEST_INDETERMINATE", "response", true))?;
+    drop(output);
+
+    if body_size <= MAX_INLINE_HTTP_RESULT_BYTES as u64 {
+        let bytes = tokio::fs::read(body_path)
+            .await
+            .map_err(|_| http_failure("HTTP_REQUEST_INDETERMINATE", "response", true))?;
+        if let Some(body) = http_body_value(bytes, &content_type) {
+            let result = json!({
+                "schemaVersion": HTTP_RESULT_SCHEMA,
+                "statusCode": status,
+                "headers": headers,
+                "bodyStorage": "inline",
+                "body": body,
+                "durationMs": started.elapsed().as_millis() as u64,
+            });
+            if serde_json::to_vec(&result)
+                .map_err(|_| http_failure("HTTP_REQUEST_INDETERMINATE", "response", true))?
+                .len()
+                < MAX_INLINE_HTTP_RESULT_BYTES
+            {
+                tokio::fs::remove_file(body_path)
+                    .await
+                    .map_err(|_| http_failure("HTTP_REQUEST_INDETERMINATE", "response", true))?;
+                return Ok(result);
+            }
+        }
+    }
+    Ok(json!({
+        "schemaVersion": HTTP_RESULT_SCHEMA,
+        "statusCode": status,
+        "headers": headers,
+        "bodyPath": body_path,
+        "bodyContentType": content_type,
+        "bodySizeBytes": body_size,
+        "durationMs": started.elapsed().as_millis() as u64,
+    }))
 }
 
 async fn execute_job(
@@ -836,24 +1143,12 @@ async fn execute_job(
     if argv.is_empty() {
         bail!("INVALID_COMMAND")
     };
-    if !is_http && let Some(provider) = payload["provider"].as_str() {
-        let input = payload["providerInput"]
-            .as_str()
-            .context("PROVIDER_INPUT_MISSING")?;
-        if payload["providerInputDigest"] != state::digest(input.as_bytes()) {
-            bail!("PROVIDER_INPUT_DIGEST_MISMATCH")
+    if !is_http {
+        if payload.get("provider").is_some() {
+            validate_provider_input(payload, &argv)?;
+        } else if provider_contract_fields(payload) {
+            bail!("PROVIDER_ADAPTER_INVALID")
         }
-        let exact = match provider {
-            "codex" => argv.last().is_some_and(|arg| arg == input),
-            "claude" | "gemini" | "antigravity" => argv
-                .windows(2)
-                .any(|args| args[0] == "-p" && args[1] == input),
-            _ => false,
-        };
-        if !exact {
-            bail!("PROVIDER_INPUT_ARGV_MISMATCH")
-        }
-        validate_provider_adapter(payload, &argv)?;
     }
 
     argv[0] = find_executable(&argv[0])
@@ -861,24 +1156,8 @@ async fn execute_job(
         .to_string_lossy()
         .into_owned();
     let output_dir = path.parent().context("journal parent")?.to_path_buf();
-    if !is_http && let Some(schema) = payload.get("providerOutputSchema") {
-        if !schema.is_object()
-            || payload["providerOutputSchemaDigest"] != state::json_digest(schema)
-        {
-            bail!("PROVIDER_SCHEMA_INVALID")
-        }
-        let schema_path = output_dir.join("provider-schema.json");
-        state::write_json(&schema_path, schema)?;
-        let mut replaced = 0;
-        for arg in &mut argv {
-            if arg == "{loomex:provider-schema}" {
-                *arg = schema_path.to_string_lossy().into_owned();
-                replaced += 1
-            }
-        }
-        if payload["provider"] == "codex" && replaced != 1 {
-            bail!("PROVIDER_SCHEMA_INVALID")
-        }
+    if !is_http && payload.get("provider").is_some() {
+        materialize_provider_output_schema(payload, &mut argv, &output_dir)?;
     }
     let requested_env: BTreeMap<String, String> = match payload["env"].as_object() {
         Some(map) => map
@@ -1010,7 +1289,8 @@ async fn execute_job(
             record.phase = "running".into();
             state::write_json(path, &*record)?;
         }
-        let result = execute_http_request(payload, cancel.clone()).await?;
+        let response_path = output_dir.join("http-response-body");
+        let result = execute_http_request(payload, cancel.clone(), &response_path).await?;
         {
             let mut record = journal.lock().unwrap();
             record.phase = "exited".into();
@@ -1171,7 +1451,46 @@ async fn materialize_terminal(
         return Ok(());
     }
     if j.job["kind"] == "http.request" {
+        if let Some(local) = result.get("bodyPath").and_then(Value::as_str) {
+            let path = PathBuf::from(local);
+            let name = format!(
+                "{}-http-response.bin",
+                j.job["id"].as_str().context("BACKEND_PROTOCOL_ERROR")?
+            );
+            let content_type = result["bodyContentType"]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("application/octet-stream");
+            // The local path remains in the durable journal until the
+            // transfer's complete endpoint returns its artifact id. If this
+            // process stops mid-upload, `upload` resumes from the backend's
+            // offset using its stable job/body idempotency key.
+            let artifact =
+                upload(daemon, &j, &path, &name, content_type, "http-response-body").await?;
+            result
+                .as_object_mut()
+                .context("BACKEND_PROTOCOL_ERROR")?
+                .remove("bodyPath");
+            result
+                .as_object_mut()
+                .context("BACKEND_PROTOCOL_ERROR")?
+                .remove("bodyContentType");
+            result
+                .as_object_mut()
+                .context("BACKEND_PROTOCOL_ERROR")?
+                .remove("bodySizeBytes");
+            result["bodyStorage"] = json!("artifact");
+            result["bodyRef"] = json!({
+                "schemaVersion": HTTP_BODY_REF_SCHEMA,
+                "artifactId": artifact["artifactId"],
+                "name": artifact["name"],
+                "sizeBytes": artifact["sizeBytes"],
+                "checksumSha256": artifact["checksumSha256"],
+                "contentType": artifact["contentType"],
+            });
+        }
         let mut locked = journal.lock().unwrap();
+        locked.result = Some(result);
         locked.phase = "terminal_pending".into();
         state::write_json(path, &*locked)?;
         return Ok(());
@@ -1523,6 +1842,17 @@ async fn recover(daemon: Arc<Daemon>, org: &str, session: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn http_result_contract() -> Value {
+        json!({"schemaVersion":HTTP_RESULT_SCHEMA,"artifactRefSchemaVersion":HTTP_BODY_REF_SCHEMA})
+    }
+    async fn execute_test_http_request(payload: &Value, cancel: Arc<AtomicBool>) -> Result<Value> {
+        let temp = tempfile::tempdir()?;
+        let mut payload = payload.clone();
+        if payload.get("resultContract").is_none() {
+            payload["resultContract"] = http_result_contract();
+        }
+        execute_http_request(&payload, cancel, &temp.path().join("response-body")).await
+    }
     fn leased_payload_fixture() -> Value {
         json!({
             "payloadDigest": "cbab9f708061faba6e1a3bdc5be2cdac766e781a6f8b0e09f86cd512f2983a3b",
@@ -1590,7 +1920,8 @@ mod tests {
             "headers": {"content-type": "application/json"},
             "body": {"encoding": "json", "value": {"safe": true}},
             "timeoutSeconds": 10,
-            "expectedStatusCodes": [200]
+            "expectedStatusCodes": [200],
+            "resultContract": http_result_contract()
         });
         assert!(http_request(&payload).is_ok());
         let mut invalid = payload.clone();
@@ -1601,6 +1932,74 @@ mod tests {
         );
         assert!(local_or_private("127.0.0.1".parse().unwrap()));
         assert!(!local_or_private("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn resolved_http_addresses_must_be_nonempty_and_all_private() {
+        let local: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert_eq!(
+            validate_private_http_addresses(vec![local]).unwrap(),
+            vec![local]
+        );
+        assert_eq!(
+            validate_private_http_addresses(vec![])
+                .unwrap_err()
+                .to_string(),
+            "HTTP_REQUEST_URL_DENIED"
+        );
+        // This documentation-range address is only synthetic test data; the
+        // test makes no network request to it.
+        let public: SocketAddr = "203.0.113.1:8080".parse().unwrap();
+        assert_eq!(
+            validate_private_http_addresses(vec![local, public])
+                .unwrap_err()
+                .to_string(),
+            "HTTP_REQUEST_URL_DENIED"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_resolution_cancellation_prevents_dispatch_phase() {
+        let (started, observed_start) = tokio::sync::oneshot::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancellation = cancel.clone();
+        let resolution = tokio::spawn(async move {
+            resolve_private_http_addresses_with(
+                cancellation,
+                TokioInstant::now() + Duration::from_secs(1),
+                async move {
+                    let _ = started.send(());
+                    std::future::pending::<Result<Vec<SocketAddr>>>().await
+                },
+            )
+            .await
+        });
+        observed_start.await.unwrap();
+        cancel.store(true, Ordering::SeqCst);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(250), resolution)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err()
+                .to_string(),
+            "JOB_CANCELED"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_resolution_deadline_is_known_not_dispatched_timeout() {
+        assert_eq!(
+            resolve_private_http_addresses_with(
+                Arc::new(AtomicBool::new(false)),
+                TokioInstant::now() + Duration::from_millis(30),
+                std::future::pending::<Result<Vec<SocketAddr>>>(),
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "HTTP_REQUEST_TIMEOUT"
+        );
     }
 
     #[tokio::test]
@@ -1627,7 +2026,7 @@ mod tests {
             "idempotencyKey": "exact-key",
             "timeoutSeconds": 10
         });
-        let result = execute_http_request(&payload, Arc::new(AtomicBool::new(false)))
+        let result = execute_test_http_request(&payload, Arc::new(AtomicBool::new(false)))
             .await
             .unwrap();
         server.await.unwrap();
@@ -1638,7 +2037,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canceled_http_request_is_not_dispatched() {
+    async fn cancellation_before_http_dispatch_is_not_dispatched() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let payload = json!({
             "schemaVersion": HTTP_REQUEST_SCHEMA,
@@ -1648,7 +2047,7 @@ mod tests {
         });
         let cancel = Arc::new(AtomicBool::new(true));
         assert_eq!(
-            execute_http_request(&payload, cancel)
+            execute_test_http_request(&payload, cancel)
                 .await
                 .unwrap_err()
                 .to_string(),
@@ -1675,7 +2074,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(2)).await;
         });
         assert_eq!(
-            execute_http_request(&payload, Arc::new(AtomicBool::new(false)))
+            execute_test_http_request(&payload, Arc::new(AtomicBool::new(false)))
                 .await
                 .unwrap_err()
                 .to_string(),
@@ -1684,18 +2083,188 @@ mod tests {
         server.abort();
     }
 
-    #[test]
-    fn provider_adapter_binds_antigravity_to_agy_without_rewriting_gemini() {
-        let antigravity = json!({"provider":"antigravity","providerAdapter":{"schemaVersion":"loomex.provider-adapter/v1","provider":"antigravity","adapter":"antigravity","executable":"agy","outputTransport":"antigravity.json/v1"}});
-        validate_provider_adapter(&antigravity, &["agy".into(), "-p".into(), "prompt".into()])
-            .unwrap();
-        let mut mismatch = antigravity.clone();
-        mismatch["provider"] = json!("gemini");
+    #[tokio::test]
+    async fn cancellation_after_http_dispatch_is_indeterminate_without_replay() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (dispatched, observed_dispatch) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let _ = dispatched.send(());
+            // The client drops this stalled response on cancellation. A second
+            // accepted connection would demonstrate an implicit replay.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(125), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let payload = json!({
+            "schemaVersion": HTTP_REQUEST_SCHEMA,
+            "method": "GET",
+            "url": format!("http://{address}/"),
+            "headers": {}, "timeoutSeconds": 10
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let execution_cancel = cancel.clone();
+        let execution =
+            tokio::spawn(
+                async move { execute_test_http_request(&payload, execution_cancel).await },
+            );
+        observed_dispatch.await.unwrap();
+        cancel.store(true, Ordering::SeqCst);
         assert_eq!(
-            validate_provider_adapter(&mismatch, &["agy".into()])
+            tokio::time::timeout(Duration::from_millis(500), execution)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err()
+                .to_string(),
+            "HTTP_REQUEST_INDETERMINATE"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_http_dispatch_is_not_retried_by_transport() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            drop(stream); // Simulate a transport failure after first dispatch.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let payload = json!({
+            "schemaVersion": HTTP_REQUEST_SCHEMA,
+            "method": "GET",
+            "url": format!("http://{address}/"),
+            "headers": {}, "timeoutSeconds": 10
+        });
+        assert_eq!(
+            execute_test_http_request(&payload, Arc::new(AtomicBool::new(false)))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "HTTP_REQUEST_INDETERMINATE"
+        );
+        server.await.unwrap();
+    }
+
+    fn provider_payload(provider: &str, input: &str) -> (Value, Vec<String>) {
+        let adapter = canonical_provider_adapter(provider).unwrap();
+        let executable = adapter["executable"].as_str().unwrap();
+        let transport = if provider == "codex" {
+            "codex.native-json/v2"
+        } else {
+            adapter["outputTransport"].as_str().unwrap()
+        };
+        let argv = if provider == "codex" {
+            vec![
+                executable.into(),
+                "exec".into(),
+                "--output-schema".into(),
+                "{loomex:provider-schema}".into(),
+                input.into(),
+            ]
+        } else {
+            vec![executable.into(), "-p".into(), input.into()]
+        };
+        let mut payload = json!({
+            "provider": provider,
+            "providerAdapter": adapter,
+            "providerOutputTransport": transport,
+            "providerInput": input,
+            "providerInputDigest": state::digest(input.as_bytes()),
+        });
+        if provider == "codex" {
+            let schema = json!({"type":"object","properties":{"answer":{"type":"string"}}});
+            payload["providerOutputSchema"] = schema.clone();
+            payload["providerOutputSchemaDigest"] = json!(state::json_digest(&schema));
+        }
+        (payload, argv)
+    }
+
+    #[test]
+    fn provider_adapters_require_exact_canonical_prepared_contracts() {
+        for provider in ["codex", "claude", "gemini", "antigravity"] {
+            let (payload, argv) = provider_payload(provider, "fixture prompt");
+            validate_provider_input(&payload, &argv).unwrap();
+        }
+
+        let (mut missing, argv) = provider_payload("claude", "fixture prompt");
+        missing.as_object_mut().unwrap().remove("providerAdapter");
+        assert_eq!(
+            validate_provider_input(&missing, &argv)
                 .unwrap_err()
                 .to_string(),
             "PROVIDER_ADAPTER_INVALID"
+        );
+
+        let (mut extended, argv) = provider_payload("claude", "fixture prompt");
+        extended["providerAdapter"]["unreviewed"] = json!(true);
+        assert_eq!(
+            validate_provider_input(&extended, &argv)
+                .unwrap_err()
+                .to_string(),
+            "PROVIDER_ADAPTER_INVALID"
+        );
+
+        let (mut mismatch, argv) = provider_payload("antigravity", "fixture prompt");
+        mismatch["provider"] = json!("gemini");
+        assert_eq!(
+            validate_provider_input(&mismatch, &argv)
+                .unwrap_err()
+                .to_string(),
+            "PROVIDER_ADAPTER_INVALID"
+        );
+
+        let (mut transport, argv) = provider_payload("gemini", "fixture prompt");
+        transport["providerOutputTransport"] = json!("antigravity.json/v1");
+        assert_eq!(
+            validate_provider_input(&transport, &argv)
+                .unwrap_err()
+                .to_string(),
+            "PROVIDER_ADAPTER_INVALID"
+        );
+    }
+
+    #[test]
+    fn codex_schema_materialization_is_bound_and_provider_specific() {
+        let temp = tempfile::tempdir().unwrap();
+        let (payload, mut argv) = provider_payload("codex", "fixture prompt");
+        materialize_provider_output_schema(&payload, &mut argv, temp.path()).unwrap();
+        let written: Value = state::read_json(&temp.path().join("provider-schema.json")).unwrap();
+        assert_eq!(written, payload["providerOutputSchema"]);
+        assert_ne!(argv[3], "{loomex:provider-schema}");
+
+        let (payload, mut argv) = provider_payload("codex", "fixture prompt");
+        argv.push("{loomex:provider-schema}".into());
+        assert_eq!(
+            materialize_provider_output_schema(&payload, &mut argv, temp.path())
+                .unwrap_err()
+                .to_string(),
+            "PROVIDER_SCHEMA_INVALID"
+        );
+
+        let (mut payload, mut argv) = provider_payload("claude", "fixture prompt");
+        payload["providerOutputSchema"] = json!({"type":"object"});
+        payload["providerOutputSchemaDigest"] =
+            json!(state::json_digest(&payload["providerOutputSchema"]));
+        assert_eq!(
+            materialize_provider_output_schema(&payload, &mut argv, temp.path())
+                .unwrap_err()
+                .to_string(),
+            "PROVIDER_SCHEMA_INVALID"
         );
     }
 
@@ -1934,6 +2503,75 @@ mod protocol_tests {
         assert!(retry.await.unwrap());
         assert!(snapshot(&recovered).unwrap().progress_pending.is_none());
     }
+
+    #[tokio::test]
+    async fn canonical_provider_completion_progress_is_delivered_from_fixture_output() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = daemon(
+            &temp.path().join("state"),
+            format!("http://{}", listener.local_addr().unwrap()),
+        );
+        let fixtures = [
+            (
+                "codex",
+                r#"{"type":"turn.completed"}"#,
+                "activity.completed",
+            ),
+            (
+                "claude",
+                r#"{"type":"result","is_error":false}"#,
+                "activity.completed",
+            ),
+            (
+                "gemini",
+                r#"{"type":"result","status":"success"}"#,
+                "activity.completed",
+            ),
+            (
+                "antigravity",
+                r#"{"conversation_id":"fixture","structured_output":{}}"#,
+                "activity.completed",
+            ),
+        ];
+        for (provider, output, expected_kind) in fixtures {
+            let mut record = journal();
+            record.job["payload"]["provider"] = json!(provider);
+            record.job["createdByNodeExecutionId"] = json!("33333333-3333-4333-8333-333333333333");
+            let shared = Arc::new(Mutex::new(record));
+            let path = daemon
+                .dir
+                .join("jobs")
+                .join(format!("provider-{provider}"))
+                .join("journal.json");
+            state::write_json(&path, &snapshot(&shared).unwrap()).unwrap();
+            std::fs::write(path.parent().unwrap().join("stdout"), format!("{output}\n")).unwrap();
+            let task_daemon = daemon.clone();
+            let task_path = path.clone();
+            let task_journal = shared.clone();
+            let task = tokio::spawn(async move {
+                stream_events(&task_daemon, &task_path, &task_journal)
+                    .await
+                    .unwrap()
+            });
+            let (stream, body) = receive(&listener).await;
+            assert_eq!(body["events"].as_array().unwrap().len(), 2, "{provider}");
+            assert_eq!(
+                body["events"][1]["eventType"], "ai.progress.v1",
+                "{provider}"
+            );
+            assert_eq!(
+                body["events"][1]["payload"]["kind"], expected_kind,
+                "{provider}"
+            );
+            assert_eq!(
+                body["events"][1]["payload"]["provenance"], "provider_reported",
+                "{provider}"
+            );
+            reply(stream, json!({})).await;
+            assert!(task.await.unwrap(), "{provider}");
+        }
+    }
     #[tokio::test]
     async fn helper_scope_joins_writers_before_panic_terminal_is_recorded() {
         let t = tempfile::tempdir().unwrap();
@@ -2058,6 +2696,106 @@ mod protocol_tests {
         assert_eq!(result["sizeBytes"], data.len());
         assert_eq!(result["checksumSha256"], state::digest(&data));
     }
+
+    #[tokio::test]
+    async fn large_binary_http_response_is_finalized_as_a_versioned_artifact_reference() {
+        let artifact_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let response_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let response_address = response_listener.local_addr().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = daemon(
+            &temp.path().join("state"),
+            format!("http://{}", artifact_listener.local_addr().unwrap()),
+        );
+        let response_body = vec![0xff; MAX_INLINE_HTTP_RESULT_BYTES + 1];
+        let expected_upload = response_body.clone();
+        let expected_checksum = state::digest(&expected_upload);
+        let response_server = tokio::spawn(async move {
+            let (mut stream, _) = response_listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        response_body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(&response_body).await.unwrap();
+        });
+        let artifact_server = tokio::spawn(async move {
+            let (stream, start) = receive(&artifact_listener).await;
+            assert_eq!(start["sizeBytes"], expected_upload.len());
+            assert_eq!(start["checksumSha256"], state::digest(&expected_upload));
+            reply(stream, json!({"transferId":"http-body","offset":0})).await;
+            let mut offset = 0usize;
+            while offset < expected_upload.len() {
+                let (stream, chunk) = receive(&artifact_listener).await;
+                assert_eq!(chunk["offset"], offset);
+                let bytes = STANDARD
+                    .decode(chunk["dataBase64"].as_str().unwrap())
+                    .unwrap();
+                assert_eq!(bytes, expected_upload[offset..offset + bytes.len()]);
+                offset += bytes.len();
+                reply(stream, json!({"offset":offset})).await;
+            }
+            let (stream, complete) = receive(&artifact_listener).await;
+            assert_eq!(complete, json!({}));
+            reply(
+                stream,
+                json!({"artifactId":"44444444-4444-4444-8444-444444444444"}),
+            )
+            .await;
+        });
+        let payload = json!({
+            "schemaVersion": HTTP_REQUEST_SCHEMA,
+            "resultContract": {"schemaVersion":HTTP_RESULT_SCHEMA,"artifactRefSchemaVersion":HTTP_BODY_REF_SCHEMA},
+            "method": "GET",
+            "url": format!("http://{response_address}/"),
+            "headers": {},
+            "timeoutSeconds": 10,
+        });
+        let journal_path = daemon.dir.join("jobs/http-response/journal.json");
+        let body_path = journal_path.parent().unwrap().join("http-response-body");
+        state::private_dir(journal_path.parent().unwrap()).unwrap();
+        let result = execute_http_request(&payload, Arc::new(AtomicBool::new(false)), &body_path)
+            .await
+            .unwrap();
+        response_server.await.unwrap();
+        assert!(result.get("body").is_none());
+        assert_eq!(result["bodyPath"], body_path.to_string_lossy().as_ref());
+        assert!(body_path.exists());
+
+        let mut record = journal();
+        record.job["kind"] = json!("http.request");
+        record.phase = "exited".into();
+        record.result = Some(result);
+        state::write_json(&journal_path, &record).unwrap();
+        let journal = Arc::new(Mutex::new(record));
+        materialize_terminal(&daemon, &journal_path, &journal)
+            .await
+            .unwrap();
+        artifact_server.await.unwrap();
+        let finalized = snapshot(&journal).unwrap();
+        let result = finalized.result.unwrap();
+        assert_eq!(finalized.phase, "terminal_pending");
+        assert_eq!(result["bodyStorage"], "artifact");
+        assert!(result.get("bodyPath").is_none());
+        assert_eq!(
+            result["bodyRef"],
+            json!({
+                "schemaVersion": HTTP_BODY_REF_SCHEMA,
+                "artifactId":"44444444-4444-4444-8444-444444444444",
+                "name":"11111111-1111-4111-8111-111111111111-http-response.bin",
+                "sizeBytes":MAX_INLINE_HTTP_RESULT_BYTES + 1,
+                "checksumSha256":expected_checksum,
+                "contentType":"application/octet-stream",
+            })
+        );
+    }
     #[tokio::test]
     async fn restart_reclaims_only_terminal_delivery_after_historical_fence_is_rejected() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2175,6 +2913,112 @@ pub async fn purge_deleted_jobs(daemon: &Daemon) -> Result<()> {
 mod authorization_tests {
     use super::*;
     use crate::{api::Api, auth::Auth, state::WorkspaceGrant};
+
+    #[test]
+    fn unavailable_provider_binary_fixture_never_discovers_or_executes_a_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing-provider-binary");
+        assert!(find_executable(missing.to_str().unwrap()).is_none());
+        assert!(!missing.exists());
+    }
+
+    #[tokio::test]
+    async fn provider_snapshot_drift_rejects_a_prepared_binding_deterministically() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let workspace = std::fs::canonicalize(workspace).unwrap();
+        let api = Api::for_test_origin("http://127.0.0.1:9").unwrap();
+        let daemon = Daemon::new(
+            temp.path().join("state"),
+            api.clone(),
+            Auth::test_enrolled(api, "org", "runner"),
+        )
+        .unwrap();
+        let install = daemon.auth.installation_id().await.unwrap();
+        daemon
+            .public
+            .lock()
+            .await
+            .grants
+            .push(WorkspaceGrant::new(&workspace, "org", &install, "key").unwrap());
+        let prepared_snapshot = json!({
+            "gemini": {
+                "path": "/fixture/gemini",
+                "adapter": "gemini",
+                "checksumSha256": "fixture-before",
+                "sizeBytes": 1,
+                "modifiedNanos": "1",
+                "executionPolicy": "host_user/v1"
+            }
+        });
+        let config = json!({"requested": {}, "installed": prepared_snapshot});
+        let preparation = Uuid::new_v4();
+        let journal = Journal {
+            job: json!({"id":Uuid::new_v4(),"kind":"command.run","payload":{"preparationId":preparation,"bindingDigest":"exact-binding","executionPolicy":"host_user/v1","workspacePath":workspace,"providerConfiguration":config,"command":["/usr/bin/true"]}}),
+            organization: "org".into(),
+            session: "session".into(),
+            recovery_session: None,
+            phase: "leased".into(),
+            identity: None,
+            result: None,
+            error: None,
+            terminal_key: "terminal".into(),
+            started_at: 0,
+            acknowledged_at: None,
+            event_sender: Default::default(),
+            stdout_pending: None,
+            stderr_pending: None,
+            progress_buffer: Vec::new(),
+            progress_buffer_offset: 0,
+            progress_discarding: false,
+            progress_pending: None,
+            stdout_offset: 0,
+            stderr_offset: 0,
+        };
+        state::write_json(
+            &daemon
+                .dir
+                .join("preparations")
+                .join(format!("{preparation}.json")),
+            &json!({
+                "organizationId":"org",
+                "installationId":install,
+                "workspacePath":workspace,
+                "bindingDigest":"exact-binding",
+                "binding":{"executionPolicy":"host_user/v1","providerConfiguration":config},
+                "providers":prepared_snapshot,
+                "commitAuthorization":{"preparationId":preparation,"bindingDigest":"exact-binding"}
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            require_execution_authorization_with(&daemon, &journal, || Ok(
+                prepared_snapshot.clone()
+            ))
+            .await
+            .unwrap(),
+            workspace
+        );
+        let changed_snapshot = json!({
+            "gemini": {
+                "path": "/fixture/gemini",
+                "adapter": "gemini",
+                "checksumSha256": "fixture-after",
+                "sizeBytes": 1,
+                "modifiedNanos": "2",
+                "executionPolicy": "host_user/v1"
+            }
+        });
+        assert_eq!(
+            require_execution_authorization_with(&daemon, &journal, || Ok(changed_snapshot))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "PROVIDER_CONFIGURATION_CHANGED"
+        );
+    }
+
     #[tokio::test]
     async fn workspace_choice_never_substitutes_for_confirmed_preparation() {
         let temp = tempfile::tempdir().unwrap();

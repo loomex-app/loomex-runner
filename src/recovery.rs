@@ -15,6 +15,9 @@ use std::{
 };
 use uuid::Uuid;
 
+/// Only a fully removed recovery record is retired automatically.  All other
+/// states can still affect a host automation or require reconciliation, so
+/// they remain durable until an explicit lifecycle action resolves them.
 const RETENTION_SECONDS: u64 = 30 * 24 * 60 * 60;
 const MAX_JSON_BYTES: usize = 128 * 1024;
 const SCHEMA_VERSION: u64 = 1;
@@ -203,7 +206,7 @@ impl RecoveryStore {
                     "OPERATION_PENDING"
                 );
                 update_fields(&mut record, p, now)?;
-                write_record(&tx, scope, &record, now)?;
+                write_record(&tx, scope, &mut record, now)?;
                 json!({"recovery":record})
             }
             None => {
@@ -298,7 +301,7 @@ impl RecoveryStore {
         record["registrationState"] = json!("attempt_in_flight");
         record["currentOperationId"] = json!(operation_id);
         record["updatedAt"] = json!(now);
-        write_record(&tx, scope, &record, now)?;
+        write_record(&tx, scope, &mut record, now)?;
         let summary = operation_value(&tx, &operation_id)?.context("INTERNAL")?;
         let result = json!({"recovery":record,"operation":summary,"attemptPermitted":true});
         // Store a safe replay projection.  The immediate creator may perform the
@@ -404,7 +407,7 @@ impl RecoveryStore {
             record["hostEvidence"] = evidence.clone();
             record["observedAt"] = json!(now);
         }
-        write_record(&tx, scope, &record, now)?;
+        write_record(&tx, scope, &mut record, now)?;
         let result = json!({"recovery":record,"operation":operation_value(&tx, operation_id)?});
         save_receipt(
             &tx,
@@ -430,8 +433,8 @@ impl RecoveryStore {
         )?;
         // In-flight and ambiguous rows intentionally never expire: expiry must
         // never restore permission to create an automation after a lost reply.
-        connection.execute("DELETE FROM recovery_operations WHERE expires_at IS NOT NULL AND expires_at < ?1 AND status='succeeded'", params![now])?;
-        connection.execute("DELETE FROM recovery_records WHERE expires_at IS NOT NULL AND expires_at < ?1 AND registration_state IN ('registered','removed') AND current_operation_id IS NULL", params![now])?;
+        connection.execute("DELETE FROM recovery_operations WHERE expires_at IS NOT NULL AND expires_at <= ?1 AND status='succeeded'", params![now])?;
+        connection.execute("DELETE FROM recovery_records WHERE expires_at IS NOT NULL AND expires_at <= ?1 AND registration_state='removed' AND lifecycle='removed' AND current_operation_id IS NULL AND pending_request_id IS NULL", params![now])?;
         Ok(())
     }
 }
@@ -518,9 +521,12 @@ fn insert_record(connection: &Connection, scope: Scope<'_>, record: &Value) -> R
 fn write_record(
     connection: &Connection,
     scope: Scope<'_>,
-    record: &Value,
+    record: &mut Value,
     _now: u64,
 ) -> Result<()> {
+    record["expiresAt"] = recovery_expiry(record)
+        .map(Value::from)
+        .unwrap_or(Value::Null);
     let changed=connection.execute("UPDATE recovery_records SET revision=?10,monitoring_intent=?11,initialization=?12,registration_state=?13,lifecycle=?14,automation_id=?15,evidence_json=?16,observed_at=?17,last_event_sequence=?18,pending_request_id=?19,presentation_reference=?20,cleanup_status=?21,diagnostic_reason=?22,current_operation_id=?23,updated_at=?25,expires_at=?26 WHERE recovery_id=?1 AND organization_id=?2 AND account_subject=?3 AND installation_id=?4 AND host_id=?5 AND host_task_id=?6 AND run_id=?7 AND marker=?8 AND schema_version=?9", rusqlite::params_from_iter(record_params(scope, record)))?;
     ensure!(changed == 1, "RECOVERY_NOT_FOUND");
     Ok(())
@@ -592,8 +598,27 @@ fn record_params(scope: Scope<'_>, record: &Value) -> Vec<rusqlite::types::Value
             .unwrap_or(rusqlite::types::Value::Null),
         (record["createdAt"].as_u64().unwrap() as i64).into(),
         (record["updatedAt"].as_u64().unwrap() as i64).into(),
-        rusqlite::types::Value::Null,
+        recovery_expiry(record)
+            .map(|expiry| (expiry as i64).into())
+            .unwrap_or(rusqlite::types::Value::Null),
     ]
+}
+
+fn recovery_expiry(record: &Value) -> Option<u64> {
+    // `removed` is the one terminal local fact: the exact host remove operation
+    // settled successfully, no operation is in flight, and no human request is
+    // waiting.  A verified registration is still a live recovery schedule and
+    // must not age out with its credentials or execution lease.
+    (record["registrationState"] == "removed"
+        && record["lifecycle"] == "removed"
+        && record["currentOperationId"].is_null()
+        && record["pendingRequestId"].is_null())
+    .then(|| {
+        record["updatedAt"]
+            .as_u64()
+            .unwrap_or(0)
+            .saturating_add(RETENTION_SECONDS)
+    })
 }
 fn find(connection: &Connection, scope: Scope<'_>, b: &Binding) -> Result<Option<Value>> {
     let mut record: Option<Value> = connection.query_row("SELECT recovery_id,marker,schema_version,revision,monitoring_intent,initialization,registration_state,lifecycle,automation_id,evidence_json,observed_at,last_event_sequence,pending_request_id,presentation_reference,cleanup_status,diagnostic_reason,current_operation_id,created_at,updated_at,expires_at FROM recovery_records WHERE organization_id=?1 AND account_subject=?2 AND installation_id=?3 AND host_id=?4 AND host_task_id=?5 AND run_id=?6", params![scope.organization,scope.account,scope.installation,b.host,b.task,b.run], |r| { let evidence:Option<Vec<u8>>=r.get(9)?; let operation_id:Option<String>=r.get(16)?; Ok(json!({"recoveryId":r.get::<_,String>(0)?,"schemaVersion":r.get::<_,u64>(2)?,"revision":r.get::<_,u64>(3)?,"binding":json!({"organizationId":scope.organization,"installationId":scope.installation,"hostId":b.host,"hostTaskId":b.task,"runId":b.run,"marker":r.get::<_,String>(1)?}),"monitoringIntent":r.get::<_,String>(4)?,"initialization":r.get::<_,Option<String>>(5)?,"registrationState":r.get::<_,String>(6)?,"lifecycle":r.get::<_,String>(7)?,"automationId":r.get::<_,Option<String>>(8)?,"hostEvidence":evidence.map(|v|decode_sql(&v)).transpose()?,"observedAt":r.get::<_,Option<u64>>(10)?,"lastEventSequence":r.get::<_,Option<u64>>(11)?,"pendingRequestId":r.get::<_,Option<String>>(12)?,"presentationReference":r.get::<_,Option<String>>(13)?,"cleanupStatus":r.get::<_,Option<String>>(14)?,"diagnosticReason":r.get::<_,Option<String>>(15)?,"currentOperationId":operation_id,"operation":Value::Null,"createdAt":r.get::<_,u64>(17)?,"updatedAt":r.get::<_,u64>(18)?,"expiresAt":r.get::<_,Option<u64>>(19)?})) }).optional()?;
@@ -873,6 +898,72 @@ mod tests {
         assert_eq!(
             s.update(scope(), &p).unwrap_err().to_string(),
             "VERIFIED_HOST_TASK_REQUIRED"
+        );
+    }
+
+    #[test]
+    fn only_clean_removed_recovery_records_expire_after_thirty_days() {
+        let d = tempfile::tempdir().unwrap();
+        let s = RecoveryStore::open(d.path()).unwrap();
+        let b = binding();
+        update(&s, &b, 0);
+
+        let mut create = b.clone();
+        create["expectedRevision"] = json!(1);
+        create["operation"] =
+            json!({"kind":"create","arguments":{},"idempotencyKey":Uuid::new_v4()});
+        create["idempotencyKey"] = json!(Uuid::new_v4());
+        let started = s.operation_begin(scope(), &create).unwrap();
+        let mut created = b.clone();
+        created["expectedRevision"] = json!(2);
+        created["operationId"] = started["operation"]["operationId"].clone();
+        created["status"] = json!("succeeded");
+        created["automationId"] = json!("automation-1");
+        created["lifecycle"] = json!("verified");
+        created["idempotencyKey"] = json!(Uuid::new_v4());
+        s.operation_settle(scope(), &created).unwrap();
+
+        let mut stopped = b.clone();
+        stopped["expectedRevision"] = json!(3);
+        stopped["monitoringIntent"] = json!("stopped");
+        stopped["idempotencyKey"] = json!(Uuid::new_v4());
+        let stopped = s.update(scope(), &stopped).unwrap();
+        let mut remove = b.clone();
+        remove["expectedRevision"] = stopped["recovery"]["revision"].clone();
+        remove["operation"] =
+            json!({"kind":"remove","arguments":{},"idempotencyKey":Uuid::new_v4()});
+        remove["idempotencyKey"] = json!(Uuid::new_v4());
+        let remove_started = s.operation_begin(scope(), &remove).unwrap();
+        let mut removed = b.clone();
+        removed["expectedRevision"] = remove_started["recovery"]["revision"].clone();
+        removed["operationId"] = remove_started["operation"]["operationId"].clone();
+        removed["status"] = json!("succeeded");
+        removed["lifecycle"] = json!("verified");
+        removed["idempotencyKey"] = json!(Uuid::new_v4());
+        let removed = s.operation_settle(scope(), &removed).unwrap();
+        let expiry = removed["recovery"]["expiresAt"].as_u64().unwrap();
+        s.sweep(expiry - 1).unwrap();
+        assert!(s.get(scope(), &b).unwrap()["found"].as_bool().unwrap());
+        s.sweep(expiry).unwrap();
+        assert!(!s.get(scope(), &b).unwrap()["found"].as_bool().unwrap());
+
+        let unresolved = binding();
+        update(&s, &unresolved, 0);
+        let unresolved_run = unresolved["binding"]["runId"].as_str().unwrap();
+        {
+            let connection = s.connection.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE recovery_records SET expires_at=?1 WHERE run_id=?2",
+                    params![1_u64, unresolved_run],
+                )
+                .unwrap();
+        }
+        s.sweep(2).unwrap();
+        assert!(
+            s.get(scope(), &unresolved).unwrap()["found"]
+                .as_bool()
+                .unwrap()
         );
     }
 }

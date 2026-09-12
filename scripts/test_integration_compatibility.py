@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import subprocess
 import unittest
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
+GATE = ROOT / "scripts" / "run-integration-compatibility-gate.sh"
 SPEC = importlib.util.spec_from_file_location("integration_compatibility", ROOT / "scripts" / "verify-integration-compatibility.py")
 assert SPEC and SPEC.loader
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -17,7 +19,7 @@ SPEC.loader.exec_module(MODULE)
 
 
 class IntegrationCompatibilityTests(unittest.TestCase):
-    def components(self) -> tuple[dict, dict, dict, dict]:
+    def components(self) -> tuple[dict, dict, dict, dict, dict]:
         runner_routes = {
             "schemaVersion": "loomex.runner.backend-routes/v1",
             "basePath": "/api/v1/runner-control/runner/",
@@ -191,6 +193,85 @@ class IntegrationCompatibilityTests(unittest.TestCase):
                 plugin=plugin,
                 backend=backend,
             )
+
+    def test_required_mode_accepts_clean_immutable_component_identities(self) -> None:
+        runner_manifest, runner_routes, runner_catalog, plugin, backend = self.components()
+        revision = "a" * 40
+        plugin["source"] = {"headRevision": revision, "workingTree": "clean"}
+        backend["source"] = {"headRevision": "b" * 40, "workingTree": "clean"}
+        result = MODULE.verify(
+            runner_manifest=runner_manifest,
+            runner_routes=runner_routes,
+            runner_catalog=runner_catalog,
+            plugin=plugin,
+            backend=backend,
+            require_clean_identities=True,
+            expected_plugin_revision=revision,
+            expected_backend_revision="b" * 40,
+        )
+        self.assertEqual(result["verification"]["sourceRevisions"], {
+            "plugin": revision,
+            "backend": "b" * 40,
+        })
+
+    def test_required_mode_rejects_missing_or_dirty_component_identities(self) -> None:
+        runner_manifest, runner_routes, runner_catalog, plugin, backend = self.components()
+        with self.assertRaisesRegex(MODULE.CompatibilityError, "missing source identity"):
+            MODULE.verify(
+                runner_manifest=runner_manifest,
+                runner_routes=runner_routes,
+                runner_catalog=runner_catalog,
+                plugin=plugin,
+                backend=backend,
+                require_clean_identities=True,
+            )
+        plugin["source"] = {"headRevision": "a" * 40, "workingTree": "dirty"}
+        backend["source"] = {"headRevision": "b" * 40, "workingTree": "clean"}
+        with self.assertRaisesRegex(MODULE.CompatibilityError, "workingTree must be clean"):
+            MODULE.verify(
+                runner_manifest=runner_manifest,
+                runner_routes=runner_routes,
+                runner_catalog=runner_catalog,
+                plugin=plugin,
+                backend=backend,
+                require_clean_identities=True,
+            )
+
+    def test_required_mode_rejects_unverifiable_component_identity(self) -> None:
+        runner_manifest, runner_routes, runner_catalog, plugin, backend = self.components()
+        plugin["source"] = {"headRevision": "HEAD", "workingTree": "clean"}
+        backend["source"] = {"headRevision": "b" * 40, "workingTree": "clean"}
+        with self.assertRaisesRegex(MODULE.CompatibilityError, "unverifiable source.headRevision"):
+            MODULE.verify(
+                runner_manifest=runner_manifest,
+                runner_routes=runner_routes,
+                runner_catalog=runner_catalog,
+                plugin=plugin,
+                backend=backend,
+                require_clean_identities=True,
+            )
+
+    def test_required_mode_rejects_an_export_from_a_different_checkout(self) -> None:
+        runner_manifest, runner_routes, runner_catalog, plugin, backend = self.components()
+        plugin["source"] = {"headRevision": "a" * 40, "workingTree": "clean"}
+        backend["source"] = {"headRevision": "b" * 40, "workingTree": "clean"}
+        with self.assertRaisesRegex(MODULE.CompatibilityError, "does not match the supplied checkout revision"):
+            MODULE.verify(
+                runner_manifest=runner_manifest,
+                runner_routes=runner_routes,
+                runner_catalog=runner_catalog,
+                plugin=plugin,
+                backend=backend,
+                require_clean_identities=True,
+                expected_plugin_revision="c" * 40,
+            )
+
+    def test_gate_required_mode_rejects_missing_component_inputs(self) -> None:
+        result = subprocess.run(
+            [str(GATE), "--required"], cwd=ROOT, text=True, capture_output=True, check=False
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("--required mode requires plugin/backend", result.stderr)
 
 
 if __name__ == "__main__":

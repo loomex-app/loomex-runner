@@ -28,6 +28,7 @@ SCHEMA_VERSION = "loomex/compatibility-manifest/v1"
 RUNNER_SCHEMA_VERSION = "loomex.runner.compatibility-manifest/v1"
 PLUGIN_SCHEMA_VERSION = "loomex.plugin-compatibility-components/v1"
 BACKEND_SCHEMA_VERSION = "loomex.backend.runner-routes/v1"
+IMMUTABLE_GIT_REVISION = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 
 
 class CompatibilityError(ValueError):
@@ -175,6 +176,23 @@ def normalized_backend_path(path: str, base_path: str) -> str:
     return re.sub(r"<(?:uuid|str):([a-z_]+)>", placeholder, path.removeprefix(base_path))
 
 
+def require_clean_identity(component: dict[str, Any], label: str, expected_revision: str | None = None) -> str:
+    """Return a component's immutable source revision after validating its provenance."""
+    source = component.get("source")
+    if not isinstance(source, dict):
+        raise CompatibilityError(f"{label} export is missing source identity required for --required mode")
+    revision = source.get("headRevision")
+    if not isinstance(revision, str) or not IMMUTABLE_GIT_REVISION.fullmatch(revision):
+        raise CompatibilityError(f"{label} export has an unverifiable source.headRevision")
+    if source.get("workingTree") != "clean":
+        raise CompatibilityError(f"{label} export source.workingTree must be clean in --required mode")
+    if expected_revision is not None and revision != expected_revision:
+        raise CompatibilityError(
+            f"{label} export source.headRevision does not match the supplied checkout revision"
+        )
+    return revision
+
+
 def verify(
     *,
     runner_manifest: dict[str, Any],
@@ -182,6 +200,9 @@ def verify(
     runner_catalog: dict[str, Any],
     plugin: dict[str, Any],
     backend: dict[str, Any],
+    require_clean_identities: bool = False,
+    expected_plugin_revision: str | None = None,
+    expected_backend_revision: str | None = None,
 ) -> dict[str, Any]:
     if runner_manifest.get("schemaVersion") != RUNNER_SCHEMA_VERSION:
         raise CompatibilityError("runner manifest uses an unsupported schema version")
@@ -191,6 +212,13 @@ def verify(
         raise CompatibilityError("plugin component export uses an unsupported schema version")
     if backend.get("schemaVersion") != BACKEND_SCHEMA_VERSION:
         raise CompatibilityError("backend route export uses an unsupported schema version")
+
+    identities: dict[str, str] = {}
+    if require_clean_identities:
+        identities = {
+            "plugin": require_clean_identity(plugin, "plugin component", expected_plugin_revision),
+            "backend": require_clean_identity(backend, "backend route", expected_backend_revision),
+        }
 
     runner_method_names, runner_capabilities = validate_runner_inputs(
         runner_manifest, runner_routes, runner_catalog
@@ -271,7 +299,7 @@ def verify(
         formatted = ", ".join(f"{method} {path}" for path, method in missing_routes)
         raise CompatibilityError(f"backend does not register runner-required routes: {formatted}")
 
-    return {
+    result = {
         "schemaVersion": SCHEMA_VERSION,
         "components": {
             "backend": {"digest": digest(backend), "schemaVersion": BACKEND_SCHEMA_VERSION},
@@ -285,6 +313,9 @@ def verify(
             "runnerMethodCount": len(runner_method_names),
         },
     }
+    if identities:
+        result["verification"]["sourceRevisions"] = identities
+    return result
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -294,6 +325,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--runner-manifest", type=Path, default=RUNNER_MANIFEST)
     parser.add_argument("--runner-routes", type=Path, default=RUNNER_ROUTES)
     parser.add_argument("--runner-catalog", type=Path, default=RUNNER_CATALOG)
+    parser.add_argument("--require-clean-identities", action="store_true")
+    parser.add_argument("--expected-plugin-revision")
+    parser.add_argument("--expected-backend-revision")
     parser.add_argument("--output", type=Path)
     return parser.parse_args(argv)
 
@@ -307,6 +341,9 @@ def main(argv: list[str]) -> int:
             runner_catalog=load_object(args.runner_catalog, "runner method catalog"),
             plugin=load_object(args.plugin_components, "plugin component export"),
             backend=load_object(args.backend_routes, "backend route export"),
+            require_clean_identities=args.require_clean_identities,
+            expected_plugin_revision=args.expected_plugin_revision,
+            expected_backend_revision=args.expected_backend_revision,
         )
     except CompatibilityError as exc:
         print(f"compatibility verification failed: {exc}", file=sys.stderr)

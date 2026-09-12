@@ -17,6 +17,9 @@ use std::{
 };
 use uuid::Uuid;
 
+/// Follow state is execution evidence.  An active, blocked, suspended, or
+/// handoff-pending session never expires automatically; only a terminal
+/// session with its required result receipt gets the 30-day retirement window.
 const RETENTION_SECONDS: u64 = 30 * 24 * 60 * 60;
 const SCHEMA_VERSION: u64 = 1;
 const MAX_JSON_BYTES: usize = 128 * 1024;
@@ -638,7 +641,7 @@ impl FollowStore {
                 // prior active follows. Late callbacks can only resolve their
                 // exact result digest and therefore cannot mutate this record.
                 tx.execute(
-                    "UPDATE follow_sessions SET lifecycle='superseded', required_action='none', updated_at=?1 WHERE organization_id=?2 AND account_subject=?3 AND installation_id=?4 AND host_id=?5 AND host_session_id=?6 AND host_task_id=?7 AND run_id<>?8 AND lifecycle='active'",
+                    "UPDATE follow_sessions SET lifecycle='superseded', required_action='none', updated_at=?1, expires_at=NULL WHERE organization_id=?2 AND account_subject=?3 AND installation_id=?4 AND host_id=?5 AND host_session_id=?6 AND host_task_id=?7 AND run_id<>?8 AND lifecycle='active' AND required_action='none'",
                     params![now, scope.organization, scope.account, scope.installation, binding.host, binding.host_session, binding.task, binding.run],
                 )?;
                 insert(&tx, scope, &session)?;
@@ -727,6 +730,9 @@ impl FollowStore {
         if decision["decision"] == "suspend" {
             session["lastError"] = decision["error"].clone();
         }
+        session["expiresAt"] = follow_expiry(&session)
+            .map(Value::from)
+            .unwrap_or(Value::Null);
         // The wire decision is deliberately compact; the durable session holds
         // all context needed to diagnose or resume it.
         decision["generation"] = json!(generation);
@@ -752,7 +758,7 @@ impl FollowStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
         connection.execute(
-            "DELETE FROM follow_sessions WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+            "DELETE FROM follow_sessions WHERE expires_at IS NOT NULL AND expires_at <= ?1 AND lifecycle='terminal' AND required_action='none' AND terminal_receipt_json IS NOT NULL",
             params![at],
         )?;
         connection.execute(
@@ -1251,13 +1257,25 @@ fn new_session(scope: Scope<'_>, binding: &Binding, anchor: &Value, now: u64) ->
     json!({"followSessionId":Uuid::new_v4(),"organizationId":scope.organization,"accountSubject":scope.account,"installationId":scope.installation,
         "hostId":binding.host,"hostSessionId":binding.host_session,"hostTaskId":binding.task,"runId":binding.run,"anchor":anchor,"schemaVersion":SCHEMA_VERSION,
         "generation":1,"revision":1,"mode":"follow","lifecycle":"active","eventCursor":null,"pendingHandoffReceipt":null,"terminalReceipt":null,"recovery":null,"cleanup":null,
-        "actionProgress":{"kind":"none","attempted":true},"requiredAction":"none","missedActionCount":0,"hookCount":0,"lastError":null,"createdAt":now,"updatedAt":now,"expiresAt":now.saturating_add(RETENTION_SECONDS)})
+        "actionProgress":{"kind":"none","attempted":true},"requiredAction":"none","missedActionCount":0,"hookCount":0,"lastError":null,"createdAt":now,"updatedAt":now,"expiresAt":null})
 }
 fn reset_generation(session: &mut Value, generation: u64, anchor: &Value, now: u64) {
     *session = json!({"followSessionId":session["followSessionId"],"organizationId":session["organizationId"],"accountSubject":session["accountSubject"],"installationId":session["installationId"],
         "hostId":session["hostId"],"hostSessionId":session["hostSessionId"],"hostTaskId":session["hostTaskId"],"runId":session["runId"],"anchor":anchor,"schemaVersion":SCHEMA_VERSION,
         "generation":generation,"revision":session["revision"].as_u64().unwrap_or(0)+1,"mode":"follow","lifecycle":"active","eventCursor":null,"pendingHandoffReceipt":null,"terminalReceipt":null,"recovery":session["recovery"],"cleanup":session["cleanup"],
-        "actionProgress":{"kind":"none","attempted":true},"requiredAction":"none","missedActionCount":0,"hookCount":0,"lastError":null,"createdAt":session["createdAt"],"updatedAt":now,"expiresAt":now.saturating_add(RETENTION_SECONDS)});
+        "actionProgress":{"kind":"none","attempted":true},"requiredAction":"none","missedActionCount":0,"hookCount":0,"lastError":null,"createdAt":session["createdAt"],"updatedAt":now,"expiresAt":null});
+}
+
+fn follow_expiry(session: &Value) -> Option<u64> {
+    (session["lifecycle"] == "terminal"
+        && session["requiredAction"] == "none"
+        && !session["terminalReceipt"].is_null())
+    .then(|| {
+        session["updatedAt"]
+            .as_u64()
+            .unwrap_or(0)
+            .saturating_add(RETENTION_SECONDS)
+    })
 }
 fn public_binding(b: &Binding) -> Value {
     json!({"hostId":b.host,"hostSessionId":b.host_session,"hostTaskId":b.task,"runId":b.run})
@@ -1604,6 +1622,73 @@ mod tests {
             "none",
         );
         assert_eq!(interrupted["decision"]["decision"], "suspend");
+    }
+
+    #[test]
+    fn only_clean_terminal_sessions_receive_the_thirty_day_expiry() {
+        let t = tempfile::tempdir().unwrap();
+        let store = FollowStore::open(t.path()).unwrap();
+        let terminal_binding = binding();
+        let active = activate(&store, &terminal_binding, 0);
+        assert!(active["expiresAt"].is_null());
+        store
+            .sweep(crate::state::now() + RETENTION_SECONDS + 1)
+            .unwrap();
+        assert!(
+            store
+                .get(scope(), &json!({"binding":terminal_binding}))
+                .unwrap()["found"]
+                .as_bool()
+                .unwrap()
+        );
+
+        let terminal = decide(
+            &store,
+            &terminal_binding,
+            &active,
+            json!({"kind":"terminal","receiptId":Uuid::new_v4()}),
+            true,
+            "result_read",
+        );
+        let expiry = terminal["session"]["expiresAt"].as_u64().unwrap();
+        store.sweep(expiry - 1).unwrap();
+        assert!(
+            store
+                .get(scope(), &json!({"binding":terminal_binding}))
+                .unwrap()["found"]
+                .as_bool()
+                .unwrap()
+        );
+        store.sweep(expiry).unwrap();
+        assert!(
+            !store
+                .get(scope(), &json!({"binding":terminal_binding}))
+                .unwrap()["found"]
+                .as_bool()
+                .unwrap()
+        );
+
+        let suspended_binding = binding();
+        let active = activate(&store, &suspended_binding, 0);
+        let suspended = decide(
+            &store,
+            &suspended_binding,
+            &active,
+            json!({"kind":"interrupted","code":"RUNNER_UNAVAILABLE"}),
+            true,
+            "none",
+        );
+        assert!(suspended["session"]["expiresAt"].is_null());
+        store
+            .sweep(crate::state::now() + RETENTION_SECONDS + 1)
+            .unwrap();
+        assert!(
+            store
+                .get(scope(), &json!({"binding":suspended_binding}))
+                .unwrap()["found"]
+                .as_bool()
+                .unwrap()
+        );
     }
 
     fn hook(event: &str, session: &str) -> Value {

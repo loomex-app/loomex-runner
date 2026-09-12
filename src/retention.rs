@@ -4,9 +4,13 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::{
     fs,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
+/// Acknowledged local evidence and completed, inactive results are retained
+/// for thirty days.  Cleanup is intentionally conservative: unknown, active,
+/// or malformed evidence stays on disk for a later explicit recovery.
 const RETENTION_SECONDS: u64 = 30 * 24 * 60 * 60;
 pub fn mark_deleted_tree(dir: &Path, run: &str, metadata: &Value) -> Result<()> {
     Uuid::parse_str(run)?;
@@ -81,7 +85,10 @@ pub fn purge_job(path: &Path) -> Result<()> {
         return Ok(());
     };
     let metadata = fs::symlink_metadata(dir)?;
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+    if metadata.is_dir()
+        && !metadata.file_type().is_symlink()
+        && metadata.uid() == unsafe { libc::geteuid() }
+    {
         fs::remove_dir_all(dir)?;
     }
     Ok(())
@@ -91,14 +98,18 @@ pub fn sweep(dir: &Path, at: u64) -> Result<()> {
     if jobs.exists() {
         for entry in fs::read_dir(jobs)? {
             let entry = entry?;
-            if !entry.file_type()?.is_dir() {
+            if !entry.file_type()?.is_dir() || !owned_directory(&entry.path()) {
                 continue;
             }
             let path = entry.path().join("journal.json");
-            if !path.exists() {
+            if !owned_regular_file(&path) {
                 continue;
             };
-            let record: Value = state::read_json(&path)?;
+            let Ok(record) = state::read_json::<Value>(&path) else {
+                // Do not make malformed local evidence disappear merely
+                // because a retention pass could not interpret it.
+                continue;
+            };
             // Undelivered, running and blocked evidence has no automatic expiration.
             if record["phase"] == "acknowledged"
                 && record["acknowledgedAt"]
@@ -146,12 +157,18 @@ fn purge_responses(dir: &Path, run: Option<&str>, at: u64) -> Result<()> {
         if Uuid::parse_str(id).is_err() {
             continue;
         }
-        let metadata: Value = state::read_json(&entry.path())?;
+        if !owned_regular_file(&entry.path()) {
+            continue;
+        }
+        let Ok(metadata) = state::read_json::<Value>(&entry.path()) else {
+            continue;
+        };
         let remove = match run {
             Some(run) => metadata["executionId"] == run,
-            None => metadata["lastAccessAt"]
-                .as_u64()
-                .is_some_and(|last| at.saturating_sub(last) >= RETENTION_SECONDS),
+            None => metadata["lastAccessAt"].as_u64().is_some_and(|last| {
+                at.saturating_sub(last) >= RETENTION_SECONDS
+                    && response_has_no_active_execution_evidence(dir, &metadata)
+            }),
         };
         if remove {
             purge_response(dir, id)?;
@@ -169,23 +186,77 @@ fn expire_operation_results(dir: &Path, run: Option<&str>, at: u64) -> Result<()
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
-        let mut record: Value = state::read_json(&path)?;
+        if !owned_regular_file(&path) {
+            continue;
+        }
+        let Ok(mut record) = state::read_json::<Value>(&path) else {
+            continue;
+        };
         if record.get("result").is_none() {
             continue;
         }
         let expired = match run {
             Some(run) => record["executionId"] == run,
-            None => record["cachedAt"]
-                .as_u64()
-                .is_some_and(|time| at.saturating_sub(time) >= RETENTION_SECONDS),
+            None => record["cachedAt"].as_u64().is_some_and(|time| {
+                at.saturating_sub(time) >= RETENTION_SECONDS
+                    && operation_has_no_active_execution_evidence(&record)
+            }),
         };
         if expired {
-            record.as_object_mut().unwrap().remove("result");
+            let Some(object) = record.as_object_mut() else {
+                continue;
+            };
+            object.remove("result");
             record["expired"] = json!(true);
             state::write_json(&path, &record)?;
         }
     }
     Ok(())
+}
+
+fn owned_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == unsafe { libc::geteuid() }
+    })
+}
+
+fn owned_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == unsafe { libc::geteuid() }
+    })
+}
+
+fn response_has_no_active_execution_evidence(dir: &Path, metadata: &Value) -> bool {
+    let Some(run) = metadata["executionId"].as_str() else {
+        return true;
+    };
+    // A response spool only records a run ID, never a terminal backend fact.
+    // Keep it unless an authoritative local deletion tombstone proves that the
+    // execution cannot still be live.
+    Uuid::parse_str(run).is_ok()
+        && owned_regular_file(&dir.join("tombstones").join(format!("{run}.json")))
+}
+
+fn operation_has_no_active_execution_evidence(record: &Value) -> bool {
+    let Some(run) = record["executionId"].as_str() else {
+        return true;
+    };
+    if Uuid::parse_str(run).is_err() {
+        return false;
+    }
+    let status = record
+        .pointer("/result/execution/status")
+        .or_else(|| record.pointer("/result/status"))
+        .and_then(Value::as_str)
+        .map(|status| status.to_ascii_lowercase());
+    matches!(
+        status.as_deref(),
+        Some("completed" | "failed" | "cancelled" | "canceled" | "deleted" | "succeeded" | "error")
+    )
 }
 
 #[cfg(test)]
@@ -258,6 +329,101 @@ mod tests {
             !t.path()
                 .join("responses")
                 .join(format!("{id}.json"))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn old_active_or_malformed_spools_and_operation_results_are_retained() {
+        let t = tempfile::tempdir().unwrap();
+        let now = RETENTION_SECONDS + 10;
+        let run = Uuid::new_v4().to_string();
+        let response = Uuid::new_v4().to_string();
+        let operation = Uuid::new_v4().to_string();
+        let malformed = Uuid::new_v4().to_string();
+        let stale_response = Uuid::new_v4().to_string();
+        let completed_operation = Uuid::new_v4().to_string();
+        state::write_json(
+            &t.path()
+                .join("responses")
+                .join(format!("{response}.meta.json")),
+            &json!({"executionId":run,"lastAccessAt":0}),
+        )
+        .unwrap();
+        state::atomic_write(
+            &t.path().join("responses").join(format!("{response}.json")),
+            b"active response",
+        )
+        .unwrap();
+        state::write_json(
+            &t.path()
+                .join("operations")
+                .join(format!("{operation}.json")),
+            &json!({"executionId":run,"cachedAt":0,"result":{"execution":{"status":"running"}}}),
+        )
+        .unwrap();
+        state::atomic_write(
+            &t.path()
+                .join("operations")
+                .join(format!("{malformed}.json")),
+            b"not json",
+        )
+        .unwrap();
+        state::write_json(
+            &t.path()
+                .join("responses")
+                .join(format!("{stale_response}.meta.json")),
+            &json!({"lastAccessAt":0}),
+        )
+        .unwrap();
+        state::atomic_write(
+            &t.path()
+                .join("responses")
+                .join(format!("{stale_response}.json")),
+            b"retired response",
+        )
+        .unwrap();
+        state::write_json(
+            &t.path()
+                .join("operations")
+                .join(format!("{completed_operation}.json")),
+            &json!({"executionId":Uuid::new_v4(),"cachedAt":0,"result":{"execution":{"status":"completed"}}}),
+        )
+        .unwrap();
+
+        sweep(t.path(), now).unwrap();
+
+        assert!(
+            t.path()
+                .join("responses")
+                .join(format!("{response}.json"))
+                .exists()
+        );
+        let operation_record: Value = state::read_json(
+            &t.path()
+                .join("operations")
+                .join(format!("{operation}.json")),
+        )
+        .unwrap();
+        assert!(operation_record.get("result").is_some());
+        assert!(
+            !t.path()
+                .join("responses")
+                .join(format!("{stale_response}.json"))
+                .exists()
+        );
+        let completed_record: Value = state::read_json(
+            &t.path()
+                .join("operations")
+                .join(format!("{completed_operation}.json")),
+        )
+        .unwrap();
+        assert!(completed_record.get("result").is_none());
+        assert_eq!(completed_record["expired"], true);
+        assert!(
+            t.path()
+                .join("operations")
+                .join(format!("{malformed}.json"))
                 .exists()
         );
     }

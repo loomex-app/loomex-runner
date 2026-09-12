@@ -11,7 +11,7 @@ printf '%s\n' '#!/bin/bash' 'exit 0' > "$provider_bin/not-executable"; chmod 064
 ln -s "$provider_bin/codex" "$fixture/codex-link"
 
 make_payload(){
-  version="$1"; payload="$2"
+  version="$1"; payload="$2"; source_revision="$3"
   mkdir -p "$payload/bin" "$payload/metadata" "$payload/launchd"
   printf '%s\n' '#!/bin/bash' "VERSION='$version'" 'track(){ [[ ! -f "${LOOMEX_STATE_DIR}/test-track-uninstall" ]] || printf '\''%s\n'\'' "$1" >> "${LOOMEX_STATE_DIR}/test-uninstall-order"; }' 'case "${1:-}" in' 'status) track status; if [[ -f "${LOOMEX_STATE_DIR}/test-race" && ! -f "${LOOMEX_STATE_DIR}/drain.json" ]]; then touch "${LOOMEX_STATE_DIR}/test-race-triggered"; active=1; else active="$(test -f "${LOOMEX_STATE_DIR}/test-active" && cat "${LOOMEX_STATE_DIR}/test-active" || printf 0)"; fi; reported="$VERSION"; [[ ! -f "${LOOMEX_STATE_DIR}/test-health-bad" ]] || reported=bad; [[ -f "${LOOMEX_STATE_DIR}/drain.json" ]] && draining=true || draining=false; printf '\''{"version":"%s","activeJobs":%s,"draining":%s,"updateDeferred":false}\n'\'' "$reported" "$active" "$draining";;' 'drain) track drain; touch "${LOOMEX_STATE_DIR}/drain.json"; printf '\''{"updateDeferred":true}\n'\'';;' 'logout) track logout; [[ "${2:-}" == --offline ]] || exit 70; [[ -f "${LOOMEX_STATE_DIR}/uninstall-ready.json" ]] || exit 71; [[ ! -f "${LOOMEX_STATE_DIR}/test-logout-fail" ]] || exit 72; [[ "${LOOMEX_DEV_API_ORIGIN:-}" == "http://127.0.0.1:9/" ]] || exit 73; touch "${LOOMEX_STATE_DIR}/test-revoked";;' '*) exit 0;;' 'esac' > "$payload/bin/loomex"
   printf '%s\n' '#!/bin/bash' 'exit 0' > "$payload/bin/loomex-runner"
@@ -22,11 +22,44 @@ from pathlib import Path
 v,o=sys.argv[1:]; Path(o).write_text(json.dumps({'project':'loomex-runner','version':v,'platform':'darwin-arm64','stateSchema':'app.loomex.runner.state/v1'},indent=2,sort_keys=True)+'\n')
 PY
   cp "$repo/contracts/compatibility-manifest.json" "$payload/metadata/compatibility-manifest.json"
+  python3 - "$source_revision" "$payload/metadata/source-content-manifest.json" <<'PY'
+import json,sys
+from pathlib import Path
+revision,out=sys.argv[1:]
+Path(out).write_text(json.dumps({'schema':'app.loomex.source-content/v1','sourceRevision':revision,'files':[]},sort_keys=True,separators=(',',':'))+'\n')
+PY
   cp "$repo/scripts/app.loomex.runner.template.plist" "$payload/launchd/app.loomex.runner.template.plist"
   python3 "$repo/scripts/validate_package.py" "$payload" --expected-version "$version"
 }
 
-payload="$fixture/payload"; make_payload 0.1.0 "$payload"
+payload="$fixture/payload"; make_payload 0.1.0 "$payload" test
+# Source identity covers both tracked and nonignored untracked inputs.  A fresh
+# package verifies against that exact content and rejects edits at the same path.
+source_fixture="$fixture/source-fixture"; mkdir "$source_fixture"; git -C "$source_fixture" init -q
+git -C "$source_fixture" config user.name test; git -C "$source_fixture" config user.email test@example.invalid
+printf tracked > "$source_fixture/tracked.txt"; git -C "$source_fixture" add tracked.txt; git -C "$source_fixture" commit -qm initial
+printf untracked > "$source_fixture/untracked.txt"; source_revision="$(git -C "$source_fixture" rev-parse HEAD)"
+source_manifest="$fixture/source-content-manifest.json"; source_snapshot="$fixture/source-snapshot"
+python3 "$repo/scripts/artifact.py" source-manifest --source-root "$source_fixture" --source-revision "$source_revision" --output "$source_manifest" --snapshot "$source_snapshot"
+python3 "$repo/scripts/artifact.py" verify-source --source-root "$source_fixture" --manifest "$source_manifest"
+python3 - "$source_manifest" <<'PY'
+import json,sys
+data=json.load(open(sys.argv[1])); entries={entry['path']:entry for entry in data['files']}
+assert entries['tracked.txt']['tracked'] is True
+assert entries['untracked.txt']['tracked'] is False
+assert all(len(entry['sha256'])==64 for entry in entries.values())
+PY
+provenance_payload="$fixture/provenance-payload"; cp -R "$payload" "$provenance_payload"; cp "$source_manifest" "$provenance_payload/metadata/source-content-manifest.json"
+python3 "$repo/scripts/validate_package.py" "$provenance_payload" --expected-version 0.1.0 --source-root "$source_fixture"
+provenance_release="$fixture/provenance-release"
+SOURCE_DATE_EPOCH=1 python3 "$repo/scripts/artifact.py" create --payload "$provenance_payload" --output "$provenance_release" --project loomex-runner --version 0.1.0 --platform darwin-arm64 --source-revision "$source_revision" --unsigned-development
+python3 "$repo/scripts/artifact.py" verify --release "$provenance_release" --project loomex-runner --platform darwin-arm64 --allow-unsigned-development --source-root "$source_fixture"
+printf changed > "$source_fixture/tracked.txt"
+if python3 "$repo/scripts/validate_package.py" "$provenance_payload" --expected-version 0.1.0 --source-root "$source_fixture" >/dev/null 2>&1; then echo "package/source validation accepted changed tracked content" >&2; exit 1; fi
+if python3 "$repo/scripts/artifact.py" verify --release "$provenance_release" --project loomex-runner --platform darwin-arm64 --allow-unsigned-development --source-root "$source_fixture" >/dev/null 2>&1; then echo "source content mismatch at an unchanged path was accepted" >&2; exit 1; fi
+printf tracked > "$source_fixture/tracked.txt"
+printf changed > "$source_fixture/untracked.txt"
+if python3 "$repo/scripts/artifact.py" verify-source --source-root "$source_fixture" --manifest "$source_manifest" >/dev/null 2>&1; then echo "untracked source content mismatch was accepted" >&2; exit 1; fi
 compatibility="$payload/metadata/compatibility-manifest.json"; mv "$compatibility" "$compatibility.saved"
 if python3 "$repo/scripts/validate_package.py" "$payload" --expected-version 0.1.0 >/dev/null 2>&1; then echo "package without compatibility manifest accepted" >&2; exit 1; fi
 mv "$compatibility.saved" "$compatibility"; printf '\n' >> "$compatibility"
@@ -58,6 +91,10 @@ touch "$payload/.env"
 if python3 "$repo/scripts/validate_package.py" "$payload" --expected-version 0.1.0 2>/dev/null; then echo "forbidden development file accepted" >&2; exit 1; fi
 rm "$payload/.env"
 openssl genrsa -out "$fixture/private.pem" 2048 >/dev/null 2>&1; openssl rsa -in "$fixture/private.pem" -pubout -out "$fixture/public.pem" >/dev/null 2>&1
+mv "$payload/metadata/source-content-manifest.json" "$fixture/source-content-manifest.saved"
+if SOURCE_DATE_EPOCH=1 python3 "$repo/scripts/artifact.py" create --payload "$payload" --output "$fixture/missing-source-release" --project loomex-runner --version 0.1.0 --platform darwin-arm64 --source-revision test --unsigned-development >/dev/null 2>&1; then echo "artifact creation without source provenance succeeded" >&2; exit 1; fi
+test ! -e "$fixture/missing-source-release"
+mv "$fixture/source-content-manifest.saved" "$payload/metadata/source-content-manifest.json"
 signed="$fixture/signed"; SOURCE_DATE_EPOCH=1 python3 "$repo/scripts/artifact.py" create --payload "$payload" --output "$signed" --project loomex-runner --version 0.1.0 --platform darwin-arm64 --source-revision test --signing-key "$fixture/private.pem"
 SOURCE_DATE_EPOCH=1 python3 "$repo/scripts/artifact.py" create --payload "$payload" --output "$fixture/signed-repeat" --project loomex-runner --version 0.1.0 --platform darwin-arm64 --source-revision test --signing-key "$fixture/private.pem"
 cmp "$signed/manifest.json" "$fixture/signed-repeat/manifest.json"; cmp "$signed/payload.tar.gz" "$fixture/signed-repeat/payload.tar.gz"; cmp "$signed/manifest.sig" "$fixture/signed-repeat/manifest.sig"
@@ -143,8 +180,8 @@ old,agent,state=sys.argv[1:]; state=Path(state)
 PY
 printf 1 > "$state/test-active"
 LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/install.sh" "$release" --allow-unsigned-development --development-api-origin "$dev_origin" --provider-executable "codex=$fixture/codex-link" --install-base "$base" --state-dir "$state" --launch-agents-dir "$agents"
-test -f "$base/current/metadata/compatibility-manifest.json"
-python3 "$repo/scripts/export-compatibility.py" --check-package-root "$base/current"
+test -f "$base/versions/0.1.0/metadata/compatibility-manifest.json"
+python3 "$repo/scripts/export-compatibility.py" --check-package-root "$base/versions/0.1.0"
 test "$(readlink "$base/current")" = "$old"; test -f "$state/pending-update.json"; test -f "$state/drain.json"
 test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["providerExecutables"]["codex"])' "$state/pending-update.json")" = "$provider_bin/codex"
 printf '%s\n' '{"schema":"app.loomex.runner.uninstall-ready/v1","versionPath":"'"$old"'"}' > "$state/uninstall-ready.json"; printf interrupted > "$state/uninstall-ready.json.new"
@@ -160,7 +197,7 @@ assert environment['LOOMEX_CODEX_EXECUTABLE']==sys.argv[3]
 assert receipt['providerExecutables']=={'codex':sys.argv[3]}
 PY
 
-payload2="$fixture/payload2"; make_payload 0.1.1 "$payload2"; release2="$fixture/release2"; SOURCE_DATE_EPOCH=2 python3 "$repo/scripts/artifact.py" create --payload "$payload2" --output "$release2" --project loomex-runner --version 0.1.1 --platform darwin-arm64 --source-revision test2 --unsigned-development
+payload2="$fixture/payload2"; make_payload 0.1.1 "$payload2" test2; release2="$fixture/release2"; SOURCE_DATE_EPOCH=2 python3 "$repo/scripts/artifact.py" create --payload "$payload2" --output "$release2" --project loomex-runner --version 0.1.1 --platform darwin-arm64 --source-revision test2 --unsigned-development
 touch "$state/test-race"
 launchctl_bin="$fixture/launchctl-bin"; mkdir "$launchctl_bin"; touch "$state/test-launchctl-loaded"; : > "$state/test-launchctl-log"
 printf '%s\n' '#!/bin/bash' "log='$state/test-launchctl-log'; loaded='$state/test-launchctl-loaded'" 'printf '\''%s\n'\'' "$1" >> "$log"' 'case "$1" in bootout) rm -f "$loaded";; bootstrap) [[ ! -e "$loaded" ]] || exit 1; touch "$loaded";; print) [[ -e "$loaded" ]];; *) exit 1;; esac' > "$launchctl_bin/launchctl"; chmod 0755 "$launchctl_bin/launchctl"
@@ -172,7 +209,7 @@ import json,plistlib,sys
 assert plistlib.load(open(sys.argv[1],'rb'))['EnvironmentVariables']['LOOMEX_CODEX_EXECUTABLE']==sys.argv[3]
 assert json.load(open(sys.argv[2]))['providerExecutables']=={'codex':sys.argv[3]}
 PY
-payload3="$fixture/payload3"; make_payload 0.1.2 "$payload3"; release3="$fixture/release3"; SOURCE_DATE_EPOCH=3 python3 "$repo/scripts/artifact.py" create --payload "$payload3" --output "$release3" --project loomex-runner --version 0.1.2 --platform darwin-arm64 --source-revision test3 --unsigned-development
+payload3="$fixture/payload3"; make_payload 0.1.2 "$payload3" test3; release3="$fixture/release3"; SOURCE_DATE_EPOCH=3 python3 "$repo/scripts/artifact.py" create --payload "$payload3" --output "$release3" --project loomex-runner --version 0.1.2 --platform darwin-arm64 --source-revision test3 --unsigned-development
 printf 1 > "$state/test-active"
 LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/install.sh" "$release2" --allow-unsigned-development --development-api-origin "$dev_origin" --install-base "$base" --state-dir "$state" --launch-agents-dir "$agents"
 LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_INSTALL_TEST_MODE=1 "$repo/scripts/install.sh" "$release3" --allow-unsigned-development --development-api-origin "$dev_origin" --install-base "$base" --state-dir "$state" --launch-agents-dir "$agents"

@@ -15,6 +15,11 @@ use std::{
 };
 use uuid::Uuid;
 
+/// Retired presentation state is useful for an exact restore/retry, but is
+/// local convenience state rather than execution authority.  Keep inactive or
+/// resolved sessions and completed-operation results for thirty days.  Active
+/// sessions, and any pending or ambiguous operation, are deliberately never
+/// put on this expiry path.
 const RETENTION_SECONDS: u64 = 30 * 24 * 60 * 60;
 const MAX_STATE_BYTES: usize = 512 * 1024;
 const MAX_JSON_DEPTH: usize = 32;
@@ -372,6 +377,27 @@ impl PresentationStore {
             "UPDATE presentation_operations SET status=?1,result_reference_json=?2,updated_at=?3,expires_at=?4 WHERE operation_id=?5",
             params![status, (!reference.is_null()).then(|| encode(&reference)).transpose()?, now, expires, operation],
         )?;
+        // A session may have been retired while its exact operation was still
+        // awaiting reconciliation.  Pending and ambiguous operations must
+        // clear any old retirement deadline; a completed operation starts a
+        // fresh 30-day restore window only for an already inactive/resolved
+        // session.  This prevents a delayed settlement from being swept by a
+        // deadline armed before the operation was known to be final.
+        match status {
+            "completed" => {
+                tx.execute(
+                    "UPDATE presentation_sessions SET expires_at=CASE WHEN status IN ('inactive','resolved') THEN ?1 ELSE NULL END WHERE view_session_id=?2 AND organization_id=?3 AND account_subject=?4",
+                    params![now.saturating_add(RETENTION_SECONDS), session, scope.organization, scope.account],
+                )?;
+            }
+            "ambiguous" => {
+                tx.execute(
+                    "UPDATE presentation_sessions SET expires_at=NULL WHERE view_session_id=?1 AND organization_id=?2 AND account_subject=?3",
+                    params![session, scope.organization, scope.account],
+                )?;
+            }
+            _ => unreachable!("status validated above"),
+        }
         let result = json!({"operationId":operation,"viewSessionId":session,"status":status,"updatedAt":now,"resultReference":reference});
         save_receipt(
             &tx,
@@ -400,13 +426,14 @@ impl PresentationStore {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for id in ids {
             let now = crate::state::now();
+            // Entity retirement is not an instruction to erase an owner view
+            // immediately.  Preserve the exact resolved session for the same
+            // 30-day restore window as an explicit inactive/resolved update.
+            // An unresolved operation is execution evidence, so it clears the
+            // deadline until a final settlement explicitly starts a new window.
             tx.execute(
-                "UPDATE presentation_sessions SET status='resolved',revision=revision+1,updated_at=?1,expires_at=?2 WHERE organization_id=?3 AND account_subject=?4 AND entity_type=?5 AND entity_id=?6 AND EXISTS (SELECT 1 FROM presentation_operations operation WHERE operation.view_session_id=presentation_sessions.view_session_id AND operation.status IN ('pending','ambiguous'))",
+                "UPDATE presentation_sessions SET status='resolved',revision=revision+1,updated_at=?1,expires_at=CASE WHEN EXISTS (SELECT 1 FROM presentation_operations operation WHERE operation.view_session_id=presentation_sessions.view_session_id AND operation.status IN ('pending','ambiguous')) THEN NULL ELSE ?2 END WHERE organization_id=?3 AND account_subject=?4 AND entity_type=?5 AND entity_id=?6",
                 params![now, now.saturating_add(RETENTION_SECONDS), org, account, entity_type, id],
-            )?;
-            tx.execute(
-                "DELETE FROM presentation_sessions WHERE organization_id=?1 AND account_subject=?2 AND entity_type=?3 AND entity_id=?4 AND NOT EXISTS (SELECT 1 FROM presentation_operations operation WHERE operation.view_session_id=presentation_sessions.view_session_id AND operation.status IN ('pending','ambiguous'))",
-                params![org, account, entity_type, id],
             )?;
         }
         tx.commit()?;
@@ -419,8 +446,11 @@ impl PresentationStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
         connection.execute("DELETE FROM presentation_sessions WHERE expires_at IS NOT NULL AND expires_at <= ?1 AND NOT EXISTS (SELECT 1 FROM presentation_operations operation WHERE operation.view_session_id=presentation_sessions.view_session_id AND operation.status IN ('pending','ambiguous'))", params![at])?;
+        // Only completed operation results receive an expiry.  Keeping this
+        // predicate explicit makes a corrupt or future status conservative:
+        // it cannot turn an unresolved operation into a cleanup candidate.
         connection.execute(
-            "DELETE FROM presentation_operations WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+            "DELETE FROM presentation_operations WHERE expires_at IS NOT NULL AND expires_at <= ?1 AND status='completed'",
             params![at],
         )?;
         connection.execute(
@@ -820,10 +850,12 @@ mod tests {
         store
             .sweep(crate::state::now() + RETENTION_SECONDS + 1)
             .unwrap();
-        assert!(
+        assert_eq!(
             store
                 .get(scope(), &json!({"viewSessionId":resolved_id}))
-                .is_err()
+                .unwrap_err()
+                .to_string(),
+            "VIEW_SESSION_NOT_FOUND"
         );
         assert!(
             store
@@ -837,6 +869,97 @@ mod tests {
                     &json!({"viewSessionId":active_id,"operationId":operation_id})
                 )
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn entity_retirement_uses_the_same_thirty_day_restore_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = PresentationStore::open(temp.path()).unwrap();
+        let session = create(&store);
+        let id = session["viewSessionId"].as_str().unwrap();
+        let entity = session["entityId"].as_str().unwrap();
+        store
+            .delete_entities("org-a", "user-a", "execution", &[entity])
+            .unwrap();
+        let retired = store.get(scope(), &json!({"viewSessionId":id})).unwrap();
+        assert_eq!(retired["status"], "resolved");
+        let expiry = retired["expiresAt"].as_u64().unwrap();
+        store.sweep(expiry - 1).unwrap();
+        assert!(store.get(scope(), &json!({"viewSessionId":id})).is_ok());
+        store.sweep(expiry).unwrap();
+        assert_eq!(
+            store
+                .get(scope(), &json!({"viewSessionId":id}))
+                .unwrap_err()
+                .to_string(),
+            "VIEW_SESSION_NOT_FOUND"
+        );
+    }
+
+    #[test]
+    fn delayed_operation_settlement_rearms_retired_session_retention() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = PresentationStore::open(temp.path()).unwrap();
+        let session = create(&store);
+        let id = session["viewSessionId"].as_str().unwrap();
+        let entity = session["entityId"].as_str().unwrap();
+        let pending = store
+            .update(
+                scope(),
+                &json!({"viewSessionId":id,"expectedRevision":0,"state":{},"operation":{"method":"interactions.respond","params":{"requestId":Uuid::new_v4()},"idempotencyKey":Uuid::new_v4()},"idempotencyKey":Uuid::new_v4()}),
+            )
+            .unwrap();
+        let operation = pending["operation"]["operationId"].as_str().unwrap();
+        store
+            .delete_entities("org-a", "user-a", "execution", &[entity])
+            .unwrap();
+        assert!(store.get(scope(), &json!({"viewSessionId":id})).unwrap()["expiresAt"].is_null());
+
+        // Model a pre-fix retired deadline that elapsed while this operation
+        // was awaiting reconciliation.  Sweep must retain the unresolved row.
+        {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE presentation_sessions SET expires_at=1 WHERE view_session_id=?1",
+                    params![id],
+                )
+                .unwrap();
+        }
+        store.sweep(2).unwrap();
+        assert!(store.get(scope(), &json!({"viewSessionId":id})).is_ok());
+
+        store
+            .operation_settle(
+                scope(),
+                &json!({"viewSessionId":id,"operationId":operation,"status":"ambiguous","idempotencyKey":Uuid::new_v4()}),
+            )
+            .unwrap();
+        assert!(store.get(scope(), &json!({"viewSessionId":id})).unwrap()["expiresAt"].is_null());
+        store
+            .sweep(crate::state::now() + RETENTION_SECONDS + 1)
+            .unwrap();
+        assert!(store.get(scope(), &json!({"viewSessionId":id})).is_ok());
+
+        store
+            .operation_settle(
+                scope(),
+                &json!({"viewSessionId":id,"operationId":operation,"status":"completed","idempotencyKey":Uuid::new_v4()}),
+            )
+            .unwrap();
+        let expiry = store.get(scope(), &json!({"viewSessionId":id})).unwrap()["expiresAt"]
+            .as_u64()
+            .unwrap();
+        store.sweep(expiry - 1).unwrap();
+        assert!(store.get(scope(), &json!({"viewSessionId":id})).is_ok());
+        store.sweep(expiry).unwrap();
+        assert_eq!(
+            store
+                .get(scope(), &json!({"viewSessionId":id}))
+                .unwrap_err()
+                .to_string(),
+            "VIEW_SESSION_NOT_FOUND"
         );
     }
 
