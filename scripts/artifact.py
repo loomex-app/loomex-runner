@@ -134,6 +134,13 @@ def create(args: argparse.Namespace) -> None:
     except FileExistsError: raise SystemExit("release output already exists")
     archive=destination/"payload.tar.gz"; deterministic_tar(root,archive,epoch)
     manifest={"schema":"app.loomex.release/v1","project":args.project,"version":args.version,"platform":args.platform,"sourceRevision":args.source_revision,"sourceDateEpoch":epoch,"developmentOnly":args.unsigned_development,"payload":{"file":archive.name,"sha256":digest(archive),"files":inventory(root)}}
+    if args.bootstrap:
+        bootstrap=Path(args.bootstrap).resolve()
+        if not bootstrap.is_file() or bootstrap.is_symlink() or not bootstrap.stat().st_mode & stat.S_IXUSR: raise SystemExit("release bootstrap must be a regular executable")
+        target=destination/"loomex-lifecycle-bootstrap"
+        shutil.copy2(bootstrap,target)
+        target.chmod(0o755)
+        manifest["bootstrap"]={"file":target.name,"sha256":digest(target),"size":target.stat().st_size}
     manifest["sourceContent"]={"file":"metadata/source-content-manifest.json","sha256":digest(source_path)}
     manifest_path=destination/"manifest.json"; manifest_path.write_bytes(canonical(manifest))
     signature=destination/"manifest.sig"
@@ -153,6 +160,11 @@ def verified(args: argparse.Namespace) -> tuple[Path,dict[str,object]]:
         openssl("dgst","-sha256","-verify",args.public_key,"-signature",str(signature),str(manifest_path))
     archive=release/str(manifest["payload"]["file"])
     if digest(archive)!=manifest["payload"]["sha256"]: raise SystemExit("payload digest mismatch")
+    bootstrap=manifest.get("bootstrap")
+    if bootstrap is not None:
+        if not isinstance(bootstrap,dict) or set(bootstrap)!={"file","sha256","size"} or bootstrap.get("file")!="loomex-lifecycle-bootstrap" or not isinstance(bootstrap.get("sha256"),str) or len(bootstrap["sha256"])!=64 or not isinstance(bootstrap.get("size"),int) or bootstrap["size"]<=0: raise SystemExit("release bootstrap metadata mismatch")
+        path=release/bootstrap["file"]
+        if not path.is_file() or path.is_symlink() or path.stat().st_size!=bootstrap["size"] or digest(path)!=bootstrap["sha256"]: raise SystemExit("release bootstrap mismatch")
     return archive,manifest
 
 def verify_or_extract(args: argparse.Namespace) -> None:
@@ -187,6 +199,7 @@ source_check.add_argument("--source-root"); source_check.add_argument("--manifes
 make=sub.add_parser("create")
 for name in ("payload","output","project","version","platform","source_revision"): make.add_argument("--"+name.replace("_","-"),required=True)
 make.add_argument("--signing-key"); make.add_argument("--unsigned-development",action="store_true"); make.set_defaults(run=create)
+make.add_argument("--bootstrap")
 for command in ("verify","extract"):
     item=sub.add_parser(command); item.add_argument("--release",required=True); item.add_argument("--project",required=True); item.add_argument("--platform",required=True); item.add_argument("--public-key"); item.add_argument("--allow-unsigned-development",action="store_true"); item.add_argument("--allow-legacy-source-provenance",action="store_true"); item.add_argument("--source-root")
     if command=="extract": item.add_argument("--extract",required=True)

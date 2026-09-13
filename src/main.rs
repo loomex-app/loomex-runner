@@ -1,6 +1,7 @@
-use anyhow::{Result, bail};
-use loomex_runner::{control, state};
+use anyhow::{Context, Result, bail};
+use loomex_runner::{control, lifecycle, state};
 use serde_json::json;
+use std::path::PathBuf;
 
 fn main() {
     if let Err(error) = entry() {
@@ -21,6 +22,9 @@ async fn run() -> Result<()> {
     if command == "--version" || command == "version" {
         println!("loomex {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+    if command == "lifecycle" {
+        return run_lifecycle(args.collect()).await;
     }
     let dir = state::state_dir()?;
     if command == "logout" {
@@ -56,7 +60,7 @@ async fn run() -> Result<()> {
         }
         "--help" | "help" => {
             println!(
-                "loomex status | login | logout [--offline] | drain | rpc METHOD JSON | --version"
+                "loomex status | login | logout [--offline] | drain | lifecycle {{status|resume|rollback|repair}} [--json] | rpc METHOD JSON | --version"
             );
             return Ok(());
         }
@@ -119,6 +123,74 @@ async fn run() -> Result<()> {
                 break;
             }
         }
+    }
+    Ok(())
+}
+
+async fn run_lifecycle(arguments: Vec<String>) -> Result<()> {
+    let mut args = arguments.into_iter();
+    let action = args.next().unwrap_or_else(|| "status".into());
+    let mut json_output = false;
+    let mut install_base = None;
+    let mut state_dir = None;
+    let mut launch_agents_dir = None;
+    let mut version = None;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--json" => json_output = true,
+            "--install-base" => {
+                install_base = Some(PathBuf::from(
+                    args.next().context("--install-base requires a path")?,
+                ))
+            }
+            "--state-dir" => {
+                state_dir = Some(PathBuf::from(
+                    args.next().context("--state-dir requires a path")?,
+                ))
+            }
+            "--launch-agents-dir" => {
+                launch_agents_dir = Some(PathBuf::from(
+                    args.next().context("--launch-agents-dir requires a path")?,
+                ))
+            }
+            "--to" => version = Some(args.next().context("--to requires a version")?),
+            _ => bail!("invalid lifecycle argument"),
+        }
+    }
+    let mut paths = lifecycle::Paths::from_environment()?;
+    if let Some(path) = install_base {
+        paths.install_base = path;
+    }
+    if let Some(path) = state_dir {
+        paths.state_dir = path;
+    }
+    if let Some(path) = launch_agents_dir {
+        paths.launch_agents_dir = path;
+    }
+    paths.validate()?;
+    let value = match action.as_str() {
+        "status" => lifecycle::status(&paths)?,
+        "resume" => lifecycle::resume(&paths).await?,
+        "rollback" => {
+            lifecycle::rollback(
+                &paths,
+                &version.context("lifecycle rollback requires --to VERSION")?,
+            )
+            .await?
+        }
+        "repair" => lifecycle::repair(&paths).await?,
+        "--help" | "help" => {
+            println!(
+                "loomex lifecycle status [--json] [--install-base DIR --state-dir DIR --launch-agents-dir DIR]\nloomex lifecycle resume|repair [--json] [directories]\nloomex lifecycle rollback --to VERSION [--json] [directories]"
+            );
+            return Ok(());
+        }
+        _ => bail!("unknown lifecycle command"),
+    };
+    if json_output || action != "status" {
+        println!("{}", serde_json::to_string(&value)?);
+    } else {
+        println!("{}", lifecycle::readable(&value));
     }
     Ok(())
 }

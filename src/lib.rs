@@ -4,6 +4,7 @@ pub mod control;
 pub mod executor;
 pub mod follow;
 pub mod jobs;
+pub mod lifecycle;
 pub mod presentation;
 pub mod progress;
 pub mod recovery;

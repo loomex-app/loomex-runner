@@ -35,18 +35,19 @@ remap_cflags="${CFLAGS:-} -ffile-prefix-map=$build_root=/loomex/src -ffile-prefi
 (cd "$build_root" && CARGO_TARGET_DIR="$temporary/target" RUSTFLAGS="$remap_flags" CFLAGS="$remap_cflags" cargo test --locked)
 python3 "$build_root/scripts/export-compatibility.py" --check
 if [[ "$mode" == "--production" ]]; then
-  (cd "$build_root" && CARGO_TARGET_DIR="$temporary/target" RUSTFLAGS="$remap_flags" CFLAGS="$remap_cflags" cargo build --locked --release --target aarch64-apple-darwin)
+  (cd "$build_root" && CARGO_TARGET_DIR="$temporary/target" RUSTFLAGS="$remap_flags" CFLAGS="$remap_cflags" cargo build --locked --release --target aarch64-apple-darwin --bin loomex --bin loomex-runner --bin loomex-lifecycle-bootstrap)
   binary_root="$temporary/target/aarch64-apple-darwin/release"
 else
   [[ "$(uname -s)-$(uname -m)" == "Darwin-arm64" ]] || { echo "unsigned development artifact requires a macOS arm64 host" >&2; exit 1; }
-  (cd "$build_root" && CARGO_TARGET_DIR="$temporary/target" RUSTFLAGS="$remap_flags" CFLAGS="$remap_cflags" cargo build --locked)
+  (cd "$build_root" && CARGO_TARGET_DIR="$temporary/target" RUSTFLAGS="$remap_flags" CFLAGS="$remap_cflags" cargo build --locked --bin loomex --bin loomex-runner --bin loomex-lifecycle-bootstrap)
   binary_root="$temporary/target/debug"
 fi
 payload="$temporary/payload"
 mkdir -p "$payload/bin" "$payload/metadata" "$payload/launchd"
 cp "$binary_root/loomex" "$payload/bin/loomex"
 cp "$binary_root/loomex-runner" "$payload/bin/loomex-runner"
-chmod 0755 "$payload/bin/loomex" "$payload/bin/loomex-runner"
+cp "$binary_root/loomex-lifecycle-bootstrap" "$payload/bin/loomex-lifecycle-bootstrap"
+chmod 0755 "$payload/bin/loomex" "$payload/bin/loomex-runner" "$payload/bin/loomex-lifecycle-bootstrap"
 python3 - "$version" "$payload/metadata/project.json" <<'PY'
 import json,sys
 from pathlib import Path
@@ -59,8 +60,9 @@ python3 "$build_root/scripts/validate_package.py" "$payload" --expected-version 
 if [[ "$mode" == "--production" ]]; then
   codesign --force --timestamp --options runtime --sign "$LOOMEX_CODESIGN_IDENTITY" "$payload/bin/loomex"
   codesign --force --timestamp --options runtime --sign "$LOOMEX_CODESIGN_IDENTITY" "$payload/bin/loomex-runner"
+  codesign --force --timestamp --options runtime --sign "$LOOMEX_CODESIGN_IDENTITY" "$payload/bin/loomex-lifecycle-bootstrap"
 else
-  strip -S "$payload/bin/loomex" "$payload/bin/loomex-runner"
+  strip -S "$payload/bin/loomex" "$payload/bin/loomex-runner" "$payload/bin/loomex-lifecycle-bootstrap"
   echo "WARNING: building unsigned development artifact for isolated testing only" >&2
 fi
 python3 - "$payload" "${HOME:?}" <<'PY'
@@ -71,14 +73,14 @@ for path in root.rglob('*'):
  if path.is_file() and needle in path.read_bytes(): raise SystemExit(f'payload embeds build home path: {path.relative_to(root)}')
 PY
 release_stage="$temporary/release"
-arguments=(create --payload "$payload" --output "$release_stage" --project loomex-runner --version "$version" --platform darwin-arm64 --source-revision "$revision")
+arguments=(create --payload "$payload" --output "$release_stage" --project loomex-runner --version "$version" --platform darwin-arm64 --source-revision "$revision" --bootstrap "$payload/bin/loomex-lifecycle-bootstrap")
 if [[ "$mode" == "--production" ]]; then arguments+=(--signing-key "$LOOMEX_MANIFEST_SIGNING_KEY"); else arguments+=(--unsigned-development); fi
 python3 "$build_root/scripts/artifact.py" "${arguments[@]}"
 if [[ "$mode" == "--production" ]]; then
   ditto -c -k --keepParent "$payload/bin" "$temporary/notary.zip"
   xcrun notarytool submit "$temporary/notary.zip" --keychain-profile "$LOOMEX_NOTARY_PROFILE" --wait --output-format json > "$temporary/notary.json"
   python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["status"]=="Accepted"' "$temporary/notary.json"
-  for binary in "$payload/bin/loomex" "$payload/bin/loomex-runner"; do codesign --verify --strict --verbose=2 "$binary"; spctl --assess --type execute --verbose=2 "$binary"; done
+  for binary in "$payload/bin/loomex" "$payload/bin/loomex-runner" "$payload/bin/loomex-lifecycle-bootstrap" "$release_stage/loomex-lifecycle-bootstrap"; do codesign --verify --strict --verbose=2 "$binary"; spctl --assess --type execute --verbose=2 "$binary"; done
 fi
 [[ ! -e "$output" ]] || { echo "output appeared during build; refusing to replace it: $output" >&2; exit 1; }
 mkdir -p "$(dirname "$output")"

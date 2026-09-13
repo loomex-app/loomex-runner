@@ -7,7 +7,7 @@ root=Path(args.root).resolve()
 for path in root.rglob("*"):
     relative=path.relative_to(root)
     if any(part in {".git","credentials","secrets","target",".cache","__pycache__",".DS_Store"} or part.startswith(".env") or part.endswith((".pem",".key",".log")) or "credential" in part.lower() or "secret" in part.lower() for part in relative.parts): raise SystemExit(f"forbidden packaged path: {relative}")
-for name in ("loomex","loomex-runner"):
+for name in ("loomex","loomex-runner","loomex-lifecycle-bootstrap"):
     binary=root/"bin"/name
     if not binary.is_file() or not (binary.stat().st_mode & 0o111): raise SystemExit(f"runner executable missing: {name}")
 metadata=json.loads((root/"metadata/project.json").read_text())
