@@ -590,6 +590,21 @@ async fn launchctl(action: &str, agent: &Path) -> Result<()> {
     if action == "bootout" && !launchctl_label_absent().await? {
         bail!("launchctl service remained loaded after bootout")
     }
+    // `bootstrap` registers a LaunchAgent but does not reliably start it on
+    // every supported launchd state, even when the plist declares RunAtLoad.
+    // Start the exact registered label before the health check so activation
+    // observes a running candidate rather than merely a loaded definition.
+    if action == "bootstrap" {
+        let status = tokio::process::Command::new(NATIVE_EXECUTABLES[0])
+            .arg("kickstart")
+            .arg("-k")
+            .arg(format!("gui/{uid}/app.loomex.runner"))
+            .status()
+            .await?;
+        if !status.success() {
+            bail!("launchctl failed to start lifecycle service")
+        }
+    }
     Ok(())
 }
 
