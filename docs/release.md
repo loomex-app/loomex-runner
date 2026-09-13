@@ -1,6 +1,6 @@
 # Loomex runner release and installation
 
-Version 0.3.9 contains a private native `loomex-runner` daemon and a thin public `loomex` CLI for macOS arm64. The CLI cannot start daemon, worker, or supervisor modes. It installs without root privileges under `~/Library/Application Support/Loomex/runner`, keeps explicit state under `~/.local/share/loomex/runner`, listens on its per-user control socket, and runs `loomex-runner` as LaunchAgent `app.loomex.runner`. The package has explicit project, version, platform, and state-schema metadata; it preserves existing supported installation state and initializes the versioned presentation database on first use.
+Version 0.3.10 contains a private native `loomex-runner` daemon and a thin public `loomex` CLI for macOS arm64. The CLI cannot start daemon, worker, or supervisor modes. It installs without root privileges under `~/Library/Application Support/Loomex/runner`, keeps explicit state under `~/.local/share/loomex/runner`, listens on its per-user control socket, and runs `loomex-runner` as LaunchAgent `app.loomex.runner`. The package has explicit project, version, platform, and state-schema metadata; it preserves existing supported installation state and initializes the versioned presentation database on first use.
 
 The production release workflow requires a cross-component qualification before
 the runner is signed or published. Its manual inputs identify the plugin and
