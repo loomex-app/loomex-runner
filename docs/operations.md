@@ -10,13 +10,14 @@ The default state root is `~/.local/share/loomex/runner`. A test or development 
 
 ```sh
 loomex status
+loomex diagnostics
 loomex login
 loomex logout
 loomex drain
 loomex rpc METHOD JSON
 ```
 
-`status` returns the runner version, local protocol, active-job count, drain state, and whether a staged update is pending. `login` starts device approval and opens the returned same-origin verification page. Organization selection and workspace grant are separate catalogued operations, for example:
+`status` returns a concise runner version, local protocol, active-job count, drain state, and staged-update view. `diagnostics` is read-only JSON for repair: it reports daemon connectivity, the non-secret installation ID when the daemon can read it, and each provider executable's availability with a safe reason. It never starts a daemon, reads provider authentication, or prints provider paths and checksums. `login` starts device approval and opens the returned same-origin verification page. Organization selection and workspace grant are separate catalogued operations, for example:
 
 ```sh
 loomex rpc organizations.list '{}'
@@ -58,7 +59,8 @@ If a provider or command effect may have started and the daemon loses durable ou
 
 | Symptom or state | Meaning and action |
 | --- | --- |
-| `RUNNER_UNAVAILABLE` | The socket is absent, unsafe, inaccessible, or transport failed before a mutation was known sent. Check LaunchAgent/daemon status, state ownership, and `control.sock`; preserve state. |
+| `RUNNER_UNAVAILABLE` | The socket is absent, unsafe, inaccessible, refused a connection, or transport failed before a mutation was known sent. Run `loomex diagnostics`, check LaunchAgent/daemon status, state ownership, and `control.sock`; preserve state. |
+| `LIFECYCLE_ERROR` | A lifecycle journal, LaunchAgent, or candidate-health operation could not be completed. Run `loomex lifecycle status --json`; preserve the lifecycle journal and use `resume` or `repair` when it identifies an action. |
 | `NETWORK_AMBIGUOUS` | A local mutation may have reached the runner. Retry the same intended mutation with the returned idempotency key or query the resulting resource. |
 | `AUTH_REQUIRED` / `AUTH_EXPIRED` | Device or organization authority is missing. Inspect `auth.status`; complete login or repair enrollment rather than supplying tokens manually. |
 | `AUTH_RECOVERY_PENDING` / `AUTH_RECOVERY_EXHAUSTED` | A credential mutation has durable uncertain state. Preserve Keychain state and reconcile the backend record; repeated recovery is intentionally blocked. |
@@ -110,3 +112,26 @@ cargo test --locked
 CI also builds an unsigned development package in isolated temporary directories, installs it without touching the user's LaunchAgent or Keychain, starts the daemon against a non-listening loopback origin, and checks installed CLI status. Unit and fake-backend tests cover state permissions, workspace replacement, signed requests, credential recovery, socket safety, prepare/commit binding, process-group cancellation, output larger than a transport frame, resumable artifact upload, restart without replay, retention, update deferral, rollback, and uninstall boundaries.
 
 These checks do not qualify a production environment. Before release, satisfy the [release gates](../../planning/plugin-runner-clean-slate/release-gates.md), including Developer ID signing, notarization/Gatekeeper, an actually signed clean-host LaunchAgent lifecycle, deployed backend migrations and compatibility, real Desktop UI use, real account and revocation flows, confirmation of historical remote credential revocation, and real Codex, Claude, and Gemini execution. The current planning authority and historical-decision disposition are the [clean-slate baseline](../../planning/plugin-runner-clean-slate/README.md) and [superseded decision index](../../planning/plugin-runner-clean-slate/superseded-decisions-index.md).
+
+## Repairing receipt identity
+
+`loomex lifecycle repair` reconciles a stale installation receipt only after the owned current package, LaunchAgent configuration, and daemon version agree. Receipt repair has its own pending/completed record so interruption after the receipt write can finish without replacing the service. A changed active lifecycle operation or conflicting target/plist fails closed. Repair does not adopt an arbitrary package or transfer execution ownership. Read the lifecycle status before interpreting repair as complete.
+
+Public error recovery rules are exported in `contracts/error-recovery.json`. New local-control clients explicitly negotiate `error.recovery/v1` to receive recovery/outcome fields; older clients retain the original wire envelope. Unknown outcomes require exact reconciliation. A retryable transport hint never permits replay of uncertain command effects.
+
+## Execution ownership diagnostics
+
+When drain remains pending, inspect active/managed work and durable job state
+before replacing the daemon. Managed work includes recovery, delivery and
+control operations; an exited child alone does not prove quiescence.
+
+After an execution-task failure, preserve the journal and output directory.
+A confirmed exit/result is retained for delivery; absence of trustworthy
+terminal evidence produces an indeterminate outcome, never automatic command
+replay. An unreadable journal is retained and does not prevent reconciliation
+of other readable jobs. Repair storage availability before retrying delivery;
+do not delete evidence to force another execution.
+
+Source validation and evidence for the modular execution implementation are in
+[Phase 5 completion](../../planning/plugin-runner-integration/phase-5-completion.md).
+Installed provider and signed-package qualification remain separate gates.

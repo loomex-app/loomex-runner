@@ -5,11 +5,21 @@
   "$defs": {
     "validationIssue": {
       "type": "object",
-      "required": ["code", "message", "nextAction"],
+      "required": [
+        "code",
+        "message",
+        "nextAction"
+      ],
       "properties": {
-        "code": {"type": "string"},
-        "message": {"type": "string"},
-        "nextAction": {"type": "string"},
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "nextAction": {
+          "type": "string"
+        },
         "nodeIndex": {
           "type": "integer",
           "minimum": 1,
@@ -21,72 +31,132 @@
           "oneOf": [
             {
               "properties": {
-                "code": {"const": "RUN_INPUT_SCHEMA_INVALID"},
-                "message": {"const": "Workflow inputs do not match the required schema."},
-                "nextAction": {"const": "correct_workflow_inputs"}
+                "code": {
+                  "const": "RUN_INPUT_SCHEMA_INVALID"
+                },
+                "message": {
+                  "const": "Workflow inputs do not match the required schema."
+                },
+                "nextAction": {
+                  "const": "correct_workflow_inputs"
+                }
               }
             },
             {
               "properties": {
-                "code": {"const": "RUN_VALIDATION_EXECUTION_POLICY_INVALID"},
-                "message": {"const": "The workflow execution policy does not support a required capability."},
-                "nextAction": {"const": "update_workflow_definition"}
+                "code": {
+                  "const": "RUN_VALIDATION_EXECUTION_POLICY_INVALID"
+                },
+                "message": {
+                  "const": "The workflow execution policy does not support a required capability."
+                },
+                "nextAction": {
+                  "const": "update_workflow_definition"
+                }
               }
             },
             {
               "properties": {
-                "code": {"const": "UNSUPPORTED_CAPABILITY"},
-                "message": {"const": "The workflow execution policy does not support a required capability."},
-                "nextAction": {"const": "update_workflow_definition"}
+                "code": {
+                  "const": "UNSUPPORTED_CAPABILITY"
+                },
+                "message": {
+                  "const": "The workflow execution policy does not support a required capability."
+                },
+                "nextAction": {
+                  "const": "update_workflow_definition"
+                }
               }
             },
             {
               "properties": {
-                "code": {"const": "RUN_VALIDATION_EXECUTION_ROOT_REQUIRED"},
-                "message": {"const": "This workflow requires a prepared local runner execution root."},
-                "nextAction": {"const": "prepare_runner_execution"}
+                "code": {
+                  "const": "RUN_VALIDATION_EXECUTION_ROOT_REQUIRED"
+                },
+                "message": {
+                  "const": "This workflow requires a prepared local runner execution root."
+                },
+                "nextAction": {
+                  "const": "prepare_runner_execution"
+                }
               }
             },
             {
               "properties": {
-                "code": {"const": "RUN_VALIDATION_RUNNER_UNAVAILABLE"},
-                "message": {"const": "The required local runner is not connected."},
-                "nextAction": {"const": "connect_runner"}
+                "code": {
+                  "const": "RUN_VALIDATION_RUNNER_UNAVAILABLE"
+                },
+                "message": {
+                  "const": "The required local runner is not connected."
+                },
+                "nextAction": {
+                  "const": "connect_runner"
+                }
               }
             },
             {
               "properties": {
-                "code": {"const": "RUN_VALIDATION_PROVIDER_UNSUPPORTED"},
-                "message": {"const": "The selected provider does not support a required workflow capability."},
-                "nextAction": {"const": "choose_supported_provider"}
+                "code": {
+                  "const": "RUN_VALIDATION_PROVIDER_UNSUPPORTED"
+                },
+                "message": {
+                  "const": "The selected provider does not support a required workflow capability."
+                },
+                "nextAction": {
+                  "const": "choose_supported_provider"
+                }
               }
             },
             {
               "properties": {
-                "code": {"const": "RUN_VALIDATION_PROVIDER_INVALID"},
-                "message": {"const": "The workflow selects a provider that cannot run this work."},
-                "nextAction": {"const": "choose_supported_provider"}
+                "code": {
+                  "const": "RUN_VALIDATION_PROVIDER_INVALID"
+                },
+                "message": {
+                  "const": "The workflow selects a provider that cannot run this work."
+                },
+                "nextAction": {
+                  "const": "choose_supported_provider"
+                }
               }
             },
             {
               "properties": {
-                "code": {"const": "RUN_VALIDATION_POLICY_DENIED"},
-                "message": {"const": "The execution policy does not allow a required workflow capability."},
-                "nextAction": {"const": "allow_capability"}
+                "code": {
+                  "const": "RUN_VALIDATION_POLICY_DENIED"
+                },
+                "message": {
+                  "const": "The execution policy does not allow a required workflow capability."
+                },
+                "nextAction": {
+                  "const": "allow_capability"
+                }
               }
             },
             {
               "properties": {
-                "code": {"const": "RUN_VALIDATION_POLICY_REQUIRED"},
-                "message": {"const": "A required workflow capability policy has not been configured."},
-                "nextAction": {"const": "configure_capability_policy"}
+                "code": {
+                  "const": "RUN_VALIDATION_POLICY_REQUIRED"
+                },
+                "message": {
+                  "const": "A required workflow capability policy has not been configured."
+                },
+                "nextAction": {
+                  "const": "configure_capability_policy"
+                }
               }
             },
             {
               "properties": {
-                "code": {"const": "RUN_VALIDATION_FAILED"},
-                "message": {"const": "The workflow has a validation issue that must be reviewed."},
-                "nextAction": {"const": "review_workflow_validation"}
+                "code": {
+                  "const": "RUN_VALIDATION_FAILED"
+                },
+                "message": {
+                  "const": "The workflow has a validation issue that must be reviewed."
+                },
+                "nextAction": {
+                  "const": "review_workflow_validation"
+                }
               }
             }
           ]
@@ -142,6 +212,10 @@
             "editor.finalize",
             "runs.prepare",
             "runs.commit",
+            "runs.start_handoff.issue",
+            "runs.start_handoff.restore",
+            "runs.start_handoff.get",
+            "runs.start_handoff.commit",
             "runs.list",
             "runs.get",
             "runs.wait",
@@ -162,8 +236,12 @@
             "builder.commit",
             "editor.commit",
             "preparations.get",
+            "presentation.delivery.get",
+            "presentation.delivery.begin",
+            "presentation.delivery.settle",
             "presentation.sessions.create",
             "presentation.sessions.get",
+            "presentation.sessions.restore",
             "presentation.sessions.update",
             "presentation.sessions.delete",
             "presentation.operations.get",
@@ -239,23 +317,59 @@
             },
             "data": {
               "type": "object",
-              "required": ["validationIssueVersion", "validationIssues"],
+              "required": [
+                "validationIssueVersion",
+                "validationIssues"
+              ],
               "properties": {
-                "validationIssueVersion": {"const": "v1"},
+                "validationIssueVersion": {
+                  "const": "v1"
+                },
                 "validationIssues": {
                   "type": "array",
                   "minItems": 1,
                   "maxItems": 32,
-                  "items": {"$ref": "#/$defs/validationIssue"}
+                  "items": {
+                    "$ref": "#/$defs/validationIssue"
+                  }
                 }
               },
               "additionalProperties": false
+            },
+            "recovery": {
+              "type": "string",
+              "enum": [
+                "correct_input",
+                "retry_exact_operation",
+                "reconcile_outcome",
+                "refresh_authority",
+                "unavailable"
+              ]
+            },
+            "outcome": {
+              "type": "string",
+              "enum": [
+                "not_dispatched",
+                "rejected",
+                "unknown",
+                "completed"
+              ]
             }
           },
           "allOf": [
             {
-              "if": {"required": ["data"]},
-              "then": {"properties": {"code": {"const": "RUN_VALIDATION_FAILED"}}}
+              "if": {
+                "required": [
+                  "data"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "code": {
+                    "const": "RUN_VALIDATION_FAILED"
+                  }
+                }
+              }
             }
           ],
           "additionalProperties": false

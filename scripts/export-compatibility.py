@@ -145,6 +145,8 @@ def validate_catalog(catalog: dict[str, Any]) -> dict[str, dict[str, Any]]:
             fail(f"method catalog.methods: duplicate method {name}")
         if not isinstance(method.get("mutating"), bool) or not isinstance(method.get("idempotent"), bool):
             fail(f"method catalog.methods[{index}]: mutating and idempotent must be booleans")
+        if not isinstance(method.get("appOnly"), bool):
+            fail(f"method catalog.methods[{index}].appOnly: expected boolean")
         if "transportRetry" in method and method["transportRetry"] not in {"before_response_once", "never_after_send"}:
             fail(f"method catalog.methods[{index}].transportRetry: unsupported retry classification")
         validate_schema(method.get("inputSchema"), f"method catalog.methods[{index}].inputSchema")
@@ -186,7 +188,7 @@ def validate_routes(routes: dict[str, Any], catalog_methods: set[str]) -> tuple[
             fail(f"backend routes.routes[{index}].method: unsupported HTTP method")
         if not PATH_TEMPLATE.fullmatch(template):
             fail(f"backend routes.routes[{index}].pathTemplate: invalid route template")
-        if not re.fullmatch(r"src/[a-z_]+\.rs", source) or not (ROOT / source).is_file():
+        if not re.fullmatch(r"src/(?:[a-z_]+/)*[a-z_]+\.rs", source) or not (ROOT / source).is_file():
             fail(f"backend routes.routes[{index}].source: expected existing runner source file")
         endpoint = (method, template)
         if endpoint in seen_endpoints:

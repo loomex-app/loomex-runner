@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use loomex_runner::{control, lifecycle, state};
-use serde_json::json;
-use std::path::PathBuf;
+use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 
 fn main() {
     if let Err(error) = entry() {
@@ -27,6 +27,13 @@ async fn run() -> Result<()> {
         return run_lifecycle(args.collect()).await;
     }
     let dir = state::state_dir()?;
+    if command == "diagnostics" {
+        if args.next().is_some() {
+            bail!("INVALID_REQUEST")
+        }
+        println!("{}", serde_json::to_string(&diagnostics(&dir).await)?);
+        return Ok(());
+    }
     if command == "logout" {
         match args.next().as_deref() {
             Some("--offline") if args.next().is_none() => {
@@ -60,19 +67,24 @@ async fn run() -> Result<()> {
         }
         "--help" | "help" => {
             println!(
-                "loomex status | login | logout [--offline] | drain | lifecycle {{status|resume|rollback|repair}} [--json] | rpc METHOD JSON | --version"
+                "loomex status | diagnostics | login | logout [--offline] | drain | lifecycle {{status|resume|rollback|repair}} [--json] | rpc METHOD JSON | --version"
             );
             return Ok(());
         }
         _ => bail!("unknown command"),
     };
     let response = control::client(&dir, &method, params).await?;
+    let display = if command == "status" && response.get("error").is_none() {
+        compact_status(&response["result"])
+    } else {
+        response.clone()
+    };
     println!(
         "{}",
         serde_json::to_string(if command == "rpc" || response.get("error").is_some() {
             &response
         } else {
-            &response["result"]
+            &display
         })?
     );
     if response.get("error").is_some() {
@@ -127,6 +139,70 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
+/// Read-only local diagnostics.  It does not start a daemon, access provider
+/// credential stores, or print executable paths/checksums.  It is deliberately
+/// useful when the daemon is unavailable, so runner-connect errors become data
+/// instead of terminating the command.
+async fn diagnostics(dir: &Path) -> Value {
+    let mut daemon = json!({"connected":false,"reason":"RUNNER_UNAVAILABLE"});
+    let mut installation = json!({"available":false,"reason":"RUNNER_UNAVAILABLE"});
+    match control::client(dir, "status.get", json!({})).await {
+        Ok(response) if response.get("error").is_none() => {
+            let status = &response["result"];
+            daemon = json!({
+                "connected":true,
+                "reason":"available",
+                "version":status["version"],
+                "protocol":status["protocol"],
+            });
+            match control::client(dir, "auth.status", json!({})).await {
+                Ok(response) if response.get("error").is_none() => {
+                    let result = &response["result"];
+                    if let Some(id) = result["installationId"].as_str() {
+                        installation = json!({"available":true,"reason":"available","id":id});
+                    } else {
+                        installation =
+                            json!({"available":false,"reason":"INSTALLATION_ID_UNAVAILABLE"});
+                    }
+                }
+                Ok(response) => {
+                    installation = json!({"available":false,"reason":response["error"]["code"].as_str().unwrap_or("RUNNER_UNAVAILABLE")});
+                }
+                Err(error) => {
+                    let (code, _, _) = control::public_error(&error);
+                    installation = json!({"available":false,"reason":code});
+                }
+            }
+        }
+        Ok(response) => {
+            daemon = json!({"connected":false,"reason":response["error"]["code"].as_str().unwrap_or("RUNNER_UNAVAILABLE")});
+        }
+        Err(error) => {
+            let (code, _, _) = control::public_error(&error);
+            daemon = json!({"connected":false,"reason":code});
+        }
+    }
+    json!({
+        "schemaVersion":"loomex.runner.diagnostics/v1",
+        "daemon":daemon,
+        "installation":installation,
+        "providers":control::provider_diagnostics(),
+    })
+}
+
+/// Keep the ordinary status command suitable for scripts and quick checks.
+/// Detailed runner observations remain available through `rpc status.get` and
+/// the separate diagnostics command.
+fn compact_status(status: &Value) -> Value {
+    json!({
+        "version":status["version"],
+        "protocol":status["protocol"],
+        "activeJobs":status["activeJobs"],
+        "draining":status["draining"],
+        "updateDeferred":status["updateDeferred"],
+    })
+}
+
 async fn run_lifecycle(arguments: Vec<String>) -> Result<()> {
     let mut args = arguments.into_iter();
     let action = args.next().unwrap_or_else(|| "status".into());
@@ -156,6 +232,17 @@ async fn run_lifecycle(arguments: Vec<String>) -> Result<()> {
             "--to" => version = Some(args.next().context("--to requires a version")?),
             _ => bail!("invalid lifecycle argument"),
         }
+    }
+    // Validate the command before filesystem discovery so malformed input is
+    // not misreported as an installation or service failure.
+    if !matches!(
+        action.as_str(),
+        "status" | "resume" | "rollback" | "repair" | "--help" | "help"
+    ) {
+        bail!("INVALID_REQUEST");
+    }
+    if action == "rollback" && version.is_none() {
+        bail!("INVALID_REQUEST");
     }
     let mut paths = lifecycle::Paths::from_environment()?;
     if let Some(path) = install_base {
@@ -193,4 +280,39 @@ async fn run_lifecycle(arguments: Vec<String>) -> Result<()> {
         println!("{}", lifecycle::readable(&value));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_output_excludes_extended_diagnostics() {
+        let value = compact_status(&json!({
+            "version":"0.3.22",
+            "protocol":"loomex.local-control/v2",
+            "activeJobs":0,
+            "draining":false,
+            "updateDeferred":false,
+            "details":{"monitoring":{"runObservationAvailable":true}},
+        }));
+        assert_eq!(value["version"], "0.3.22");
+        assert!(value.get("details").is_none());
+    }
+
+    #[tokio::test]
+    async fn diagnostics_reports_an_unavailable_daemon_without_sensitive_provider_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let value = diagnostics(temp.path()).await;
+        assert_eq!(value["schemaVersion"], "loomex.runner.diagnostics/v1");
+        assert_eq!(value["daemon"]["connected"], false);
+        assert_eq!(value["daemon"]["reason"], "RUNNER_UNAVAILABLE");
+        assert_eq!(value["installation"]["available"], false);
+        for provider in value["providers"].as_object().unwrap().values() {
+            assert!(provider["available"].is_boolean());
+            assert!(provider["reason"].is_string());
+            assert!(provider.get("path").is_none());
+            assert!(provider.get("checksumSha256").is_none());
+        }
+    }
 }

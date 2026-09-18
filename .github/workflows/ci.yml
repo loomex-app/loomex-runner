@@ -19,7 +19,7 @@ jobs:
       - run: python3 scripts/test_compatibility_export.py
       - run: python3 scripts/test_integration_compatibility.py
       - run: python3 scripts/test_integration_gate.py
-      - run: python3 scripts/test_release_workflow_contract.py
+      - run: python3 -m unittest scripts/test_release_workflow_contract.py scripts/test_production_config.py
       - run: python3 scripts/export-compatibility.py --check
       - run: ./scripts/test-packaging.sh
       - name: Smoke installed development daemon and CLI

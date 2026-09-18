@@ -445,7 +445,24 @@ async fn install(args: Arguments) -> Result<()> {
     let _lifecycle_lock = lifecycle::LifecycleLock::acquire(&paths)?;
     if bootstrap_journal.exists() && state::read_json::<Value>(&bootstrap_journal)? != configuration
     {
-        bail!("LIFECYCLE_OPERATION_CONFIGURATION_MISMATCH")
+        // A bootstrap journal binds retries of an unfinished installation to
+        // its exact configuration.  It must not, however, turn a completed
+        // installation into a permanent update barrier.  Lifecycle owns the
+        // authoritative transaction record; only after it has reached a
+        // validated terminal phase may this stale, bootstrap-local retry
+        // record be released for a new package transaction.
+        let operation_path = paths.state_dir.join("lifecycle-operation.json");
+        let terminal = if operation_path.exists() {
+            let operation: lifecycle::Operation = state::read_json(&operation_path)?;
+            lifecycle::operation_is_terminal(&operation)?
+        } else {
+            false
+        };
+        if terminal {
+            remove_regular(&bootstrap_journal)?;
+        } else {
+            bail!("LIFECYCLE_OPERATION_CONFIGURATION_MISMATCH")
+        }
     }
     let preflight = lifecycle::preflight_package_locked(
         &paths,

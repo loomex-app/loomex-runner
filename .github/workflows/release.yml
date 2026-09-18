@@ -147,6 +147,8 @@ jobs:
           xcrun notarytool store-credentials loomex-ci --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
       - name: Build signed and notarized release
         env:
+          LOOMEX_API_ORIGIN: ${{ vars.LOOMEX_API_ORIGIN }}
+          LOOMEX_WEB_APP_ORIGIN: ${{ vars.LOOMEX_WEB_APP_ORIGIN }}
           LOOMEX_CODESIGN_IDENTITY: ${{ secrets.LOOMEX_CODESIGN_IDENTITY }}
           LOOMEX_NOTARY_PROFILE: loomex-ci
           LOOMEX_MANIFEST_SIGNING_KEY: ${{ runner.temp }}/manifest-private.pem

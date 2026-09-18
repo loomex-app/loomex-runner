@@ -2,18 +2,21 @@
 
 `presentation.sessions/v1` persists optional custom UI state in the runner's existing owner-only state directory. It is a local projection only: no restored value grants a workspace, prepares an execution, commits a preparation, resolves a human request, or invokes a recorded operation.
 
-All methods derive `organizationId` and the authenticated child runner subject from the current runner credential. Clients cannot supply either scope. The backend binds that child identity to one user, organization, and installation and reuses it for the same owner tuple. A session has an immutable `{kind, entityType, entityId}` binding. `entityType` is one of `catalog`, `workflow`, `request`, `execution`, `builderSession`, or `preparation`; `catalog` uses the nil UUID. `kind` is one of `browser`, `authoring`, `prepare`, `monitor`, or `interaction`.
+All methods derive `organizationId` and the authenticated child runner subject from the current runner credential. Clients cannot supply either scope. The backend binds that child identity to one user, organization, and installation and reuses it for the same owner tuple. A session has an immutable `{kind, entityType, entityId}` binding. `entityType` is one of `catalog`, `workflow`, `request`, `execution`, `builderSession`, or `preparation`; `catalog` uses the nil UUID. `kind` is one of `browser`, `authoring`, `prepare`, `monitor`, `interaction`, or `runs`. The `runs` kind is the workspace-wide run-list view and must use `{entityType:"catalog", entityId:"00000000-0000-0000-0000-000000000000"}`.
 
 The session methods use these exact inputs:
 
 - `presentation.sessions.create`: `{kind, entityType, entityId, state, idempotencyKey}`
 - `presentation.sessions.get`: `{viewSessionId}`
+- `presentation.sessions.restore`: `{viewSessionId}`
 - `presentation.sessions.update`: `{viewSessionId, expectedRevision, state, status?, operation?, idempotencyKey}`
 - `presentation.sessions.delete`: `{viewSessionId, idempotencyKey}`
 
 Create, get, and update return the bare projection `{viewSessionId, kind, entityType, entityId, revision, state, status, createdAt, updatedAt, expiresAt, operation}`. `operation` is null or the safe reference `{operationId,status}`. `status` is `active`, `inactive`, or `resolved`. Updates compare `expectedRevision` and fail with `REVISION_CONFLICT` rather than overwriting concurrent state.
 
-Presentation state accepts bounded JSON domain data. Normalized keys containing credential, token, password, secret, confirmation, authorization, API/private/signing key, cookie, or idempotency-key terms are rejected. The filter operates on field names; it does not attempt to infer secrets from arbitrary answer text. Exact mutable requests belong only in an update's optional operation value:
+`presentation.sessions.restore/v1` is the deliberate, read-only re-entry surface. It owner-checks the exact session and returns only `{restoreVersion:"presentation.sessions.restore/v1", viewSessionId, kind, entityType, entityId, revision, state, status, pendingOperation, details:{}}`. `pendingOperation` is null or `{operationId,status}`. Its `state` is a separately allowlisted display projection: an optional screen and bounded display labels, status, counts, and up to five workflow rows. The `runs` view may use the `runs` screen and retains only this same display/navigation projection. It never includes controls, workspace paths, query text, answer drafts, reading position, or arbitrary stored state. The runner revalidates stored state before deriving this projection. Restore never returns timestamps, owner credentials, confirmation material, mutation idempotency keys, operation params, reconciliation data, or result references; it does not invoke or authorize an operation. Missing and other-owner session IDs return `VIEW_SESSION_NOT_FOUND` without revealing ownership.
+
+Presentation state accepts bounded JSON domain data. Normalized keys containing credential, token, password, secret, confirmation, authorization, API/private/signing key, cookie, idempotency-key, or capability terms are rejected. The filter operates on field names; it does not attempt to infer secrets from arbitrary answer text. Exact mutable requests belong only in an update's optional operation value:
 
 ```json
 {

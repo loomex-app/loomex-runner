@@ -23,11 +23,14 @@ use uuid::Uuid;
 const RETENTION_SECONDS: u64 = 30 * 24 * 60 * 60;
 const SCHEMA_VERSION: u64 = 1;
 const MAX_JSON_BYTES: usize = 128 * 1024;
+const MAX_MONITORING_RECORDS: usize = 32;
+const MAX_HOOK_DIAGNOSTICS: usize = 8;
 
 pub struct FollowStore {
     connection: Mutex<Connection>,
 }
 
+#[derive(Debug)]
 pub struct FollowTarget {
     pub run_id: String,
     pub event_cursor: Option<u64>,
@@ -50,8 +53,7 @@ struct Binding {
 
 struct Continuation {
     run: String,
-    source: String,
-    receipt: Option<String>,
+    receipt: String,
 }
 
 struct ToolProgress {
@@ -143,7 +145,34 @@ impl FollowStore {
             created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL
           );
           CREATE INDEX IF NOT EXISTS follow_continuation_scope ON follow_continuations(organization_id, account_subject, installation_id, run_id);
+          -- Lifecycle diagnostics are intentionally identity-minimal. They
+          -- establish whether the installed host reached this runner without
+          -- retaining prompts, paths, tool bodies, or session identifiers.
+          CREATE TABLE IF NOT EXISTS follow_hook_diagnostics (
+            diagnostic_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            organization_id TEXT NOT NULL,
+            account_subject TEXT NOT NULL,
+            installation_id TEXT NOT NULL,
+            run_id TEXT,
+            event_id_digest TEXT NOT NULL,
+            event TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            code TEXT NOT NULL,
+            observed_at INTEGER NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS follow_hook_diagnostics_run
+            ON follow_hook_diagnostics(organization_id, account_subject, installation_id, run_id, observed_at DESC);
           PRAGMA user_version = 1;")?;
+        // Older releases represented an app-originated handoff as `active`.
+        // Those records lack a native host-session identity and must not retain
+        // workspace-derived Stop authority after this semantic change. Keep the
+        // receipt for exact wait-based promotion, but make every such record
+        // explicitly pending on startup.
+        connection.execute(
+            "UPDATE follow_sessions SET lifecycle='handoff_pending', required_action='none', updated_at=?1, expires_at=NULL
+             WHERE host_id='codex-ui' AND host_session_id='unbound' AND lifecycle='active'",
+            params![crate::state::now()],
+        )?;
         for candidate in [
             path,
             dir.join("follow.sqlite3-wal"),
@@ -262,7 +291,18 @@ impl FollowStore {
         };
         self.sweep(crate::state::now())?;
         match method {
-            "follow.session.lifecycle" => self.lifecycle(scope, p, observation),
+            "follow.session.lifecycle" => {
+                let result = self.lifecycle(scope, p, observation);
+                let (outcome, code) = match &result {
+                    Ok(_) => ("accepted", lifecycle_diagnostic_code(p)),
+                    Err(_) => ("rejected", "LIFECYCLE_REJECTED"),
+                };
+                // Diagnostics must never change lifecycle behavior. A full or
+                // unavailable local diagnostic store therefore cannot turn a
+                // valid host hook into an allow-to-stop decision.
+                let _ = self.record_lifecycle_diagnostic(scope, p, outcome, code);
+                result
+            }
             _ => bail!("METHOD_NOT_FOUND"),
         }
     }
@@ -293,28 +333,26 @@ impl FollowStore {
         }))
     }
 
-    /// Activate a follow session for a runner-issued UI handoff.  MCP Apps can
-    /// ask the host to create a chat message, but that message is not required
-    /// to produce a `UserPromptSubmit` hook callback.  Recording the follow
-    /// here, at the same trust boundary that issued the continuation receipt,
-    /// makes the later Stop callback enforce the live-follow contract even on
-    /// hosts that do not expose app-originated user-prompt events.
+    /// Record a pending, runner-issued UI handoff. MCP Apps can ask the host
+    /// to create a chat message, but the bridge does not expose a verified
+    /// host-session identity. This record is therefore evidence that the
+    /// runner issued a continuation, not authority for an unrelated hook in
+    /// the same workspace to follow the run.
     ///
-    /// The binding is deliberately scoped to the canonical workspace rather
-    /// than pretending an app view knows a host session ID.  A Stop callback
-    /// may recover it only when its cwd matches and it is the sole active
-    /// UI-originated follow in that workspace.
+    /// A later exact `loomex_run_wait` tool association can atomically consume
+    /// this pending handoff and bind it to the host session that actually began
+    /// following the run. Until then it is deliberately not lifecycle-hook
+    /// eligible.
     pub fn activate_ui_handoff(
         &self,
         org: &str,
         account: &str,
         installation: &str,
         run: &str,
-        workspace: &str,
         receipt: &str,
+        request_id: Option<&str>,
     ) -> Result<()> {
         Uuid::parse_str(run).map_err(|_| anyhow::anyhow!("INVALID_REQUEST"))?;
-        ensure!(Path::new(workspace).is_absolute(), "INVALID_REQUEST");
         ensure!(
             !receipt.is_empty()
                 && receipt.len() <= 2048
@@ -323,6 +361,9 @@ impl FollowStore {
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),
             "INVALID_REQUEST"
         );
+        if let Some(request_id) = request_id {
+            Uuid::parse_str(request_id).map_err(|_| anyhow::anyhow!("INVALID_REQUEST"))?;
+        }
         // The opaque receipt is runner-issued. Its deterministic UUID makes a
         // duplicate mutation delivery replay the original activation instead
         // of resetting the generation and losing an in-flight wait.
@@ -341,13 +382,27 @@ impl FollowStore {
         let binding = Binding {
             host: "codex-ui".into(),
             host_session: "unbound".into(),
-            task: workspace.into(),
+            // An MCP App bridge has no verified Codex task identity. A
+            // receipt-scoped placeholder keeps independently issued handoffs
+            // distinguishable without ever mistaking a workspace path for a
+            // host task identity.
+            task: format!("ui-handoff:{key}"),
             run: run.into(),
+        };
+        let anchor = if let Some(request_id) = request_id {
+            json!({"kind":"accepted_interaction","receiptId":key,"requestId":request_id})
+        } else {
+            json!({"kind":"explicit_follow","receiptId":key})
         };
         let existing = self.get(scope, &json!({"binding":public_binding(&binding)}))?;
         if existing["found"] == true
             && existing["session"]["anchor"]["receiptId"] == key
-            && existing["session"]["lifecycle"] == "active"
+            && existing["session"]["anchor"]["requestId"]
+                == request_id.map(Value::from).unwrap_or(Value::Null)
+            && matches!(
+                existing["session"]["lifecycle"].as_str(),
+                Some("handoff_pending") | Some("active")
+            )
         {
             return Ok(());
         }
@@ -356,10 +411,23 @@ impl FollowStore {
             scope,
             &json!({
                 "binding":public_binding(&binding),
-                "anchor":{"kind":"explicit_follow","receiptId":key},
+                "anchor":anchor,
                 "expectedGeneration":generation,
                 "idempotencyKey":key,
             }),
+        )?;
+        // `activate` is shared with native host bindings and initializes an
+        // active record. A UI bridge has no host-session authority, so retain
+        // the durable receipt while making the record non-enforceable.
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
+        connection.execute(
+            "UPDATE follow_sessions SET lifecycle='handoff_pending', required_action='none', updated_at=?1, expires_at=NULL
+             WHERE organization_id=?2 AND account_subject=?3 AND installation_id=?4
+               AND host_id='codex-ui' AND host_session_id='unbound' AND host_task_id=?5 AND run_id=?6",
+            params![crate::state::now(), org, account, installation, binding.task, run],
         )?;
         Ok(())
     }
@@ -382,6 +450,137 @@ impl FollowStore {
                     ]
                     .contains(&status.to_ascii_lowercase().as_str())
                 })
+    }
+
+    /// Return compact, owner-scoped evidence for one run without implying
+    /// that the host will deliver another lifecycle hook. Multiple bindings
+    /// remain separate because a UI workspace handoff, an unverified host
+    /// session, and a verified host task are different authorities.
+    pub fn monitoring_observation(
+        &self,
+        org: &str,
+        account: &str,
+        installation: &str,
+        run: &str,
+    ) -> Result<Value> {
+        Uuid::parse_str(run).map_err(|_| anyhow::anyhow!("INVALID_REQUEST"))?;
+        self.sweep(crate::state::now())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
+        let total: u64 = connection.query_row(
+            "SELECT COUNT(*) FROM follow_sessions
+             WHERE organization_id=?1 AND account_subject=?2
+               AND installation_id=?3 AND run_id=?4",
+            params![org, account, installation, run],
+            |row| row.get(0),
+        )?;
+        let mut statement = connection.prepare(
+            "SELECT host_id,host_session_id,host_task_id,lifecycle,hook_count,
+                    required_action,last_error,updated_at
+             FROM follow_sessions
+             WHERE organization_id=?1 AND account_subject=?2
+               AND installation_id=?3 AND run_id=?4
+             ORDER BY updated_at DESC, follow_session_id DESC LIMIT ?5",
+        )?;
+        let records = statement
+            .query_map(
+                params![
+                    org,
+                    account,
+                    installation,
+                    run,
+                    (MAX_MONITORING_RECORDS + 1) as u64
+                ],
+                |row| {
+                    let host: String = row.get(0)?;
+                    let session: String = row.get(1)?;
+                    let task: String = row.get(2)?;
+                    let lifecycle: String = row.get(3)?;
+                    let hook_count: u64 = row.get(4)?;
+                    let required_action: String = row.get(5)?;
+                    let diagnostic_code: Option<String> = row.get(6)?;
+                    let updated_at: u64 = row.get(7)?;
+                    let ui_handoff = host == "codex-ui" && session == "unbound";
+                    let verified_task = task != "unverified" && !ui_handoff;
+                    let binding_kind = if ui_handoff {
+                        "ui_workspace_handoff"
+                    } else if verified_task {
+                        "verified_host_task"
+                    } else {
+                        "host_session_unverified_task"
+                    };
+                    // A row created at handoff time is not hook-delivery
+                    // evidence. Count only a processed hook on an actual Codex
+                    // host-session binding.
+                    let hook_observed = host == "codex" && session != "unbound" && hook_count > 0;
+                    Ok(json!({
+                        "binding": {
+                            // Monitoring output is an operational summary, not
+                            // a host-identity export. The stored binding stays
+                            // exact for lifecycle ownership, while callers see
+                            // only its authority category and verification.
+                            "state": binding_kind,
+                            "verified": verified_task,
+                        },
+                        "lifecycle": lifecycle,
+                        "hookCount": hook_count,
+                        "hostHookObserved": hook_observed,
+                        "uiHandoffRecorded": ui_handoff,
+                        "activationState": if ui_handoff {
+                            "handoff_pending"
+                        } else if hook_observed {
+                            "hook_observed"
+                        } else {
+                            "hook_not_observed"
+                        },
+                        "requiredAction": required_action,
+                        "diagnosticCode": diagnostic_code,
+                        "updatedAt": updated_at,
+                    }))
+                },
+            )?
+            .take(MAX_MONITORING_RECORDS)
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let diagnostic_total: u64 = connection.query_row(
+            "SELECT COUNT(*) FROM follow_hook_diagnostics
+             WHERE organization_id=?1 AND account_subject=?2
+               AND installation_id=?3 AND run_id=?4",
+            params![org, account, installation, run],
+            |row| row.get(0),
+        )?;
+        let mut diagnostics_statement = connection.prepare(
+            "SELECT event,outcome,code,observed_at FROM follow_hook_diagnostics
+             WHERE organization_id=?1 AND account_subject=?2
+               AND installation_id=?3 AND run_id=?4
+             ORDER BY diagnostic_id DESC LIMIT ?5",
+        )?;
+        let diagnostics = diagnostics_statement
+            .query_map(
+                params![org, account, installation, run, MAX_HOOK_DIAGNOSTICS as u64],
+                |row| {
+                    Ok(json!({
+                        "event": row.get::<_, String>(0)?,
+                        "outcome": row.get::<_, String>(1)?,
+                        "code": row.get::<_, String>(2)?,
+                        "observedAt": row.get::<_, u64>(3)?,
+                    }))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(json!({
+            "records": records,
+            "recordCount": total,
+            "truncated": total > MAX_MONITORING_RECORDS as u64,
+            "hostHookDeliveryGuaranteed": false,
+            "hookDiagnostics": {
+                "records": diagnostics,
+                "recordCount": diagnostic_total,
+                "truncated": diagnostic_total > MAX_HOOK_DIAGNOSTICS as u64,
+            },
+        }))
     }
 
     /// The only hook-facing entrypoint. The adapter supplies a compact
@@ -410,9 +609,11 @@ impl FollowStore {
                         json!({"schemaVersion":"loomex.follow-session.decision/v1","decision":"allow"}),
                     );
                 };
-                if continuation.source == "generated_markdown" {
-                    self.verify_continuation(scope, &continuation)?;
-                }
+                // A lifecycle hook may activate a new follow only from the
+                // capability issued with an authoritative runner result.
+                // Prompt text and legacy command-shaped records cannot name a
+                // run into an active session.
+                self.verify_continuation(scope, &continuation)?;
                 let run = continuation.run;
                 let binding = lifecycle_binding(session, &run)?;
                 let existing = self.get(scope, &json!({"binding":public_binding(&binding)}))?;
@@ -514,14 +715,19 @@ impl FollowStore {
         let signal = if interrupted {
             json!({"kind":"interrupted","code":"HOST_INTERRUPT"})
         } else {
-            let Some(signal) =
-                observation.and_then(|value| signal_from_observation(value, &binding, None))
-            else {
-                return Ok(
-                    json!({"schemaVersion":"loomex.follow-session.decision/v1","decision":"allow"}),
-                );
-            };
-            signal
+            match observation.and_then(|value| signal_from_observation(value, &binding, None)) {
+                Some(signal) => signal,
+                None => {
+                    // This is an already-authorized, active native follow. A
+                    // missing or malformed observation cannot establish that
+                    // the run is terminal, so it must not let the host end
+                    // the chat turn. The next bounded wait reconciles the
+                    // authoritative execution state. This remains scoped to
+                    // the exact active binding; unrelated sessions still
+                    // receive `allow` above.
+                    json!({"kind":"active","code":"OBSERVATION_UNAVAILABLE"})
+                }
+            }
         };
         let decision = self.decide(scope, &json!({"binding":public_binding(&binding),"generation":current["generation"],"expectedRevision":current["revision"],"signal":signal,"actionProgress":{"kind":"none","attempted":false},"idempotencyKey":lifecycle_key(p, "stop")?}))?;
         public_hook_decision(&decision)
@@ -536,12 +742,134 @@ impl FollowStore {
         if let Some(run) = p.pointer("/tool/association/runId").and_then(Value::as_str) {
             let binding = lifecycle_binding(session, run)?;
             let found = self.get(scope, &json!({"binding":public_binding(&binding)}))?;
-            return Ok(
-                (found["found"] == true && found["session"]["lifecycle"] == "active")
-                    .then_some(binding),
-            );
+            if found["found"] == true && found["session"]["lifecycle"] == "active" {
+                return Ok(Some(binding));
+            }
+            // A status/detail read can carry a valid run association, but it
+            // must never turn a UI card into a live chat follow. Only the
+            // bounded wait tool proves that this host session has started the
+            // explicit monitoring protocol for this exact run.
+            if p["event"] == "PostToolUse"
+                && p.pointer("/tool/name").and_then(Value::as_str)
+                    == Some("mcp__loomex__loomex_run_wait")
+                && tool_progress(&p["tool"], &binding).is_some()
+            {
+                return self.promote_pending_ui_handoff(scope, &binding);
+            }
+            return Ok(None);
         }
         self.binding_for_unique_active_host(scope, session)
+    }
+
+    /// Promote exactly one runner-issued UI handoff only after the native
+    /// session has made an associated run-wait call. The transaction consumes
+    /// the UI record, so another host session cannot later claim the same
+    /// handoff. The native task remains `unverified`: this is sufficient for
+    /// hook scoping, never for durable recovery scheduling.
+    fn promote_pending_ui_handoff(
+        &self,
+        scope: Scope<'_>,
+        native: &Binding,
+    ) -> Result<Option<Binding>> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing_native = find(&tx, scope, native)?;
+        let mut statement = tx.prepare(
+            "SELECT host_task_id FROM follow_sessions
+             WHERE organization_id=?1 AND account_subject=?2 AND installation_id=?3
+               AND host_id='codex-ui' AND host_session_id='unbound' AND run_id=?4
+               AND lifecycle='handoff_pending'",
+        )?;
+        let tasks = statement
+            .query_map(
+                params![
+                    scope.organization,
+                    scope.account,
+                    scope.installation,
+                    native.run
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        // More than one record means the runner cannot prove which handoff
+        // this session received. Keep every record pending for explicit
+        // continuation instead of guessing from a workspace path.
+        if tasks.len() != 1 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let pending = Binding {
+            host: "codex-ui".into(),
+            host_session: "unbound".into(),
+            task: tasks[0].clone(),
+            run: native.run.clone(),
+        };
+        let pending_session = find(&tx, scope, &pending)?.context("FOLLOW_SESSION_NOT_FOUND")?;
+        ensure!(
+            matches!(
+                pending_session["anchor"]["kind"].as_str(),
+                Some("explicit_follow") | Some("accepted_interaction")
+            ),
+            "FOLLOW_SESSION_NOT_FOUND"
+        );
+        let now = crate::state::now();
+        if let Some(mut existing) = existing_native {
+            if existing["lifecycle"] == "active" {
+                tx.commit()?;
+                return Ok(Some(native.clone()));
+            }
+            // An interaction request deliberately pauses the native follow. Its
+            // accepted response can resume only when this newly issued UI
+            // receipt names the exact request that put the native session into
+            // input_pending. This avoids letting an older or unrelated card
+            // reactivate a stopped follow.
+            ensure!(
+                existing["lifecycle"] == "input_pending"
+                    && existing["pendingHandoffReceipt"]["requestId"]
+                        == pending_session["anchor"]["requestId"],
+                "FOLLOW_HANDOFF_MISMATCH"
+            );
+            let generation = existing["generation"]
+                .as_u64()
+                .context("FOLLOW_SESSION_NOT_FOUND")?
+                .checked_add(1)
+                .context("INVALID_REQUEST")?;
+            reset_generation(&mut existing, generation, &pending_session["anchor"], now);
+            existing["lifecycle"] = json!("active");
+            existing["pendingHandoffReceipt"] = Value::Null;
+            existing["requiredAction"] = json!("none");
+            existing["updatedAt"] = json!(now);
+            existing["expiresAt"] = Value::Null;
+            write(&tx, scope, &existing)?;
+        } else {
+            // An accepted response never creates a new native follow. It may
+            // only resume the exact input_pending session that displayed the
+            // request; otherwise an old or detached UI card could turn a
+            // response into unsolicited monitoring work.
+            ensure!(
+                pending_session["anchor"]["kind"] != "accepted_interaction",
+                "FOLLOW_HANDOFF_MISMATCH"
+            );
+            let promoted = new_session(scope, native, &pending_session["anchor"], now);
+            insert(&tx, scope, &promoted)?;
+        }
+        let changed = tx.execute(
+            "UPDATE follow_sessions SET lifecycle='superseded', required_action='none', updated_at=?1, expires_at=NULL
+             WHERE organization_id=?2 AND account_subject=?3 AND installation_id=?4
+               AND host_id='codex-ui' AND host_session_id='unbound' AND host_task_id=?5 AND run_id=?6
+               AND lifecycle='handoff_pending'",
+            params![
+                now, scope.organization, scope.account, scope.installation,
+                pending.task, pending.run,
+            ],
+        )?;
+        ensure!(changed == 1, "FOLLOW_SESSION_NOT_FOUND");
+        tx.commit()?;
+        Ok(Some(native.clone()))
     }
 
     fn binding_for_unique_active_host(
@@ -570,27 +898,11 @@ impl FollowStore {
             }));
         }
 
-        // `ui/message` has no documented host-session identity.  The runner
-        // creates this binding only after it has committed a run or accepted a
-        // response and issued the opaque continuation receipt.  Match its
-        // canonical workspace to the hook cwd and refuse ambiguity, so a
-        // different chat cannot be held open merely because it shares an
-        // account or installation.
-        let cwd = short(session, "cwd")?;
-        let ui_rows = connection.prepare(
-            "SELECT run_id,lifecycle FROM follow_sessions WHERE organization_id=?1 AND account_subject=?2 AND installation_id=?3 AND host_id='codex-ui' AND host_session_id='unbound' AND host_task_id=?4",
-        )?.query_map(
-            params![scope.organization, scope.account, scope.installation, cwd],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(
-            (ui_rows.len() == 1 && ui_rows[0].1 == "active").then(|| Binding {
-                host: "codex-ui".into(),
-                host_session: "unbound".into(),
-                task: cwd,
-                run: ui_rows[0].0.clone(),
-            }),
-        )
+        // `ui/message` has no documented host-session identity. Never use a
+        // workspace or cwd as a substitute: a list-only turn in the same
+        // project must not inherit a prior UI handoff. Pending UI handoffs are
+        // promoted only by `binding_for_event` after an exact run-wait call.
+        Ok(None)
     }
 
     fn get(&self, scope: Scope<'_>, p: &Value) -> Result<Value> {
@@ -769,14 +1081,39 @@ impl FollowStore {
             "DELETE FROM follow_continuations WHERE expires_at <= ?1",
             params![at],
         )?;
+        connection.execute(
+            "DELETE FROM follow_hook_diagnostics WHERE observed_at <= ?1",
+            params![at.saturating_sub(RETENTION_SECONDS)],
+        )?;
+        Ok(())
+    }
+
+    fn record_lifecycle_diagnostic(
+        &self,
+        scope: Scope<'_>,
+        p: &Value,
+        outcome: &str,
+        code: &str,
+    ) -> Result<()> {
+        let event = p.get("event").and_then(Value::as_str).unwrap_or("unknown");
+        let event_id = p.get("eventId").and_then(Value::as_str).unwrap_or("");
+        let event_id_digest = hex::encode(Sha256::digest(event_id.as_bytes()))[..24].to_owned();
+        let run = lifecycle_diagnostic_run(p).map(str::to_owned);
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
+        connection.execute(
+            "INSERT INTO follow_hook_diagnostics
+             (organization_id,account_subject,installation_id,run_id,event_id_digest,event,outcome,code,observed_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![scope.organization, scope.account, scope.installation, run, event_id_digest, event, outcome, code, crate::state::now()],
+        )?;
         Ok(())
     }
 
     fn verify_continuation(&self, scope: Scope<'_>, continuation: &Continuation) -> Result<()> {
-        let receipt = continuation
-            .receipt
-            .as_deref()
-            .context("FOLLOW_RECEIPT_REQUIRED")?;
+        let receipt = &continuation.receipt;
         let connection = self
             .connection
             .lock()
@@ -968,6 +1305,46 @@ fn public_hook_decision(decision: &Value) -> Result<Value> {
     Ok(json!({"schemaVersion":"loomex.follow-session.decision/v1","decision":hook}))
 }
 
+/// Stable, non-sensitive outcome labels for installed hook diagnostics.  They
+/// are deliberately derived from the normalized lifecycle envelope rather
+/// than runner/backend error text.
+fn lifecycle_diagnostic_code(p: &Value) -> &'static str {
+    match p.get("event").and_then(Value::as_str) {
+        Some("UserPromptSubmit") => {
+            if p.get("continuation").is_some() {
+                "CONTINUATION_RECEIVED"
+            } else {
+                "NO_CONTINUATION"
+            }
+        }
+        Some("PostToolUse") => {
+            if p.pointer("/tool/association/runId")
+                .and_then(Value::as_str)
+                .is_some()
+            {
+                "RUN_ASSOCIATED"
+            } else {
+                "RUN_UNASSOCIATED"
+            }
+        }
+        Some("Stop") => "STOP_RECEIVED",
+        Some("Interrupt") => "INTERRUPT_RECEIVED",
+        Some("SessionStart") => "SESSION_START_RECEIVED",
+        _ => "LIFECYCLE_RECEIVED",
+    }
+}
+
+/// Only direct, schema-validated run identities are retained for a
+/// monitoring diagnostic. Stop and session events intentionally remain
+/// unscoped because they do not carry a run association in the host contract.
+fn lifecycle_diagnostic_run(p: &Value) -> Option<&str> {
+    let candidate = p
+        .pointer("/continuation/runId")
+        .and_then(Value::as_str)
+        .or_else(|| p.pointer("/tool/association/runId").and_then(Value::as_str));
+    candidate.filter(|value| Uuid::parse_str(value).is_ok())
+}
+
 fn validate_lifecycle(p: &Value) -> Result<()> {
     let object = p.as_object().context("INVALID_REQUEST")?;
     ensure!(
@@ -1057,36 +1434,23 @@ fn continuation(p: &Value) -> Result<Option<Continuation>> {
     );
     let run = uuid(value, "runId")?;
     let source = value["source"].as_str().context("INVALID_REQUEST")?;
-    ensure!(
-        matches!(source, "bare_command" | "generated_markdown"),
-        "INVALID_REQUEST"
-    );
+    ensure!(source == "generated_markdown", "INVALID_REQUEST");
     let receipt = value
         .get("receipt")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    match source {
-        "bare_command" => ensure!(object.len() == 3 && receipt.is_none(), "INVALID_REQUEST"),
-        "generated_markdown" => {
-            let receipt = receipt.as_deref().context("INVALID_REQUEST")?;
-            ensure!(
-                object.len() == 4
-                    && receipt.len() <= 256
-                    && !receipt.is_empty()
-                    && receipt
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-                    && URL_SAFE_NO_PAD.decode(receipt).is_ok(),
-                "INVALID_REQUEST"
-            );
-        }
-        _ => unreachable!(),
-    }
-    Ok(Some(Continuation {
-        run,
-        source: source.into(),
-        receipt,
-    }))
+    let receipt = receipt.context("INVALID_REQUEST")?;
+    ensure!(
+        object.len() == 4
+            && receipt.len() <= 256
+            && !receipt.is_empty()
+            && receipt
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            && URL_SAFE_NO_PAD.decode(&receipt).is_ok(),
+        "INVALID_REQUEST"
+    );
+    Ok(Some(Continuation { run, receipt }))
 }
 
 fn lifecycle_key(p: &Value, purpose: &str) -> Result<String> {
@@ -1126,12 +1490,16 @@ fn lifecycle_binding(session: &Value, run: &str) -> Result<Binding> {
 
 fn tool_kind(name: &str) -> Option<&'static str> {
     match name {
-        "mcp__loomex__loomex_run_events" => Some("drain_events"),
-        "mcp__loomex__loomex_run_wait" | "mcp__loomex__loomex_run_get" => Some("wait"),
-        "mcp__loomex__loomex_interaction_view" | "mcp__loomex__loomex_interaction_get" => {
-            Some("handoff")
-        }
-        "mcp__loomex__loomex_run_result" => Some("result_read"),
+        "mcp__loomex__loomex_run_events" | "loomex_run_events" => Some("drain_events"),
+        "mcp__loomex__loomex_run_wait"
+        | "mcp__loomex__loomex_run_get"
+        | "loomex_run_wait"
+        | "loomex_run_get" => Some("wait"),
+        "mcp__loomex__loomex_interaction_view"
+        | "mcp__loomex__loomex_interaction_get"
+        | "loomex_interaction_view"
+        | "loomex_interaction_get" => Some("handoff"),
+        "mcp__loomex__loomex_run_result" | "loomex_run_result" => Some("result_read"),
         _ => None,
     }
 }
@@ -1550,6 +1918,92 @@ mod tests {
         );
     }
     #[test]
+    fn monitoring_keeps_handoff_and_delivered_hook_evidence_distinct() {
+        let t = tempfile::tempdir().unwrap();
+        let store = FollowStore::open(t.path()).unwrap();
+        let run = Uuid::new_v4().to_string();
+        let receipt = store
+            .issue_continuation("org", "account", "install", &run, "run_commit", None)
+            .unwrap();
+        store
+            .activate_ui_handoff("org", "account", "install", &run, &receipt, None)
+            .unwrap();
+        let bound = json!({
+            "hostId":"codex",
+            "hostSessionId":"host-session",
+            "hostTaskId":"unverified",
+            "runId":run,
+        });
+        let active = activate(&store, &bound, 0);
+
+        let before = store
+            .monitoring_observation("org", "account", "install", &run)
+            .unwrap();
+        assert_eq!(before["recordCount"], 2);
+        assert!(before["hostHookDeliveryGuaranteed"] == false);
+        let records = before["records"].as_array().unwrap();
+        let ui = records
+            .iter()
+            .find(|record| record["uiHandoffRecorded"] == true)
+            .unwrap();
+        assert_eq!(ui["hookCount"], 0);
+        assert_eq!(ui["hostHookObserved"], false);
+        assert_eq!(ui["activationState"], "handoff_pending");
+        let host = records
+            .iter()
+            .find(|record| record["binding"]["state"] == "host_session_unverified_task")
+            .unwrap();
+        assert_eq!(host["hookCount"], 0);
+        assert_eq!(host["hostHookObserved"], false);
+        assert_eq!(host["activationState"], "hook_not_observed");
+        assert_eq!(host["binding"]["verified"], false);
+
+        decide(
+            &store,
+            &bound,
+            &active,
+            json!({"kind":"active"}),
+            false,
+            "none",
+        );
+        let after = store
+            .monitoring_observation("org", "account", "install", &run)
+            .unwrap();
+        let host = after["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["binding"]["state"] == "host_session_unverified_task")
+            .unwrap();
+        assert_eq!(host["hookCount"], 1);
+        assert_eq!(host["hostHookObserved"], true);
+        assert_eq!(host["activationState"], "hook_observed");
+    }
+    #[test]
+    fn monitoring_observation_never_serializes_host_session_or_task_values() {
+        let t = tempfile::tempdir().unwrap();
+        let store = FollowStore::open(t.path()).unwrap();
+        let run = Uuid::new_v4().to_string();
+        let session = "session-value-must-not-leak";
+        let task = "task-value-must-not-leak";
+        let binding = json!({
+            "hostId":"codex",
+            "hostSessionId":session,
+            "hostTaskId":task,
+            "runId":run,
+        });
+        activate(&store, &binding, 0);
+
+        let observation = store
+            .monitoring_observation("org", "account", "install", &run)
+            .unwrap();
+        let serialized = observation.to_string();
+        assert!(!serialized.contains(session));
+        assert!(!serialized.contains(task));
+        assert!(serialized.contains("verified_host_task"));
+        assert!(serialized.contains("\"verified\":true"));
+    }
+    #[test]
     fn stale_generation_cannot_change_newer_session() {
         let t = tempfile::tempdir().unwrap();
         let store = FollowStore::open(t.path()).unwrap();
@@ -1695,8 +2149,25 @@ mod tests {
         json!({"schemaVersion":"loomex.follow-session.lifecycle/v1","event":event,"eventId":Uuid::new_v4(),"session":{"id":session,"cwd":"/workspace","turnId":"turn-not-a-task"}})
     }
 
+    fn receipt_key(receipt: &str) -> String {
+        let mut bytes: [u8; 16] = Sha256::digest(receipt.as_bytes())[..16]
+            .try_into()
+            .expect("SHA-256 prefix has sixteen bytes");
+        bytes[6] = (bytes[6] & 0x0f) | 0x80;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Uuid::from_bytes(bytes).to_string()
+    }
+
     fn snapshot(run: &Uuid, status: &str, has_more: bool) -> Value {
         json!({"execution":{"id":run,"status":status},"events":[],"latestSequence":0,"hasMoreEvents":has_more,"humanRequest":null})
+    }
+
+    fn runner_issued_continuation(store: &FollowStore, run: &Uuid) -> Value {
+        let run = run.to_string();
+        let receipt = store
+            .issue_continuation("org", "account", "install", &run, "run_commit", None)
+            .unwrap();
+        json!({"schemaVersion":"loomex.follow-session.continuation/v1","runId":run,"source":"generated_markdown","receipt":receipt})
     }
 
     #[test]
@@ -1706,7 +2177,7 @@ mod tests {
         let session = "hook-session";
         let run = Uuid::new_v4();
         let mut start = hook("UserPromptSubmit", session);
-        start["continuation"] = json!({"schemaVersion":"loomex.follow-session.continuation/v1","runId":run,"source":"bare_command"});
+        start["continuation"] = runner_issued_continuation(&store, &run);
         assert_eq!(
             store
                 .dispatch(
@@ -1760,7 +2231,37 @@ mod tests {
     }
 
     #[test]
-    fn ui_handoff_activates_before_app_message_and_stop_recovers_only_its_workspace() {
+    fn lifecycle_diagnostics_prove_hook_receipt_without_retaining_host_payloads() {
+        let t = tempfile::tempdir().unwrap();
+        let store = FollowStore::open(t.path()).unwrap();
+        let run = Uuid::new_v4();
+        let mut start = hook("UserPromptSubmit", "diagnostic-session");
+        start["continuation"] = runner_issued_continuation(&store, &run);
+        store
+            .dispatch(
+                "org",
+                "account",
+                "install",
+                "follow.session.lifecycle",
+                &start,
+            )
+            .unwrap();
+
+        let observation = store
+            .monitoring_observation("org", "account", "install", &run.to_string())
+            .unwrap();
+        let diagnostics = &observation["hookDiagnostics"];
+        assert_eq!(diagnostics["recordCount"], 1);
+        let row = &diagnostics["records"][0];
+        assert_eq!(row["event"], "UserPromptSubmit");
+        assert_eq!(row["outcome"], "accepted");
+        assert_eq!(row["code"], "CONTINUATION_RECEIVED");
+        assert!(row.get("sessionId").is_none());
+        assert!(row.get("cwd").is_none());
+    }
+
+    #[test]
+    fn ui_handoff_is_pending_until_an_exact_run_wait_promotes_it() {
         let t = tempfile::tempdir().unwrap();
         let store = FollowStore::open(t.path()).unwrap();
         let run = Uuid::new_v4().to_string();
@@ -1768,54 +2269,261 @@ mod tests {
             .issue_continuation("org", "account", "install", &run, "run_commit", None)
             .unwrap();
         store
-            .activate_ui_handoff("org", "account", "install", &run, "/workspace", &receipt)
+            .activate_ui_handoff("org", "account", "install", &run, &receipt, None)
             .unwrap();
-        // A duplicate UI delivery must preserve the active generation, not
-        // reset the cursor a just-started chat turn will use.
+        // A duplicate UI delivery preserves the pending handoff rather than
+        // resetting a follow that a host session may already be starting.
         store
-            .activate_ui_handoff("org", "account", "install", &run, "/workspace", &receipt)
+            .activate_ui_handoff("org", "account", "install", &run, &receipt, None)
             .unwrap();
-        let binding = json!({"hostId":"codex-ui","hostSessionId":"unbound","hostTaskId":"/workspace","runId":run});
-        assert_eq!(
-            store.get(scope(), &json!({"binding":binding})).unwrap()["session"]["generation"],
-            1
-        );
+        let binding = json!({"hostId":"codex-ui","hostSessionId":"unbound","hostTaskId":format!("ui-handoff:{}", receipt_key(&receipt)),"runId":run});
+        let pending = store.get(scope(), &json!({"binding":binding})).unwrap()["session"].clone();
+        assert_eq!(pending["generation"], 1);
+        assert_eq!(pending["lifecycle"], "handoff_pending");
 
         let stop = hook("Stop", "host-session-that-never-saw-ui-message");
-        assert_eq!(
+        assert!(
             store
                 .lifecycle_target("org", "account", "install", &stop)
                 .unwrap()
-                .unwrap()
-                .run_id,
-            run,
+                .is_none()
         );
-        let mut other_workspace = stop.clone();
-        other_workspace["session"]["cwd"] = json!("/another-workspace");
+        // A run detail uses the same exact run association but is a read, not
+        // a declaration that this session should be monitored.
+        let mut get = hook("PostToolUse", "host-session-that-never-saw-ui-message");
+        get["tool"] = json!({"name":"mcp__loomex__loomex_run_get","useId":"get-1","association":{"schemaVersion":"loomex.follow-session.tool-association/v1","runId":run,"request":{"runId":run},"response":{"runId":run}}});
         assert!(
             store
-                .lifecycle_target("org", "account", "install", &other_workspace)
+                .lifecycle_target("org", "account", "install", &get)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut wait = hook("PostToolUse", "host-session-that-never-saw-ui-message");
+        wait["tool"] = json!({"name":"mcp__loomex__loomex_run_wait","useId":"wait-1","association":{"schemaVersion":"loomex.follow-session.tool-association/v1","runId":run,"request":{"runId":run},"response":{"runId":run}}});
+        let target = store
+            .lifecycle_target("org", "account", "install", &wait)
+            .unwrap()
+            .unwrap();
+        assert_eq!(target.run_id, run);
+        let native = json!({"hostId":"codex","hostSessionId":"host-session-that-never-saw-ui-message","hostTaskId":"unverified","runId":run});
+        assert_eq!(
+            store.get(scope(), &json!({"binding":native})).unwrap()["session"]["lifecycle"],
+            "active"
+        );
+        assert_eq!(
+            store.get(scope(), &json!({"binding":binding})).unwrap()["session"]["lifecycle"],
+            "superseded"
+        );
+    }
+
+    #[test]
+    fn pending_ui_handoff_cannot_be_claimed_by_a_second_host_session() {
+        let t = tempfile::tempdir().unwrap();
+        let store = FollowStore::open(t.path()).unwrap();
+        let run = Uuid::new_v4().to_string();
+        let receipt = store
+            .issue_continuation("org", "account", "install", &run, "run_commit", None)
+            .unwrap();
+        store
+            .activate_ui_handoff("org", "account", "install", &run, &receipt, None)
+            .unwrap();
+        let mut first_wait = hook("PostToolUse", "first-session");
+        first_wait["tool"] = json!({"name":"mcp__loomex__loomex_run_wait","useId":"wait-1","association":{"schemaVersion":"loomex.follow-session.tool-association/v1","runId":run,"request":{"runId":run},"response":{"runId":run}}});
+        assert!(
+            store
+                .lifecycle_target("org", "account", "install", &first_wait)
+                .unwrap()
+                .is_some()
+        );
+
+        let mut second_wait = hook("PostToolUse", "second-session");
+        second_wait["tool"] = json!({"name":"mcp__loomex__loomex_run_wait","useId":"wait-2","association":{"schemaVersion":"loomex.follow-session.tool-association/v1","runId":run,"request":{"runId":run},"response":{"runId":run}}});
+        assert!(
+            store
+                .lifecycle_target("org", "account", "install", &second_wait)
                 .unwrap()
                 .is_none()
         );
     }
 
     #[test]
-    fn ui_handoff_never_guesses_between_two_active_runs_in_one_workspace() {
+    fn accepted_interaction_reactivates_only_its_exact_native_follow() {
         let t = tempfile::tempdir().unwrap();
         let store = FollowStore::open(t.path()).unwrap();
-        for _ in 0..2 {
-            let run = Uuid::new_v4().to_string();
-            let receipt = store
-                .issue_continuation("org", "account", "install", &run, "run_commit", None)
-                .unwrap();
-            store
-                .activate_ui_handoff("org", "account", "install", &run, "/workspace", &receipt)
-                .unwrap();
-        }
+        let run = Uuid::new_v4().to_string();
+        let start_receipt = store
+            .issue_continuation("org", "account", "install", &run, "run_commit", None)
+            .unwrap();
+        store
+            .activate_ui_handoff("org", "account", "install", &run, &start_receipt, None)
+            .unwrap();
+        let mut initial_wait = hook("PostToolUse", "native-session");
+        initial_wait["tool"] = json!({"name":"mcp__loomex__loomex_run_wait","useId":"wait-start","association":{"schemaVersion":"loomex.follow-session.tool-association/v1","runId":run,"request":{"runId":run},"response":{"runId":run}}});
         assert!(
             store
-                .lifecycle_target("org", "account", "install", &hook("Stop", "host"))
+                .lifecycle_target("org", "account", "install", &initial_wait)
+                .unwrap()
+                .is_some()
+        );
+
+        let native = json!({"hostId":"codex","hostSessionId":"native-session","hostTaskId":"unverified","runId":run});
+        let active = store.get(scope(), &json!({"binding":native})).unwrap()["session"].clone();
+        let request = Uuid::new_v4().to_string();
+        let input = json!({"kind":"input","requestId":request,"receiptId":Uuid::new_v4()});
+        let requested = decide(&store, &native, &active, input.clone(), true, "none");
+        let handoff = decide(
+            &store,
+            &native,
+            &requested["session"],
+            input,
+            true,
+            "handoff",
+        );
+        assert_eq!(handoff["decision"]["decision"], "needs-handoff");
+        assert_eq!(
+            store.get(scope(), &json!({"binding":native})).unwrap()["session"]["lifecycle"],
+            "input_pending"
+        );
+
+        let response_receipt = store
+            .issue_continuation(
+                "org",
+                "account",
+                "install",
+                &run,
+                "accepted_interaction",
+                Some(&request),
+            )
+            .unwrap();
+        store
+            .activate_ui_handoff(
+                "org",
+                "account",
+                "install",
+                &run,
+                &response_receipt,
+                Some(&request),
+            )
+            .unwrap();
+        let mut resumed_wait = hook("PostToolUse", "native-session");
+        resumed_wait["tool"] = json!({"name":"mcp__loomex__loomex_run_wait","useId":"wait-resume","association":{"schemaVersion":"loomex.follow-session.tool-association/v1","runId":run,"request":{"runId":run},"response":{"runId":run}}});
+        assert_eq!(
+            store
+                .lifecycle_target("org", "account", "install", &resumed_wait)
+                .unwrap()
+                .unwrap()
+                .run_id,
+            run
+        );
+        let resumed = store.get(scope(), &json!({"binding":native})).unwrap()["session"].clone();
+        assert_eq!(resumed["lifecycle"], "active");
+        assert!(resumed["generation"].as_u64().unwrap() > active["generation"].as_u64().unwrap());
+        assert!(resumed["pendingHandoffReceipt"].is_null());
+    }
+
+    #[test]
+    fn mismatched_accepted_interaction_cannot_reactivate_input_pending_follow() {
+        let t = tempfile::tempdir().unwrap();
+        let store = FollowStore::open(t.path()).unwrap();
+        let run = Uuid::new_v4().to_string();
+        let receipt = store
+            .issue_continuation("org", "account", "install", &run, "run_commit", None)
+            .unwrap();
+        store
+            .activate_ui_handoff("org", "account", "install", &run, &receipt, None)
+            .unwrap();
+        let mut wait = hook("PostToolUse", "native-session");
+        wait["tool"] = json!({"name":"mcp__loomex__loomex_run_wait","useId":"wait-start","association":{"schemaVersion":"loomex.follow-session.tool-association/v1","runId":run,"request":{"runId":run},"response":{"runId":run}}});
+        store
+            .lifecycle_target("org", "account", "install", &wait)
+            .unwrap();
+        let native = json!({"hostId":"codex","hostSessionId":"native-session","hostTaskId":"unverified","runId":run});
+        let active = store.get(scope(), &json!({"binding":native})).unwrap()["session"].clone();
+        let pending_request = Uuid::new_v4().to_string();
+        let input = json!({"kind":"input","requestId":pending_request,"receiptId":Uuid::new_v4()});
+        let requested = decide(&store, &native, &active, input.clone(), true, "none");
+        decide(
+            &store,
+            &native,
+            &requested["session"],
+            input,
+            true,
+            "handoff",
+        );
+        let other_request = Uuid::new_v4().to_string();
+        let other_receipt = store
+            .issue_continuation(
+                "org",
+                "account",
+                "install",
+                &run,
+                "accepted_interaction",
+                Some(&other_request),
+            )
+            .unwrap();
+        store
+            .activate_ui_handoff(
+                "org",
+                "account",
+                "install",
+                &run,
+                &other_receipt,
+                Some(&other_request),
+            )
+            .unwrap();
+        let mut resumed_wait = hook("PostToolUse", "native-session");
+        resumed_wait["tool"] = json!({"name":"mcp__loomex__loomex_run_wait","useId":"wait-resume","association":{"schemaVersion":"loomex.follow-session.tool-association/v1","runId":run,"request":{"runId":run},"response":{"runId":run}}});
+        assert_eq!(
+            store
+                .lifecycle_target("org", "account", "install", &resumed_wait)
+                .unwrap_err()
+                .to_string(),
+            "FOLLOW_HANDOFF_MISMATCH"
+        );
+        assert_eq!(
+            store.get(scope(), &json!({"binding":native})).unwrap()["session"]["lifecycle"],
+            "input_pending"
+        );
+    }
+
+    #[test]
+    fn pending_ui_handoff_never_guesses_between_two_sources_for_the_same_run() {
+        let t = tempfile::tempdir().unwrap();
+        let store = FollowStore::open(t.path()).unwrap();
+        let run = Uuid::new_v4().to_string();
+        let first_receipt = store
+            .issue_continuation("org", "account", "install", &run, "run_commit", None)
+            .unwrap();
+        store
+            .activate_ui_handoff("org", "account", "install", &run, &first_receipt, None)
+            .unwrap();
+        let request = Uuid::new_v4().to_string();
+        let second_receipt = store
+            .issue_continuation(
+                "org",
+                "account",
+                "install",
+                &run,
+                "accepted_interaction",
+                Some(&request),
+            )
+            .unwrap();
+        store
+            .activate_ui_handoff(
+                "org",
+                "account",
+                "install",
+                &run,
+                &second_receipt,
+                Some(&request),
+            )
+            .unwrap();
+        let mut wait = hook("PostToolUse", "host");
+        wait["tool"] = json!({"name":"mcp__loomex__loomex_run_wait","useId":"wait-1","association":{"schemaVersion":"loomex.follow-session.tool-association/v1","runId":run,"request":{"runId":run},"response":{"runId":run}}});
+        assert!(
+            store
+                .lifecycle_target("org", "account", "install", &wait)
                 .unwrap()
                 .is_none()
         );
@@ -1828,7 +2536,7 @@ mod tests {
         let session = "hook-session";
         let mut start = hook("UserPromptSubmit", session);
         let run = Uuid::new_v4();
-        start["continuation"] = json!({"schemaVersion":"loomex.follow-session.continuation/v1","runId":run,"source":"bare_command"});
+        start["continuation"] = runner_issued_continuation(&store, &run);
         store
             .dispatch(
                 "org",
@@ -1863,6 +2571,40 @@ mod tests {
                     "follow.session.lifecycle",
                     &next_stop,
                     Some(&snapshot(&run, "running", false))
+                )
+                .unwrap()["decision"],
+            "continue"
+        );
+    }
+
+    #[test]
+    fn active_native_follow_blocks_stop_when_observation_is_unavailable() {
+        let t = tempfile::tempdir().unwrap();
+        let store = FollowStore::open(t.path()).unwrap();
+        let session = "hook-session-observation-unavailable";
+        let run = Uuid::new_v4();
+        let mut start = hook("UserPromptSubmit", session);
+        start["continuation"] = runner_issued_continuation(&store, &run);
+        store
+            .dispatch(
+                "org",
+                "account",
+                "install",
+                "follow.session.lifecycle",
+                &start,
+            )
+            .unwrap();
+
+        let stop = hook("Stop", session);
+        assert_eq!(
+            store
+                .dispatch_observed(
+                    "org",
+                    "account",
+                    "install",
+                    "follow.session.lifecycle",
+                    &stop,
+                    None,
                 )
                 .unwrap()["decision"],
             "continue"
@@ -1908,7 +2650,7 @@ mod tests {
         let second = Uuid::new_v4();
         for run in [first, second] {
             let mut prompt = hook("UserPromptSubmit", session);
-            prompt["continuation"] = json!({"schemaVersion":"loomex.follow-session.continuation/v1","runId":run,"source":"bare_command"});
+            prompt["continuation"] = runner_issued_continuation(&store, &run);
             store
                 .dispatch(
                     "org",
@@ -2043,11 +2785,7 @@ mod tests {
         let run = Uuid::new_v4();
         let request = Uuid::new_v4();
         let mut start = hook("UserPromptSubmit", "session");
-        start["continuation"] = json!({
-            "schemaVersion":"loomex.follow-session.continuation/v1",
-            "runId":run,
-            "source":"bare_command"
-        });
+        start["continuation"] = runner_issued_continuation(&store, &run);
         store
             .dispatch(
                 "org",
@@ -2127,10 +2865,33 @@ mod tests {
     }
 
     #[test]
+    fn server_local_tool_names_remain_compatible_with_the_checked_association_contract() {
+        assert_eq!(tool_kind("loomex_run_wait"), Some("wait"));
+        assert_eq!(tool_kind("loomex_interaction_view"), Some("handoff"));
+        assert_eq!(tool_kind("loomex_run_result"), Some("result_read"));
+        assert_eq!(tool_kind("unrelated_tool"), None);
+    }
+
+    #[test]
     fn generated_continuation_requires_runner_minted_receipt() {
         let temp = tempfile::tempdir().unwrap();
         let store = FollowStore::open(temp.path()).unwrap();
         let run = Uuid::new_v4().to_string();
+        let mut legacy = hook("UserPromptSubmit", "legacy-session");
+        legacy["continuation"] = json!({"schemaVersion":"loomex.follow-session.continuation/v1","runId":run,"source":"bare_command"});
+        assert_eq!(
+            store
+                .dispatch(
+                    "org",
+                    "account",
+                    "install",
+                    "follow.session.lifecycle",
+                    &legacy
+                )
+                .unwrap_err()
+                .to_string(),
+            "INVALID_REQUEST"
+        );
         let receipt = store
             .issue_continuation("org", "account", "install", &run, "run_commit", None)
             .unwrap();
@@ -2147,6 +2908,21 @@ mod tests {
                 )
                 .unwrap()["decision"],
             "continue"
+        );
+        let mut wrong_run = hook("UserPromptSubmit", "wrong-run-session");
+        wrong_run["continuation"] = json!({"schemaVersion":"loomex.follow-session.continuation/v1","runId":Uuid::new_v4(),"source":"generated_markdown","receipt":receipt});
+        assert_eq!(
+            store
+                .dispatch(
+                    "org",
+                    "account",
+                    "install",
+                    "follow.session.lifecycle",
+                    &wrong_run
+                )
+                .unwrap_err()
+                .to_string(),
+            "FOLLOW_RECEIPT_INVALID"
         );
         let mut forged = hook("UserPromptSubmit", "other-session");
         forged["continuation"] = json!({"schemaVersion":"loomex.follow-session.continuation/v1","runId":run,"source":"generated_markdown","receipt":"AAAAAAAAAAAAAAAAAAAAAA"});

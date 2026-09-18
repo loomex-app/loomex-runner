@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 import subprocess
 import unittest
@@ -63,6 +64,7 @@ class IntegrationCompatibilityTests(unittest.TestCase):
         runner_catalog["methods"][0]["inputSchema"] = {"type": "object"}
         runner_catalog["methods"][0]["outputSchema"] = {"type": "object"}
         runner_catalog["methods"][0]["mutating"] = False
+        runner_catalog["methods"][0]["appOnly"] = False
         runner_catalog["methods"][0]["idempotent"] = True
         runner_catalog["methods"][0]["transportRetry"] = "before_response_once"
         runner_catalog["capabilities"] = ["method:workflows.list"]
@@ -75,7 +77,26 @@ class IntegrationCompatibilityTests(unittest.TestCase):
             "basePath": "/api/v1/runner-control/runner/",
             "routes": [{"path": "/api/v1/runner-control/runner/v1/workflows/", "methods": ["GET"]}],
         }
+        plugin["recoveryContracts"] = {
+            name: hashlib.sha256((ROOT / "contracts" / name).read_bytes()).hexdigest()
+            for name in ("error-recovery.json", "mutation-recovery.json")
+        }
         return runner_manifest, runner_routes, runner_catalog, plugin, backend
+
+    def test_required_mode_rejects_missing_or_drifted_recovery_contracts(self) -> None:
+        for name in (None, "error-recovery.json", "mutation-recovery.json"):
+            with self.subTest(contract=name):
+                manifest, routes, catalog, plugin, backend = self.components()
+                plugin["source"] = {"headRevision": "a" * 40, "workingTree": "clean"}
+                backend["source"] = {"headRevision": "b" * 40, "workingTree": "clean"}
+                if name is None:
+                    del plugin["recoveryContracts"]
+                else:
+                    plugin["recoveryContracts"][name] = "0" * 64
+                with self.assertRaisesRegex(MODULE.CompatibilityError, "recovery contracts"):
+                    MODULE.verify(runner_manifest=manifest, runner_routes=routes,
+                                  runner_catalog=catalog, plugin=plugin, backend=backend,
+                                  require_clean_identities=True)
 
     def test_matches_real_component_exports(self) -> None:
         runner_manifest, runner_routes, runner_catalog, plugin, backend = self.components()

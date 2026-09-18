@@ -105,7 +105,8 @@
             "additionalProperties": false
           }
         ]
-      }
+      },
+      "appOnly": false
     },
     {
       "name": "status.get",
@@ -188,7 +189,8 @@
           }
         ]
       },
-      "transportRetry": "before_response_once"
+      "transportRetry": "before_response_once",
+      "appOnly": false
     },
     {
       "name": "connection.get",
@@ -298,7 +300,8 @@
           }
         ]
       },
-      "transportRetry": "before_response_once"
+      "transportRetry": "before_response_once",
+      "appOnly": false
     },
     {
       "name": "auth.status",
@@ -386,7 +389,8 @@
           }
         ]
       },
-      "transportRetry": "before_response_once"
+      "transportRetry": "before_response_once",
+      "appOnly": false
     },
     {
       "name": "auth.login",
@@ -493,7 +497,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "auth.poll",
@@ -582,7 +587,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "auth.logout",
@@ -658,7 +664,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "organizations.list",
@@ -728,7 +735,8 @@
           }
         ]
       },
-      "transportRetry": "before_response_once"
+      "transportRetry": "before_response_once",
+      "appOnly": false
     },
     {
       "name": "organizations.select",
@@ -814,7 +822,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "workspaces.list",
@@ -884,7 +893,8 @@
           }
         ]
       },
-      "transportRetry": "before_response_once"
+      "transportRetry": "before_response_once",
+      "appOnly": false
     },
     {
       "name": "workspaces.grant",
@@ -970,7 +980,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "workspaces.revoke",
@@ -1051,7 +1062,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "workflows.list",
@@ -1142,7 +1154,8 @@
           }
         ]
       },
-      "transportRetry": "before_response_once"
+      "transportRetry": "before_response_once",
+      "appOnly": false
     },
     {
       "name": "workflows.get",
@@ -1257,7 +1270,8 @@
           }
         ]
       },
-      "transportRetry": "before_response_once"
+      "transportRetry": "before_response_once",
+      "appOnly": false
     },
     {
       "name": "workflows.create",
@@ -1351,7 +1365,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "workflows.update",
@@ -1451,7 +1466,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "workflows.validate",
@@ -1533,7 +1549,8 @@
           }
         ]
       },
-      "transportRetry": "before_response_once"
+      "transportRetry": "before_response_once",
+      "appOnly": false
     },
     {
       "name": "workflows.publish",
@@ -1624,7 +1641,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "workflows.activate",
@@ -1708,7 +1726,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "builder.catalog",
@@ -1790,7 +1809,8 @@
           }
         ]
       },
-      "transportRetry": "before_response_once"
+      "transportRetry": "before_response_once",
+      "appOnly": false
     },
     {
       "name": "builder.validate",
@@ -1872,7 +1892,8 @@
           }
         ]
       },
-      "transportRetry": "before_response_once"
+      "transportRetry": "before_response_once",
+      "appOnly": false
     },
     {
       "name": "builder.prepare",
@@ -1986,7 +2007,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "builder.get",
@@ -2104,7 +2126,8 @@
           }
         ]
       },
-      "transportRetry": "before_response_once"
+      "transportRetry": "before_response_once",
+      "appOnly": false
     },
     {
       "name": "builder.respond",
@@ -2214,7 +2237,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "builder.finalize",
@@ -2319,7 +2343,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "editor.prepare",
@@ -2438,7 +2463,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "editor.respond",
@@ -2548,7 +2574,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "editor.finalize",
@@ -2657,7 +2684,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "runs.prepare",
@@ -2774,7 +2802,591 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
+    },
+    {
+      "name": "runs.start_handoff.issue",
+      "mutating": true,
+      "idempotent": false,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "preparationId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "bindingDigest": {
+            "type": "string"
+          },
+          "confirmationKey": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "preparationId",
+          "bindingDigest",
+          "confirmationKey",
+          "idempotencyKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "schemaVersion": {
+                "const": "loomex.run-start-handoff/v2"
+              },
+              "handoffRef": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "lifecycle": {
+                "enum": [
+                  "prepared",
+                  "approved",
+                  "committing",
+                  "committed",
+                  "ambiguous",
+                  "expired"
+                ]
+              },
+              "approvalObserved": {
+                "type": "boolean"
+              },
+              "nextAction": {
+                "enum": [
+                  "approve",
+                  "commit",
+                  "reconcile",
+                  "none"
+                ]
+              },
+              "preparationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "runId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "result": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "schemaVersion",
+              "handoffRef",
+              "lifecycle",
+              "approvalObserved",
+              "nextAction",
+              "preparationId"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "transportRetry": "never_after_send",
+      "appOnly": true
+    },
+    {
+      "name": "runs.start_handoff.restore",
+      "mutating": false,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "idempotencyKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "schemaVersion": {
+                "const": "loomex.run-start-handoff/v2"
+              },
+              "handoffRef": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "lifecycle": {
+                "enum": [
+                  "prepared",
+                  "approved",
+                  "committing",
+                  "committed",
+                  "ambiguous",
+                  "expired"
+                ]
+              },
+              "approvalObserved": {
+                "type": "boolean"
+              },
+              "nextAction": {
+                "enum": [
+                  "approve",
+                  "commit",
+                  "reconcile",
+                  "none"
+                ]
+              },
+              "preparationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "runId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "result": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "schemaVersion",
+              "handoffRef",
+              "lifecycle",
+              "approvalObserved",
+              "nextAction",
+              "preparationId"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "transportRetry": "before_response_once",
+      "appOnly": true
+    },
+    {
+      "name": "runs.start_handoff.approve",
+      "mutating": true,
+      "idempotent": false,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "handoffRef": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "handoffRef",
+          "idempotencyKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "schemaVersion": {
+                "const": "loomex.run-start-handoff/v2"
+              },
+              "handoffRef": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "lifecycle": {
+                "const": "approved"
+              },
+              "approvalObserved": {
+                "const": true
+              },
+              "nextAction": {
+                "const": "commit"
+              },
+              "preparationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "runId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "result": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "schemaVersion",
+              "handoffRef",
+              "lifecycle",
+              "approvalObserved",
+              "nextAction",
+              "preparationId"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "transportRetry": "never_after_send",
+      "appOnly": true
+    },
+    {
+      "name": "runs.start_handoff.get",
+      "mutating": false,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "handoffRef": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "handoffRef"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "schemaVersion": {
+                "const": "loomex.run-start-handoff/v2"
+              },
+              "handoffRef": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "lifecycle": {
+                "enum": [
+                  "prepared",
+                  "approved",
+                  "committing",
+                  "committed",
+                  "ambiguous",
+                  "expired"
+                ]
+              },
+              "approvalObserved": {
+                "type": "boolean"
+              },
+              "nextAction": {
+                "enum": [
+                  "approve",
+                  "commit",
+                  "reconcile",
+                  "none"
+                ]
+              },
+              "preparationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "runId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "result": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "schemaVersion",
+              "handoffRef",
+              "lifecycle",
+              "approvalObserved",
+              "nextAction",
+              "preparationId"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "transportRetry": "before_response_once",
+      "appOnly": false
+    },
+    {
+      "name": "runs.start_handoff.commit",
+      "mutating": true,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "handoffRef": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "handoffRef"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "schemaVersion": {
+                "const": "loomex.run-start-handoff/v2"
+              },
+              "handoffRef": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "lifecycle": {
+                "const": "committed"
+              },
+              "approvalObserved": {
+                "type": "boolean"
+              },
+              "nextAction": {
+                "const": "none"
+              },
+              "runId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "result": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "execution": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "preparationId": {
+                "type": "string"
+              },
+              "executionPolicy": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "schemaVersion",
+              "handoffRef",
+              "lifecycle",
+              "approvalObserved",
+              "nextAction",
+              "execution",
+              "preparationId",
+              "executionPolicy"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "runs.commit",
@@ -2930,7 +3542,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "runs.list",
@@ -3022,7 +3635,8 @@
           }
         ]
       },
-      "transportRetry": "before_response_once"
+      "transportRetry": "before_response_once",
+      "appOnly": false
     },
     {
       "name": "runs.get",
@@ -3181,7 +3795,8 @@
           }
         ]
       },
-      "transportRetry": "before_response_once"
+      "transportRetry": "before_response_once",
+      "appOnly": false
     },
     {
       "name": "runs.wait",
@@ -3340,7 +3955,8 @@
           }
         ]
       },
-      "transportRetry": "before_response_once"
+      "transportRetry": "before_response_once",
+      "appOnly": false
     },
     {
       "name": "runs.events",
@@ -3499,7 +4115,8 @@
           }
         ]
       },
-      "transportRetry": "before_response_once"
+      "transportRetry": "before_response_once",
+      "appOnly": false
     },
     {
       "name": "runs.result",
@@ -3658,7 +4275,8 @@
           }
         ]
       },
-      "transportRetry": "before_response_once"
+      "transportRetry": "before_response_once",
+      "appOnly": false
     },
     {
       "name": "runs.cancel",
@@ -3749,7 +4367,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "runs.delete",
@@ -3853,7 +4472,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "interactions.list",
@@ -3958,7 +4578,8 @@
           }
         ]
       },
-      "transportRetry": "before_response_once"
+      "transportRetry": "before_response_once",
+      "appOnly": false
     },
     {
       "name": "interactions.get",
@@ -4043,7 +4664,8 @@
           }
         ]
       },
-      "transportRetry": "before_response_once"
+      "transportRetry": "before_response_once",
+      "appOnly": false
     },
     {
       "name": "interactions.respond",
@@ -4158,7 +4780,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "interactions.decide",
@@ -4273,7 +4896,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "artifacts.list",
@@ -4364,7 +4988,8 @@
           }
         ]
       },
-      "transportRetry": "before_response_once"
+      "transportRetry": "before_response_once",
+      "appOnly": false
     },
     {
       "name": "artifacts.read",
@@ -4470,7 +5095,8 @@
           }
         ]
       },
-      "transportRetry": "before_response_once"
+      "transportRetry": "before_response_once",
+      "appOnly": false
     },
     {
       "name": "artifacts.download",
@@ -4568,7 +5194,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "responses.read",
@@ -4674,7 +5301,8 @@
           }
         ]
       },
-      "transportRetry": "before_response_once"
+      "transportRetry": "before_response_once",
+      "appOnly": false
     },
     {
       "name": "responses.delete",
@@ -4752,7 +5380,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "daemon.drain",
@@ -4834,7 +5463,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "builder.commit",
@@ -4940,7 +5570,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "editor.commit",
@@ -5047,7 +5678,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "preparations.get",
@@ -5226,7 +5858,8 @@
           }
         ]
       },
-      "transportRetry": "before_response_once"
+      "transportRetry": "before_response_once",
+      "appOnly": false
     },
     {
       "name": "presentation.sessions.create",
@@ -5242,7 +5875,8 @@
               "authoring",
               "prepare",
               "monitor",
-              "interaction"
+              "interaction",
+              "runs"
             ]
           },
           "entityType": {
@@ -5379,7 +6013,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "presentation.sessions.get",
@@ -5499,7 +6134,125 @@
             "additionalProperties": false
           }
         ]
-      }
+      },
+      "appOnly": false
+    },
+    {
+      "name": "presentation.sessions.restore",
+      "mutating": false,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "viewSessionId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "viewSessionId"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "restoreVersion": {
+                "const": "presentation.sessions.restore/v1"
+              },
+              "viewSessionId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "entityType": {
+                "type": "string"
+              },
+              "entityId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "revision": {
+                "type": "integer"
+              },
+              "state": {
+                "type": "object"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "inactive",
+                  "resolved"
+                ]
+              },
+              "pendingOperation": {
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "restoreVersion",
+              "viewSessionId",
+              "kind",
+              "entityType",
+              "entityId",
+              "revision",
+              "state",
+              "status",
+              "pendingOperation",
+              "details"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "transportRetry": "before_response_once",
+      "appOnly": false
     },
     {
       "name": "presentation.sessions.update",
@@ -5644,7 +6397,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "presentation.sessions.delete",
@@ -5727,7 +6481,662 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
+    },
+    {
+      "name": "presentation.delivery.get",
+      "mutating": false,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "identity": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 384
+          }
+        },
+        "required": [
+          "identity"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "schemaVersion": {
+                "const": 2
+              },
+              "identity": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 384
+              },
+              "continuation": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "const": "follow"
+                      },
+                      "schemaVersion": {
+                        "const": "loomex.follow-session.continuation/v1"
+                      },
+                      "runId": {
+                        "type": "string",
+                        "format": "uuid"
+                      },
+                      "receipt": {
+                        "type": "string",
+                        "minLength": 16,
+                        "maxLength": 2048
+                      },
+                      "trigger": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 64
+                      },
+                      "requestId": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "requestStatus": {
+                        "type": [
+                          "string",
+                          "null"
+                        ],
+                        "minLength": 1,
+                        "maxLength": 32
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "schemaVersion",
+                      "runId",
+                      "receipt",
+                      "trigger",
+                      "requestId",
+                      "requestStatus"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "const": "start"
+                      },
+                      "schemaVersion": {
+                        "const": "loomex.start-continuation/v1"
+                      },
+                      "handoffRef": {
+                        "type": "string",
+                        "format": "uuid"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "schemaVersion",
+                      "handoffRef"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "const": "question"
+                      },
+                      "schemaVersion": {
+                        "const": "loomex.question-continuation/v1"
+                      },
+                      "requestId": {
+                        "type": "string",
+                        "format": "uuid"
+                      },
+                      "schemaDigest": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "schemaVersion",
+                      "requestId",
+                      "schemaDigest"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "revision": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "ready",
+                  "sending",
+                  "not_sent",
+                  "acknowledged",
+                  "rejected",
+                  "unknown"
+                ]
+              },
+              "attemptId": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "schemaVersion",
+              "identity",
+              "continuation",
+              "revision",
+              "status",
+              "attemptId"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "transportRetry": "before_response_once",
+      "appOnly": true
+    },
+    {
+      "name": "presentation.delivery.begin",
+      "mutating": true,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "identity": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 384
+          },
+          "expectedRevision": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "attemptId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "identity",
+          "expectedRevision",
+          "attemptId",
+          "idempotencyKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "schemaVersion": {
+                "const": 2
+              },
+              "identity": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 384
+              },
+              "continuation": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "const": "follow"
+                      },
+                      "schemaVersion": {
+                        "const": "loomex.follow-session.continuation/v1"
+                      },
+                      "runId": {
+                        "type": "string",
+                        "format": "uuid"
+                      },
+                      "receipt": {
+                        "type": "string",
+                        "minLength": 16,
+                        "maxLength": 2048
+                      },
+                      "trigger": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 64
+                      },
+                      "requestId": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "requestStatus": {
+                        "type": [
+                          "string",
+                          "null"
+                        ],
+                        "minLength": 1,
+                        "maxLength": 32
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "schemaVersion",
+                      "runId",
+                      "receipt",
+                      "trigger",
+                      "requestId",
+                      "requestStatus"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "const": "start"
+                      },
+                      "schemaVersion": {
+                        "const": "loomex.start-continuation/v1"
+                      },
+                      "handoffRef": {
+                        "type": "string",
+                        "format": "uuid"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "schemaVersion",
+                      "handoffRef"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "const": "question"
+                      },
+                      "schemaVersion": {
+                        "const": "loomex.question-continuation/v1"
+                      },
+                      "requestId": {
+                        "type": "string",
+                        "format": "uuid"
+                      },
+                      "schemaDigest": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "schemaVersion",
+                      "requestId",
+                      "schemaDigest"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "revision": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "ready",
+                  "sending",
+                  "not_sent",
+                  "acknowledged",
+                  "rejected",
+                  "unknown"
+                ]
+              },
+              "attemptId": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "schemaVersion",
+              "identity",
+              "continuation",
+              "revision",
+              "status",
+              "attemptId"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "transportRetry": "never_after_send",
+      "appOnly": true
+    },
+    {
+      "name": "presentation.delivery.settle",
+      "mutating": true,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "identity": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 384
+          },
+          "expectedRevision": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "attemptId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "not_sent",
+              "acknowledged",
+              "rejected",
+              "unknown"
+            ]
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "errorCode": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          }
+        },
+        "required": [
+          "identity",
+          "expectedRevision",
+          "attemptId",
+          "status",
+          "idempotencyKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "schemaVersion": {
+                "const": 2
+              },
+              "identity": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 384
+              },
+              "continuation": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "const": "follow"
+                      },
+                      "schemaVersion": {
+                        "const": "loomex.follow-session.continuation/v1"
+                      },
+                      "runId": {
+                        "type": "string",
+                        "format": "uuid"
+                      },
+                      "receipt": {
+                        "type": "string",
+                        "minLength": 16,
+                        "maxLength": 2048
+                      },
+                      "trigger": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 64
+                      },
+                      "requestId": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "requestStatus": {
+                        "type": [
+                          "string",
+                          "null"
+                        ],
+                        "minLength": 1,
+                        "maxLength": 32
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "schemaVersion",
+                      "runId",
+                      "receipt",
+                      "trigger",
+                      "requestId",
+                      "requestStatus"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "const": "start"
+                      },
+                      "schemaVersion": {
+                        "const": "loomex.start-continuation/v1"
+                      },
+                      "handoffRef": {
+                        "type": "string",
+                        "format": "uuid"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "schemaVersion",
+                      "handoffRef"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "const": "question"
+                      },
+                      "schemaVersion": {
+                        "const": "loomex.question-continuation/v1"
+                      },
+                      "requestId": {
+                        "type": "string",
+                        "format": "uuid"
+                      },
+                      "schemaDigest": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "schemaVersion",
+                      "requestId",
+                      "schemaDigest"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "revision": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "ready",
+                  "sending",
+                  "not_sent",
+                  "acknowledged",
+                  "rejected",
+                  "unknown"
+                ]
+              },
+              "attemptId": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "schemaVersion",
+              "identity",
+              "continuation",
+              "revision",
+              "status",
+              "attemptId"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "transportRetry": "never_after_send",
+      "appOnly": true
     },
     {
       "name": "presentation.operations.get",
@@ -5846,7 +7255,8 @@
             "additionalProperties": false
           }
         ]
-      }
+      },
+      "appOnly": false
     },
     {
       "name": "presentation.operations.settle",
@@ -5961,7 +7371,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "interactions.draft.get",
@@ -6036,7 +7447,8 @@
             "additionalProperties": false
           }
         ]
-      }
+      },
+      "appOnly": false
     },
     {
       "name": "interactions.draft.update",
@@ -6140,7 +7552,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "interactions.draft.delete",
@@ -6234,7 +7647,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "recovery.get",
@@ -6321,7 +7735,8 @@
             "additionalProperties": false
           }
         ]
-      }
+      },
+      "appOnly": false
     },
     {
       "name": "recovery.update",
@@ -6427,7 +7842,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "recovery.operations.begin",
@@ -6519,7 +7935,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "recovery.operations.settle",
@@ -6630,7 +8047,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "follow.session.lifecycle",
@@ -6671,10 +8089,7 @@
               },
               "source": {
                 "type": "string",
-                "enum": [
-                  "bare_command",
-                  "generated_markdown"
-                ]
+                "const": "generated_markdown"
               },
               "receipt": {
                 "type": "string"
@@ -6683,7 +8098,8 @@
             "required": [
               "schemaVersion",
               "runId",
-              "source"
+              "source",
+              "receipt"
             ],
             "additionalProperties": false
           },
@@ -6762,7 +8178,8 @@
         ],
         "additionalProperties": false
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "connection.views.create",
@@ -6907,7 +8324,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     },
     {
       "name": "connection.views.get",
@@ -7027,7 +8445,8 @@
             "additionalProperties": false
           }
         ]
-      }
+      },
+      "appOnly": false
     },
     {
       "name": "connection.views.update",
@@ -7161,7 +8580,8 @@
           }
         ]
       },
-      "transportRetry": "never_after_send"
+      "transportRetry": "never_after_send",
+      "appOnly": false
     }
   ],
   "capabilities": [
@@ -7193,6 +8613,11 @@
     "method:editor.respond",
     "method:editor.finalize",
     "method:runs.prepare",
+    "method:runs.start_handoff.issue",
+    "method:runs.start_handoff.restore",
+    "method:runs.start_handoff.approve",
+    "method:runs.start_handoff.get",
+    "method:runs.start_handoff.commit",
     "method:runs.commit",
     "method:runs.list",
     "method:runs.get",
@@ -7216,6 +8641,7 @@
     "method:preparations.get",
     "method:presentation.sessions.create",
     "method:presentation.sessions.get",
+    "method:presentation.sessions.restore",
     "method:presentation.sessions.update",
     "method:presentation.sessions.delete",
     "method:presentation.operations.get",
@@ -7233,13 +8659,19 @@
     "connection.projection/v1",
     "transfer.chunked/v1",
     "error.validation-issues/v1",
+    "method:presentation.delivery.get",
+    "method:presentation.delivery.begin",
+    "method:presentation.delivery.settle",
+    "presentation.delivery/v2",
     "presentation.sessions/v1",
+    "presentation.sessions.restore/v1",
     "interactions.drafts/v1",
     "recovery.coordination/v1",
     "method:follow.session.lifecycle",
     "follow.session.lifecycle/v1",
     "method:connection.views.create",
     "method:connection.views.get",
-    "method:connection.views.update"
+    "method:connection.views.update",
+    "error.recovery/v1"
   ]
 }

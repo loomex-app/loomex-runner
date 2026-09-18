@@ -9,6 +9,7 @@ repo="$(cd "$(dirname "$0")/.." && pwd -P)"; version="$(sed -n 's/^version = "\(
 output="${output:-$repo/release/loomex-runner-$version-darwin-arm64}"
 [[ ! -e "$output" ]] || { echo "output already exists; refusing to replace it: $output" >&2; exit 1; }
 if [[ "$mode" == "--production" ]]; then
+  python3 "$repo/scripts/verify-production-config.py"
   : "${LOOMEX_CODESIGN_IDENTITY:?production requires LOOMEX_CODESIGN_IDENTITY}"; : "${LOOMEX_NOTARY_PROFILE:?production requires LOOMEX_NOTARY_PROFILE}"; : "${LOOMEX_MANIFEST_SIGNING_KEY:?production requires LOOMEX_MANIFEST_SIGNING_KEY}"
   security find-identity -v -p codesigning | grep -Fq "$LOOMEX_CODESIGN_IDENTITY" || { echo "configured production signing identity is unavailable" >&2; exit 1; }
   [[ "$LOOMEX_CODESIGN_IDENTITY" == Developer\ ID\ Application:* ]] || { echo "production requires a Developer ID Application identity" >&2; exit 1; }

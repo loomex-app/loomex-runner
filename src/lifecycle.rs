@@ -721,6 +721,15 @@ fn terminal(phase: &str) -> bool {
     matches!(phase, "completed" | "rolled_back")
 }
 
+/// Validate a persisted lifecycle operation before a caller decides whether a
+/// bootstrap-local retry record may be superseded.  The terminal decision is
+/// deliberately owned here so callers cannot treat malformed state as safe to
+/// discard.
+pub fn operation_is_terminal(operation: &Operation) -> Result<bool> {
+    operation.validate()?;
+    Ok(terminal(&operation.phase))
+}
+
 /// Reconcile an interrupted install before a bootstrap stages another package
 /// or changes the ownership inventory.  The caller supplies the release-bound
 /// identity; differing identities are never allowed to share a journal.
@@ -1376,7 +1385,14 @@ pub async fn rollback(paths: &Paths, version: &str) -> Result<Value> {
 
 pub async fn repair(paths: &Paths) -> Result<Value> {
     let reconciliation = resume(paths).await?;
-    if reconciliation["resumed"] != true {
+    // A completed operation and the absence of an operation are both stable
+    // states. They may still leave bootstrap-owned metadata behind after a
+    // crash between native activation and receipt replacement.
+    let stable = matches!(
+        reconciliation["reason"].as_str(),
+        Some("no pending lifecycle operation") | Some("operation is terminal")
+    );
+    if reconciliation["resumed"] != true && !stable {
         return Ok(json!({
             "repaired":false,
             "reconciliation":reconciliation,
@@ -1384,6 +1400,16 @@ pub async fn repair(paths: &Paths) -> Result<Value> {
         }));
     }
     let _lock = LifecycleLock::acquire(paths)?;
+    // Resume releases its lock. Recheck under this lock before touching receipt
+    // metadata in case another lifecycle operation began in between.
+    if let Some(operation) = read_optional::<Operation>(&paths.operation())? {
+        operation.validate()?;
+        if !terminal(&operation.phase) {
+            return Ok(
+                json!({"repaired":false,"actionRequired":true,"reason":"lifecycle operation changed; resume it first"}),
+            );
+        }
+    }
     let temporary = paths.state_dir.join(format!("{OPERATION_NAME}.new"));
     let removed_temporary = if temporary.exists() {
         if fs::symlink_metadata(&temporary)?.file_type().is_symlink() {
@@ -1394,9 +1420,147 @@ pub async fn repair(paths: &Paths) -> Result<Value> {
     } else {
         false
     };
+    let observed = observe_receipt_identity(paths).await?;
+    let receipt = reconcile_install_receipt(paths, &observed)?;
     Ok(
-        json!({"repaired":true,"removedTemporary":removed_temporary,"reconciliation":reconciliation}),
+        json!({"repaired":true,"removedTemporary":removed_temporary,"receipt":receipt,"reconciliation":reconciliation}),
     )
+}
+
+/// Reconcile only bootstrap-owned receipt identity after the native lifecycle
+/// transaction is stable. It never selects a target, installs a service, or
+/// invents provider configuration.
+#[derive(Debug)]
+struct ReceiptObservation {
+    target: PathBuf,
+    version: String,
+    plist_digest: String,
+}
+
+async fn observe_receipt_identity(paths: &Paths) -> Result<ReceiptObservation> {
+    let target = current_target(paths)?.context("LIFECYCLE_IDENTITY_CONFLICT")?;
+    verify_owned_version(paths, &target)?;
+    let plist = launch_agent(paths);
+    checked_regular(&plist)?;
+    let output = tokio::process::Command::new("/usr/bin/plutil")
+        .args(["-convert", "json", "-o", "-"])
+        .arg(&plist)
+        .output()
+        .await?;
+    if !output.status.success() {
+        bail!("LIFECYCLE_IDENTITY_CONFLICT")
+    }
+    let value: Value = serde_json::from_slice(&output.stdout)?;
+    let program = value["ProgramArguments"][0]
+        .as_str()
+        .context("LIFECYCLE_IDENTITY_CONFLICT")?;
+    if value["Label"] != "app.loomex.runner"
+        || fs::canonicalize(program)? != fs::canonicalize(target.join("bin/loomex-runner"))?
+        || value["EnvironmentVariables"]["LOOMEX_STATE_DIR"] != json!(paths.state_dir)
+    {
+        bail!("LIFECYCLE_IDENTITY_CONFLICT")
+    }
+    let status = daemon_status(paths).await?;
+    let version = target
+        .file_name()
+        .and_then(|v| v.to_str())
+        .context("LIFECYCLE_IDENTITY_CONFLICT")?
+        .to_owned();
+    if status["version"] != version {
+        bail!("LIFECYCLE_IDENTITY_CONFLICT")
+    }
+    Ok(ReceiptObservation {
+        target,
+        version,
+        plist_digest: state::digest(&fs::read(plist)?),
+    })
+}
+
+fn reconcile_install_receipt(paths: &Paths, observed: &ReceiptObservation) -> Result<Value> {
+    let receipt_path = paths.state_dir.join("install-receipt.json");
+    let Some(receipt) = read_optional::<Value>(&receipt_path)? else {
+        return Ok(json!({"reconciled":false,"reason":"receipt is absent"}));
+    };
+    let target = match current_target(paths)? {
+        Some(target) => target,
+        None => return Ok(json!({"reconciled":false,"reason":"current target is absent"})),
+    };
+    verify_owned_version(paths, &target)?;
+    let version = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("current runner version is invalid")?;
+    let project: Value = state::read_json(&target.join("metadata/project.json"))?;
+    if target != observed.target
+        || version != observed.version
+        || project["version"] != version
+        || project["project"] != "loomex-runner"
+        || state::digest(&fs::read(launch_agent(paths))?) != observed.plist_digest
+    {
+        bail!("LIFECYCLE_IDENTITY_CONFLICT")
+    }
+
+    let development_only = receipt["developmentOnly"]
+        .as_bool()
+        .context("install receipt has invalid development mode")?;
+    let development_origin = &receipt["developmentApiOrigin"];
+    if !(development_origin.is_null() || development_origin.is_string()) {
+        bail!("install receipt has invalid development origin")
+    }
+    let providers = receipt["providerExecutables"]
+        .as_object()
+        .context("install receipt has invalid provider executables")?;
+    for (provider, executable) in providers {
+        if !matches!(
+            provider.as_str(),
+            "codex" | "claude" | "gemini" | "antigravity"
+        ) || !executable
+            .as_str()
+            .is_some_and(|value| Path::new(value).is_absolute())
+        {
+            bail!("install receipt has invalid provider executables")
+        }
+    }
+    let bootstrap = target.join("bin/loomex-lifecycle-bootstrap");
+    checked_regular(&bootstrap)?;
+    let expected = json!({
+        "schema":"app.loomex.runner.install-receipt/v2",
+        "version":version,
+        "versionPath":target,
+        "launchAgent":launch_agent(paths),
+        "bootstrapSha256":state::digest(&fs::read(bootstrap)?),
+        "developmentOnly":development_only,
+        "developmentApiOrigin":development_origin,
+        "providerExecutables":providers,
+    });
+    if receipt == expected {
+        let intent_path = paths.state_dir.join("receipt-repair.json");
+        if let Some(mut intent) = read_optional::<Value>(&intent_path)? {
+            if intent["phase"] == "pending"
+                && intent["expectedDigest"] == state::json_digest(&expected)
+            {
+                intent["phase"] = json!("completed");
+                state::write_json(&intent_path, &intent)?;
+            }
+        }
+        return Ok(json!({"reconciled":false,"reason":"receipt is current"}));
+    }
+    // Atomic intent and replacement make interruption resumable without inventing
+    // a new installation. Re-observe all identities on every repair invocation.
+    let intent = paths.state_dir.join("receipt-repair.json");
+    state::write_json(
+        &intent,
+        &json!({"schema":"loomex.receipt-repair/v1","target":target,"version":version,"expectedDigest":state::json_digest(&expected),"phase":"pending"}),
+    )?;
+    if current_target(paths)?.as_ref() != Some(&target) {
+        bail!("LIFECYCLE_IDENTITY_CONFLICT")
+    }
+    state::write_json(&receipt_path, &expected)?;
+    state::write_json(
+        &intent,
+        &json!({"schema":"loomex.receipt-repair/v1","target":target,"version":version,"expectedDigest":state::json_digest(&expected),"phase":"completed"}),
+    )?;
+    Ok(json!({"reconciled":true,"version":version}))
 }
 
 pub fn readable(value: &Value) -> String {
@@ -1474,6 +1638,26 @@ mod tests {
         state::write_json(&owned_path, &owned).unwrap();
     }
 
+    fn add_owned_bootstrap(paths: &Paths, version: &str) {
+        let target = paths.versions().join(version);
+        let bootstrap = target.join("bin/loomex-lifecycle-bootstrap");
+        fs::write(&bootstrap, b"bootstrap").unwrap();
+        fs::set_permissions(&bootstrap, fs::Permissions::from_mode(0o700)).unwrap();
+        let owned_path = paths.state_dir.join("owned-versions.json");
+        let mut owned: Value = state::read_json(&owned_path).unwrap();
+        let files = owned["inventories"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["path"] == json!(target))
+            .unwrap()["files"]
+            .as_array_mut()
+            .unwrap();
+        files.push(json!({"path":"bin/loomex-lifecycle-bootstrap","sha256":state::digest(b"bootstrap"),"size":9,"mode":0o700}));
+        files.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
+        state::write_json(&owned_path, &owned).unwrap();
+    }
+
     #[test]
     fn lifecycle_lock_serializes_writers_and_is_distinct_from_daemon_lock() {
         let temp = tempfile::tempdir().unwrap();
@@ -1494,6 +1678,61 @@ mod tests {
         let mut paths = paths(temp.path());
         paths.state_dir = PathBuf::from("/");
         assert!(paths.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn repair_reconciles_a_stale_receipt_to_the_verified_current_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        make_compatible_target(&paths);
+        add_owned_bootstrap(&paths, "1.2.3");
+        symlink(paths.versions().join("1.2.3"), paths.current()).unwrap();
+        state::write_json(
+            &paths.state_dir.join("install-receipt.json"),
+            &json!({
+                "schema":"app.loomex.runner.install-receipt/v2",
+                "version":"1.2.2",
+                "versionPath":paths.versions().join("1.2.2"),
+                "launchAgent":launch_agent(&paths),
+                "bootstrapSha256":"0".repeat(64),
+                "developmentOnly":false,
+                "developmentApiOrigin":null,
+                "providerExecutables":{},
+            }),
+        )
+        .unwrap();
+
+        fs::write(launch_agent(&paths), b"fixture plist").unwrap();
+        let observed = ReceiptObservation {
+            target: paths.versions().join("1.2.3"),
+            version: "1.2.3".into(),
+            plist_digest: state::digest(b"fixture plist"),
+        };
+        let repaired = reconcile_install_receipt(&paths, &observed).unwrap();
+        assert_eq!(repaired["reconciled"], true);
+        let intent_path = paths.state_dir.join("receipt-repair.json");
+        let mut intent: Value = state::read_json(&intent_path).unwrap();
+        intent["phase"] = json!("pending");
+        state::write_json(&intent_path, &intent).unwrap();
+        reconcile_install_receipt(&paths, &observed).unwrap();
+        assert_eq!(
+            state::read_json::<Value>(&intent_path).unwrap()["phase"],
+            "completed"
+        );
+        assert_eq!(
+            reconcile_install_receipt(&paths, &observed).unwrap()["reconciled"],
+            false
+        );
+        fs::write(launch_agent(&paths), b"changed").unwrap();
+        assert!(reconcile_install_receipt(&paths, &observed).is_err());
+        let receipt: Value =
+            state::read_json(&paths.state_dir.join("install-receipt.json")).unwrap();
+        assert_eq!(receipt["version"], "1.2.3");
+        assert_eq!(
+            receipt["versionPath"],
+            json!(paths.versions().join("1.2.3"))
+        );
+        assert_eq!(receipt["bootstrapSha256"], state::digest(b"bootstrap"));
     }
 
     #[test]

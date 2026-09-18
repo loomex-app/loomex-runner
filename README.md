@@ -1,10 +1,11 @@
-# Loomex runner 0.3.9
+# Loomex runner
 
 A fresh macOS per-user execution service. `loomex-runner` is the private daemon;
 `loomex` is the public CLI. This project has no old runner imports, state migration,
 or legacy command aliases.
 
-The product version is `0.3.9`, sourced from `Cargo.toml`. It is separate from
+The product version is sourced from the package metadata in `Cargo.toml` at
+build time. It is separate from
 the local-control protocol (`loomex.local-control/v2`) and the method-catalog
 contract version (`0.3.0`); those compatibility identifiers change
 independently of the product release version.
@@ -155,11 +156,11 @@ Control operations capture their organization when admitted and serialize only r
 `follow.session.lifecycle` is a strict hook bridge. Every callback carries an
 event UUID, a compact session identity, and either a
 `loomex.follow-session.continuation/v1` record or a
-`loomex.follow-session.tool-association/v1` record. Continuations carry only
-the exact run UUID and `bare_command` or `generated_markdown` source. Generated
-markdown also carries an opaque runner-minted receipt, emitted in commit or
-accepted-interaction result details and verified against owner, installation,
-run, trigger, and expiry. Run-tool associations carry matching run IDs from the
+`loomex.follow-session.tool-association/v1` record. Lifecycle continuations use
+the `generated_markdown` source and carry the exact run UUID plus an opaque
+runner-minted receipt, emitted in commit or accepted-interaction result details
+and verified against owner, installation, run, trigger, and expiry. Run-tool
+associations carry matching run IDs from the
 documented request and response. `loomex_interaction_get` and
 `loomex_interaction_view` instead carry the request UUID alone in their request
 projection and carry run plus request UUIDs in their response projection; all
@@ -170,10 +171,12 @@ authenticated run projection agree on the run identity. A live follow may use
 the session-scoped `unverified` task sentinel; recovery scheduling rejects that
 sentinel and needs a separately verified host task ID.
 
-An MCP App handoff is activated by the runner before the app calls `ui/message`.
-That host request is not assumed to trigger `UserPromptSubmit`. Its follow record
-is recoverable by a Stop hook only for the same canonical workspace and only
-when exactly one UI-originated follow is active there; ambiguous matches never
-block an unrelated conversation.
+An MCP App response handoff is recorded by the runner before the app calls `ui/message`. Start first uses the app-only, non-idempotent `runs.start_handoff.issue` operation. Its reference alone never authorizes execution. The mounted app then calls app-only `runs.start_handoff.approve` in response to the user’s explicit Start gesture. That call travels through the existing MCP bridge and owner-checked local-control socket; it does not use browser networking. Chat can then call `runs.start_handoff.commit` with the opaque reference.
+
+After an interrupted issue, a remount can explicitly call read-only `runs.start_handoff.restore` with the original issue idempotency key; it owner-checks the existing handoff and returns only the safe status projection. Restore never authorizes Start. A prepared handoff requires a new explicit Start gesture, and the app-only approval is never automatically replayed after an ambiguous response. That host request is not assumed to trigger `UserPromptSubmit`, and its pending
+record is never recovered from a workspace or cwd. Only an exact associated
+`loomex_run_wait` call promotes it to the native Codex session that actually
+began monitoring. This keeps list-only and detail-only turns inert while
+allowing the explicit follow protocol to survive host prompt-routing gaps.
 
 Uninstall first drains without cancelling active work, waits for idle, and stops the daemon. It then calls `loomex logout --offline`, which takes the same exclusive daemon lock and performs only native credential revocation and cleanup. Failed revocation preserves files and protected retry state; retrying this command does not restart execution or require a socket.

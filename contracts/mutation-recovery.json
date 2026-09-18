@@ -1,0 +1,23 @@
+{
+  "schemaVersion": "loomex.mutation-recovery/v1",
+  "unknownOutcome": "retain_exact_operation_and_reconcile",
+  "successorRequires": "settled_predecessor_and_verified_target",
+  "reconciliation": {
+    "interactions.respond": {
+      "method": "interactions.get",
+      "identity": "requestId"
+    },
+    "interactions.decide": {
+      "method": "interactions.get",
+      "identity": "requestId"
+    },
+    "builder.respond": {
+      "method": "builder.get",
+      "identity": "sessionId"
+    },
+    "runs.cancel": {
+      "method": "runs.get",
+      "identity": "runId"
+    }
+  }
+}

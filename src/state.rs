@@ -142,8 +142,22 @@ impl PublicState {
         bail!("WORKSPACE_DENIED")
     }
 }
+/// Shared public recovery rules. Unknown failures never authorize replay.
+pub fn error_recovery(code: &str) -> Value {
+    static CONTRACT: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    let contract = CONTRACT.get_or_init(|| {
+        serde_json::from_str(include_str!("../contracts/error-recovery.json"))
+            .expect("validated error contract")
+    });
+    contract["codes"]
+        .get(code)
+        .unwrap_or(&contract["default"])
+        .clone()
+}
+
 pub fn safe_error(code: &str, retryable: bool) -> Value {
-    json!({"code":code,"message":code.replace('_'," ").to_ascii_lowercase(),"correlationId":Uuid::new_v4(),"retryable":retryable})
+    let classification = error_recovery(code);
+    json!({"recovery":classification["recovery"],"outcome":classification["outcome"],"code":code,"message":code.replace('_'," ").to_ascii_lowercase(),"correlationId":Uuid::new_v4(),"retryable":retryable})
 }
 
 pub fn safe_error_with_data(code: &str, retryable: bool, data: Option<&Value>) -> Value {
@@ -157,6 +171,22 @@ pub fn safe_error_with_data(code: &str, retryable: bool, data: Option<&Value>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn error_contract_unknown_outcomes_do_not_authorize_replay() {
+        assert_eq!(error_recovery("FUTURE_FAILURE")["outcome"], "unknown");
+        assert_eq!(
+            error_recovery("FUTURE_FAILURE")["recovery"],
+            "reconcile_outcome"
+        );
+        assert_eq!(
+            safe_error("OPERATION_PENDING", false)["outcome"],
+            "not_dispatched"
+        );
+        assert_eq!(
+            safe_error("RUNNER_UNAVAILABLE", true)["recovery"],
+            "unavailable"
+        );
+    }
     #[test]
     fn grant_rejects_org_and_replaced_directory() {
         let t = tempfile::tempdir().unwrap();

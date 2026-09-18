@@ -1,0 +1,114 @@
+{
+  "schemaVersion": "loomex.error-recovery/v1",
+  "capability": "error.recovery/v1",
+  "default": {
+    "recovery": "reconcile_outcome",
+    "outcome": "unknown"
+  },
+  "codes": {
+    "INVALID_REQUEST": {
+      "recovery": "correct_input",
+      "outcome": "rejected"
+    },
+    "INVALID_ARGUMENT": {
+      "recovery": "correct_input",
+      "outcome": "rejected"
+    },
+    "IDEMPOTENCY_CONFLICT": {
+      "recovery": "correct_input",
+      "outcome": "rejected"
+    },
+    "UNSAFE_PRESENTATION_STATE": {
+      "recovery": "correct_input",
+      "outcome": "rejected"
+    },
+    "RUN_VALIDATION_FAILED": {
+      "recovery": "correct_input",
+      "outcome": "rejected"
+    },
+    "VERSION_NOT_OWNED": {
+      "recovery": "correct_input",
+      "outcome": "rejected"
+    },
+    "REVISION_CONFLICT": {
+      "recovery": "refresh_authority",
+      "outcome": "rejected"
+    },
+    "WORKSPACE_DENIED": {
+      "recovery": "refresh_authority",
+      "outcome": "rejected"
+    },
+    "PRECONDITION_FAILED": {
+      "recovery": "refresh_authority",
+      "outcome": "rejected"
+    },
+    "START_HANDOFF_STALE": {
+      "recovery": "refresh_authority",
+      "outcome": "rejected"
+    },
+    "START_HANDOFF_UNAPPROVED": {
+      "recovery": "refresh_authority",
+      "outcome": "rejected"
+    },
+    "ORGANIZATION_REQUIRED": {
+      "recovery": "refresh_authority",
+      "outcome": "rejected"
+    },
+    "VIEW_SESSION_NOT_FOUND": {
+      "recovery": "refresh_authority",
+      "outcome": "rejected"
+    },
+    "NETWORK_AMBIGUOUS": {
+      "recovery": "reconcile_outcome",
+      "outcome": "unknown"
+    },
+    "IDEMPOTENCY_REQUEST_IN_PROGRESS": {
+      "recovery": "reconcile_outcome",
+      "outcome": "unknown"
+    },
+    "START_HANDOFF_AMBIGUOUS": {
+      "recovery": "reconcile_outcome",
+      "outcome": "unknown"
+    },
+    "OPERATION_PENDING": {
+      "recovery": "reconcile_outcome",
+      "outcome": "not_dispatched"
+    },
+    "INTERNAL": {
+      "recovery": "reconcile_outcome",
+      "outcome": "unknown"
+    },
+    "LIFECYCLE_ERROR": {
+      "recovery": "reconcile_outcome",
+      "outcome": "unknown"
+    },
+    "RUNNER_UNAVAILABLE": {
+      "recovery": "unavailable",
+      "outcome": "not_dispatched"
+    },
+    "COMPATIBILITY_ERROR": {
+      "recovery": "unavailable",
+      "outcome": "not_dispatched"
+    },
+    "PROTOCOL_MISMATCH": {
+      "recovery": "unavailable",
+      "outcome": "not_dispatched"
+    },
+    "LIFECYCLE_IDENTITY_CONFLICT": {
+      "recovery": "refresh_authority",
+      "outcome": "rejected"
+    },
+    "DELIVERY_NOT_READY": {
+      "recovery": "refresh_authority",
+      "outcome": "not_dispatched"
+    },
+    "DELIVERY_IDENTITY_CONFLICT": {
+      "recovery": "refresh_authority",
+      "outcome": "rejected"
+    },
+    "DELIVERY_ATTEMPT_CONFLICT": {
+      "recovery": "refresh_authority",
+      "outcome": "rejected"
+    }
+  }
+}

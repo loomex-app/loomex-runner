@@ -3,6 +3,7 @@
     "auth.device-v2/v1",
     "authorization.prepare-commit/v1",
     "connection.projection/v1",
+    "error.recovery/v1",
     "error.validation-issues/v1",
     "execution.host_user/v1",
     "follow.session.lifecycle/v1",
@@ -41,11 +42,15 @@
     "method:organizations.list",
     "method:organizations.select",
     "method:preparations.get",
+    "method:presentation.delivery.begin",
+    "method:presentation.delivery.get",
+    "method:presentation.delivery.settle",
     "method:presentation.operations.get",
     "method:presentation.operations.settle",
     "method:presentation.sessions.create",
     "method:presentation.sessions.delete",
     "method:presentation.sessions.get",
+    "method:presentation.sessions.restore",
     "method:presentation.sessions.update",
     "method:recovery.get",
     "method:recovery.operations.begin",
@@ -61,6 +66,11 @@
     "method:runs.list",
     "method:runs.prepare",
     "method:runs.result",
+    "method:runs.start_handoff.approve",
+    "method:runs.start_handoff.commit",
+    "method:runs.start_handoff.get",
+    "method:runs.start_handoff.issue",
+    "method:runs.start_handoff.restore",
     "method:runs.wait",
     "method:status.get",
     "method:workflows.activate",
@@ -73,6 +83,8 @@
     "method:workspaces.grant",
     "method:workspaces.list",
     "method:workspaces.revoke",
+    "presentation.delivery/v2",
+    "presentation.sessions.restore/v1",
     "presentation.sessions/v1",
     "recovery.coordination/v1",
     "transfer.chunked/v1"
@@ -80,11 +92,11 @@
   "catalogVersion": "0.3.0",
   "generatedFrom": {
     "backendRoutes": {
-      "digest": "sha256:2d755bf52b0195bf2fc5435d6c38492753b0942dee05ca7f97c5decc5360b690",
+      "digest": "sha256:95fa7905d1c629e3572ef38fa05c1353372f4e81497cc0151a4ce4af298ca61f",
       "path": "contracts/backend-routes.json"
     },
     "methodCatalog": {
-      "digest": "sha256:eb53cf0a06db29b946f8cad0964f2befbc5ea9b1b35da3cc6d29ea9b93ae38bf",
+      "digest": "sha256:70bb32d2502779fd4ec684eaf6121f341fdcdd27d3a0a18a776994bef35d68cd",
       "path": "contracts/method-catalog.json"
     }
   },
@@ -358,7 +370,7 @@
     {
       "classification": "local-control",
       "idempotent": true,
-      "inputSchemaDigest": "sha256:a50c6296b47f4bb3d61e0848f539083e8b6f5d7c1ef93bd08fc9c7116b52a50a",
+      "inputSchemaDigest": "sha256:9bd97f55a76e4af7cf12ec39f9089735f130d61762a83b8a7dcdebbd479b6040",
       "mutating": true,
       "name": "follow.session.lifecycle",
       "outputSchemaDigest": "sha256:032e756f1902caeac75c90fd03efd4c5c5daebde4fd92dbc78dd42a582857b36",
@@ -487,6 +499,36 @@
     {
       "classification": "local-control",
       "idempotent": true,
+      "inputSchemaDigest": "sha256:e5f3efa3772df7305d11d0b8acfeac7c0185645b7e11d61a2d243fd4daa19308",
+      "mutating": true,
+      "name": "presentation.delivery.begin",
+      "outputSchemaDigest": "sha256:2ce3a4eedaffe0ef95e0829014ee1865b94a5c41453dc1b7483705e3fb11c818",
+      "routeIds": [],
+      "transportRetry": "never_after_send"
+    },
+    {
+      "classification": "local-control",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:23e1164885d960e0d6f46e96996e4e6f5de26ebd38fa699c65dfc20e316aee43",
+      "mutating": false,
+      "name": "presentation.delivery.get",
+      "outputSchemaDigest": "sha256:2ce3a4eedaffe0ef95e0829014ee1865b94a5c41453dc1b7483705e3fb11c818",
+      "routeIds": [],
+      "transportRetry": "before_response_once"
+    },
+    {
+      "classification": "local-control",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:88da5a864b6f14cd95ea4468c51a43d108d923198f053d97e35e54dbf0b54fa2",
+      "mutating": true,
+      "name": "presentation.delivery.settle",
+      "outputSchemaDigest": "sha256:2ce3a4eedaffe0ef95e0829014ee1865b94a5c41453dc1b7483705e3fb11c818",
+      "routeIds": [],
+      "transportRetry": "never_after_send"
+    },
+    {
+      "classification": "local-control",
+      "idempotent": true,
       "inputSchemaDigest": "sha256:5d6c700c61ce1b67cbf9b1966d994461881c355f907b89d46d0f19a3e5ab754d",
       "mutating": false,
       "name": "presentation.operations.get",
@@ -507,7 +549,7 @@
     {
       "classification": "local-control",
       "idempotent": true,
-      "inputSchemaDigest": "sha256:c6fd6570d0cc5eb30fc839aef548a7f2daffb1d157b1c02a18c26b28cac3f51e",
+      "inputSchemaDigest": "sha256:2ef57d515219430e0f7724eec69581d5c91716fcf38f869fcb1d12e9fd30240f",
       "mutating": true,
       "name": "presentation.sessions.create",
       "outputSchemaDigest": "sha256:7dd4836a3f538015ab0823325ee469c602ca1af417cb93cf59585fc21af54e21",
@@ -531,6 +573,16 @@
       "mutating": false,
       "name": "presentation.sessions.get",
       "outputSchemaDigest": "sha256:7dd4836a3f538015ab0823325ee469c602ca1af417cb93cf59585fc21af54e21",
+      "routeIds": [],
+      "transportRetry": "before_response_once"
+    },
+    {
+      "classification": "local-control",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:15f1361be7813d281b58dcd7ddc437c04a51fea1dc9553a307085b6f039ffc92",
+      "mutating": false,
+      "name": "presentation.sessions.restore",
+      "outputSchemaDigest": "sha256:34cc99acaf095c3cb1d4ab17a24fb5f7c7859950634c9fd543d881e08a54b72a",
       "routeIds": [],
       "transportRetry": "before_response_once"
     },
@@ -711,6 +763,56 @@
       "transportRetry": "before_response_once"
     },
     {
+      "classification": "local-control",
+      "idempotent": false,
+      "inputSchemaDigest": "sha256:24184233966a4e73543174839a6cd43284e1b9a28cc2aea3c83afca3a4f60c5a",
+      "mutating": true,
+      "name": "runs.start_handoff.approve",
+      "outputSchemaDigest": "sha256:e68710898cd8a586d130d4a394009d192013271df86d7154f3be9a1cee04359b",
+      "routeIds": [],
+      "transportRetry": "never_after_send"
+    },
+    {
+      "classification": "local-control",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:42127d623c6043a303e8cf0f36333ce533dcd8efacaaab6f194a817ff221f8da",
+      "mutating": true,
+      "name": "runs.start_handoff.commit",
+      "outputSchemaDigest": "sha256:2a07357e067470fcc5503afff3ce9777c9b42d02c4b237adadbc147634b48169",
+      "routeIds": [],
+      "transportRetry": "never_after_send"
+    },
+    {
+      "classification": "local-control",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:42127d623c6043a303e8cf0f36333ce533dcd8efacaaab6f194a817ff221f8da",
+      "mutating": false,
+      "name": "runs.start_handoff.get",
+      "outputSchemaDigest": "sha256:854c728e306e1e975f95c84cf267755b9c559f7814cc0dd22b8ac67e521a32a3",
+      "routeIds": [],
+      "transportRetry": "before_response_once"
+    },
+    {
+      "classification": "local-control",
+      "idempotent": false,
+      "inputSchemaDigest": "sha256:fbe3d5301300ae79feaf7084600a360065f37f31c3cde4ab8e884fcf29580a85",
+      "mutating": true,
+      "name": "runs.start_handoff.issue",
+      "outputSchemaDigest": "sha256:854c728e306e1e975f95c84cf267755b9c559f7814cc0dd22b8ac67e521a32a3",
+      "routeIds": [],
+      "transportRetry": "never_after_send"
+    },
+    {
+      "classification": "local-control",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:2c7c9cce11a36fbffd45d731f3f9a5a291551262fa927319d499bfb2a275257f",
+      "mutating": false,
+      "name": "runs.start_handoff.restore",
+      "outputSchemaDigest": "sha256:854c728e306e1e975f95c84cf267755b9c559f7814cc0dd22b8ac67e521a32a3",
+      "routeIds": [],
+      "transportRetry": "before_response_once"
+    },
+    {
       "classification": "backend-proxy",
       "idempotent": true,
       "inputSchemaDigest": "sha256:f63aad9a2dcb72fe66bcb95fba2de4971851b849ed7797adfe45ba425f8df597",
@@ -865,19 +967,19 @@
       "id": "artifact.transfer.append",
       "method": "PUT",
       "pathTemplate": "v2/artifact-transfers/{transferId}/",
-      "source": "src/jobs.rs"
+      "source": "src/jobs/transfer.rs"
     },
     {
       "id": "artifact.transfer.complete",
       "method": "POST",
       "pathTemplate": "v2/artifact-transfers/{transferId}/complete/",
-      "source": "src/jobs.rs"
+      "source": "src/jobs/transfer.rs"
     },
     {
       "id": "artifact.transfer.create",
       "method": "POST",
       "pathTemplate": "v2/artifact-transfers/",
-      "source": "src/jobs.rs"
+      "source": "src/jobs/transfer.rs"
     },
     {
       "id": "auth.delegation.refresh",
@@ -967,61 +1069,61 @@
       "id": "daemon.job.complete",
       "method": "POST",
       "pathTemplate": "v1/jobs/{jobId}/complete/",
-      "source": "src/jobs.rs"
+      "source": "src/jobs/delivery.rs"
     },
     {
       "id": "daemon.job.events",
       "method": "POST",
       "pathTemplate": "v1/jobs/{jobId}/events/",
-      "source": "src/jobs.rs"
+      "source": "src/jobs/transfer.rs"
     },
     {
       "id": "daemon.job.fail",
       "method": "POST",
       "pathTemplate": "v1/jobs/{jobId}/fail/",
-      "source": "src/jobs.rs"
+      "source": "src/jobs/delivery.rs"
     },
     {
       "id": "daemon.job.lease",
       "method": "POST",
       "pathTemplate": "v1/jobs/lease/",
-      "source": "src/jobs.rs"
+      "source": "src/jobs/supervisor.rs"
     },
     {
       "id": "daemon.job.reclaim",
       "method": "POST",
       "pathTemplate": "v1/jobs/{jobId}/reclaim/",
-      "source": "src/jobs.rs"
+      "source": "src/jobs/delivery.rs"
     },
     {
       "id": "daemon.job.renew",
       "method": "POST",
       "pathTemplate": "v1/jobs/{jobId}/renew/",
-      "source": "src/jobs.rs"
+      "source": "src/jobs/execution.rs"
     },
     {
       "id": "daemon.job.start",
       "method": "POST",
       "pathTemplate": "v1/jobs/{jobId}/start/",
-      "source": "src/jobs.rs"
+      "source": "src/jobs/execution.rs"
     },
     {
       "id": "daemon.session.create",
       "method": "POST",
       "pathTemplate": "v1/sessions/",
-      "source": "src/jobs.rs"
+      "source": "src/jobs/supervisor.rs"
     },
     {
       "id": "daemon.session.disconnect",
       "method": "POST",
       "pathTemplate": "v1/sessions/{sessionId}/disconnect/",
-      "source": "src/jobs.rs"
+      "source": "src/jobs/supervisor.rs"
     },
     {
       "id": "daemon.session.heartbeat",
       "method": "POST",
       "pathTemplate": "v1/sessions/{sessionId}/heartbeat/",
-      "source": "src/jobs.rs"
+      "source": "src/jobs/supervisor.rs"
     },
     {
       "id": "editor.commit",
@@ -1171,13 +1273,13 @@
   "schemaVersion": "loomex.runner.compatibility-manifest/v1",
   "summary": {
     "backendRouteCount": 53,
-    "capabilityCount": 76,
+    "capabilityCount": 88,
     "methodClassifications": {
       "backend-auth": 5,
       "backend-proxy": 37,
       "daemon-lifecycle": 1,
-      "local-control": 24
+      "local-control": 33
     },
-    "methodCount": 67
+    "methodCount": 76
   }
 }

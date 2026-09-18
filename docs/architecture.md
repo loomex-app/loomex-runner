@@ -31,11 +31,16 @@ Loomex device and organization child credentials plus the installation signing k
 
 Production builds embed one HTTPS API origin in `LOOMEX_API_ORIGIN`. They reject a runtime development-origin override. Debug builds require an explicit loopback HTTP or HTTPS `LOOMEX_DEV_API_ORIGIN`. The HTTP client follows no redirects and performs no implicit request retry. Device and child requests use scoped bearer credentials and Ed25519 request proofs over the exact method, path/query, body digest, timestamp, nonce, token prefix, and subject.
 
+Reviewed run starts use runner-mediated MCP approval. The app explicitly
+issues and approves an owner-bound handoff; chat reads that exact handoff and
+commits only after authoritative approval. Presentation state is never proof
+of approval, and browser loopback networking is not part of this route.
+
 Credential creation and rotation persist the exact pending operation before transmission. Only the backend-defined one-time recovery may resend bootstrap, enrollment, or refresh material after an ambiguous response, within 30 seconds. Logout marks protected state pending, revokes remotely, and only then clears local Loomex credentials.
 
 ## Protocol ownership and versioning
 
-The product version is `0.3.9`, sourced from `Cargo.toml`. The runner owns `contracts/local-control.schema.json` and `contracts/method-catalog.json`; the method catalog's contract version is independently `0.3.0`, and the local protocol remains `loomex.local-control/v2`. These protocol and catalog identifiers are compatibility versions, not product release numbers. Fixed-text `validationIssueVersion: "v1"` issues are behind the negotiated `error.validation-issues/v1` capability. Durable UI sessions and backend interaction drafts are separately negotiated through `presentation.sessions/v1` and `interactions.drafts/v1`; older runners therefore fail compatibility checks before a new UI can write. `protocol.negotiate` establishes the selected protocol and required capabilities on the same socket before actions; incompatible peers cannot mutate state. `daemon.drain` is internal lifecycle control. The plugin vendors a pinned catalog copy and exposes only its intended model/app surface.
+The product version is sourced from package metadata at build time. The runner owns `contracts/local-control.schema.json` and `contracts/method-catalog.json`; the method catalog's contract version is independently versioned, and the local protocol remains `loomex.local-control/v2`. These protocol and catalog identifiers are compatibility versions, not product release numbers. Fixed-text `validationIssueVersion: "v1"` issues are behind the negotiated `error.validation-issues/v1` capability. Durable UI sessions and backend interaction drafts are separately negotiated through `presentation.sessions/v1` and `interactions.drafts/v1`; older runners therefore fail compatibility checks before a new UI can write. `protocol.negotiate` establishes the selected protocol and required capabilities on the same socket before actions; incompatible peers cannot mutate state. `daemon.drain` is internal lifecycle control. The plugin vendors a pinned catalog copy and exposes only its intended model/app surface.
 
 Presentation state is stored in `presentation.sqlite3` inside the existing mode-0700 daemon directory; the database is mode 0600. Rows carry both the selected organization and authenticated child runner subject. The backend binds that subject to one user, organization, and installation, so a later login by another account cannot restore the first account's views while the same owner tuple remains stable across credential rotation. Session state and exact operation arguments use separate tables. SQLite immediate transactions serialize revision updates and atomically journal a UI mutation before its session revision becomes visible. This store is presentation only and is never consulted by workspace, preparation, commit, job admission, or human-request authorization paths.
 
@@ -45,9 +50,10 @@ Protocol input and output changes require synchronized plugin schemas, new diges
 
 `follow.sqlite3` is the one durable controller for a live follow. It has no
 internal scheduler. The hook envelope contains a stable event UUID, session
-identity, and either a v1 continuation (`runId`, `bare_command` or
-`generated_markdown`) or a v1 normalized tool association. Generated markdown
-requires an opaque continuation receipt minted by the runner after an
+identity, and either a receipt-bearing v1 generated-markdown continuation
+(`runId`, `generated_markdown`, and receipt) or a v1 normalized tool
+association. Generated markdown requires an opaque continuation receipt minted
+by the runner after an
 authoritative commit or accepted interaction; it is bound to owner,
 installation, run, trigger, and expiry. A run-tool association has one run UUID
 repeated in its documented request and response projections. Interaction get/view
@@ -65,6 +71,37 @@ does not expose a verified task ID. `recovery.sqlite3` never accepts that value:
 host automation records require a separately verified task binding. It journals
 create/update/pause/remove before a host mutation, treats replay or uncertainty
 as reconciliation, and never makes scheduling itself.
+
+Authenticated run reads expose a bounded, owner-scoped monitoring observation
+in `details.monitoring`. The observation keeps each host binding separate. A
+UI handoffs are recorded as `handoff_pending`; they are evidence that the
+runner issued a continuation, not hook-delivery evidence or workspace-scoped
+authority. The runner promotes one pending handoff only after the native Codex
+session makes an exact associated `loomex_run_wait` call for that run. When an
+accepted interaction has paused that native follow, only a new pending handoff
+whose runner-issued request ID exactly matches the paused request may advance
+the same native binding back to `active`; it increments the generation and
+cannot be claimed by an older card. Status/detail reads, Stop hooks, and
+matching cwd values cannot promote or select a pending handoff. `hostHookObserved` requires
+a processed hook on an actual Codex host-session binding, and even then says
+only that a prior callback arrived. UI handoffs never qualify as recovery task
+bindings. Recovery records likewise report prior runner journal state per exact
+host task.
+`previouslyVerified` requires recorded host
+evidence, but every read still requires a fresh host view to establish the
+current automation state. The projection deliberately reports no delivery
+guarantee because hook delivery and recovery scheduling remain host-managed.
+
+The backend wakes an execution wait for every durable event, including safe
+provider activity. The runner turns `runs.wait` into a bounded semantic wait:
+while a complete response contains only non-actionable `ai.progress.v1` events
+for an automated stage, it advances the local event cursor and continues the
+same wait. It returns immediately for a pending interaction, terminal state,
+non-progress event, paginated page, malformed projection, transport failure,
+or the requested deadline. This prevents provider chatter from consuming chat
+turns while retaining every event that can change the caller's next action.
+`status.get` advertises availability and these authority limits without exposing
+owner or run records.
 
 ## Workspace and prepared authority
 
@@ -124,3 +161,41 @@ Current unit and fake-backend tests verify many enforcement and recovery paths b
 ### Connection presentation
 
 `connection.views.create/get/update` provide owner-local pre-authentication navigation persistence, using a fixed scope distinct from organization-bound presentation records. The Unix socket owner check remains the trust boundary; these records contain no credentials and authorize no backend actions. Restoring a record requires fresh connection/list reads. Revisions and idempotent writes prevent silent concurrent overwrites. `connection.get.webAppUrl` is an optional validated HTTPS destination set with the build-time `LOOMEX_WEB_APP_ORIGIN`; no frontend URL is guessed from the API origin.
+
+## Execution ownership (Phase 5)
+
+The former `jobs.rs` is replaced by the `jobs/` module tree. The daemon owns
+one `ExecutionSupervisor`. Its admission lock and counters cover execution,
+recovery, and control work during drain. A job registration grants one local
+owner and releases both ownership and its cancellation token on drop.
+Organization sessions own their workers and heartbeat; the supervisor owns
+recovery tasks and joins them on shutdown. Execution scopes stop and join
+renewal/output helpers before terminal delivery, including error paths.
+
+| Module | Responsibility |
+| --- | --- |
+| supervisor | Admission, ownership, cancellation registry, session/task lifetime, drain |
+| journal | Typed persisted phases, checked transitions, atomic journal writes |
+| authorization | Validate local preparation, workspace, policy, payload and provider binding |
+| provider | Construct authorized command requests and validate provider results |
+| http | Authorized HTTP dispatch, cancellable resolution and dispatch evidence |
+| execution | Start/renew orchestration and durable executor observations |
+| transfer | Output events, offsets and resumable artifacts |
+| delivery | Terminal submission, fencing and exact redelivery |
+| recovery | Read durable evidence and reconcile without replaying execution |
+
+Command and HTTP entrypoints require an internal `AuthorizedJob`, which only
+the authorization module constructs. The existing executor remains responsible
+for argv, null stdin, process groups, guardian and disk output.
+
+Normal journal progression is `leased → start_pending → started →
+spawn_intent → running → exited → terminal_pending → acknowledged`.
+HTTP uses `started → running`. Failures may advance a nonterminal phase to
+`terminal_pending`; unrecoverable delivery can enter `delivery_blocked`.
+Transitions cannot return terminal evidence to execution. Serialized phase
+names and terminal keys are unchanged, so existing journal evidence remains
+readable. Unknown phases are rejected and retained for investigation.
+
+Graceful daemon shutdown closes admission, joins organization workers and
+recovery tasks, then removes the control socket. It does not imply cancellation
+of active work or transfer ownership to another daemon.

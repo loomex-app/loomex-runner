@@ -193,6 +193,15 @@ def require_clean_identity(component: dict[str, Any], label: str, expected_revis
     return revision
 
 
+def verify_recovery_contracts(plugin: dict[str, Any]) -> None:
+    expected = {
+        name: hashlib.sha256((ROOT / "contracts" / name).read_bytes()).hexdigest()
+        for name in ("error-recovery.json", "mutation-recovery.json")
+    }
+    if plugin.get("recoveryContracts") != expected:
+        raise CompatibilityError("plugin recovery contracts differ from runner-owned bytes or are missing")
+
+
 def verify(
     *,
     runner_manifest: dict[str, Any],
@@ -215,6 +224,7 @@ def verify(
 
     identities: dict[str, str] = {}
     if require_clean_identities:
+        verify_recovery_contracts(plugin)
         identities = {
             "plugin": require_clean_identity(plugin, "plugin component", expected_plugin_revision),
             "backend": require_clean_identity(backend, "backend route", expected_backend_revision),

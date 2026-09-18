@@ -21,6 +21,7 @@ use uuid::Uuid;
 const RETENTION_SECONDS: u64 = 30 * 24 * 60 * 60;
 const MAX_JSON_BYTES: usize = 128 * 1024;
 const SCHEMA_VERSION: u64 = 1;
+const MAX_MONITORING_RECORDS: usize = 32;
 
 pub struct RecoveryStore {
     connection: Mutex<Connection>,
@@ -164,6 +165,90 @@ impl RecoveryStore {
             "recovery.operations.settle" => self.operation_settle(scope, p),
             _ => bail!("METHOD_NOT_FOUND"),
         }
+    }
+
+    /// Return prior runner-journal observations for one exact run. A record
+    /// can say that a host automation was previously verified, but this read
+    /// never inspects the host and therefore cannot establish current delivery.
+    pub fn monitoring_observation(
+        &self,
+        org: &str,
+        account: &str,
+        installation: &str,
+        run: &str,
+    ) -> Result<Value> {
+        Uuid::parse_str(run).map_err(|_| anyhow::anyhow!("INVALID_REQUEST"))?;
+        self.sweep(crate::state::now())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
+        let total: u64 = connection.query_row(
+            "SELECT COUNT(*) FROM recovery_records
+             WHERE organization_id=?1 AND account_subject=?2
+               AND installation_id=?3 AND run_id=?4",
+            params![org, account, installation, run],
+            |row| row.get(0),
+        )?;
+        let mut statement = connection.prepare(
+            "SELECT monitoring_intent,registration_state,lifecycle,
+                    automation_id,evidence_json,observed_at,current_operation_id,
+                    updated_at
+             FROM recovery_records
+             WHERE organization_id=?1 AND account_subject=?2
+               AND installation_id=?3 AND run_id=?4
+             ORDER BY updated_at DESC, recovery_id DESC LIMIT ?5",
+        )?;
+        let records = statement
+            .query_map(
+                params![
+                    org,
+                    account,
+                    installation,
+                    run,
+                    (MAX_MONITORING_RECORDS + 1) as u64
+                ],
+                |row| {
+                    let monitoring_intent: String = row.get(0)?;
+                    let registration_state: String = row.get(1)?;
+                    let lifecycle: String = row.get(2)?;
+                    let automation_id: Option<String> = row.get(3)?;
+                    let evidence: Option<Vec<u8>> = row.get(4)?;
+                    let observed_at: Option<u64> = row.get(5)?;
+                    let operation_id: Option<String> = row.get(6)?;
+                    let updated_at: u64 = row.get(7)?;
+                    let evidence_recorded = evidence.is_some() && observed_at.is_some();
+                    let previously_verified = registration_state == "registered"
+                        && lifecycle == "verified"
+                        && automation_id.is_some()
+                        && evidence_recorded;
+                    Ok(json!({
+                        // Recovery records are admitted only for verified host
+                        // tasks. Keep the exact host/task binding in the
+                        // private journal, but never expose it through run
+                        // monitoring output.
+                        "binding": {"authority":"verified_host_task", "verified":true},
+                        "monitoringIntent": monitoring_intent,
+                        "registrationState": registration_state,
+                        "recordedLifecycle": lifecycle,
+                        "automationIdRecorded": automation_id.is_some(),
+                        "hostEvidenceRecorded": evidence_recorded,
+                        "previouslyVerified": previously_verified,
+                        "operationPending": operation_id.is_some(),
+                        "observedAt": observed_at,
+                        "updatedAt": updated_at,
+                        "freshHostVerificationRequired": true,
+                    }))
+                },
+            )?
+            .take(MAX_MONITORING_RECORDS)
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(json!({
+            "records": records,
+            "recordCount": total,
+            "truncated": total > MAX_MONITORING_RECORDS as u64,
+            "hostSchedulingGuaranteed": false,
+        }))
     }
 
     fn get(&self, scope: Scope<'_>, p: &Value) -> Result<Value> {
@@ -446,10 +531,18 @@ fn binding(p: &Value) -> Result<Binding> {
     let run = required_uuid(b, "runId")?.to_owned();
     validate_short(&host)?;
     validate_short(&task)?;
-    // Hook session/turn identifiers are not a host scheduling authority. Live
-    // follows may use this sentinel, but recovery automation must be bound to
-    // a separately verified host task.
-    ensure!(task != "unverified", "VERIFIED_HOST_TASK_REQUIRED");
+    // UI handoff rows and a workspace are not a host scheduling authority.
+    // Recovery can only be journaled under a host identity supplied by the
+    // scheduler integration. Rejecting these values here prevents an
+    // unavailable task lookup from leaving a durable, misleading record that
+    // later looks eligible for automation creation.
+    ensure!(
+        host != "codex-ui"
+            && host != "unverified"
+            && task != "unverified"
+            && !std::path::Path::new(&task).is_absolute(),
+        "VERIFIED_HOST_TASK_REQUIRED"
+    );
     Ok(Binding { host, task, run })
 }
 fn public_binding(scope: Scope<'_>, b: &Binding) -> Value {
@@ -738,6 +831,29 @@ mod tests {
         p["idempotencyKey"] = json!(Uuid::new_v4());
         store.update(scope(), &p).unwrap()
     }
+    fn settle_create(store: &RecoveryStore, b: &Value, host_evidence: Option<Value>) {
+        update(store, b, 0);
+        let mut begin = b.clone();
+        begin["expectedRevision"] = json!(1);
+        begin["operation"] =
+            json!({"kind":"create","arguments":{},"idempotencyKey":Uuid::new_v4()});
+        begin["idempotencyKey"] = json!(Uuid::new_v4());
+        let started = store.operation_begin(scope(), &begin).unwrap();
+        let mut settled = b.clone();
+        settled["expectedRevision"] = json!(2);
+        settled["operationId"] = started["operation"]["operationId"].clone();
+        settled["status"] = json!("succeeded");
+        settled["automationId"] = json!(format!(
+            "automation-{}",
+            b["binding"]["hostTaskId"].as_str().unwrap()
+        ));
+        settled["lifecycle"] = json!("verified");
+        if let Some(evidence) = host_evidence {
+            settled["hostEvidence"] = evidence;
+        }
+        settled["idempotencyKey"] = json!(Uuid::new_v4());
+        store.operation_settle(scope(), &settled).unwrap();
+    }
     #[test]
     fn initial_then_first_registration_and_restart_are_durable() {
         let d = tempfile::tempdir().unwrap();
@@ -756,6 +872,50 @@ mod tests {
         let read = reopened.get(scope(), &b).unwrap();
         assert_eq!(read["recovery"]["registrationState"], "attempt_in_flight");
         assert_eq!(read["recovery"]["operation"]["status"], "in_flight");
+    }
+    #[test]
+    fn monitoring_reports_prior_verification_without_exposing_task_bindings() {
+        let d = tempfile::tempdir().unwrap();
+        let store = RecoveryStore::open(d.path()).unwrap();
+        let run = Uuid::new_v4();
+        let without_evidence =
+            json!({"binding":{"hostId":"local","hostTaskId":"task-without-evidence","runId":run}});
+        let with_evidence =
+            json!({"binding":{"hostId":"local","hostTaskId":"task-with-evidence","runId":run}});
+        settle_create(&store, &without_evidence, None);
+        settle_create(
+            &store,
+            &with_evidence,
+            Some(json!({"automationId":"observed-on-host"})),
+        );
+
+        let observation = store
+            .monitoring_observation("org", "owner", "install", &run.to_string())
+            .unwrap();
+        assert_eq!(observation["recordCount"], 2);
+        assert_eq!(observation["hostSchedulingGuaranteed"], false);
+        let records = observation["records"].as_array().unwrap();
+        let serialized = observation.to_string();
+        assert!(!serialized.contains("task-without-evidence"));
+        assert!(!serialized.contains("task-with-evidence"));
+        assert!(!serialized.contains("\"hostId\""));
+        assert!(!serialized.contains("\"hostTaskId\""));
+        assert!(records.iter().all(|record| {
+            record["binding"] == json!({"authority":"verified_host_task", "verified":true})
+        }));
+        let recorded_only = records
+            .iter()
+            .find(|record| record["previouslyVerified"] == false)
+            .unwrap();
+        assert_eq!(recorded_only["registrationState"], "registered");
+        assert_eq!(recorded_only["recordedLifecycle"], "verified");
+        assert_eq!(recorded_only["previouslyVerified"], false);
+        let prior_evidence = records
+            .iter()
+            .find(|record| record["previouslyVerified"] == true)
+            .unwrap();
+        assert_eq!(prior_evidence["previouslyVerified"], true);
+        assert_eq!(prior_evidence["freshHostVerificationRequired"], true);
     }
     #[test]
     fn begin_replay_requires_reconciliation_and_cannot_duplicate_host_create() {
@@ -893,6 +1053,21 @@ mod tests {
         let mut b = binding();
         b["binding"]["hostTaskId"] = json!("unverified");
         let mut p = b;
+        p["expectedRevision"] = json!(0);
+        p["idempotencyKey"] = json!(Uuid::new_v4());
+        assert_eq!(
+            s.update(scope(), &p).unwrap_err().to_string(),
+            "VERIFIED_HOST_TASK_REQUIRED"
+        );
+    }
+
+    #[test]
+    fn ui_workspace_handoff_cannot_create_a_recovery_record() {
+        let d = tempfile::tempdir().unwrap();
+        let s = RecoveryStore::open(d.path()).unwrap();
+        let mut p = binding();
+        p["binding"]["hostId"] = json!("codex-ui");
+        p["binding"]["hostTaskId"] = json!("/Users/example/workspace");
         p["expectedRevision"] = json!(0);
         p["idempotencyKey"] = json!(Uuid::new_v4());
         assert_eq!(

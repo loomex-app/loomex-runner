@@ -8,64 +8,324 @@
     "local-control"
   ],
   "routes": [
-    {"id": "auth.device.start", "method": "POST", "pathTemplate": "v2/device-authorities/start/", "source": "src/auth.rs"},
-    {"id": "auth.device.token", "method": "POST", "pathTemplate": "v2/device-authorities/token/", "source": "src/auth.rs"},
-    {"id": "auth.device.bootstrap", "method": "POST", "pathTemplate": "v2/device-authorities/bootstrap/", "source": "src/auth.rs"},
-    {"id": "auth.device.refresh", "method": "POST", "pathTemplate": "v2/device-authorities/refresh/", "source": "src/auth.rs"},
-    {"id": "auth.device.logout", "method": "POST", "pathTemplate": "v2/device-authorities/logout/", "source": "src/auth.rs"},
-    {"id": "auth.organizations.list", "method": "GET", "pathTemplate": "v2/organizations/", "source": "src/auth.rs"},
-    {"id": "auth.organization.enroll", "method": "POST", "pathTemplate": "v2/organizations/{organizationId}/enroll/", "source": "src/auth.rs"},
-    {"id": "auth.delegation.refresh", "method": "POST", "pathTemplate": "v1/delegations/refresh/", "source": "src/auth.rs"},
-
-    {"id": "workflow.list", "method": "GET", "pathTemplate": "v1/workflows/", "source": "src/control.rs"},
-    {"id": "workflow.get", "method": "GET", "pathTemplate": "v1/workflows/{workflowId}/", "source": "src/control.rs"},
-    {"id": "workflow.create", "method": "POST", "pathTemplate": "v2/workflows/", "source": "src/control.rs"},
-    {"id": "workflow.update", "method": "POST", "pathTemplate": "v1/workflows/{workflowId}/draft/", "source": "src/control.rs"},
-    {"id": "workflow.validate", "method": "POST", "pathTemplate": "v1/workflows/validate/", "source": "src/control.rs"},
-    {"id": "workflow.publish", "method": "POST", "pathTemplate": "v1/workflows/{workflowId}/publish/", "source": "src/control.rs"},
-    {"id": "workflow.activate", "method": "POST", "pathTemplate": "v1/workflow-versions/{versionId}/activate/", "source": "src/control.rs"},
-    {"id": "builder.catalog", "method": "GET", "pathTemplate": "v2/builder/catalog/", "source": "src/control.rs"},
-    {"id": "builder.session.get", "method": "GET", "pathTemplate": "v1/workflow-builder/sessions/{sessionId}/", "source": "src/control.rs"},
-    {"id": "builder.session.respond", "method": "POST", "pathTemplate": "v1/workflow-builder/sessions/{sessionId}/responses/", "source": "src/control.rs"},
-    {"id": "builder.session.finalize", "method": "POST", "pathTemplate": "v1/workflow-builder/sessions/{sessionId}/finalize/", "source": "src/control.rs"},
-    {"id": "builder.prepare", "method": "POST", "pathTemplate": "v2/workflow-builder/prepare/", "source": "src/control.rs"},
-    {"id": "builder.commit", "method": "POST", "pathTemplate": "v2/workflow-builder/commit/", "source": "src/control.rs"},
-    {"id": "editor.session.respond", "method": "POST", "pathTemplate": "v1/workflow-edit/sessions/{sessionId}/responses/", "source": "src/control.rs"},
-    {"id": "editor.session.finalize", "method": "POST", "pathTemplate": "v1/workflow-edit/sessions/{sessionId}/finalize/", "source": "src/control.rs"},
-    {"id": "editor.prepare", "method": "POST", "pathTemplate": "v2/workflow-edit/prepare/", "source": "src/control.rs"},
-    {"id": "editor.commit", "method": "POST", "pathTemplate": "v2/workflow-edit/commit/", "source": "src/control.rs"},
-
-    {"id": "execution.prepare", "method": "POST", "pathTemplate": "v2/executions/prepare/", "source": "src/control.rs"},
-    {"id": "execution.commit", "method": "POST", "pathTemplate": "v2/executions/commit/", "source": "src/control.rs"},
-    {"id": "execution.list", "method": "GET", "pathTemplate": "v2/executions/", "source": "src/control.rs"},
-    {"id": "execution.detail", "method": "GET", "pathTemplate": "v1/executions/{executionId}/", "source": "src/control.rs"},
-    {"id": "execution.cancel", "method": "POST", "pathTemplate": "v1/executions/{executionId}/cancel/", "source": "src/control.rs"},
-    {"id": "execution.delete", "method": "POST", "pathTemplate": "v1/executions/{executionId}/delete/", "source": "src/control.rs"},
-
-    {"id": "interaction.list", "method": "GET", "pathTemplate": "v1/human-requests/", "source": "src/control.rs"},
-    {"id": "execution.interaction.list", "method": "GET", "pathTemplate": "v1/executions/{executionId}/human-requests/", "source": "src/control.rs"},
-    {"id": "interaction.get", "method": "GET", "pathTemplate": "v1/human-requests/{requestId}/", "source": "src/control.rs"},
-    {"id": "interaction.resolve", "method": "POST", "pathTemplate": "v1/human-requests/{requestId}/resolve/", "source": "src/control.rs"},
-    {"id": "interaction.draft", "method": "GET", "pathTemplate": "v1/human-requests/{requestId}/draft/", "source": "src/control.rs"},
-    {"id": "interaction.draft.update", "method": "PUT", "pathTemplate": "v1/human-requests/{requestId}/draft/", "source": "src/control.rs"},
-    {"id": "interaction.draft.delete", "method": "DELETE", "pathTemplate": "v1/human-requests/{requestId}/draft/", "source": "src/control.rs"},
-
-    {"id": "artifact.list", "method": "GET", "pathTemplate": "v2/executions/{executionId}/artifacts/", "source": "src/control.rs"},
-    {"id": "artifact.content", "method": "GET", "pathTemplate": "v2/artifacts/{artifactId}/content/", "source": "src/control.rs"},
-    {"id": "artifact.transfer.create", "method": "POST", "pathTemplate": "v2/artifact-transfers/", "source": "src/jobs.rs"},
-    {"id": "artifact.transfer.append", "method": "PUT", "pathTemplate": "v2/artifact-transfers/{transferId}/", "source": "src/jobs.rs"},
-    {"id": "artifact.transfer.complete", "method": "POST", "pathTemplate": "v2/artifact-transfers/{transferId}/complete/", "source": "src/jobs.rs"},
-
-    {"id": "daemon.session.create", "method": "POST", "pathTemplate": "v1/sessions/", "source": "src/jobs.rs"},
-    {"id": "daemon.session.heartbeat", "method": "POST", "pathTemplate": "v1/sessions/{sessionId}/heartbeat/", "source": "src/jobs.rs"},
-    {"id": "daemon.session.disconnect", "method": "POST", "pathTemplate": "v1/sessions/{sessionId}/disconnect/", "source": "src/jobs.rs"},
-    {"id": "daemon.job.lease", "method": "POST", "pathTemplate": "v1/jobs/lease/", "source": "src/jobs.rs"},
-    {"id": "daemon.job.start", "method": "POST", "pathTemplate": "v1/jobs/{jobId}/start/", "source": "src/jobs.rs"},
-    {"id": "daemon.job.renew", "method": "POST", "pathTemplate": "v1/jobs/{jobId}/renew/", "source": "src/jobs.rs"},
-    {"id": "daemon.job.reclaim", "method": "POST", "pathTemplate": "v1/jobs/{jobId}/reclaim/", "source": "src/jobs.rs"},
-    {"id": "daemon.job.events", "method": "POST", "pathTemplate": "v1/jobs/{jobId}/events/", "source": "src/jobs.rs"},
-    {"id": "daemon.job.complete", "method": "POST", "pathTemplate": "v1/jobs/{jobId}/complete/", "source": "src/jobs.rs"},
-    {"id": "daemon.job.fail", "method": "POST", "pathTemplate": "v1/jobs/{jobId}/fail/", "source": "src/jobs.rs"}
+    {
+      "id": "auth.device.start",
+      "method": "POST",
+      "pathTemplate": "v2/device-authorities/start/",
+      "source": "src/auth.rs"
+    },
+    {
+      "id": "auth.device.token",
+      "method": "POST",
+      "pathTemplate": "v2/device-authorities/token/",
+      "source": "src/auth.rs"
+    },
+    {
+      "id": "auth.device.bootstrap",
+      "method": "POST",
+      "pathTemplate": "v2/device-authorities/bootstrap/",
+      "source": "src/auth.rs"
+    },
+    {
+      "id": "auth.device.refresh",
+      "method": "POST",
+      "pathTemplate": "v2/device-authorities/refresh/",
+      "source": "src/auth.rs"
+    },
+    {
+      "id": "auth.device.logout",
+      "method": "POST",
+      "pathTemplate": "v2/device-authorities/logout/",
+      "source": "src/auth.rs"
+    },
+    {
+      "id": "auth.organizations.list",
+      "method": "GET",
+      "pathTemplate": "v2/organizations/",
+      "source": "src/auth.rs"
+    },
+    {
+      "id": "auth.organization.enroll",
+      "method": "POST",
+      "pathTemplate": "v2/organizations/{organizationId}/enroll/",
+      "source": "src/auth.rs"
+    },
+    {
+      "id": "auth.delegation.refresh",
+      "method": "POST",
+      "pathTemplate": "v1/delegations/refresh/",
+      "source": "src/auth.rs"
+    },
+    {
+      "id": "workflow.list",
+      "method": "GET",
+      "pathTemplate": "v1/workflows/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "workflow.get",
+      "method": "GET",
+      "pathTemplate": "v1/workflows/{workflowId}/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "workflow.create",
+      "method": "POST",
+      "pathTemplate": "v2/workflows/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "workflow.update",
+      "method": "POST",
+      "pathTemplate": "v1/workflows/{workflowId}/draft/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "workflow.validate",
+      "method": "POST",
+      "pathTemplate": "v1/workflows/validate/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "workflow.publish",
+      "method": "POST",
+      "pathTemplate": "v1/workflows/{workflowId}/publish/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "workflow.activate",
+      "method": "POST",
+      "pathTemplate": "v1/workflow-versions/{versionId}/activate/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "builder.catalog",
+      "method": "GET",
+      "pathTemplate": "v2/builder/catalog/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "builder.session.get",
+      "method": "GET",
+      "pathTemplate": "v1/workflow-builder/sessions/{sessionId}/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "builder.session.respond",
+      "method": "POST",
+      "pathTemplate": "v1/workflow-builder/sessions/{sessionId}/responses/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "builder.session.finalize",
+      "method": "POST",
+      "pathTemplate": "v1/workflow-builder/sessions/{sessionId}/finalize/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "builder.prepare",
+      "method": "POST",
+      "pathTemplate": "v2/workflow-builder/prepare/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "builder.commit",
+      "method": "POST",
+      "pathTemplate": "v2/workflow-builder/commit/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "editor.session.respond",
+      "method": "POST",
+      "pathTemplate": "v1/workflow-edit/sessions/{sessionId}/responses/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "editor.session.finalize",
+      "method": "POST",
+      "pathTemplate": "v1/workflow-edit/sessions/{sessionId}/finalize/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "editor.prepare",
+      "method": "POST",
+      "pathTemplate": "v2/workflow-edit/prepare/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "editor.commit",
+      "method": "POST",
+      "pathTemplate": "v2/workflow-edit/commit/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "execution.prepare",
+      "method": "POST",
+      "pathTemplate": "v2/executions/prepare/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "execution.commit",
+      "method": "POST",
+      "pathTemplate": "v2/executions/commit/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "execution.list",
+      "method": "GET",
+      "pathTemplate": "v2/executions/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "execution.detail",
+      "method": "GET",
+      "pathTemplate": "v1/executions/{executionId}/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "execution.cancel",
+      "method": "POST",
+      "pathTemplate": "v1/executions/{executionId}/cancel/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "execution.delete",
+      "method": "POST",
+      "pathTemplate": "v1/executions/{executionId}/delete/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "interaction.list",
+      "method": "GET",
+      "pathTemplate": "v1/human-requests/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "execution.interaction.list",
+      "method": "GET",
+      "pathTemplate": "v1/executions/{executionId}/human-requests/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "interaction.get",
+      "method": "GET",
+      "pathTemplate": "v1/human-requests/{requestId}/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "interaction.resolve",
+      "method": "POST",
+      "pathTemplate": "v1/human-requests/{requestId}/resolve/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "interaction.draft",
+      "method": "GET",
+      "pathTemplate": "v1/human-requests/{requestId}/draft/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "interaction.draft.update",
+      "method": "PUT",
+      "pathTemplate": "v1/human-requests/{requestId}/draft/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "interaction.draft.delete",
+      "method": "DELETE",
+      "pathTemplate": "v1/human-requests/{requestId}/draft/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "artifact.list",
+      "method": "GET",
+      "pathTemplate": "v2/executions/{executionId}/artifacts/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "artifact.content",
+      "method": "GET",
+      "pathTemplate": "v2/artifacts/{artifactId}/content/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "artifact.transfer.create",
+      "method": "POST",
+      "pathTemplate": "v2/artifact-transfers/",
+      "source": "src/jobs/transfer.rs"
+    },
+    {
+      "id": "artifact.transfer.append",
+      "method": "PUT",
+      "pathTemplate": "v2/artifact-transfers/{transferId}/",
+      "source": "src/jobs/transfer.rs"
+    },
+    {
+      "id": "artifact.transfer.complete",
+      "method": "POST",
+      "pathTemplate": "v2/artifact-transfers/{transferId}/complete/",
+      "source": "src/jobs/transfer.rs"
+    },
+    {
+      "id": "daemon.session.create",
+      "method": "POST",
+      "pathTemplate": "v1/sessions/",
+      "source": "src/jobs/supervisor.rs"
+    },
+    {
+      "id": "daemon.session.heartbeat",
+      "method": "POST",
+      "pathTemplate": "v1/sessions/{sessionId}/heartbeat/",
+      "source": "src/jobs/supervisor.rs"
+    },
+    {
+      "id": "daemon.session.disconnect",
+      "method": "POST",
+      "pathTemplate": "v1/sessions/{sessionId}/disconnect/",
+      "source": "src/jobs/supervisor.rs"
+    },
+    {
+      "id": "daemon.job.lease",
+      "method": "POST",
+      "pathTemplate": "v1/jobs/lease/",
+      "source": "src/jobs/supervisor.rs"
+    },
+    {
+      "id": "daemon.job.start",
+      "method": "POST",
+      "pathTemplate": "v1/jobs/{jobId}/start/",
+      "source": "src/jobs/execution.rs"
+    },
+    {
+      "id": "daemon.job.renew",
+      "method": "POST",
+      "pathTemplate": "v1/jobs/{jobId}/renew/",
+      "source": "src/jobs/execution.rs"
+    },
+    {
+      "id": "daemon.job.reclaim",
+      "method": "POST",
+      "pathTemplate": "v1/jobs/{jobId}/reclaim/",
+      "source": "src/jobs/delivery.rs"
+    },
+    {
+      "id": "daemon.job.events",
+      "method": "POST",
+      "pathTemplate": "v1/jobs/{jobId}/events/",
+      "source": "src/jobs/transfer.rs"
+    },
+    {
+      "id": "daemon.job.complete",
+      "method": "POST",
+      "pathTemplate": "v1/jobs/{jobId}/complete/",
+      "source": "src/jobs/delivery.rs"
+    },
+    {
+      "id": "daemon.job.fail",
+      "method": "POST",
+      "pathTemplate": "v1/jobs/{jobId}/fail/",
+      "source": "src/jobs/delivery.rs"
+    }
   ],
   "daemonRouteIds": [
     "auth.device.refresh",
@@ -85,72 +345,471 @@
     "daemon.job.fail"
   ],
   "methodBindings": [
-    {"method": "protocol.negotiate", "classification": "local-control", "routeIds": []},
-    {"method": "status.get", "classification": "local-control", "routeIds": []},
-    {"method": "connection.get", "classification": "local-control", "routeIds": []},
-    {"method": "auth.status", "classification": "local-control", "routeIds": []},
-    {"method": "auth.login", "classification": "backend-auth", "routeIds": ["auth.device.start"]},
-    {"method": "auth.poll", "classification": "backend-auth", "routeIds": ["auth.device.token", "auth.device.bootstrap"]},
-    {"method": "auth.logout", "classification": "backend-auth", "routeIds": ["auth.device.logout"]},
-    {"method": "organizations.list", "classification": "backend-auth", "routeIds": ["auth.organizations.list"]},
-    {"method": "organizations.select", "classification": "backend-auth", "routeIds": ["auth.organization.enroll"]},
-    {"method": "workspaces.list", "classification": "local-control", "routeIds": []},
-    {"method": "workspaces.grant", "classification": "local-control", "routeIds": []},
-    {"method": "workspaces.revoke", "classification": "local-control", "routeIds": []},
-    {"method": "workflows.list", "classification": "backend-proxy", "routeIds": ["workflow.list"]},
-    {"method": "workflows.get", "classification": "backend-proxy", "routeIds": ["workflow.get"]},
-    {"method": "workflows.create", "classification": "backend-proxy", "routeIds": ["workflow.create"]},
-    {"method": "workflows.update", "classification": "backend-proxy", "routeIds": ["workflow.update"]},
-    {"method": "workflows.validate", "classification": "backend-proxy", "routeIds": ["workflow.validate"]},
-    {"method": "workflows.publish", "classification": "backend-proxy", "routeIds": ["workflow.publish"]},
-    {"method": "workflows.activate", "classification": "backend-proxy", "routeIds": ["workflow.activate"]},
-    {"method": "builder.catalog", "classification": "backend-proxy", "routeIds": ["builder.catalog"]},
-    {"method": "builder.validate", "classification": "backend-proxy", "routeIds": ["workflow.validate"]},
-    {"method": "builder.prepare", "classification": "backend-proxy", "routeIds": ["builder.prepare"]},
-    {"method": "builder.get", "classification": "backend-proxy", "routeIds": ["builder.session.get"]},
-    {"method": "builder.respond", "classification": "backend-proxy", "routeIds": ["builder.session.respond"]},
-    {"method": "builder.finalize", "classification": "backend-proxy", "routeIds": ["builder.session.finalize"]},
-    {"method": "builder.commit", "classification": "backend-proxy", "routeIds": ["builder.commit"]},
-    {"method": "editor.prepare", "classification": "backend-proxy", "routeIds": ["editor.prepare"]},
-    {"method": "editor.respond", "classification": "backend-proxy", "routeIds": ["editor.session.respond"]},
-    {"method": "editor.finalize", "classification": "backend-proxy", "routeIds": ["editor.session.finalize"]},
-    {"method": "editor.commit", "classification": "backend-proxy", "routeIds": ["editor.commit"]},
-    {"method": "runs.prepare", "classification": "backend-proxy", "routeIds": ["execution.prepare"]},
-    {"method": "runs.commit", "classification": "backend-proxy", "routeIds": ["execution.commit"]},
-    {"method": "runs.list", "classification": "backend-proxy", "routeIds": ["execution.list"]},
-    {"method": "runs.get", "classification": "backend-proxy", "routeIds": ["execution.detail"]},
-    {"method": "runs.wait", "classification": "backend-proxy", "routeIds": ["execution.detail"]},
-    {"method": "runs.events", "classification": "backend-proxy", "routeIds": ["execution.detail"]},
-    {"method": "runs.result", "classification": "backend-proxy", "routeIds": ["execution.detail"]},
-    {"method": "runs.cancel", "classification": "backend-proxy", "routeIds": ["execution.cancel"]},
-    {"method": "runs.delete", "classification": "backend-proxy", "routeIds": ["execution.delete"]},
-    {"method": "interactions.list", "classification": "backend-proxy", "routeIds": ["interaction.list", "execution.interaction.list"]},
-    {"method": "interactions.get", "classification": "backend-proxy", "routeIds": ["interaction.get"]},
-    {"method": "interactions.respond", "classification": "backend-proxy", "routeIds": ["interaction.resolve"]},
-    {"method": "interactions.decide", "classification": "backend-proxy", "routeIds": ["interaction.resolve"]},
-    {"method": "interactions.draft.get", "classification": "backend-proxy", "routeIds": ["interaction.draft"]},
-    {"method": "interactions.draft.update", "classification": "backend-proxy", "routeIds": ["interaction.draft.update"]},
-    {"method": "interactions.draft.delete", "classification": "backend-proxy", "routeIds": ["interaction.draft.delete"]},
-    {"method": "artifacts.list", "classification": "backend-proxy", "routeIds": ["artifact.list"]},
-    {"method": "artifacts.read", "classification": "backend-proxy", "routeIds": ["artifact.content"]},
-    {"method": "artifacts.download", "classification": "backend-proxy", "routeIds": ["artifact.content"]},
-    {"method": "responses.read", "classification": "local-control", "routeIds": []},
-    {"method": "responses.delete", "classification": "local-control", "routeIds": []},
-    {"method": "daemon.drain", "classification": "daemon-lifecycle", "routeIds": []},
-    {"method": "preparations.get", "classification": "local-control", "routeIds": []},
-    {"method": "presentation.sessions.create", "classification": "local-control", "routeIds": []},
-    {"method": "presentation.sessions.get", "classification": "local-control", "routeIds": []},
-    {"method": "presentation.sessions.update", "classification": "local-control", "routeIds": []},
-    {"method": "presentation.sessions.delete", "classification": "local-control", "routeIds": []},
-    {"method": "presentation.operations.get", "classification": "local-control", "routeIds": []},
-    {"method": "presentation.operations.settle", "classification": "local-control", "routeIds": []},
-    {"method": "recovery.get", "classification": "local-control", "routeIds": []},
-    {"method": "recovery.update", "classification": "local-control", "routeIds": []},
-    {"method": "recovery.operations.begin", "classification": "local-control", "routeIds": []},
-    {"method": "recovery.operations.settle", "classification": "local-control", "routeIds": []},
-    {"method": "follow.session.lifecycle", "classification": "local-control", "routeIds": []},
-    {"method": "connection.views.create", "classification": "local-control", "routeIds": []},
-    {"method": "connection.views.get", "classification": "local-control", "routeIds": []},
-    {"method": "connection.views.update", "classification": "local-control", "routeIds": []}
+    {
+      "method": "protocol.negotiate",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "status.get",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "connection.get",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "auth.status",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "auth.login",
+      "classification": "backend-auth",
+      "routeIds": [
+        "auth.device.start"
+      ]
+    },
+    {
+      "method": "auth.poll",
+      "classification": "backend-auth",
+      "routeIds": [
+        "auth.device.token",
+        "auth.device.bootstrap"
+      ]
+    },
+    {
+      "method": "auth.logout",
+      "classification": "backend-auth",
+      "routeIds": [
+        "auth.device.logout"
+      ]
+    },
+    {
+      "method": "organizations.list",
+      "classification": "backend-auth",
+      "routeIds": [
+        "auth.organizations.list"
+      ]
+    },
+    {
+      "method": "organizations.select",
+      "classification": "backend-auth",
+      "routeIds": [
+        "auth.organization.enroll"
+      ]
+    },
+    {
+      "method": "workspaces.list",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "workspaces.grant",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "workspaces.revoke",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "workflows.list",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "workflow.list"
+      ]
+    },
+    {
+      "method": "workflows.get",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "workflow.get"
+      ]
+    },
+    {
+      "method": "workflows.create",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "workflow.create"
+      ]
+    },
+    {
+      "method": "workflows.update",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "workflow.update"
+      ]
+    },
+    {
+      "method": "workflows.validate",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "workflow.validate"
+      ]
+    },
+    {
+      "method": "workflows.publish",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "workflow.publish"
+      ]
+    },
+    {
+      "method": "workflows.activate",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "workflow.activate"
+      ]
+    },
+    {
+      "method": "builder.catalog",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "builder.catalog"
+      ]
+    },
+    {
+      "method": "builder.validate",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "workflow.validate"
+      ]
+    },
+    {
+      "method": "builder.prepare",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "builder.prepare"
+      ]
+    },
+    {
+      "method": "builder.get",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "builder.session.get"
+      ]
+    },
+    {
+      "method": "builder.respond",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "builder.session.respond"
+      ]
+    },
+    {
+      "method": "builder.finalize",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "builder.session.finalize"
+      ]
+    },
+    {
+      "method": "builder.commit",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "builder.commit"
+      ]
+    },
+    {
+      "method": "editor.prepare",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "editor.prepare"
+      ]
+    },
+    {
+      "method": "editor.respond",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "editor.session.respond"
+      ]
+    },
+    {
+      "method": "editor.finalize",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "editor.session.finalize"
+      ]
+    },
+    {
+      "method": "editor.commit",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "editor.commit"
+      ]
+    },
+    {
+      "method": "runs.prepare",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "execution.prepare"
+      ]
+    },
+    {
+      "method": "runs.start_handoff.issue",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "runs.start_handoff.restore",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "runs.start_handoff.approve",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "runs.start_handoff.get",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "runs.start_handoff.commit",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "runs.commit",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "execution.commit"
+      ]
+    },
+    {
+      "method": "runs.list",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "execution.list"
+      ]
+    },
+    {
+      "method": "runs.get",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "execution.detail"
+      ]
+    },
+    {
+      "method": "runs.wait",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "execution.detail"
+      ]
+    },
+    {
+      "method": "runs.events",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "execution.detail"
+      ]
+    },
+    {
+      "method": "runs.result",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "execution.detail"
+      ]
+    },
+    {
+      "method": "runs.cancel",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "execution.cancel"
+      ]
+    },
+    {
+      "method": "runs.delete",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "execution.delete"
+      ]
+    },
+    {
+      "method": "interactions.list",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "interaction.list",
+        "execution.interaction.list"
+      ]
+    },
+    {
+      "method": "interactions.get",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "interaction.get"
+      ]
+    },
+    {
+      "method": "interactions.respond",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "interaction.resolve"
+      ]
+    },
+    {
+      "method": "interactions.decide",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "interaction.resolve"
+      ]
+    },
+    {
+      "method": "interactions.draft.get",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "interaction.draft"
+      ]
+    },
+    {
+      "method": "interactions.draft.update",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "interaction.draft.update"
+      ]
+    },
+    {
+      "method": "interactions.draft.delete",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "interaction.draft.delete"
+      ]
+    },
+    {
+      "method": "artifacts.list",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "artifact.list"
+      ]
+    },
+    {
+      "method": "artifacts.read",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "artifact.content"
+      ]
+    },
+    {
+      "method": "artifacts.download",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "artifact.content"
+      ]
+    },
+    {
+      "method": "responses.read",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "responses.delete",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "daemon.drain",
+      "classification": "daemon-lifecycle",
+      "routeIds": []
+    },
+    {
+      "method": "preparations.get",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "presentation.sessions.create",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "presentation.sessions.get",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "presentation.sessions.restore",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "presentation.sessions.update",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "presentation.sessions.delete",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "presentation.delivery.get",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "presentation.delivery.begin",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "presentation.delivery.settle",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "presentation.operations.get",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "presentation.operations.settle",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "recovery.get",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "recovery.update",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "recovery.operations.begin",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "recovery.operations.settle",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "follow.session.lifecycle",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "connection.views.create",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "connection.views.get",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "connection.views.update",
+      "classification": "local-control",
+      "routeIds": []
+    }
   ]
 }
