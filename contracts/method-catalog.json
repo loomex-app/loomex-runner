@@ -1,6 +1,6 @@
 {
   "protocol": "loomex.local-control/v2",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "maxFrameBytes": 1048576,
   "methods": [
     {
@@ -1286,6 +1286,13 @@
           "slug": {
             "type": "string"
           },
+          "definition": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "notes": {
+            "type": "string"
+          },
           "idempotencyKey": {
             "type": "string",
             "format": "uuid"
@@ -1316,6 +1323,13 @@
                   "string",
                   "null"
                 ]
+              },
+              "draft": {
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "additionalProperties": true
               },
               "details": {
                 "type": "object",
@@ -1496,6 +1510,13 @@
               },
               "errors": {
                 "type": "array"
+              },
+              "issues": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
               },
               "workflow": {
                 "type": "object",
@@ -1751,6 +1772,10 @@
                   "additionalProperties": true
                 }
               },
+              "authoringContract": {
+                "type": "object",
+                "additionalProperties": true
+              },
               "executionPolicies": {
                 "type": "array",
                 "items": {
@@ -1768,6 +1793,7 @@
             },
             "required": [
               "nodeTypes",
+              "authoringContract",
               "executionPolicies",
               "limits"
             ],
@@ -1839,6 +1865,13 @@
               },
               "errors": {
                 "type": "array"
+              },
+              "issues": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
               },
               "workflow": {
                 "type": "object",
@@ -8672,6 +8705,9 @@
     "method:connection.views.create",
     "method:connection.views.get",
     "method:connection.views.update",
-    "error.recovery/v1"
+    "error.recovery/v1",
+    "workflows.atomic-draft-create/v1",
+    "workflows.canonical-authoring-contract/v1",
+    "workflows.runtime-draft-mutations/v1"
   ]
 }

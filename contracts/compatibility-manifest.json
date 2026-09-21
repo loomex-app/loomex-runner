@@ -87,16 +87,19 @@
     "presentation.sessions.restore/v1",
     "presentation.sessions/v1",
     "recovery.coordination/v1",
-    "transfer.chunked/v1"
+    "transfer.chunked/v1",
+    "workflows.atomic-draft-create/v1",
+    "workflows.canonical-authoring-contract/v1",
+    "workflows.runtime-draft-mutations/v1"
   ],
-  "catalogVersion": "0.3.0",
+  "catalogVersion": "0.3.2",
   "generatedFrom": {
     "backendRoutes": {
-      "digest": "sha256:95fa7905d1c629e3572ef38fa05c1353372f4e81497cc0151a4ce4af298ca61f",
+      "digest": "sha256:490267c41829588742759eeb24251433b6bc69fa4830e8ee0ad977e66c68467f",
       "path": "contracts/backend-routes.json"
     },
     "methodCatalog": {
-      "digest": "sha256:70bb32d2502779fd4ec684eaf6121f341fdcdd27d3a0a18a776994bef35d68cd",
+      "digest": "sha256:16f03659ce756fe9e018ba39adce5f8fd31e1624dc518f7c84988f002e381d80",
       "path": "contracts/method-catalog.json"
     }
   },
@@ -191,7 +194,7 @@
       "inputSchemaDigest": "sha256:d0157ce84790721854763c7480015e84f7cb0c7fde53afb21c3a42908805bf35",
       "mutating": false,
       "name": "builder.catalog",
-      "outputSchemaDigest": "sha256:f6066db77194e128ff89eb829604ebc05f5296ee74f4e28262ec7c088a656a31",
+      "outputSchemaDigest": "sha256:8addef6c93f611f5a897efecb314fb75855f97ffe124e5a5063b4b2c6e0d587b",
       "routeIds": [
         "builder.catalog"
       ],
@@ -263,7 +266,7 @@
       "inputSchemaDigest": "sha256:d6cc4d915d5ae43565bf864490611b065fd6d48375f469b32289b92407c4f28f",
       "mutating": false,
       "name": "builder.validate",
-      "outputSchemaDigest": "sha256:2830e0a7c9d9a9464adfa9176e38ff42d4ed0567113a097bec870767b61a452f",
+      "outputSchemaDigest": "sha256:d516c38e3dfe5bf7b4cc062e7d4253d906b09bc8441ce3829e0da92bc7b1ae96",
       "routeIds": [
         "workflow.validate"
       ],
@@ -849,12 +852,13 @@
     {
       "classification": "backend-proxy",
       "idempotent": true,
-      "inputSchemaDigest": "sha256:ed27799bc93d3b6a7bb2d2e7582027292904bb907b98e118aab73b2635d87145",
+      "inputSchemaDigest": "sha256:1e1cd2899bb3fc9c1f9d2687d181ea6774fd26ed18a4263dd1b6aa010ae788eb",
       "mutating": true,
       "name": "workflows.create",
-      "outputSchemaDigest": "sha256:3787e248b022994998fce68a86642b0cf178111afdd75ad31285f88972dd8f3e",
+      "outputSchemaDigest": "sha256:eed6edf6ecfeb5c7c785ecc800631bf83776863a53ad4d826cee4cf169d52b2e",
       "routeIds": [
-        "workflow.create"
+        "workflow.create",
+        "workflow.draft.create"
       ],
       "transportRetry": "never_after_send"
     },
@@ -912,7 +916,7 @@
       "inputSchemaDigest": "sha256:d6cc4d915d5ae43565bf864490611b065fd6d48375f469b32289b92407c4f28f",
       "mutating": false,
       "name": "workflows.validate",
-      "outputSchemaDigest": "sha256:2830e0a7c9d9a9464adfa9176e38ff42d4ed0567113a097bec870767b61a452f",
+      "outputSchemaDigest": "sha256:d516c38e3dfe5bf7b4cc062e7d4253d906b09bc8441ce3829e0da92bc7b1ae96",
       "routeIds": [
         "workflow.validate"
       ],
@@ -1240,6 +1244,12 @@
       "source": "src/control.rs"
     },
     {
+      "id": "workflow.draft.create",
+      "method": "POST",
+      "pathTemplate": "v2/workflow-drafts/",
+      "source": "src/control.rs"
+    },
+    {
       "id": "workflow.get",
       "method": "GET",
       "pathTemplate": "v1/workflows/{workflowId}/",
@@ -1272,8 +1282,8 @@
   ],
   "schemaVersion": "loomex.runner.compatibility-manifest/v1",
   "summary": {
-    "backendRouteCount": 53,
-    "capabilityCount": 88,
+    "backendRouteCount": 54,
+    "capabilityCount": 91,
     "methodClassifications": {
       "backend-auth": 5,
       "backend-proxy": 37,

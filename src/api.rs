@@ -43,6 +43,7 @@ impl ApiError {
 }
 
 const MAX_VALIDATION_ISSUES: usize = 32;
+const MAX_AUTHORING_ERROR_MESSAGE_BYTES: usize = 4_096;
 
 fn validation_issue_contract(code: &str) -> Option<(&'static str, &'static str)> {
     match code {
@@ -122,6 +123,23 @@ fn safe_validation_data(payload: &Value) -> Option<Value> {
         .take(MAX_VALIDATION_ISSUES)
         .collect::<Vec<_>>();
     (!issues.is_empty()).then(|| json!({"validationIssueVersion":"v1","validationIssues":issues}))
+}
+
+/// Creation-time definition failures are user-correctable authoring feedback,
+/// rather than execution-policy advice.  The backend deliberately supplies a
+/// single canonical message for these codes; preserve only that bounded field
+/// so a local client can surface the validation outcome without exposing an
+/// arbitrary backend error envelope.
+fn safe_authoring_error_data(code: &str, payload: &Value) -> Option<Value> {
+    if !matches!(
+        code,
+        "WORKFLOW_DEFINITION_REQUIRED" | "WORKFLOW_NOTES_INVALID" | "WORKFLOW_GRAPH_INVALID"
+    ) {
+        return None;
+    }
+    let message = payload.pointer("/error/details/message")?.as_str()?;
+    (!message.is_empty() && message.len() <= MAX_AUTHORING_ERROR_MESSAGE_BYTES)
+        .then(|| json!({"message": message}))
 }
 pub(crate) fn now() -> u64 {
     SystemTime::now()
@@ -378,9 +396,11 @@ fn parse_envelope(status: u16, payload: Value) -> Result<Value, ApiError> {
         })
         .unwrap_or("API_REQUEST_FAILED");
     let mut error = ApiError::new(code, status >= 500 || status == 429 || status == 408);
-    if code == "RUN_VALIDATION_FAILED" {
-        error.data = safe_validation_data(&payload);
-    }
+    error.data = if code == "RUN_VALIDATION_FAILED" {
+        safe_validation_data(&payload)
+    } else {
+        safe_authoring_error_data(code, &payload)
+    };
     Err(error)
 }
 #[cfg(test)]
@@ -604,5 +624,42 @@ mod tests {
             .unwrap_err();
             assert!(error.data.is_none());
         }
+    }
+
+    #[test]
+    fn workflow_authoring_errors_preserve_only_the_canonical_message() {
+        for code in [
+            "WORKFLOW_DEFINITION_REQUIRED",
+            "WORKFLOW_NOTES_INVALID",
+            "WORKFLOW_GRAPH_INVALID",
+        ] {
+            let error = parse_envelope(
+                422,
+                json!({
+                    "error": {
+                        "code": code,
+                        "message": "untrusted backend summary",
+                        "details": {
+                            "message": "The workflow graph has an invalid transition.",
+                            "authorization": "Bearer never-print-this-token",
+                            "definition": {"secret": "never-forward"}
+                        }
+                    }
+                }),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(
+                error.data,
+                Some(json!({"message": "The workflow graph has an invalid transition."}))
+            );
+        }
+
+        let error = parse_envelope(
+            422,
+            json!({"error": {"code": "WORKFLOW_GRAPH_INVALID", "details": {"message": "x".repeat(MAX_AUTHORING_ERROR_MESSAGE_BYTES + 1)}}}),
+        )
+        .unwrap_err();
+        assert!(error.data.is_none());
     }
 }

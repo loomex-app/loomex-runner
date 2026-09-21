@@ -2416,6 +2416,9 @@ pub fn backend_route(method: &str, p: &Value) -> Result<(String, String, Option<
             "GET",
             format!("v1/workflows/{}/", required(p, "workflowId")?),
         ),
+        "workflows.create" if p.get("definition").is_some() => {
+            ("POST", "v2/workflow-drafts/".into())
+        }
         "workflows.create" => ("POST", "v2/workflows/".into()),
         "workflows.update" => (
             "POST",
@@ -3176,6 +3179,60 @@ mod tests {
         let schema =
             json!({"required":["runId"],"properties":{"runId":{"type":"string","format":"uuid"}}});
         assert!(validate_params(&json!({"runId":Uuid::new_v4(),"url":"x"}), &schema).is_err());
+    }
+    #[test]
+    fn workflow_create_catalog_accepts_atomic_draft_or_metadata_only_inputs() {
+        let catalog: Value =
+            serde_json::from_str(include_str!("../contracts/method-catalog.json")).unwrap();
+        let schema = &catalog["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "workflows.create")
+            .unwrap()["inputSchema"];
+        let key = Uuid::new_v4();
+        let full = json!({
+            "name":"Author a release workflow",
+            "slug":"release-authoring",
+            "definition":{"nodes":[{"id":"draft","kind":"task","config":{"prompt":"preserve this complete payload"}}],"transitions":[]},
+            "notes":"initial canonical draft",
+            "idempotencyKey":key,
+        });
+        assert!(validate_params(&full, schema).is_ok());
+        assert!(
+            validate_params(
+                &json!({"name":"Metadata only","idempotencyKey":key}),
+                schema
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_params(
+                &json!({"name":"Wrong definition","definition":[],"idempotencyKey":key}),
+                schema
+            )
+            .is_err()
+        );
+        assert!(
+            validate_params(
+                &json!({"name":"Wrong notes","notes":{},"idempotencyKey":key}),
+                schema
+            )
+            .is_err()
+        );
+
+        let (verb, route, body) = backend_route("workflows.create", &full).unwrap();
+        assert_eq!(verb, "POST");
+        assert_eq!(route, "v2/workflow-drafts/");
+        assert_eq!(
+            body,
+            Some(json!({
+                "name":"Author a release workflow",
+                "slug":"release-authoring",
+                "definition":{"nodes":[{"id":"draft","kind":"task","config":{"prompt":"preserve this complete payload"}}],"transitions":[]},
+                "notes":"initial canonical draft",
+            }))
+        );
     }
     #[test]
     fn lifecycle_catalog_accepts_const_only_version_and_rejects_substitution() {

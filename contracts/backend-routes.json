@@ -325,6 +325,12 @@
       "method": "POST",
       "pathTemplate": "v1/jobs/{jobId}/fail/",
       "source": "src/jobs/delivery.rs"
+    },
+    {
+      "id": "workflow.draft.create",
+      "method": "POST",
+      "pathTemplate": "v2/workflow-drafts/",
+      "source": "src/control.rs"
     }
   ],
   "daemonRouteIds": [
@@ -434,7 +440,8 @@
       "method": "workflows.create",
       "classification": "backend-proxy",
       "routeIds": [
-        "workflow.create"
+        "workflow.create",
+        "workflow.draft.create"
       ]
     },
     {
