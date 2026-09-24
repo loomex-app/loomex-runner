@@ -117,13 +117,13 @@ jobs:
           if-no-files-found: error
 
   build:
-    runs-on: macos-14-xlarge
+    runs-on: macos-14
     needs: compatibility
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.85.0
+          toolchain: 1.88.0
           targets: aarch64-apple-darwin
       - name: Configure production signing and notarization
         env:

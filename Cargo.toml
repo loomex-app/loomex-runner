@@ -2,7 +2,7 @@
 name = "loomex-runner"
 version = "0.3.43"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "Proprietary"
 description = "Loomex per-user execution daemon and credential-free local client"
 

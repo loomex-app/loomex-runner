@@ -1279,10 +1279,10 @@ fn remove_operation_resources(paths: &Paths, operation: &Operation) -> Result<()
         (&resources.launch_agent_backup, "lifecycle-agent-"),
     ] {
         if path.parent() != Some(paths.state_dir.as_path())
-            || !path
+            || path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name == format!("{prefix}{}.plist", operation.id))
+                .is_none_or(|name| name != format!("{prefix}{}.plist", operation.id))
         {
             bail!("unsafe lifecycle recovery resource")
         }
