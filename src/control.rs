@@ -212,14 +212,20 @@ impl Daemon {
         // boundary. Use it as the local singleflight and receipt key because
         // the chat commit surface intentionally accepts no caller-selected
         // idempotency key.
-        let key = params
-            .get("idempotencyKey")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                (method == "runs.start_handoff.commit")
-                    .then(|| params.get("handoffRef").and_then(Value::as_str))
-                    .flatten()
-            });
+        // Read-only receipt lookups carry the mutation's idempotency key as
+        // data. They must not claim the mutation's local journal slot.
+        let key = write
+            .then(|| {
+                params
+                    .get("idempotencyKey")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        (method == "runs.start_handoff.commit")
+                            .then(|| params.get("handoffRef").and_then(Value::as_str))
+                            .flatten()
+                    })
+            })
+            .flatten();
         // Capture organization before waiting for any operation. The handler never
         // substitutes a later active organization into this operation's identity.
         let scope = if method.starts_with("auth.")
@@ -3506,6 +3512,62 @@ mod conformance {
             ),
         )
         .unwrap()
+    }
+    #[tokio::test]
+    async fn workflow_operation_reconciliation_uses_mutation_key_without_replaying_local_mutation()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = fixture(temp.path(), api);
+        let org = "11111111-1111-4111-8111-111111111111";
+        daemon.public.lock().await.active_organization = Some(org.into());
+        let key = Uuid::new_v4().to_string();
+        let original = json!({"name":"Draft","idempotencyKey":key});
+        let identity = state::json_digest(&json!({
+            "method":"workflows.create","params":original,"organizationId":org,"accountSubject":null,
+        }));
+        let journal = temp.path().join("operations").join(format!("{key}.json"));
+        state::write_json(
+            &journal,
+            &json!({"digest":identity,"method":"workflows.create","status":"pending"}),
+        )
+        .unwrap();
+        let response =
+            json!({"operation":"workflows.create","idempotencyKey":key,"status":"not_found"});
+        let backend = tokio::spawn(async move {
+            let (stream, head) = receive_http(&listener).await;
+            assert!(head.starts_with(
+                "POST /api/v1/runner-control/runner/v2/workflow-operations/get/ HTTP/1.1"
+            ));
+            reply_http(stream, 200, response).await;
+        });
+
+        let result = daemon
+            .dispatch(
+                "workflow.operations.get",
+                json!({"operation":"workflows.create","idempotencyKey":key}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "not_found");
+        assert_eq!(
+            state::read_json::<Value>(&journal).unwrap()["status"],
+            "pending"
+        );
+        backend.await.unwrap();
+        assert_eq!(
+            daemon
+                .dispatch(
+                    "workflows.create",
+                    json!({"name":"Changed","idempotencyKey":key})
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+            "IDEMPOTENCY_CONFLICT"
+        );
     }
     #[tokio::test]
     async fn connection_get_is_advertised_and_reports_local_active_work() {
