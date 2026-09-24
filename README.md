@@ -66,7 +66,11 @@ cargo clippy --locked --all-targets -- -D warnings
 Production artifacts must compile with `LOOMEX_API_ORIGIN` set to the deployment's
 HTTPS origin. Runtime origin overrides are rejected for that build. An unsigned
 development/debug build may instead set `LOOMEX_DEV_API_ORIGIN` to an explicit
-loopback origin. No production origin is guessed.
+loopback origin. The workflow-editor link separately requires
+`LOOMEX_WEB_APP_ORIGIN` at build time. Production accepts an HTTPS origin; debug
+builds also accept an explicit loopback HTTP origin. The frontend must use the
+same backend and organization as the runner. Neither address is inferred from
+the other.
 
 ```sh
 LOOMEX_DEV_API_ORIGIN=http://127.0.0.1:8000 cargo run --bin loomex-runner
@@ -74,8 +78,17 @@ cargo run --bin loomex -- status
 cargo run --bin loomex -- login
 ```
 
-`login` opens the same-origin approval page and polls the device challenge. The
-plugin uses the same local methods. Organization selection and workspace approval
+For a local workspace frontend served at `http://127.0.0.1:5173/workspace/`,
+compile the debug runner with `LOOMEX_WEB_APP_ORIGIN=http://127.0.0.1:5173`.
+The value is the origin, without `/workspace/`; the plugin adds the workflow
+builder route. Run the frontend with `VITE_APP_BASE_PATH=/workspace/` and its
+`VITE_WORKSPACE_API_BASE_URL` pointed at the runner's local backend. Restarting
+the frontend or changing a LaunchAgent environment cannot retrofit a runner
+binary built without the web origin.
+
+`login` opens the same-origin approval page using a runner-owned loopback callback
+and PKCE. The daemon completes credential exchange; the CLI observes local state.
+The plugin uses the same local methods. Organization selection and workspace approval
 are separate explicit steps. See `contracts/method-catalog.json` for exact inputs
 and outputs. `loomex rpc METHOD JSON` makes a credential-free local request.
 

@@ -1197,7 +1197,12 @@ fn validate_operation(value: &Value) -> Result<()> {
             ensure!(
                 reconciliation["method"] == rule["method"]
                     && reconciliation["params"][identity] == value["params"][identity]
-                    && value["params"][identity].is_string(),
+                    && value["params"][identity].is_string()
+                    && rule
+                        .get("operation")
+                        .is_none_or(|operation| reconciliation["params"]["operation"] == *operation)
+                    && (identity != "idempotencyKey"
+                        || value["params"][identity] == value["idempotencyKey"]),
                 "INVALID_REQUEST"
             );
         }
@@ -1700,6 +1705,24 @@ mod tests {
         );
         operation["reconciliation"]["params"]["requestId"] = json!(request);
         operation["reconciliation"]["method"] = json!("runs.get");
+        assert_eq!(
+            validate_operation(&operation).unwrap_err().to_string(),
+            "INVALID_REQUEST"
+        );
+    }
+
+    #[test]
+    fn publish_reconciliation_is_bound_to_exact_operation_and_key() {
+        let key = Uuid::new_v4();
+        let mut operation = json!({"method":"workflows.publish","params":{"workflowId":Uuid::new_v4(),"expectedVersion":2,"idempotencyKey":key},"idempotencyKey":key,"reconciliation":{"method":"workflow.operations.get","params":{"operation":"workflows.publish","idempotencyKey":key}}});
+        validate_operation(&operation).unwrap();
+        operation["reconciliation"]["params"]["operation"] = json!("workflows.update");
+        assert_eq!(
+            validate_operation(&operation).unwrap_err().to_string(),
+            "INVALID_REQUEST"
+        );
+        operation["reconciliation"]["params"]["operation"] = json!("workflows.publish");
+        operation["reconciliation"]["params"]["idempotencyKey"] = json!(Uuid::new_v4());
         assert_eq!(
             validate_operation(&operation).unwrap_err().to_string(),
             "INVALID_REQUEST"

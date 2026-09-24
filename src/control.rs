@@ -36,7 +36,7 @@ pub const VALIDATION_ERRORS_CAPABILITY: &str = "error.validation-issues/v1";
 pub const REQUIRED_SEMANTICS: [&str; 5] = [
     "execution.host_user/v1",
     "authorization.prepare-commit/v1",
-    "auth.device-v2/v1",
+    "auth:browser-pkce/v1",
     "transfer.chunked/v1",
     VALIDATION_ERRORS_CAPABILITY,
 ];
@@ -80,6 +80,12 @@ struct ControlWriter<'a>(&'a Daemon);
 impl Drop for ControlWriter<'_> {
     fn drop(&mut self) {
         self.0.execution.end_control();
+    }
+}
+struct LogoutAdmission(Arc<crate::jobs::supervisor::ExecutionSupervisor>);
+impl Drop for LogoutAdmission {
+    fn drop(&mut self) {
+        self.0.set_logout_requested(false);
     }
 }
 impl Daemon {
@@ -173,7 +179,8 @@ impl Daemon {
             && write
             && ![
                 "auth.login",
-                "auth.poll",
+                "auth.cancel",
+                "auth.recover",
                 "auth.logout",
                 "organizations.select",
                 "daemon.drain",
@@ -366,12 +373,10 @@ impl Daemon {
             // counted once no more local files or backend state can be changed.
             let result = self.spool_response(&params, result)?;
             if let Some(path) = operation.as_ref() {
-                if !(method == "auth.poll" && result["status"] == "pending") {
-                    state::write_json(
-                        path,
-                        &json!({"digest":identity,"method":method,"cachedAt":state::now(),"executionId":execution,"result":result}),
-                    )?;
-                }
+                state::write_json(
+                    path,
+                    &json!({"digest":identity,"method":method,"cachedAt":state::now(),"executionId":execution,"result":result}),
+                )?;
             }
             result
         };
@@ -435,17 +440,27 @@ impl Daemon {
                     )
                     .await;
             }
-            "auth.poll" => return self.auth.poll(key.unwrap(), required(p, "flowId")?).await,
+            "auth.cancel" => return self.auth.cancel_login(required(p, "flowId")?).await,
+            "auth.recover" => return self.auth.reconcile().await,
             "auth.status" => return self.auth.status().await,
             "auth.logout" => {
-                {
+                let _logout_admission = {
                     let _admission = self.execution.admission_lock()?;
-                    // Refuse before changing a cancellation token when a
-                    // provider execution is live or in its fenced admission
-                    // window. Ordinary control reads do not count as work.
-                    if self.execution_work() > 0 {
+                    // Existing provider work is never stopped by logout.
+                    // Idle lease and heartbeat tasks are instead prevented
+                    // from admitting more work, then allowed to exit normally.
+                    if self.execution.active_work() > 0 {
                         bail!("ACTIVE_WORK_REQUIRES_DRAIN");
                     }
+                    self.execution.set_logout_requested(true);
+                    LogoutAdmission(self.execution.clone())
+                };
+                let deadline = Instant::now() + Duration::from_secs(40);
+                while self.execution_work() > 0 {
+                    if self.execution.active_work() > 0 || Instant::now() >= deadline {
+                        bail!("ACTIVE_WORK_REQUIRES_DRAIN");
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 let result = self.auth.logout().await?;
                 let mut public = self.public.lock().await;
@@ -2410,6 +2425,12 @@ pub fn backend_route(method: &str, p: &Value) -> Result<(String, String, Option<
             body["workflowId"] = id.clone();
         }
     }
+    if method == "workflow.operations.get" {
+        body["idempotencyKey"] = p
+            .get("idempotencyKey")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("INVALID_REQUEST"))?;
+    }
     let (verb, route) = match method {
         "workflows.list" => ("GET", "v1/workflows/".into()),
         "workflows.get" => (
@@ -2424,6 +2445,7 @@ pub fn backend_route(method: &str, p: &Value) -> Result<(String, String, Option<
             "POST",
             format!("v1/workflows/{}/draft/", required(p, "workflowId")?),
         ),
+        "workflow.operations.get" => ("POST", "v2/workflow-operations/get/".into()),
         "workflows.validate" | "builder.validate" => ("POST", "v1/workflows/validate/".into()),
         "workflows.publish" => (
             "POST",
@@ -2959,6 +2981,27 @@ pub fn public_error(error: &anyhow::Error) -> (String, bool, Option<Value>) {
     }
 }
 pub async fn client(dir: &Path, method: &str, params: Value) -> Result<Value> {
+    client_with_semantics(dir, method, params, &REQUIRED_SEMANTICS).await
+}
+
+/// Lifecycle administration must be able to drain the previously installed
+/// daemon before activating a candidate with newer product capabilities.
+/// Limit this compatibility route to read-only status and the established
+/// drain operation; ordinary plugin and CLI calls retain full negotiation.
+pub(crate) async fn lifecycle_client(dir: &Path, method: &str, params: Value) -> Result<Value> {
+    ensure!(
+        matches!(method, "status.get" | "daemon.drain"),
+        "INVALID_REQUEST"
+    );
+    client_with_semantics(dir, method, params, &[]).await
+}
+
+async fn client_with_semantics(
+    dir: &Path,
+    method: &str,
+    params: Value,
+    semantics: &[&str],
+) -> Result<Value> {
     let socket = dir.join("control.sock");
     let metadata =
         std::fs::symlink_metadata(&socket).map_err(|_| anyhow::anyhow!("RUNNER_UNAVAILABLE"))?;
@@ -2982,10 +3025,7 @@ pub async fn client(dir: &Path, method: &str, params: Value) -> Result<Value> {
     };
     let (read, mut write) = stream.into_split();
     let mut read = BufReader::new(read);
-    let mut required: Vec<String> = REQUIRED_SEMANTICS
-        .iter()
-        .map(|cap| cap.to_string())
-        .collect();
+    let mut required: Vec<String> = semantics.iter().map(|cap| cap.to_string()).collect();
     if method != "protocol.negotiate" {
         required.push(format!("method:{method}"));
     }
@@ -3049,6 +3089,61 @@ async fn exchange<R: tokio::io::AsyncBufRead + Unpin, W: tokio::io::AsyncWrite +
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn lifecycle_status_negotiates_across_a_new_auth_capability() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut read = BufReader::new(read);
+                let negotiation: Value =
+                    serde_json::from_slice(&read_frame(&mut read).await.unwrap().unwrap()).unwrap();
+                assert_eq!(negotiation["method"], "protocol.negotiate");
+                let required = negotiation["params"]["requiredCapabilities"]
+                    .as_array()
+                    .unwrap();
+                let reply = if required.contains(&json!("auth:browser-pkce/v1")) {
+                    json!({"protocol":PROTOCOL,"id":negotiation["id"],"error":state::safe_error("COMPATIBILITY_ERROR",false)})
+                } else {
+                    assert_eq!(required, &vec![json!("method:status.get")]);
+                    json!({"protocol":PROTOCOL,"id":negotiation["id"],"result":{
+                        "selectedProtocol":PROTOCOL,"serverVersion":"0.3.40","maxFrameBytes":MAX_FRAME,
+                        "capabilities":["method:status.get","method:daemon.drain"]}})
+                };
+                let mut bytes = serde_json::to_vec(&reply).unwrap();
+                bytes.push(b'\n');
+                write.write_all(&bytes).await.unwrap();
+                if reply.get("error").is_some() {
+                    continue;
+                }
+                let request: Value =
+                    serde_json::from_slice(&read_frame(&mut read).await.unwrap().unwrap()).unwrap();
+                assert_eq!(request["method"], "status.get");
+                let mut bytes =
+                    serde_json::to_vec(&json!({"protocol":PROTOCOL,"id":request["id"],"result":{
+                    "version":"0.3.40","activeJobs":0,"draining":false}}))
+                    .unwrap();
+                bytes.push(b'\n');
+                write.write_all(&bytes).await.unwrap();
+            }
+        });
+        let status = lifecycle_client(temp.path(), "status.get", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(status["result"]["version"], "0.3.40");
+        assert_eq!(
+            client(temp.path(), "status.get", json!({}))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "COMPATIBILITY_ERROR"
+        );
+        server.await.unwrap();
+    }
     #[test]
     fn gemini_discovery_snapshots_gemini_cli_and_never_falls_back_to_agy() {
         let temp = tempfile::tempdir().unwrap();
@@ -3255,6 +3350,16 @@ mod tests {
     }
 
     #[test]
+    fn workflow_operation_reconciliation_preserves_exact_identity_in_body() {
+        let key = Uuid::new_v4().to_string();
+        let input = json!({"operation":"workflows.create","idempotencyKey":key});
+        let (verb, route, body) = backend_route("workflow.operations.get", &input).unwrap();
+        assert_eq!(verb, "POST");
+        assert_eq!(route, "v2/workflow-operations/get/");
+        assert_eq!(body, Some(input));
+    }
+
+    #[test]
     fn output_normalizer_selects_the_matching_discriminated_variant() {
         let schema = json!({"oneOf":[
             {"properties":{"status":{"const":"valid"},"value":{"type":"object"}},"required":["status","value"]},
@@ -3410,7 +3515,7 @@ mod conformance {
         assert!(
             negotiate(&json!({
                 "supportedProtocols":[PROTOCOL],
-                "requiredCapabilities":["method:connection.get", "connection.projection/v1"]
+                "requiredCapabilities":["method:connection.get", "connection.projection/v2"]
             }))
             .is_ok()
         );
@@ -3423,6 +3528,12 @@ mod conformance {
         assert_eq!(result["state"], "authenticated");
         assert_eq!(result["organization"]["status"], "connected");
         assert_eq!(result["activeWork"], 4);
+        assert!(
+            result["actions"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("auth.logout"))
+        );
     }
     #[tokio::test]
     async fn connection_navigation_is_local_and_revision_checked() {
@@ -3481,7 +3592,12 @@ mod conformance {
                 .to_string(),
             "ACTIVE_WORK_REQUIRES_DRAIN"
         );
+        assert_eq!(
+            state::error_recovery("ACTIVE_WORK_REQUIRES_DRAIN"),
+            json!({"recovery":"refresh_authority","outcome":"rejected"})
+        );
         assert!(!daemon.execution.is_draining());
+        assert!(!daemon.execution.logout_requested());
         assert!(!token.load(Ordering::SeqCst));
         assert_eq!(
             daemon.public.lock().await.active_organization.as_deref(),
@@ -3521,6 +3637,35 @@ mod conformance {
                 .active_organization
                 .is_none()
         );
+    }
+    #[tokio::test]
+    async fn logout_quiesces_idle_session_work_without_persistently_draining() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = fixture(temp.path(), api);
+        let server = tokio::spawn(async move {
+            let (stream, head) = receive_http(&listener).await;
+            assert!(head.starts_with(
+                "POST /api/v1/runner-control/runner/v2/device-authorities/logout/ HTTP/1.1"
+            ));
+            reply_http(stream, 200, json!({"revoked":true})).await;
+        });
+        daemon.execution.begin_quiescence();
+        let release_idle_session = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(daemon.execution.logout_requested());
+            daemon.execution.end_quiescence();
+        };
+        let (result, ()) = tokio::join!(
+            daemon.dispatch("auth.logout", json!({"idempotencyKey":Uuid::new_v4()})),
+            release_idle_session,
+        );
+        assert_eq!(result.unwrap()["revoked"], true);
+        server.await.unwrap();
+        assert!(!daemon.execution.logout_requested());
+        assert!(!daemon.execution.is_draining());
     }
     #[tokio::test]
     async fn accepted_human_responses_always_receive_a_follow_continuation() {

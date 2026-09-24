@@ -3,6 +3,7 @@ use super::*;
 
 pub struct ExecutionSupervisor {
     draining: AtomicBool,
+    logout_requested: AtomicBool,
     active: std::sync::atomic::AtomicUsize,
     quiescence: std::sync::atomic::AtomicUsize,
     managed: std::sync::atomic::AtomicUsize,
@@ -16,6 +17,7 @@ impl ExecutionSupervisor {
     pub fn new(draining: bool) -> Self {
         Self {
             draining: AtomicBool::new(draining),
+            logout_requested: AtomicBool::new(false),
             active: Default::default(),
             quiescence: Default::default(),
             managed: Default::default(),
@@ -31,6 +33,12 @@ impl ExecutionSupervisor {
     }
     pub fn set_draining(&self, value: bool) {
         self.draining.store(value, Ordering::SeqCst);
+    }
+    pub fn logout_requested(&self) -> bool {
+        self.logout_requested.load(Ordering::SeqCst)
+    }
+    pub fn set_logout_requested(&self, value: bool) {
+        self.logout_requested.store(value, Ordering::SeqCst);
     }
     pub fn managed_work(&self) -> usize {
         self.managed.load(Ordering::SeqCst)
@@ -185,7 +193,7 @@ impl Drop for Quiescence {
 }
 pub(super) fn admit(daemon: &Arc<Daemon>) -> Result<Option<Quiescence>> {
     let _lock = daemon.execution.admission_lock()?;
-    if daemon.execution.is_draining() {
+    if daemon.execution.is_draining() || daemon.execution.logout_requested() {
         return Ok(None);
     }
 
@@ -261,7 +269,7 @@ pub async fn run(daemon: Arc<Daemon>) {
                 }
             }
         }
-        if !daemon.execution.is_draining() {
+        if !daemon.execution.is_draining() && !daemon.execution.logout_requested() {
             if let Ok(orgs) = daemon.auth.enrolled_organizations().await {
                 for org in orgs {
                     if running.insert(org.clone()) {

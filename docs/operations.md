@@ -17,7 +17,7 @@ loomex drain
 loomex rpc METHOD JSON
 ```
 
-`status` returns a concise runner version, local protocol, active-job count, drain state, and staged-update view. `diagnostics` is read-only JSON for repair: it reports daemon connectivity, the non-secret installation ID when the daemon can read it, and each provider executable's availability with a safe reason. It never starts a daemon, reads provider authentication, or prints provider paths and checksums. `login` starts device approval and opens the returned same-origin verification page. Organization selection and workspace grant are separate catalogued operations, for example:
+`status` returns a concise runner version, local protocol, active-job count, drain state, and staged-update view. `diagnostics` is read-only JSON for repair: it reports daemon connectivity, the non-secret installation ID when the daemon can read it, and each provider executable's availability with a safe reason. It never starts a daemon, reads provider authentication, or prints provider paths and checksums. `login` starts browser approval with PKCE and opens the same-origin authorization page. The daemon completes the loopback callback and credential exchange. Organization selection and workspace grant are separate catalogued operations, for example:
 
 ```sh
 loomex rpc organizations.list '{}'
@@ -37,7 +37,7 @@ Loomex credentials live in macOS Keychain service `app.loomex.runner.v1`, accoun
 
 `auth.status` distinguishes unauthenticated, pending recovery, authenticated, logout-pending, invalid store, and unavailable store states. During an ambiguous bootstrap, enrollment, or refresh, the runner may perform the backend's one permitted recovery within 30 seconds using the exact persisted request. If that recovery is spent or rejected, do not repeatedly retry or delete state manually; preserve the Keychain record and investigate the backend authority state.
 
-Logout first drains new work and requests cancellation for live jobs. It records logout intent, revokes the device and all child credentials at the backend, and clears local Loomex credentials only after the remote result. A network failure leaves logout pending so revocation can be reconciled. Provider CLI credentials are outside this process and must remain intact.
+Logout rejects an active provider job without cancelling it. Otherwise, it temporarily closes lease admission and waits for idle sessions and heartbeats to exit before recording logout intent. It revokes the device and all child credentials at the backend, then clears local Loomex credentials only after the remote result. A network failure leaves logout pending so revocation can be reconciled. The temporary admission gate is released on completion or failure; it is not a durable lifecycle drain. Provider CLI credentials are outside this process and must remain intact.
 
 ## Workspace and run admission
 
@@ -87,6 +87,8 @@ The automatic 30-day policy removes acknowledged job evidence, idle response spo
 ## Drain, update, rollback, and uninstall
 
 `loomex drain` stops admission and lets current work finish without a product deadline. The installer durably drains before checking whether managed work remains, records every staged version in `owned-versions.json`, and keeps a pending update while work is active. Retry installation when the runner is idle; the latest pending candidate is selected. The persistent drain marker is cleared only after the old daemon stops and the installed version switches. Live process or journal ownership is never transferred implicitly.
+
+During an upgrade, lifecycle administration negotiates only the stable local `status.get` and `daemon.drain` method capabilities with the previous daemon. It must prove drained, idle work before replacement and still requires the full current capability set for ordinary CLI and plugin operations. This allows a new authentication capability to be introduced without preventing safe retirement of the previous daemon. A rejected drain is never treated as a successful lifecycle response.
 
 Activation uses immutable version directories and a stable `current` symlink. The new daemon must report the expected version and healthy status before previous bytes are retired. If activation fails, rollback first confirms no active work and successfully unloads the candidate. If that cannot be established, installation retains the current service and all relevant files for recovery. Follow [release.md](release.md) for exact verification, rollback, development flags, signing, and notarization behavior.
 

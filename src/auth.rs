@@ -3,15 +3,75 @@ use crate::{
     state as runner_state,
 };
 use anyhow::{Result, anyhow, bail, ensure};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use ed25519_dalek::SigningKey;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::Mutex;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    task::JoinHandle,
+};
 
 const SERVICE: &str = "app.loomex.runner.v1";
 const ACCOUNT: &str = "installation";
+const BROWSER_AUTH_CSS: &str = include_str!("../assets/browser_authority.css");
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowserCallbackOutcome {
+    SignedIn,
+    Declined,
+    RecoveryRequired,
+    Invalid,
+}
+
+fn browser_callback_response(outcome: BrowserCallbackOutcome) -> String {
+    let (status, reason, title, description, message_class) = match outcome {
+        BrowserCallbackOutcome::SignedIn => (
+            200,
+            "OK",
+            "Signed in",
+            "Return to the Loomex connection card to finish setup.",
+            "auth-message--success",
+        ),
+        BrowserCallbackOutcome::Declined => (
+            200,
+            "OK",
+            "Sign-in declined",
+            "You can return to Loomex.",
+            "",
+        ),
+        BrowserCallbackOutcome::RecoveryRequired => (
+            202,
+            "Accepted",
+            "Sign-in needs attention",
+            "Return to Loomex to finish signing in.",
+            "",
+        ),
+        BrowserCallbackOutcome::Invalid => (
+            400,
+            "Bad Request",
+            "Sign-in unavailable",
+            "Return to Loomex and start again.",
+            "auth-message--error",
+        ),
+    };
+    let style_hash = STANDARD.encode(Sha256::digest(BROWSER_AUTH_CSS.as_bytes()));
+    let body = format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"referrer\" content=\"no-referrer\"><title>{title} · Loomex</title><style>{BROWSER_AUTH_CSS}</style></head><body class=\"auth-page\"><div class=\"auth-shell\"><div class=\"auth-brand\"><span class=\"auth-brand-mark\" aria-hidden=\"true\">L</span>Loomex</div><main class=\"auth-card\"><h1 class=\"auth-title\">{title}</h1><p class=\"auth-message {message_class}\" role=\"status\">{description}</p></main></div></body></html>"
+    );
+    format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'none'; style-src 'sha256-{style_hash}'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
 trait Store: Send + Sync {
     fn load(&self) -> Result<Option<Vec<u8>>>;
     fn save(&self, data: &[u8]) -> Result<()>;
@@ -87,18 +147,25 @@ impl Token {
         }
     }
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct Login {
     key: String,
     runner_name: String,
     #[serde(default)]
     flow_id: String,
-    device_code: Option<String>,
-    user_code: Option<String>,
-    verification_uri: Option<String>,
     expires_at: u64,
-    interval_seconds: u64,
-    next_poll_at: u64,
+    #[serde(default)]
+    authorization_url: Option<String>,
+    #[serde(default)]
+    transaction_id: Option<String>,
+    #[serde(default)]
+    redirect_uri: Option<String>,
+    #[serde(default)]
+    browser_state: Option<String>,
+    #[serde(default)]
+    code_verifier: Option<String>,
+    #[serde(default)]
+    received_code: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct OrganizationProfile {
@@ -109,6 +176,8 @@ struct OrganizationProfile {
 #[derive(Clone, Serialize, Deserialize)]
 enum Target {
     Bootstrap,
+    BrowserExchange,
+    BrowserCancel,
     DeviceRefresh,
     ChildRefresh(String),
     Enroll(String),
@@ -119,6 +188,9 @@ struct Pending {
     route: String,
     body: Value,
     started_at: u64,
+    // Retained only to decode pre-0.3.35 Keychain records. Exact proof-bound
+    // recovery is repeatable on compatible backends until the server deadline.
+    #[serde(default)]
     recovery_used: bool,
 }
 impl Pending {
@@ -126,8 +198,8 @@ impl Pending {
         // started_at records when persistence was queued, not when the request
         // reached the server. A blocked Keychain write or process restart makes
         // that timestamp unsuitable for enforcing the server's 30-second window.
-        // The backend validates expiry; the protected flag limits us to one replay.
-        !self.recovery_used
+        // The backend validates expiry and exact proof/credential-family identity.
+        true
     }
 }
 #[derive(Serialize, Deserialize)]
@@ -164,6 +236,7 @@ pub struct Auth {
     store: Arc<dyn Store>,
     lock: Arc<Mutex<()>>,
     store_lock: Arc<Mutex<()>>,
+    listeners: Arc<Mutex<BTreeMap<String, JoinHandle<()>>>>,
 }
 impl Auth {
     #[cfg(test)]
@@ -173,6 +246,7 @@ impl Auth {
             store: Arc::new(MemoryStore::default()),
             lock: Arc::new(Mutex::new(())),
             store_lock: Arc::new(Mutex::new(())),
+            listeners: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
     #[cfg(test)]
@@ -208,6 +282,7 @@ impl Auth {
             store: Arc::new(NativeStore),
             lock: Arc::new(Mutex::new(())),
             store_lock: Arc::new(Mutex::new(())),
+            listeners: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
     async fn load(&self) -> Result<Option<ProtectedState>> {
@@ -274,6 +349,38 @@ impl Auth {
             ),
         }
     }
+    /// Reconcile the exact durable authentication operation already stored in
+    /// the Keychain. This never starts a new login, enrollment, or rotation.
+    pub async fn reconcile(&self) -> Result<Value> {
+        let _guard = self.lock.lock().await;
+        let mut state = self.required().await?;
+        if state.pending.is_some() {
+            self.recover(&mut state).await?;
+        } else if let Some(login) = state
+            .login
+            .as_ref()
+            .filter(|login| login.received_code.is_some())
+        {
+            let code = login.received_code.as_deref().unwrap();
+            let proof = key_proof(&state.private_key, "browser-exchange", code);
+            let body = json!({"transactionId":login.transaction_id,"code":code,"codeVerifier":login.code_verifier,
+                "redirectUri":login.redirect_uri,"proof":proof});
+            self.begin(
+                &mut state,
+                Target::BrowserExchange,
+                "v2/browser-authorities/exchange/".into(),
+                body,
+            )
+            .await?;
+        } else {
+            bail!("AUTH_RECOVERY_NOT_REQUIRED")
+        }
+        Ok(json!({
+            "reconciled": true,
+            "authenticated": state.device.is_some() && state.pending.is_none(),
+            "activeOrganization": state.active_organization,
+        }))
+    }
     /// A credential-free, local snapshot for clients that need to resume an
     /// existing device flow. This deliberately reads only the runner store: a
     /// connection check must never start a new flow or turn a failed
@@ -286,7 +393,7 @@ impl Auth {
         let _guard = self.lock.lock().await;
         let unavailable = || {
             json!({
-                "schemaVersion":"loomex.runner.connection/v1",
+                "schemaVersion":"loomex.runner.connection/v2",
                 "state":"credential_store_unavailable",
                 "organization":{"status":"organization_required","selected":Value::Null},
                 "organizations":[],
@@ -300,7 +407,7 @@ impl Auth {
         };
         let Some(state) = stored else {
             return json!({
-                "schemaVersion":"loomex.runner.connection/v1",
+                "schemaVersion":"loomex.runner.connection/v2",
                 "state":"signed_out",
                 "organization":{"status":"organization_required","selected":Value::Null},
                 "organizations":[],
@@ -309,6 +416,27 @@ impl Auth {
                 "login":Value::Null,
             });
         };
+        let mut callback_unavailable = false;
+        if let Some(login) = state.login.as_ref().filter(|login| {
+            login.authorization_url.is_some()
+                && login.received_code.is_none()
+                && login.expires_at > now()
+        }) {
+            if !self.listeners.lock().await.contains_key(&login.flow_id) {
+                if let Some(uri) = login.redirect_uri.as_deref() {
+                    let address = uri
+                        .trim_start_matches("http://")
+                        .trim_end_matches("/oauth/callback");
+                    if let Ok(listener) = TcpListener::bind(address).await {
+                        self.spawn_callback(listener, login.flow_id.clone()).await;
+                    } else {
+                        callback_unavailable = true;
+                    }
+                } else {
+                    callback_unavailable = true;
+                }
+            }
+        }
         let mut organizations = state
             .organization_profiles
             .iter()
@@ -327,7 +455,11 @@ impl Auth {
         let (state_name, actions, login) = if state.logout_pending {
             ("logout_pending", vec!["auth.logout"], Value::Null)
         } else if state.pending.is_some() {
-            ("recovery_pending", vec!["auth.logout"], Value::Null)
+            (
+                "recovery_pending",
+                vec!["auth.recover", "auth.logout"],
+                Value::Null,
+            )
         } else if state.device.is_some() {
             (
                 "authenticated",
@@ -335,36 +467,47 @@ impl Auth {
                 Value::Null,
             )
         } else if let Some(login) = state.login.as_ref() {
-            let status = if login.expires_at > now() {
-                "verification_pending"
+            if callback_unavailable {
+                (
+                    "recovery_pending",
+                    vec!["auth.cancel"],
+                    json!({
+                        "flowId":flow_identity(&state,login),"authorizationUrl":login.authorization_url,"expiresAt":login.expires_at,
+                    }),
+                )
             } else {
-                "verification_expired"
-            };
-            let actions = if status == "verification_pending" {
-                vec!["auth.poll", "auth.logout"]
-            } else {
-                vec!["auth.login", "auth.logout"]
-            };
-            (
-                status,
-                actions,
-                json!({
-                    // Existing protected records predate `flow_id`. Derive a
-                    // stable, opaque fallback without exposing their original
-                    // idempotency key or device code.
-                    "flowId":flow_identity(&state, login),
-                    "verificationUri":login.verification_uri,
-                    "userCode":login.user_code,
-                    "expiresAt":login.expires_at,
-                    "intervalSeconds":login.interval_seconds,
-                    "retryAfterSeconds":login.next_poll_at.saturating_sub(now()),
-                }),
-            )
+                let status = if login.authorization_url.is_none() || login.expires_at <= now() {
+                    "verification_expired"
+                } else if login.received_code.is_some() {
+                    "authentication_completing"
+                } else {
+                    "browser_pending"
+                };
+                let actions = if status == "browser_pending" {
+                    vec!["auth.cancel"]
+                } else if status == "authentication_completing" {
+                    vec!["auth.recover"]
+                } else {
+                    vec!["auth.login"]
+                };
+                (
+                    status,
+                    actions,
+                    json!({
+                        // Existing protected records predate `flow_id`. Derive a
+                        // stable, opaque fallback without exposing their original
+                        // idempotency key or device code.
+                        "flowId":flow_identity(&state, login),
+                        "authorizationUrl":login.authorization_url,
+                        "expiresAt":login.expires_at,
+                    }),
+                )
+            }
         } else {
             ("signed_out", vec!["auth.login"], Value::Null)
         };
         json!({
-            "schemaVersion":"loomex.runner.connection/v1",
+            "schemaVersion":"loomex.runner.connection/v2",
             "state":state_name,
             "organization":{"status":if selected.is_some(){"connected"}else{"organization_required"},"selected":selected},
             "organizations":organizations,
@@ -390,116 +533,284 @@ impl Auth {
                 login.key != key || login.runner_name == runner_name,
                 "IDEMPOTENCY_CONFLICT"
             );
-            if login.key == key && login.device_code.is_some() && login.expires_at > now() {
+            if login.key == key && login.authorization_url.is_some() && login.expires_at > now() {
                 return Ok(login_projection(login));
             }
             ensure!(
-                login.key == key || login.expires_at <= now(),
+                login.key == key || login.expires_at <= now() || login.authorization_url.is_none(),
                 "LOGIN_ALREADY_PENDING"
             );
         }
-        state.login = Some(Login {
-            key: key.into(),
-            runner_name: runner_name.into(),
-            flow_id: uuid::Uuid::new_v4().to_string(),
-            device_code: None,
-            user_code: None,
-            verification_uri: None,
-            expires_at: now().saturating_add(600),
-            interval_seconds: 5,
-            next_poll_at: 0,
-        });
+        let reused = state
+            .login
+            .as_ref()
+            .filter(|login| {
+                login.key == key
+                    && login.authorization_url.is_none()
+                    && login.redirect_uri.is_some()
+                    && login.expires_at > now()
+            })
+            .cloned();
+        let (login, listener) = if let Some(login) = reused {
+            let listener = if self.listeners.lock().await.contains_key(&login.flow_id) {
+                None
+            } else {
+                Some(
+                    TcpListener::bind(
+                        login
+                            .redirect_uri
+                            .as_deref()
+                            .unwrap()
+                            .trim_start_matches("http://")
+                            .trim_end_matches("/oauth/callback"),
+                    )
+                    .await
+                    .map_err(|_| anyhow!("LOGIN_CALLBACK_UNAVAILABLE"))?,
+                )
+            };
+            (login, listener)
+        } else {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .map_err(|_| anyhow!("LOGIN_CALLBACK_UNAVAILABLE"))?;
+            let redirect_uri = format!("http://{}/oauth/callback", listener.local_addr()?);
+            let random = |length| {
+                let mut bytes = vec![0u8; length];
+                rand::rngs::OsRng.fill_bytes(&mut bytes);
+                URL_SAFE_NO_PAD.encode(bytes)
+            };
+            (
+                Login {
+                    key: key.into(),
+                    runner_name: runner_name.into(),
+                    flow_id: uuid::Uuid::new_v4().to_string(),
+                    expires_at: now() + 600,
+                    authorization_url: None,
+                    transaction_id: None,
+                    redirect_uri: Some(redirect_uri),
+                    browser_state: Some(random(32)),
+                    code_verifier: Some(random(32)),
+                    received_code: None,
+                },
+                Some(listener),
+            )
+        };
+        state.login = Some(login.clone());
         self.save(&state).await?;
+        if let Some(listener) = listener {
+            self.spawn_callback(listener, login.flow_id.clone()).await;
+        }
         let public_key = URL_SAFE_NO_PAD.encode(
             SigningKey::from_bytes(&state.private_key)
                 .verifying_key()
                 .as_bytes(),
         );
-        let data = self.api.request("POST","v2/device-authorities/start/",Some(json!({"installId":state.installation_id,"runnerName":runner_name,"publicKey":public_key})),None,Some(key)).await?;
-        let user_code = field(&data, "userCode")?;
-        let uri = self
-            .api
-            .verification_uri(&field(&data, "verificationUri")?, &user_code)?;
-        state.login = Some(Login {
-            key: key.into(),
-            runner_name: runner_name.into(),
-            flow_id: state
-                .login
-                .as_ref()
-                .map(|login| login.flow_id.clone())
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-            device_code: Some(field(&data, "deviceCode")?),
-            user_code: Some(user_code),
-            verification_uri: Some(uri),
-            expires_at: expiry(&data)?,
-            interval_seconds: data["intervalSeconds"].as_u64().unwrap_or(5).max(1),
-            next_poll_at: 0,
-        });
-        self.save(&state).await?;
-        Ok(login_projection(state.login.as_ref().unwrap()))
-    }
-    pub async fn poll(&self, key: &str, flow_id: &str) -> Result<Value> {
-        ensure!((16..=256).contains(&key.len()), "INVALID_IDEMPOTENCY_KEY");
-        ensure!(
-            !flow_id.is_empty() && flow_id.len() <= 160,
-            "INVALID_LOGIN_FLOW"
-        );
-        let _guard = self.lock.lock().await;
-        let mut state = self.required().await?;
-        Self::allowed(&state)?;
-        if state.pending.is_some() {
-            self.recover(&mut state).await?;
-        }
-        if state.device.is_some() {
-            return Ok(json!({"status":"authenticated","authenticated":true}));
-        }
-        let current_login = state
-            .login
-            .as_ref()
-            .ok_or_else(|| anyhow!("LOGIN_REQUIRED"))?;
-        ensure!(
-            flow_identity(&state, current_login) == flow_id,
-            "LOGIN_FLOW_MISMATCH"
-        );
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(
+            login.code_verifier.as_ref().unwrap().as_bytes(),
+        ));
+        let data = self.api.request("POST", "v2/browser-authorities/start/", Some(json!({
+            "installId":state.installation_id, "runnerName":runner_name, "publicKey":public_key,
+            "clientId":"loomex-native/v1", "redirectUri":login.redirect_uri,
+            "state":login.browser_state, "codeChallenge":challenge,
+        })), None, Some(key)).await?;
+        let uri = self.api.browser_authorization_uri(
+            &field(&data, "authorizationPath")?,
+            &field(&data, "transactionId")?,
+            login.browser_state.as_deref().unwrap(),
+        )?;
         let login = state
             .login
             .as_mut()
             .ok_or_else(|| anyhow!("LOGIN_REQUIRED"))?;
-        ensure!(login.expires_at > now(), "LOGIN_EXPIRED");
-        if now() < login.next_poll_at {
-            return Ok(
-                json!({"status":"pending","pending":true,"retryAfterSeconds":login.next_poll_at-now()}),
-            );
-        }
-        let device_code = login
-            .device_code
-            .clone()
-            .ok_or_else(|| anyhow!("LOGIN_REQUIRED"))?;
-        login.next_poll_at = now().saturating_add(login.interval_seconds);
+        login.authorization_url = Some(uri);
+        login.transaction_id = Some(field(&data, "transactionId")?);
+        login.expires_at = data["expiresAt"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("INVALID_API_RESPONSE"))?;
         self.save(&state).await?;
-        let data = self
-            .api
-            .request(
-                "POST",
-                "v2/device-authorities/token/",
-                Some(json!({"deviceCode":device_code})),
-                None,
-                None,
-            )
-            .await?;
-        if data["pending"] == true {
-            return Ok(json!({"status":"pending","pending":true}));
+        Ok(login_projection(state.login.as_ref().unwrap()))
+    }
+    async fn spawn_callback(&self, listener: TcpListener, flow_id: String) {
+        let auth = self.clone();
+        let id = flow_id.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let remaining = {
+                    let Ok(Some(state)) = auth.load().await else {
+                        break;
+                    };
+                    let Some(login) = state.login.as_ref().filter(|login| login.flow_id == id)
+                    else {
+                        break;
+                    };
+                    login.expires_at.saturating_sub(now())
+                };
+                if remaining == 0 {
+                    break;
+                }
+                let Ok(Ok((mut socket, _))) = tokio::time::timeout(
+                    std::time::Duration::from_secs(remaining.min(30)),
+                    listener.accept(),
+                )
+                .await
+                else {
+                    continue;
+                };
+                let mut buffer = [0u8; 8192];
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut size = 0;
+                while size < buffer.len()
+                    && !buffer[..size].windows(4).any(|part| part == b"\r\n\r\n")
+                {
+                    let Ok(Ok(read)) =
+                        tokio::time::timeout_at(deadline, socket.read(&mut buffer[size..])).await
+                    else {
+                        break;
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    size += read;
+                }
+                let target = (buffer[..size].windows(4).any(|part| part == b"\r\n\r\n"))
+                    .then_some(size)
+                    .and_then(|len| {
+                        let request = std::str::from_utf8(&buffer[..len]).ok()?;
+                        let expected_host = format!("Host: {}", listener.local_addr().ok()?);
+                        if !request
+                            .lines()
+                            .any(|line| line.eq_ignore_ascii_case(&expected_host))
+                        {
+                            return None;
+                        }
+                        let mut parts = request.lines().next()?.split_whitespace();
+                        (parts.next() == Some("GET")).then_some(parts.next()?)
+                    });
+                let callback = target.and_then(|target| {
+                    let url = url::Url::parse(&format!("http://127.0.0.1{target}")).ok()?;
+                    if url.path() != "/oauth/callback" {
+                        return None;
+                    }
+                    let mut query = BTreeMap::new();
+                    for (name, value) in url.query_pairs() {
+                        if !matches!(name.as_ref(), "state" | "code" | "error")
+                            || query.insert(name, value).is_some()
+                        {
+                            return None;
+                        }
+                    }
+                    if query.contains_key("code") == query.contains_key("error") {
+                        return None;
+                    }
+                    Some((
+                        query.get("state")?.to_string(),
+                        query.get("code").map(ToString::to_string),
+                        query.get("error").map(ToString::to_string),
+                    ))
+                });
+                let denied = callback
+                    .as_ref()
+                    .is_some_and(|(_, _, error)| error.as_deref() == Some("access_denied"));
+                let outcome = if let Some((state, code, error)) = callback {
+                    auth.complete_browser_callback(&id, &state, code.as_deref(), error.as_deref())
+                        .await
+                } else {
+                    Err(anyhow!("INVALID_CALLBACK"))
+                };
+                let recoverable = outcome.is_err()
+                    && auth.load().await.ok().flatten().is_some_and(|state| {
+                        state.login.as_ref().is_some_and(|login| {
+                            login.flow_id == id && login.received_code.is_some()
+                        }) && state.pending.as_ref().is_some_and(|pending| {
+                            matches!(pending.target, Target::BrowserExchange | Target::Bootstrap)
+                        })
+                    });
+                let result = if denied && outcome.is_ok() {
+                    BrowserCallbackOutcome::Declined
+                } else if outcome.is_ok() {
+                    BrowserCallbackOutcome::SignedIn
+                } else if recoverable {
+                    BrowserCallbackOutcome::RecoveryRequired
+                } else {
+                    BrowserCallbackOutcome::Invalid
+                };
+                let response = browser_callback_response(result);
+                let _ = socket.write_all(response.as_bytes()).await;
+                if outcome.is_ok() || recoverable {
+                    break;
+                }
+            }
+            auth.listeners.lock().await.remove(&id);
+        });
+        self.listeners.lock().await.insert(flow_id, task);
+    }
+    async fn complete_browser_callback(
+        &self,
+        flow_id: &str,
+        state_value: &str,
+        code: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let _guard = self.lock.lock().await;
+        let mut state = self.required().await?;
+        let login = state
+            .login
+            .as_ref()
+            .ok_or_else(|| anyhow!("LOGIN_REQUIRED"))?;
+        ensure!(
+            login.flow_id == flow_id
+                && login.expires_at > now()
+                && login.browser_state.as_deref() == Some(state_value),
+            "LOGIN_FLOW_MISMATCH"
+        );
+        if error == Some("access_denied") {
+            state.login = None;
+            self.save(&state).await?;
+            return Ok(());
         }
-        let grant = field(&data, "bootstrapGrant")?;
-        let proof = key_proof(&state.private_key, "device-bootstrap", &grant);
+        let code = code
+            .filter(|code| (32..=256).contains(&code.len()))
+            .ok_or_else(|| anyhow!("INVALID_CALLBACK"))?;
+        ensure!(login.received_code.is_none(), "LOGIN_CALLBACK_REPLAY");
+        state.login.as_mut().unwrap().received_code = Some(code.into());
+        self.save(&state).await?;
+        let login = state.login.as_ref().unwrap();
+        let proof = key_proof(&state.private_key, "browser-exchange", code);
+        let body = json!({"transactionId":login.transaction_id,"code":code,"codeVerifier":login.code_verifier,
+            "redirectUri":login.redirect_uri,"proof":proof});
         self.begin(
             &mut state,
-            Target::Bootstrap,
-            "v2/device-authorities/bootstrap/".into(),
-            json!({"bootstrapGrant":grant,"proof":proof}),
+            Target::BrowserExchange,
+            "v2/browser-authorities/exchange/".into(),
+            body,
+        )
+        .await
+    }
+    pub async fn cancel_login(&self, flow_id: &str) -> Result<Value> {
+        let _guard = self.lock.lock().await;
+        let mut state = self.required().await?;
+        let login = state
+            .login
+            .as_ref()
+            .ok_or_else(|| anyhow!("LOGIN_REQUIRED"))?;
+        ensure!(login.flow_id == flow_id, "LOGIN_FLOW_MISMATCH");
+        let state_value = login
+            .browser_state
+            .as_deref()
+            .ok_or_else(|| anyhow!("LOGIN_REQUIRED"))?;
+        let proof = key_proof(&state.private_key, "browser-cancel", state_value);
+        let body = json!({"transactionId":login.transaction_id,"state":state_value,"proof":proof});
+        self.begin(
+            &mut state,
+            Target::BrowserCancel,
+            "v2/browser-authorities/cancel/".into(),
+            body,
         )
         .await?;
-        Ok(json!({"status":"authenticated","authenticated":true}))
+        if let Some(listener) = self.listeners.lock().await.remove(flow_id) {
+            listener.abort()
+        }
+        Ok(json!({"canceled":true}))
     }
     pub async fn organizations(&self) -> Result<Value> {
         let _guard = self.lock.lock().await;
@@ -656,6 +967,32 @@ impl Auth {
         let Some(mut state) = self.load().await? else {
             return Ok(json!({"revoked":true,"alreadyLoggedOut":true}));
         };
+        if state.device.is_none() {
+            if let Some(login) = state
+                .login
+                .as_ref()
+                .filter(|login| login.transaction_id.is_some())
+            {
+                let flow = login.flow_id.clone();
+                let state_value = login
+                    .browser_state
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("LOGIN_REQUIRED"))?;
+                let proof = key_proof(&state.private_key, "browser-cancel", state_value);
+                let body =
+                    json!({"transactionId":login.transaction_id,"state":state_value,"proof":proof});
+                self.begin(
+                    &mut state,
+                    Target::BrowserCancel,
+                    "v2/browser-authorities/cancel/".into(),
+                    body,
+                )
+                .await?;
+                if let Some(listener) = self.listeners.lock().await.remove(&flow) {
+                    listener.abort()
+                }
+            }
+        }
         if let Some(device) = state.device.as_ref() {
             // Logout accepts the historical signed access token, including after
             // expiry or revocation. Never rotate credentials before recording intent.
@@ -786,6 +1123,27 @@ impl Auth {
             }
         };
         match pending.target {
+            Target::BrowserExchange => {
+                let grant = field(&data, "bootstrapGrant")?;
+                let proof = key_proof(&state.private_key, "device-bootstrap", &grant);
+                state.pending = Some(Pending {
+                    target: Target::Bootstrap,
+                    route: "v2/device-authorities/bootstrap/".into(),
+                    body: json!({"bootstrapGrant":grant,"proof":proof}),
+                    started_at: now(),
+                    recovery_used: false,
+                });
+                self.save(state).await?;
+                return Box::pin(self.transmit(state, false)).await;
+            }
+            Target::BrowserCancel => {
+                if data["canceled"] != true {
+                    state.pending = None;
+                    self.save(state).await?;
+                    bail!("LOGIN_ALREADY_APPROVED")
+                }
+                state.login = None;
+            }
             Target::Bootstrap => {
                 let device = &data["device"];
                 state.device = Some(parse_token(device, field(device, "deviceId")?)?);
@@ -851,7 +1209,7 @@ fn parse_token(value: &Value, subject: String) -> Result<Token> {
     })
 }
 fn login_projection(login: &Login) -> Value {
-    json!({"status":"pending","pending":true,"flowId":login.flow_id,"userCode":login.user_code,"verificationUri":login.verification_uri,"expiresAt":login.expires_at,"intervalSeconds":login.interval_seconds})
+    json!({"status":"pending","pending":true,"flowId":login.flow_id,"authorizationUrl":login.authorization_url,"expiresAt":login.expires_at})
 }
 fn flow_identity(state: &ProtectedState, login: &Login) -> String {
     if login.flow_id.is_empty() {
@@ -932,7 +1290,7 @@ mod tests {
         store.save(&serde_json::to_vec(&restored).unwrap()).unwrap();
         let restored: ProtectedState =
             serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
-        assert!(!restored.pending.unwrap().can_recover());
+        assert!(restored.pending.unwrap().can_recover());
     }
     #[test]
     fn absolute_expiry_survives_restart() {
@@ -957,12 +1315,9 @@ mod tests {
             key: "key".into(),
             runner_name: "runner".into(),
             flow_id: "flow-id".into(),
-            device_code: Some("SECRET".into()),
-            user_code: Some("CODE".into()),
-            verification_uri: Some("https://example.com".into()),
+            code_verifier: Some("SECRET".into()),
             expires_at: 0,
-            interval_seconds: 5,
-            next_poll_at: 0,
+            ..Login::default()
         };
         let projection = login_projection(&login);
         assert!(!projection.to_string().contains("SECRET"));
@@ -979,19 +1334,17 @@ mod tests {
             key: "idempotency-key".into(),
             runner_name: "runner".into(),
             flow_id: "opaque-flow".into(),
-            device_code: Some("DEVICE_SECRET".into()),
-            user_code: Some("PUBLIC-CODE".into()),
-            verification_uri: Some("https://example.test/verify".into()),
+            authorization_url: Some("https://example.test/authorize".into()),
+            code_verifier: Some("SECRET".into()),
             expires_at: now() + 60,
-            interval_seconds: 5,
-            next_poll_at: now() + 4,
+            ..Login::default()
         });
         auth.save(&state).await.unwrap();
         let pending = auth.connection(None, 1).await;
-        assert_eq!(pending["state"], "verification_pending");
+        assert_eq!(pending["state"], "recovery_pending");
         assert_eq!(pending["login"]["flowId"], "opaque-flow");
-        assert_eq!(pending["login"]["userCode"], "PUBLIC-CODE");
-        assert!(!pending.to_string().contains("DEVICE_SECRET"));
+        assert!(pending["login"].get("userCode").is_none());
+        assert!(!pending.to_string().contains("SECRET"));
         assert!(!pending.to_string().contains("idempotency-key"));
 
         state.login.as_mut().unwrap().expires_at = 0;
@@ -1056,77 +1409,11 @@ mod tests {
             store: Arc::new(Unavailable),
             lock: Arc::new(Mutex::new(())),
             store_lock: Arc::new(Mutex::new(())),
+            listeners: Arc::new(Mutex::new(BTreeMap::new())),
         };
         let projection = auth.connection(None, 0).await;
         assert_eq!(projection["state"], "credential_store_unavailable");
         assert_eq!(projection["actions"], json!([]));
-    }
-    #[tokio::test]
-    async fn concurrent_polls_share_the_persisted_poll_interval() {
-        let (auth, _, listener) = test_auth().await;
-        let mut state = ProtectedState::fresh();
-        state.login = Some(Login {
-            key: "initial-login-key".into(),
-            runner_name: "runner".into(),
-            flow_id: "opaque-flow".into(),
-            device_code: Some("device-code".into()),
-            user_code: Some("public-code".into()),
-            verification_uri: Some("https://example.test/verify".into()),
-            expires_at: now() + 60,
-            interval_seconds: 30,
-            next_poll_at: 0,
-        });
-        auth.save(&state).await.unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let request = read_request(&mut stream).await;
-            assert_eq!(request["deviceCode"], "device-code");
-            respond(&mut stream, 200, json!({"data":{"pending":true}})).await;
-            assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(80), listener.accept())
-                    .await
-                    .is_err()
-            );
-        });
-        let first = auth.poll("first-poll-idempotency-key", "opaque-flow");
-        let second = auth.poll("second-poll-idempotency-key", "opaque-flow");
-        let (first, second) = tokio::join!(first, second);
-        let results = [first.unwrap(), second.unwrap()];
-        assert!(
-            results
-                .iter()
-                .any(|value| value.get("retryAfterSeconds").is_some())
-        );
-        server.await.unwrap();
-    }
-    #[tokio::test]
-    async fn stale_poll_flow_is_rejected_before_any_token_request() {
-        let (auth, _, listener) = test_auth().await;
-        let mut state = ProtectedState::fresh();
-        state.login = Some(Login {
-            key: "initial-login-key".into(),
-            runner_name: "runner".into(),
-            flow_id: "current-flow".into(),
-            device_code: Some("device-code".into()),
-            user_code: Some("public-code".into()),
-            verification_uri: Some("https://example.test/verify".into()),
-            expires_at: now() + 60,
-            interval_seconds: 5,
-            next_poll_at: 0,
-        });
-        auth.save(&state).await.unwrap();
-        assert_eq!(
-            auth.poll("stale-poll-idempotency-key", "stale-flow")
-                .await
-                .unwrap_err()
-                .to_string(),
-            "LOGIN_FLOW_MISMATCH"
-        );
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
-                .await
-                .is_err()
-        );
     }
     #[tokio::test]
     async fn organization_cache_is_local_and_survives_a_list_failure() {
@@ -1191,12 +1478,8 @@ mod tests {
             key: "historic-key".into(),
             runner_name: "runner".into(),
             flow_id: "new-flow".into(),
-            device_code: Some("device-code".into()),
-            user_code: Some("public-code".into()),
-            verification_uri: Some("https://example.test/verify".into()),
             expires_at: now() + 60,
-            interval_seconds: 5,
-            next_poll_at: 0,
+            ..Login::default()
         });
         let mut legacy = serde_json::to_value(&state).unwrap();
         legacy
@@ -1255,8 +1538,140 @@ mod tests {
             store: store.clone(),
             lock: Arc::new(Mutex::new(())),
             store_lock: Arc::new(Mutex::new(())),
+            listeners: Arc::new(Mutex::new(BTreeMap::new())),
         };
         (auth, store, listener)
+    }
+    #[tokio::test]
+    async fn browser_callback_completes_exchange_and_existing_bootstrap_chain() {
+        let (auth, _, server) = test_auth().await;
+        let server_task = tokio::spawn(async move {
+            for (index, expected_path) in [
+                "/v2/browser-authorities/start/",
+                "/v2/browser-authorities/exchange/",
+                "/v2/device-authorities/bootstrap/",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let (mut socket, _) = server.accept().await.unwrap();
+                let request = read_request(&mut socket).await;
+                if index == 0 {
+                    assert_eq!(request["clientId"], "loomex-native/v1");
+                    assert!(
+                        request["redirectUri"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("http://127.0.0.1:")
+                    );
+                }
+                if index == 1 {
+                    assert_eq!(
+                        request["code"],
+                        "callback-code-with-sufficient-entropy-0001"
+                    );
+                    assert!(request["codeVerifier"].as_str().unwrap().len() >= 43);
+                }
+                let payload = match index {
+                    0 => {
+                        json!({"data":{"transactionId":"00000000-0000-4000-8000-000000000004","authorizationPath":"/api/v1/runner-control/runner/v2/browser-authorities/authorize/","expiresAt":now()+600}})
+                    }
+                    1 => json!({"data":{"bootstrapGrant":"one-bootstrap-grant"}}),
+                    _ => {
+                        json!({"data":{"device":{"deviceId":"00000000-0000-4000-8000-000000000005","accessToken":"lmxda_access","refreshToken":"lmxdr_refresh","expiresInSeconds":900}}})
+                    }
+                };
+                let _ = expected_path;
+                respond(&mut socket, 200, payload).await;
+            }
+        });
+        let started = auth
+            .login("Test runner", "00000000-0000-4000-8000-000000000001")
+            .await
+            .unwrap();
+        assert_eq!(started["status"], "pending");
+        assert!(started.get("userCode").is_none());
+        let state = auth.required().await.unwrap();
+        let login = state.login.unwrap();
+        let uri = login.redirect_uri.unwrap();
+        let address = uri
+            .trim_start_matches("http://")
+            .trim_end_matches("/oauth/callback");
+        let mut invalid = tokio::net::TcpStream::connect(address).await.unwrap();
+        invalid
+            .write_all(format!("GET /oauth/callback?state=wrong&code=callback-code-with-sufficient-entropy-0001 HTTP/1.1\r\nHost: {address}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut invalid_response = [0u8; 512];
+        let invalid_size = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            invalid.read(&mut invalid_response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            std::str::from_utf8(&invalid_response[..invalid_size])
+                .unwrap()
+                .starts_with("HTTP/1.1 400")
+        );
+        assert_eq!(auth.connection(None, 0).await["state"], "browser_pending");
+        let mut callback = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            "GET /oauth/callback?state={}&code=callback-code-with-sufficient-entropy-0001 HTTP/1.1\r\nHost: {address}\r\n\r\n",
+            login.browser_state.unwrap()
+        );
+        callback.write_all(request.as_bytes()).await.unwrap();
+        let mut response = [0u8; 512];
+        let size = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            callback.read(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            std::str::from_utf8(&response[..size])
+                .unwrap()
+                .starts_with("HTTP/1.1 200")
+        );
+        server_task.await.unwrap();
+        assert_eq!(auth.connection(None, 0).await["state"], "authenticated");
+    }
+
+    #[test]
+    fn browser_callback_pages_share_the_generated_design_and_restrict_inline_style() {
+        let style_hash = STANDARD.encode(Sha256::digest(BROWSER_AUTH_CSS.as_bytes()));
+        for (outcome, status, title) in [
+            (BrowserCallbackOutcome::SignedIn, "200 OK", "Signed in"),
+            (
+                BrowserCallbackOutcome::Declined,
+                "200 OK",
+                "Sign-in declined",
+            ),
+            (
+                BrowserCallbackOutcome::RecoveryRequired,
+                "202 Accepted",
+                "Sign-in needs attention",
+            ),
+            (
+                BrowserCallbackOutcome::Invalid,
+                "400 Bad Request",
+                "Sign-in unavailable",
+            ),
+        ] {
+            let response = browser_callback_response(outcome);
+            assert!(response.starts_with(&format!("HTTP/1.1 {status}\r\n")));
+            assert!(response.contains(&format!("style-src 'sha256-{style_hash}'")));
+            assert!(response.contains(&format!("<h1 class=\"auth-title\">{title}</h1>")));
+            assert!(response.contains(BROWSER_AUTH_CSS));
+            assert!(response.contains("Cache-Control: no-store"));
+            assert!(!response.contains("<script"));
+        }
+        assert!(
+            browser_callback_response(BrowserCallbackOutcome::SignedIn)
+                .contains("Return to the Loomex connection card to finish setup.")
+        );
     }
     #[tokio::test]
     async fn concurrent_refresh_is_singleflight_and_recovery_is_durable() {
@@ -1324,27 +1739,25 @@ mod tests {
             auth.save(&state).await.unwrap();
             let server_store = store.clone();
             let server = tokio::spawn(async move {
-                if outcome != "exhausted" {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                assert_eq!(request["recovery"], true);
+                assert_eq!(request["bootstrapGrant"], "original-grant");
+                let durable: ProtectedState =
+                    serde_json::from_slice(&server_store.load().unwrap().unwrap()).unwrap();
+                assert!(durable.logout_pending);
+                if outcome == "recovered" {
+                    respond(&mut stream,200,json!({"data":{"device":{"deviceId":"00000000-0000-4000-8000-000000000002","accessToken":"lmxda_recovered_secret","refreshToken":"refresh","expiresInSeconds":3600}}})).await;
                     let (mut stream, _) = listener.accept().await.unwrap();
-                    let request = read_request(&mut stream).await;
-                    assert_eq!(request["recovery"], true);
-                    assert_eq!(request["bootstrapGrant"], "original-grant");
-                    let durable: ProtectedState =
-                        serde_json::from_slice(&server_store.load().unwrap().unwrap()).unwrap();
-                    assert!(durable.logout_pending);
-                    if outcome == "recovered" {
-                        respond(&mut stream,200,json!({"data":{"device":{"deviceId":"00000000-0000-4000-8000-000000000002","accessToken":"lmxda_recovered_secret","refreshToken":"refresh","expiresInSeconds":3600}}})).await;
-                        let (mut stream, _) = listener.accept().await.unwrap();
-                        assert_eq!(read_request(&mut stream).await, json!({}));
-                        respond(&mut stream, 200, json!({"data":{"revoked":true}})).await;
-                    } else {
-                        respond(
-                            &mut stream,
-                            409,
-                            json!({"error":{"code":"RECOVERY_EXHAUSTED"}}),
-                        )
-                        .await;
-                    }
+                    assert_eq!(read_request(&mut stream).await, json!({}));
+                    respond(&mut stream, 200, json!({"data":{"revoked":true}})).await;
+                } else {
+                    respond(
+                        &mut stream,
+                        409,
+                        json!({"error":{"code":"RECOVERY_EXHAUSTED"}}),
+                    )
+                    .await;
                 }
                 assert!(
                     tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
@@ -1483,6 +1896,7 @@ mod tests {
             store: store.clone(),
             lock: Arc::new(Mutex::new(())),
             store_lock: Arc::new(Mutex::new(())),
+            listeners: Arc::new(Mutex::new(BTreeMap::new())),
         };
         let original = auth.installation_id().await.unwrap();
         let copy = auth.clone();
@@ -1698,6 +2112,7 @@ mod tests {
                 store: store.clone(),
                 lock: Arc::new(Mutex::new(())),
                 store_lock: Arc::new(Mutex::new(())),
+                listeners: Arc::new(Mutex::new(BTreeMap::new())),
             };
             let operation_auth = auth.clone();
             let operation = tokio::spawn(async move {
@@ -1778,6 +2193,9 @@ mod tests {
             assert!(durable.pending.unwrap().recovery_used);
             respond(&mut stream,200,json!({"data":{"accessToken":"lmxr_new_secret","refreshToken":"replacement","expiresInSeconds":3600}})).await;
         });
+        let reconciled = auth.reconcile().await.unwrap();
+        assert_eq!(reconciled["reconciled"], true);
+        assert_eq!(reconciled["authenticated"], false);
         assert_eq!(
             auth.credential("org").await.unwrap().token,
             "lmxr_new_secret"

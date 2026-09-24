@@ -26,6 +26,18 @@
       "recovery": "correct_input",
       "outcome": "rejected"
     },
+    "WORKFLOW_AUTHORING_INVALID": {
+      "recovery": "correct_input",
+      "outcome": "rejected"
+    },
+    "WORKFLOW_GRAPH_INVALID": {
+      "recovery": "correct_input",
+      "outcome": "rejected"
+    },
+    "WORKFLOW_DEFINITION_REQUIRED": {
+      "recovery": "correct_input",
+      "outcome": "rejected"
+    },
     "VERSION_NOT_OWNED": {
       "recovery": "correct_input",
       "outcome": "rejected"
@@ -54,12 +66,28 @@
       "recovery": "refresh_authority",
       "outcome": "rejected"
     },
+    "ACTIVE_WORK_REQUIRES_DRAIN": {
+      "recovery": "refresh_authority",
+      "outcome": "rejected"
+    },
     "VIEW_SESSION_NOT_FOUND": {
       "recovery": "refresh_authority",
       "outcome": "rejected"
     },
     "NETWORK_AMBIGUOUS": {
       "recovery": "reconcile_outcome",
+      "outcome": "unknown"
+    },
+    "NETWORK_UNAVAILABLE": {
+      "recovery": "retry_exact_operation",
+      "outcome": "not_dispatched"
+    },
+    "AUTH_RECOVERY_PENDING": {
+      "recovery": "reconcile_outcome",
+      "outcome": "unknown"
+    },
+    "AUTH_RECOVERY_EXHAUSTED": {
+      "recovery": "refresh_authority",
       "outcome": "unknown"
     },
     "IDEMPOTENCY_REQUEST_IN_PROGRESS": {

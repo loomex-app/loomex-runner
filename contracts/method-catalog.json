@@ -1,6 +1,6 @@
 {
   "protocol": "loomex.local-control/v2",
-  "version": "0.3.2",
+  "version": "0.3.5",
   "maxFrameBytes": 1048576,
   "methods": [
     {
@@ -208,7 +208,7 @@
             "type": "object",
             "properties": {
               "schemaVersion": {
-                "const": "loomex.runner.connection/v1"
+                "const": "loomex.runner.connection/v2"
               },
               "webAppUrl": {
                 "type": [
@@ -221,12 +221,13 @@
                 "type": "string",
                 "enum": [
                   "signed_out",
-                  "verification_pending",
                   "verification_expired",
                   "authenticated",
                   "recovery_pending",
                   "logout_pending",
-                  "credential_store_unavailable"
+                  "credential_store_unavailable",
+                  "browser_pending",
+                  "authentication_completing"
                 ]
               },
               "organization": {
@@ -431,29 +432,19 @@
                 "minLength": 1,
                 "maxLength": 160
               },
-              "userCode": {
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
-              "verificationUri": {
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
               "expiresAt": {
-                "type": "integer",
-                "minimum": 0
-              },
-              "intervalSeconds": {
                 "type": "integer",
                 "minimum": 0
               },
               "details": {
                 "type": "object",
                 "additionalProperties": true
+              },
+              "authorizationUrl": {
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             },
             "required": [
@@ -501,7 +492,7 @@
       "appOnly": false
     },
     {
-      "name": "auth.poll",
+      "name": "auth.cancel",
       "mutating": true,
       "idempotent": true,
       "inputSchema": {
@@ -528,18 +519,8 @@
           {
             "type": "object",
             "properties": {
-              "status": {
-                "type": "string"
-              },
-              "pending": {
+              "canceled": {
                 "type": "boolean"
-              },
-              "authenticated": {
-                "type": "boolean"
-              },
-              "retryAfterSeconds": {
-                "type": "integer",
-                "minimum": 0
               },
               "details": {
                 "type": "object",
@@ -547,7 +528,91 @@
               }
             },
             "required": [
-              "status"
+              "canceled"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "transportRetry": "never_after_send",
+      "appOnly": false
+    },
+    {
+      "name": "auth.recover",
+      "mutating": true,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "idempotencyKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "reconciled": {
+                "type": "boolean"
+              },
+              "authenticated": {
+                "type": "boolean"
+              },
+              "activeOrganization": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "reconciled",
+              "authenticated"
             ],
             "additionalProperties": false
           },
@@ -1484,6 +1549,111 @@
       "appOnly": false
     },
     {
+      "name": "workflow.operations.get",
+      "mutating": false,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "operation": {
+            "type": "string",
+            "enum": [
+              "workflows.create",
+              "workflows.update",
+              "workflows.publish"
+            ]
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "operation",
+          "idempotencyKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "operation": {
+                "type": "string",
+                "enum": [
+                  "workflows.create",
+                  "workflows.update",
+                  "workflows.publish"
+                ]
+              },
+              "idempotencyKey": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "not_found",
+                  "pending",
+                  "completed"
+                ]
+              },
+              "response": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "operation",
+              "idempotencyKey",
+              "status"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "transportRetry": "before_response_once",
+      "appOnly": false
+    },
+    {
       "name": "workflows.validate",
       "mutating": false,
       "idempotent": true,
@@ -1598,7 +1768,8 @@
         },
         "required": [
           "workflowId",
-          "idempotencyKey"
+          "idempotencyKey",
+          "expectedVersion"
         ],
         "additionalProperties": false
       },
@@ -8622,7 +8793,8 @@
     "method:connection.get",
     "method:auth.status",
     "method:auth.login",
-    "method:auth.poll",
+    "method:auth.cancel",
+    "method:auth.recover",
     "method:auth.logout",
     "method:organizations.list",
     "method:organizations.select",
@@ -8633,6 +8805,7 @@
     "method:workflows.get",
     "method:workflows.create",
     "method:workflows.update",
+    "method:workflow.operations.get",
     "method:workflows.validate",
     "method:workflows.publish",
     "method:workflows.activate",
@@ -8688,8 +8861,7 @@
     "method:recovery.operations.settle",
     "execution.host_user/v1",
     "authorization.prepare-commit/v1",
-    "auth.device-v2/v1",
-    "connection.projection/v1",
+    "connection.projection/v2",
     "transfer.chunked/v1",
     "error.validation-issues/v1",
     "method:presentation.delivery.get",
@@ -8708,6 +8880,7 @@
     "error.recovery/v1",
     "workflows.atomic-draft-create/v1",
     "workflows.canonical-authoring-contract/v1",
-    "workflows.runtime-draft-mutations/v1"
+    "workflows.runtime-draft-mutations/v1",
+    "auth:browser-pkce/v1"
   ]
 }

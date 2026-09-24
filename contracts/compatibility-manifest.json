@@ -1,8 +1,8 @@
 {
   "capabilities": [
-    "auth.device-v2/v1",
+    "auth:browser-pkce/v1",
     "authorization.prepare-commit/v1",
-    "connection.projection/v1",
+    "connection.projection/v2",
     "error.recovery/v1",
     "error.validation-issues/v1",
     "execution.host_user/v1",
@@ -11,9 +11,10 @@
     "method:artifacts.download",
     "method:artifacts.list",
     "method:artifacts.read",
+    "method:auth.cancel",
     "method:auth.login",
     "method:auth.logout",
-    "method:auth.poll",
+    "method:auth.recover",
     "method:auth.status",
     "method:builder.catalog",
     "method:builder.commit",
@@ -73,6 +74,7 @@
     "method:runs.start_handoff.restore",
     "method:runs.wait",
     "method:status.get",
+    "method:workflow.operations.get",
     "method:workflows.activate",
     "method:workflows.create",
     "method:workflows.get",
@@ -92,14 +94,14 @@
     "workflows.canonical-authoring-contract/v1",
     "workflows.runtime-draft-mutations/v1"
   ],
-  "catalogVersion": "0.3.2",
+  "catalogVersion": "0.3.5",
   "generatedFrom": {
     "backendRoutes": {
-      "digest": "sha256:490267c41829588742759eeb24251433b6bc69fa4830e8ee0ad977e66c68467f",
+      "digest": "sha256:fb9f137c67f964d21d511134f74434db869b5e3df895ce8446ce0274251a9970",
       "path": "contracts/backend-routes.json"
     },
     "methodCatalog": {
-      "digest": "sha256:16f03659ce756fe9e018ba39adce5f8fd31e1624dc518f7c84988f002e381d80",
+      "digest": "sha256:046c334967042a6f3dbc54e6897f740df264d46fca9c905543ce37c2a640be2b",
       "path": "contracts/method-catalog.json"
     }
   },
@@ -144,12 +146,24 @@
     {
       "classification": "backend-auth",
       "idempotent": true,
+      "inputSchemaDigest": "sha256:e619dd8797f4b6a473b77df61acb43814c27e87d634709b0bb6412fd8b241a14",
+      "mutating": true,
+      "name": "auth.cancel",
+      "outputSchemaDigest": "sha256:6efa29b1274115f9b6525c2e2ff39ff4c0865682e66e10db6fb346bc828365ac",
+      "routeIds": [
+        "auth.browser.cancel"
+      ],
+      "transportRetry": "never_after_send"
+    },
+    {
+      "classification": "backend-auth",
+      "idempotent": true,
       "inputSchemaDigest": "sha256:6b6c44f755b001b5db2fa135320ad457de75a489709f1c2d041d5b94b28430af",
       "mutating": true,
       "name": "auth.login",
-      "outputSchemaDigest": "sha256:d47b3c15d7fd1558917a219088b14273f4546c34a3e420e9639f12541f1a4eb8",
+      "outputSchemaDigest": "sha256:5b604a129f5194626a2e0eb21eb5cfc2b1a17d56ab6302c48eb618a302df1555",
       "routeIds": [
-        "auth.device.start"
+        "auth.browser.start"
       ],
       "transportRetry": "never_after_send"
     },
@@ -168,13 +182,14 @@
     {
       "classification": "backend-auth",
       "idempotent": true,
-      "inputSchemaDigest": "sha256:e619dd8797f4b6a473b77df61acb43814c27e87d634709b0bb6412fd8b241a14",
+      "inputSchemaDigest": "sha256:2c7c9cce11a36fbffd45d731f3f9a5a291551262fa927319d499bfb2a275257f",
       "mutating": true,
-      "name": "auth.poll",
-      "outputSchemaDigest": "sha256:8a27dfe13d6c42257ee1f91ab6b4b6908ac149ee87916950cb036ba8c2e1af0b",
+      "name": "auth.recover",
+      "outputSchemaDigest": "sha256:b4bda815815f548583c48c43753f3f1d9be8fccf265ae3596878874060e637ae",
       "routeIds": [
+        "auth.browser.exchange",
         "auth.device.bootstrap",
-        "auth.device.token"
+        "auth.device.refresh"
       ],
       "transportRetry": "never_after_send"
     },
@@ -278,7 +293,7 @@
       "inputSchemaDigest": "sha256:d0157ce84790721854763c7480015e84f7cb0c7fde53afb21c3a42908805bf35",
       "mutating": false,
       "name": "connection.get",
-      "outputSchemaDigest": "sha256:abb0729329b4c67e0ed5d0bc216a835cbc8336af919224610b613717967ba4ae",
+      "outputSchemaDigest": "sha256:c7d074e5ddd18ca080eaf9b0e4f6abb29ec9edf69a6186cab7f9b807b009b815",
       "routeIds": [],
       "transportRetry": "before_response_once"
     },
@@ -840,6 +855,18 @@
     {
       "classification": "backend-proxy",
       "idempotent": true,
+      "inputSchemaDigest": "sha256:51570cfdec1aa18d4ee474dd45d387379af0f14d79d0952317b6fb46b51006e5",
+      "mutating": false,
+      "name": "workflow.operations.get",
+      "outputSchemaDigest": "sha256:e77517293f04d7dc0c1f29cb582410b9c34303b09b2e99d4a46e814d4ae62759",
+      "routeIds": [
+        "workflow.operation.get"
+      ],
+      "transportRetry": "before_response_once"
+    },
+    {
+      "classification": "backend-proxy",
+      "idempotent": true,
       "inputSchemaDigest": "sha256:6a9364f02179717314acc961d6d6fc2716ac82ceabd822ef13511f848fa5c7a9",
       "mutating": true,
       "name": "workflows.activate",
@@ -889,7 +916,7 @@
     {
       "classification": "backend-proxy",
       "idempotent": true,
-      "inputSchemaDigest": "sha256:a0d639fd0395546467ecde5188fbeb9fff8b6bc30950471dff8b7e54f72fc297",
+      "inputSchemaDigest": "sha256:c1bf2fd73b679ac5da7bca86a4c5d76cca68c9903a4dcad8fe3695017c41bf79",
       "mutating": true,
       "name": "workflows.publish",
       "outputSchemaDigest": "sha256:f89a661a10c0bcfd74d4dc669c0691faf35fb6d525937a435abd67e9be924a28",
@@ -986,6 +1013,24 @@
       "source": "src/jobs/transfer.rs"
     },
     {
+      "id": "auth.browser.cancel",
+      "method": "POST",
+      "pathTemplate": "v2/browser-authorities/cancel/",
+      "source": "src/auth.rs"
+    },
+    {
+      "id": "auth.browser.exchange",
+      "method": "POST",
+      "pathTemplate": "v2/browser-authorities/exchange/",
+      "source": "src/auth.rs"
+    },
+    {
+      "id": "auth.browser.start",
+      "method": "POST",
+      "pathTemplate": "v2/browser-authorities/start/",
+      "source": "src/auth.rs"
+    },
+    {
       "id": "auth.delegation.refresh",
       "method": "POST",
       "pathTemplate": "v1/delegations/refresh/",
@@ -1007,18 +1052,6 @@
       "id": "auth.device.refresh",
       "method": "POST",
       "pathTemplate": "v2/device-authorities/refresh/",
-      "source": "src/auth.rs"
-    },
-    {
-      "id": "auth.device.start",
-      "method": "POST",
-      "pathTemplate": "v2/device-authorities/start/",
-      "source": "src/auth.rs"
-    },
-    {
-      "id": "auth.device.token",
-      "method": "POST",
-      "pathTemplate": "v2/device-authorities/token/",
       "source": "src/auth.rs"
     },
     {
@@ -1262,6 +1295,12 @@
       "source": "src/control.rs"
     },
     {
+      "id": "workflow.operation.get",
+      "method": "POST",
+      "pathTemplate": "v2/workflow-operations/get/",
+      "source": "src/control.rs"
+    },
+    {
       "id": "workflow.publish",
       "method": "POST",
       "pathTemplate": "v1/workflows/{workflowId}/publish/",
@@ -1282,14 +1321,14 @@
   ],
   "schemaVersion": "loomex.runner.compatibility-manifest/v1",
   "summary": {
-    "backendRouteCount": 54,
-    "capabilityCount": 91,
+    "backendRouteCount": 56,
+    "capabilityCount": 93,
     "methodClassifications": {
-      "backend-auth": 5,
-      "backend-proxy": 37,
+      "backend-auth": 6,
+      "backend-proxy": 38,
       "daemon-lifecycle": 1,
       "local-control": 33
     },
-    "methodCount": 76
+    "methodCount": 78
   }
 }

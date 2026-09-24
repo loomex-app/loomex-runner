@@ -9,15 +9,21 @@
   ],
   "routes": [
     {
-      "id": "auth.device.start",
+      "id": "auth.browser.cancel",
       "method": "POST",
-      "pathTemplate": "v2/device-authorities/start/",
+      "pathTemplate": "v2/browser-authorities/cancel/",
       "source": "src/auth.rs"
     },
     {
-      "id": "auth.device.token",
+      "id": "auth.browser.exchange",
       "method": "POST",
-      "pathTemplate": "v2/device-authorities/token/",
+      "pathTemplate": "v2/browser-authorities/exchange/",
+      "source": "src/auth.rs"
+    },
+    {
+      "id": "auth.browser.start",
+      "method": "POST",
+      "pathTemplate": "v2/browser-authorities/start/",
       "source": "src/auth.rs"
     },
     {
@@ -78,6 +84,12 @@
       "id": "workflow.update",
       "method": "POST",
       "pathTemplate": "v1/workflows/{workflowId}/draft/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "workflow.operation.get",
+      "method": "POST",
+      "pathTemplate": "v2/workflow-operations/get/",
       "source": "src/control.rs"
     },
     {
@@ -375,15 +387,23 @@
       "method": "auth.login",
       "classification": "backend-auth",
       "routeIds": [
-        "auth.device.start"
+        "auth.browser.start"
       ]
     },
     {
-      "method": "auth.poll",
+      "method": "auth.cancel",
       "classification": "backend-auth",
       "routeIds": [
-        "auth.device.token",
-        "auth.device.bootstrap"
+        "auth.browser.cancel"
+      ]
+    },
+    {
+      "method": "auth.recover",
+      "classification": "backend-auth",
+      "routeIds": [
+        "auth.browser.exchange",
+        "auth.device.bootstrap",
+        "auth.device.refresh"
       ]
     },
     {
@@ -449,6 +469,13 @@
       "classification": "backend-proxy",
       "routeIds": [
         "workflow.update"
+      ]
+    },
+    {
+      "method": "workflow.operations.get",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "workflow.operation.get"
       ]
     },
     {

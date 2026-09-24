@@ -91,15 +91,13 @@ async fn run() -> Result<()> {
         std::process::exit(1)
     }
     if command == "login" && response["result"]["status"] == "pending" {
-        // Bind each poll to the exact public flow the runner persisted. This
-        // attaches a restarted CLI to an existing login without permitting a
-        // stale poll to act on a later flow.
+        // The daemon owns callback handling. The CLI observes its local state.
         let connection = control::client(&dir, "connection.get", json!({})).await?;
         let flow_id = connection["result"]["login"]["flowId"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("LOGIN_FLOW_UNAVAILABLE"))?
             .to_owned();
-        if let Some(uri) = response["result"]["verificationUri"].as_str() {
+        if let Some(uri) = response["result"]["authorizationUrl"].as_str() {
             #[cfg(target_os = "macos")]
             {
                 let _ = tokio::process::Command::new("/usr/bin/open")
@@ -113,26 +111,26 @@ async fn run() -> Result<()> {
             }
         }
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(
-                response["result"]["intervalSeconds"]
-                    .as_u64()
-                    .unwrap_or(5)
-                    .max(1),
-            ))
-            .await;
-            let poll = control::client(
-                &dir,
-                "auth.poll",
-                json!({"idempotencyKey":uuid::Uuid::new_v4(),"flowId":flow_id}),
-            )
-            .await?;
-            if poll.get("error").is_some() {
-                println!("{}", poll);
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let current = control::client(&dir, "connection.get", json!({})).await?;
+            if current.get("error").is_some() {
+                println!("{}", current);
                 std::process::exit(1)
             }
-            if poll["result"]["status"] == "authenticated" {
-                println!("{}", poll["result"]);
+            if current["result"]["state"] == "authenticated" {
+                println!("{}", current["result"]);
                 break;
+            }
+            if current["result"]["state"] == "verification_expired"
+                || current["result"]["state"] == "signed_out"
+                || current["result"]["login"]["flowId"] != flow_id
+            {
+                bail!("LOGIN_EXPIRED_OR_CANCELED")
+            }
+            if current["result"]["state"] == "recovery_pending"
+                || current["result"]["state"] == "credential_store_unavailable"
+            {
+                bail!("LOGIN_RECOVERY_REQUIRED")
             }
         }
     }

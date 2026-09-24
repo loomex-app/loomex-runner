@@ -160,7 +160,7 @@ Current unit and fake-backend tests verify many enforcement and recovery paths b
 
 ### Connection presentation
 
-`connection.views.create/get/update` provide owner-local pre-authentication navigation persistence, using a fixed scope distinct from organization-bound presentation records. The Unix socket owner check remains the trust boundary; these records contain no credentials and authorize no backend actions. Restoring a record requires fresh connection/list reads. Revisions and idempotent writes prevent silent concurrent overwrites. `connection.get.webAppUrl` is an optional validated HTTPS destination set with the build-time `LOOMEX_WEB_APP_ORIGIN`; no frontend URL is guessed from the API origin.
+`connection.views.create/get/update` provide owner-local pre-authentication navigation persistence, using a fixed scope distinct from organization-bound presentation records. The Unix socket owner check remains the trust boundary; these records contain no credentials and authorize no backend actions. Restoring a record requires fresh connection/list reads. Revisions and idempotent writes prevent silent concurrent overwrites. `connection.get.webAppUrl` is an optional validated destination set with the build-time `LOOMEX_WEB_APP_ORIGIN`: HTTPS in production, or explicit loopback HTTP in a debug build. Invalid configured origins prevent runner startup. No frontend URL is guessed from the API origin.
 
 ## Execution ownership (Phase 5)
 

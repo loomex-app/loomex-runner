@@ -19,6 +19,7 @@ pub struct SignedCredential {
 pub struct Api {
     client: reqwest::Client,
     origin: Url,
+    web_app_origin: Option<Url>,
 }
 #[derive(Debug)]
 pub struct ApiError {
@@ -133,9 +134,43 @@ fn safe_validation_data(payload: &Value) -> Option<Value> {
 fn safe_authoring_error_data(code: &str, payload: &Value) -> Option<Value> {
     if !matches!(
         code,
-        "WORKFLOW_DEFINITION_REQUIRED" | "WORKFLOW_NOTES_INVALID" | "WORKFLOW_GRAPH_INVALID"
+        "WORKFLOW_DEFINITION_REQUIRED"
+            | "WORKFLOW_NOTES_INVALID"
+            | "WORKFLOW_GRAPH_INVALID"
+            | "WORKFLOW_AUTHORING_INVALID"
     ) {
         return None;
+    }
+    if code == "WORKFLOW_AUTHORING_INVALID" {
+        let version = payload
+            .pointer("/error/details/authoringIssueVersion")?
+            .as_str()?;
+        let issues = payload
+            .pointer("/error/details/authoringIssues")?
+            .as_array()?;
+        if version != "v1" || issues.is_empty() || issues.len() > MAX_VALIDATION_ISSUES {
+            return None;
+        }
+        let projected = issues
+            .iter()
+            .filter_map(|issue| {
+                let code = issue.get("code")?.as_str()?;
+                let path = issue.get("path")?.as_str()?;
+                let message = issue.get("message")?.as_str()?;
+                if code.is_empty()
+                    || code.len() > 120
+                    || path.is_empty()
+                    || path.len() > 512
+                    || message.is_empty()
+                    || message.len() > MAX_AUTHORING_ERROR_MESSAGE_BYTES
+                {
+                    return None;
+                }
+                Some(json!({"code":code,"path":path,"message":message}))
+            })
+            .collect::<Vec<_>>();
+        return (projected.len() == issues.len())
+            .then(|| json!({"authoringIssueVersion":"v1","authoringIssues":projected}));
     }
     let message = payload.pointer("/error/details/message")?.as_str()?;
     (!message.is_empty() && message.len() <= MAX_AUTHORING_ERROR_MESSAGE_BYTES)
@@ -215,6 +250,15 @@ fn validate_origin(raw: &str, development: bool) -> anyhow::Result<Url> {
     );
     Ok(origin)
 }
+
+fn validate_web_app_origin(raw: &str, debug_build: bool) -> anyhow::Result<Url> {
+    validate_origin(raw, false)
+        .or_else(|_| {
+            anyhow::ensure!(debug_build, "INVALID_WEB_APP_ORIGIN");
+            validate_origin(raw, true)
+        })
+        .map_err(|_| anyhow::anyhow!("INVALID_WEB_APP_ORIGIN"))
+}
 fn request_timeout(method: &str, route: &str) -> Duration {
     let path = route.split('?').next().unwrap_or(route);
     let resource_get = method == "GET"
@@ -250,9 +294,7 @@ fn select_origin(
 impl Api {
     /// Explicit product destination; an API origin does not imply a web UI.
     pub fn web_app_url(&self) -> Option<String> {
-        option_env!("LOOMEX_WEB_APP_ORIGIN")
-            .and_then(|value| validate_origin(value, false).ok())
-            .map(|url| url.to_string())
+        self.web_app_origin.as_ref().map(Url::to_string)
     }
 
     #[cfg(test)]
@@ -270,7 +312,11 @@ impl Api {
             development_origin.as_deref(),
             cfg!(debug_assertions),
         )?;
-        Self::with_origin(origin)
+        let mut api = Self::with_origin(origin)?;
+        api.web_app_origin = option_env!("LOOMEX_WEB_APP_ORIGIN")
+            .map(|value| validate_web_app_origin(value, cfg!(debug_assertions)))
+            .transpose()?;
+        Ok(api)
     }
     pub(crate) fn with_origin(origin: Url) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
@@ -279,22 +325,35 @@ impl Api {
             .timeout(Duration::from_secs(12))
             .build()
             .map_err(|_| anyhow::anyhow!("API_CLIENT_UNAVAILABLE"))?;
-        Ok(Self { client, origin })
+        Ok(Self {
+            client,
+            origin,
+            web_app_origin: None,
+        })
     }
-    pub(crate) fn verification_uri(&self, path: &str, user_code: &str) -> anyhow::Result<String> {
+    pub(crate) fn browser_authorization_uri(
+        &self,
+        path: &str,
+        transaction: &str,
+        state: &str,
+    ) -> anyhow::Result<String> {
         anyhow::ensure!(
-            path.starts_with('/') && !path.starts_with("//") && !path.contains('\\'),
-            "INVALID_VERIFICATION_URI"
+            path == "/api/v1/runner-control/runner/v2/browser-authorities/authorize/",
+            "INVALID_AUTHORIZATION_URI"
         );
         let mut url = self
             .origin
             .join(path)
-            .map_err(|_| anyhow::anyhow!("INVALID_VERIFICATION_URI"))?;
+            .map_err(|_| anyhow::anyhow!("INVALID_AUTHORIZATION_URI"))?;
         anyhow::ensure!(
-            url.origin() == self.origin.origin(),
-            "INVALID_VERIFICATION_URI"
+            url.origin() == self.origin.origin()
+                && url.query().is_none()
+                && url.fragment().is_none(),
+            "INVALID_AUTHORIZATION_URI"
         );
-        url.query_pairs_mut().append_pair("userCode", user_code);
+        url.query_pairs_mut()
+            .append_pair("transaction", transaction)
+            .append_pair("state", state);
         Ok(url.into())
     }
     pub async fn request(
@@ -461,6 +520,29 @@ mod tests {
         );
         assert!(select_origin(None, Some("http://127.0.0.1:9000"), true).is_ok());
         assert!(select_origin(None, Some("https://external.example.com"), true).is_err());
+    }
+    #[test]
+    fn web_app_origin_accepts_explicit_local_frontend_only_in_debug_build() {
+        assert_eq!(
+            validate_web_app_origin("https://app.example.com", false)
+                .unwrap()
+                .as_str(),
+            "https://app.example.com/"
+        );
+        assert_eq!(
+            validate_web_app_origin("http://127.0.0.1:5173", true)
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:5173/"
+        );
+        for invalid in [
+            "http://127.0.0.1:5173/workspace/",
+            "http://example.com",
+            "http://127.0.0.1:5173/?token=private",
+        ] {
+            assert!(validate_web_app_origin(invalid, true).is_err());
+        }
+        assert!(validate_web_app_origin("http://127.0.0.1:5173", false).is_err());
     }
     #[test]
     fn proof_binds_exact_request() {
@@ -661,5 +743,38 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.data.is_none());
+    }
+
+    #[test]
+    fn workflow_authoring_issues_preserve_only_bounded_typed_fields() {
+        let error = parse_envelope(
+            422,
+            json!({
+                "error": {
+                    "code": "WORKFLOW_AUTHORING_INVALID",
+                    "details": {
+                        "authoringIssueVersion": "v1",
+                        "authoringIssues": [{
+                            "code": "WORKFLOW_DEFINITION_INVALID",
+                            "path": "$.nodes[1].inputs.answer",
+                            "message": "The source field is not defined."
+                        }],
+                        "definition": {"secret": "must-not-cross"}
+                    }
+                }
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.data,
+            Some(json!({
+                "authoringIssueVersion": "v1",
+                "authoringIssues": [{
+                    "code": "WORKFLOW_DEFINITION_INVALID",
+                    "path": "$.nodes[1].inputs.answer",
+                    "message": "The source field is not defined."
+                }]
+            }))
+        );
     }
 }

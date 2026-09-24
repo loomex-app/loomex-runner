@@ -18,6 +18,11 @@
     "runs.cancel": {
       "method": "runs.get",
       "identity": "runId"
+    },
+    "workflows.publish": {
+      "method": "workflow.operations.get",
+      "identity": "idempotencyKey",
+      "operation": "workflows.publish"
     }
   }
 }

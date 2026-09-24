@@ -187,7 +187,7 @@
             "status.get",
             "auth.status",
             "auth.login",
-            "auth.poll",
+            "auth.cancel",
             "auth.logout",
             "organizations.list",
             "organizations.select",

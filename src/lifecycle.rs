@@ -3,7 +3,7 @@
 //! This module deliberately does not take the daemon lock.  A lifecycle
 //! operation may drain or replace the daemon, while workflow execution keeps
 //! using `daemon.lock`; the two ownership domains must remain independent.
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -630,7 +630,8 @@ async fn launchctl_label_absent() -> Result<bool> {
 }
 
 async fn daemon_status(paths: &Paths) -> Result<Value> {
-    let response = crate::control::client(&paths.state_dir, "status.get", json!({})).await?;
+    let response =
+        crate::control::lifecycle_client(&paths.state_dir, "status.get", json!({})).await?;
     response
         .get("result")
         .cloned()
@@ -645,14 +646,18 @@ async fn drain_and_require_idle(paths: &Paths, required: bool) -> Result<()> {
         }
         return Ok(());
     }
-    match crate::control::client(
+    match crate::control::lifecycle_client(
         &paths.state_dir,
         "daemon.drain",
         json!({"idempotencyKey":Uuid::new_v4()}),
     )
     .await
     {
-        Ok(_) => {}
+        Ok(response) if response["result"]["draining"] == true => {}
+        Ok(response) if response["error"]["code"] == "ACTIVE_WORK_REQUIRES_DRAIN" => {
+            bail!("ROLLBACK_REQUIRES_DRAINED_IDLE_DAEMON")
+        }
+        Ok(_) => bail!("LIFECYCLE_DRAIN_REJECTED"),
         Err(_error) if !required => return Ok(()),
         Err(error) => return Err(error),
     }
@@ -808,12 +813,16 @@ async fn restore_activation(paths: &Paths, operation: &mut Operation) -> Result<
     // phase alone.
     match daemon_status(paths).await {
         Ok(_) => {
-            crate::control::client(
+            let drained = crate::control::lifecycle_client(
                 &paths.state_dir,
                 "daemon.drain",
                 json!({"idempotencyKey":Uuid::new_v4()}),
             )
             .await?;
+            ensure!(
+                drained["result"]["draining"] == true,
+                "LIFECYCLE_DRAIN_REJECTED"
+            );
             validate_rollback_status(&json!({"result":daemon_status(paths).await?}))?;
         }
         Err(_) if launchctl_label_absent().await? => {}
