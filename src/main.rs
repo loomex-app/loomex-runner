@@ -114,7 +114,7 @@ async fn run() -> Result<()> {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let current = control::client(&dir, "connection.get", json!({})).await?;
             if current.get("error").is_some() {
-                println!("{}", current);
+                println!("{current}");
                 std::process::exit(1)
             }
             if current["result"]["state"] == "authenticated" {
@@ -142,7 +142,7 @@ async fn run() -> Result<()> {
 /// useful when the daemon is unavailable, so runner-connect errors become data
 /// instead of terminating the command.
 async fn diagnostics(dir: &Path) -> Value {
-    let mut daemon = json!({"connected":false,"reason":"RUNNER_UNAVAILABLE"});
+    let daemon;
     let mut installation = json!({"available":false,"reason":"RUNNER_UNAVAILABLE"});
     match control::client(dir, "status.get", json!({})).await {
         Ok(response) if response.get("error").is_none() => {

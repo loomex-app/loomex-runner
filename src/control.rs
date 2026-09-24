@@ -2387,7 +2387,7 @@ fn validate_params(p: &Value, schema: &Value) -> Result<()> {
         };
         let valid = s["type"]
             .as_str()
-            .map(&type_matches)
+            .map(type_matches)
             .or_else(|| {
                 s["type"]
                     .as_array()
