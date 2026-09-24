@@ -261,6 +261,13 @@ pub async fn execute_with_supervisor(
                 "guardian exited without a durable target status".to_owned()
             });
         }
+        if (canceled || error.is_some()) && !observation_failed && !guardian_alive && !others_alive
+        {
+            // The owned group has no live members. Signaling it now races the
+            // guardian's exit and can fail even though cleanup is complete.
+            managed_group_stopped = true;
+            break;
+        }
         if (canceled || error.is_some()) && terminate_at.is_none() {
             signal_owned_group(&identity, libc::SIGTERM)?;
             terminate_at = Some(Instant::now());
