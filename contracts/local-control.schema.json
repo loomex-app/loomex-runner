@@ -187,6 +187,7 @@
             "status.get",
             "auth.status",
             "auth.login",
+            "auth.open_browser",
             "auth.cancel",
             "auth.logout",
             "organizations.list",

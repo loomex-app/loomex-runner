@@ -14,6 +14,7 @@
     "method:auth.cancel",
     "method:auth.login",
     "method:auth.logout",
+    "method:auth.open_browser",
     "method:auth.recover",
     "method:auth.status",
     "method:builder.catalog",
@@ -97,11 +98,11 @@
   "catalogVersion": "0.3.5",
   "generatedFrom": {
     "backendRoutes": {
-      "digest": "sha256:fb9f137c67f964d21d511134f74434db869b5e3df895ce8446ce0274251a9970",
+      "digest": "sha256:1ddeb80c2846e2fd2a217723cac2529bf4b48b8d4445548b76c455d5c26f9eea",
       "path": "contracts/backend-routes.json"
     },
     "methodCatalog": {
-      "digest": "sha256:046c334967042a6f3dbc54e6897f740df264d46fca9c905543ce37c2a640be2b",
+      "digest": "sha256:31bbbe965a619a5cf1dd851ba71d2ff0ab485f099239da864cdfcb85a59977ee",
       "path": "contracts/method-catalog.json"
     }
   },
@@ -177,6 +178,16 @@
       "routeIds": [
         "auth.device.logout"
       ],
+      "transportRetry": "never_after_send"
+    },
+    {
+      "classification": "local-control",
+      "idempotent": false,
+      "inputSchemaDigest": "sha256:3e4bc3f223e21b9b68d4443ff2720595309c7d2f2a0961a571c2755035d47742",
+      "mutating": true,
+      "name": "auth.open_browser",
+      "outputSchemaDigest": "sha256:a960d108a0eae0e89ddb650eca851e2a722eca58aa51b80dd2b1bea0bbdebf75",
+      "routeIds": [],
       "transportRetry": "never_after_send"
     },
     {
@@ -801,13 +812,15 @@
       "transportRetry": "never_after_send"
     },
     {
-      "classification": "local-control",
+      "classification": "backend-proxy",
       "idempotent": true,
       "inputSchemaDigest": "sha256:42127d623c6043a303e8cf0f36333ce533dcd8efacaaab6f194a817ff221f8da",
       "mutating": false,
       "name": "runs.start_handoff.get",
       "outputSchemaDigest": "sha256:854c728e306e1e975f95c84cf267755b9c559f7814cc0dd22b8ac67e521a32a3",
-      "routeIds": [],
+      "routeIds": [
+        "execution.commit.outcome"
+      ],
       "transportRetry": "before_response_once"
     },
     {
@@ -1199,6 +1212,12 @@
       "source": "src/control.rs"
     },
     {
+      "id": "execution.commit.outcome",
+      "method": "POST",
+      "pathTemplate": "v2/executions/commit-outcome/",
+      "source": "src/control.rs"
+    },
+    {
       "id": "execution.delete",
       "method": "POST",
       "pathTemplate": "v1/executions/{executionId}/delete/",
@@ -1321,14 +1340,14 @@
   ],
   "schemaVersion": "loomex.runner.compatibility-manifest/v1",
   "summary": {
-    "backendRouteCount": 56,
-    "capabilityCount": 93,
+    "backendRouteCount": 57,
+    "capabilityCount": 94,
     "methodClassifications": {
       "backend-auth": 6,
-      "backend-proxy": 38,
+      "backend-proxy": 39,
       "daemon-lifecycle": 1,
       "local-control": 33
     },
-    "methodCount": 78
+    "methodCount": 79
   }
 }

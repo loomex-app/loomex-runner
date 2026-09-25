@@ -183,6 +183,12 @@
       "source": "src/control.rs"
     },
     {
+      "id": "execution.commit.outcome",
+      "method": "POST",
+      "pathTemplate": "v2/executions/commit-outcome/",
+      "source": "src/control.rs"
+    },
+    {
       "id": "execution.list",
       "method": "GET",
       "pathTemplate": "v2/executions/",
@@ -389,6 +395,11 @@
       "routeIds": [
         "auth.browser.start"
       ]
+    },
+    {
+      "method": "auth.open_browser",
+      "classification": "local-control",
+      "routeIds": []
     },
     {
       "method": "auth.cancel",
@@ -600,8 +611,10 @@
     },
     {
       "method": "runs.start_handoff.get",
-      "classification": "local-control",
-      "routeIds": []
+      "classification": "backend-proxy",
+      "routeIds": [
+        "execution.commit.outcome"
+      ]
     },
     {
       "method": "runs.start_handoff.commit",

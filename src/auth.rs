@@ -12,7 +12,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -23,6 +23,31 @@ use tokio::{
 const SERVICE: &str = "app.loomex.runner.v1";
 const ACCOUNT: &str = "installation";
 const BROWSER_AUTH_CSS: &str = include_str!("../assets/browser_authority.css");
+
+#[cfg(target_os = "macos")]
+async fn launch_browser(url: &str) -> Result<()> {
+    use std::process::Stdio;
+    let status = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new("/usr/bin/open")
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await
+    .map_err(|_| anyhow!("BROWSER_LAUNCH_TIMEOUT"))?
+    .map_err(|_| anyhow!("BROWSER_LAUNCH_FAILED"))?;
+    ensure!(status.success(), "BROWSER_LAUNCH_FAILED");
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn launch_browser(_url: &str) -> Result<()> {
+    bail!("BROWSER_LAUNCH_UNAVAILABLE")
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BrowserCallbackOutcome {
@@ -630,6 +655,54 @@ impl Auth {
         self.save(&state).await?;
         Ok(login_projection(state.login.as_ref().unwrap()))
     }
+
+    /// Launch only the authorization URL sealed for the current pending flow.
+    /// The URL is never accepted from the caller, and opening it does not prove
+    /// authentication or approval. The callback remains runner-owned.
+    pub async fn open_browser(&self, flow_id: &str) -> Result<Value> {
+        self.open_browser_with(flow_id, |url| async move { launch_browser(&url).await })
+            .await
+    }
+
+    async fn open_browser_with<F, Fut>(&self, flow_id: &str, opener: F) -> Result<Value>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        let _guard = self.lock.lock().await;
+        let state = self.required().await?;
+        Self::allowed(&state)?;
+        ensure!(state.device.is_none(), "AUTH_ALREADY_COMPLETED");
+        let login = state
+            .login
+            .as_ref()
+            .ok_or_else(|| anyhow!("LOGIN_REQUIRED"))?;
+        ensure!(
+            flow_identity(&state, login) == flow_id,
+            "LOGIN_FLOW_MISMATCH"
+        );
+        ensure!(login.expires_at > now(), "AUTH_EXPIRED");
+        ensure!(login.received_code.is_none(), "AUTH_PENDING_COMPLETION");
+        let url = login
+            .authorization_url
+            .as_ref()
+            .ok_or_else(|| anyhow!("BROWSER_LINK_UNAVAILABLE"))?;
+        let expected = self.api.browser_authorization_uri(
+            "/api/v1/runner-control/runner/v2/browser-authorities/authorize/",
+            login
+                .transaction_id
+                .as_deref()
+                .ok_or_else(|| anyhow!("BROWSER_LINK_UNAVAILABLE"))?,
+            login
+                .browser_state
+                .as_deref()
+                .ok_or_else(|| anyhow!("BROWSER_LINK_UNAVAILABLE"))?,
+        )?;
+        ensure!(url == &expected, "INVALID_AUTHORIZATION_URI");
+        opener(url.clone()).await?;
+        Ok(json!({"status":"launch_requested","flowId":flow_id}))
+    }
+
     async fn spawn_callback(&self, listener: TcpListener, flow_id: String) {
         let auth = self.clone();
         let id = flow_id.clone();
@@ -1322,6 +1395,64 @@ mod tests {
         let projection = login_projection(&login);
         assert!(!projection.to_string().contains("SECRET"));
         assert_eq!(projection["flowId"], "flow-id");
+    }
+    #[tokio::test]
+    async fn browser_launch_uses_only_the_current_sealed_flow_url() {
+        let api = Api::for_test_origin("http://127.0.0.1:28080").unwrap();
+        let expected = api
+            .browser_authorization_uri(
+                "/api/v1/runner-control/runner/v2/browser-authorities/authorize/",
+                "transaction-id",
+                "browser-state",
+            )
+            .unwrap();
+        let auth = Auth::test_unauthed(api);
+        let mut state = ProtectedState::fresh();
+        state.login = Some(Login {
+            flow_id: "current-flow".into(),
+            authorization_url: Some(expected.clone()),
+            transaction_id: Some("transaction-id".into()),
+            browser_state: Some("browser-state".into()),
+            expires_at: now() + 60,
+            ..Login::default()
+        });
+        auth.save(&state).await.unwrap();
+        let result = auth
+            .open_browser_with("current-flow", move |url| async move {
+                assert_eq!(url, expected);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "launch_requested");
+        assert_eq!(result["flowId"], "current-flow");
+        assert_eq!(
+            auth.open_browser_with("old-flow", |_| async { panic!("stale flow launched") })
+                .await
+                .unwrap_err()
+                .to_string(),
+            "LOGIN_FLOW_MISMATCH"
+        );
+        state.login.as_mut().unwrap().authorization_url = Some("https://example.test/other".into());
+        auth.save(&state).await.unwrap();
+        assert_eq!(
+            auth.open_browser_with("current-flow", |_| async {
+                panic!("unsealed URL launched")
+            })
+            .await
+            .unwrap_err()
+            .to_string(),
+            "INVALID_AUTHORIZATION_URI"
+        );
+        state.login.as_mut().unwrap().expires_at = 0;
+        auth.save(&state).await.unwrap();
+        assert_eq!(
+            auth.open_browser_with("current-flow", |_| async { panic!("expired URL launched") })
+                .await
+                .unwrap_err()
+                .to_string(),
+            "AUTH_EXPIRED"
+        );
     }
     #[tokio::test]
     async fn connection_projection_reports_resumable_states_without_credentials() {

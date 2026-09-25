@@ -492,6 +492,88 @@
       "appOnly": false
     },
     {
+      "name": "auth.open_browser",
+      "mutating": true,
+      "idempotent": false,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "flowId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 160
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "flowId",
+          "idempotencyKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "status": {
+                "const": "launch_requested"
+              },
+              "flowId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              }
+            },
+            "required": [
+              "status",
+              "flowId"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "transportRetry": "never_after_send",
+      "appOnly": true
+    },
+    {
       "name": "auth.cancel",
       "mutating": true,
       "idempotent": true,
@@ -8793,6 +8875,7 @@
     "method:connection.get",
     "method:auth.status",
     "method:auth.login",
+    "method:auth.open_browser",
     "method:auth.cancel",
     "method:auth.recover",
     "method:auth.logout",

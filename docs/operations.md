@@ -62,6 +62,7 @@ If a provider or command effect may have started and the daemon loses durable ou
 | `RUNNER_UNAVAILABLE` | The socket is absent, unsafe, inaccessible, refused a connection, or transport failed before a mutation was known sent. Run `loomex diagnostics`, check LaunchAgent/daemon status, state ownership, and `control.sock`; preserve state. |
 | `LIFECYCLE_ERROR` | A lifecycle journal, LaunchAgent, or candidate-health operation could not be completed. Run `loomex lifecycle status --json`; preserve the lifecycle journal and use `resume` or `repair` when it identifies an action. |
 | `NETWORK_AMBIGUOUS` | A local mutation may have reached the runner. Retry the same intended mutation with the returned idempotency key or query the resulting resource. |
+| Start handoff `ambiguous` | Read the exact handoff again. Its getter checks the original backend commit receipt and restores the recorded run when accepted. A missing receipt or unavailable lookup never authorizes another Start; retain the handoff and retry observation after connectivity returns. |
 | `AUTH_REQUIRED` / `AUTH_EXPIRED` | Device or organization authority is missing. Inspect `auth.status`; complete login or repair enrollment rather than supplying tokens manually. |
 | `AUTH_RECOVERY_PENDING` / `AUTH_RECOVERY_EXHAUSTED` | A credential mutation has durable uncertain state. Preserve Keychain state and reconcile the backend record; repeated recovery is intentionally blocked. |
 | `WORKSPACE_DENIED` | The canonical path, inode, organization, or installation no longer matches the grant. Inspect and explicitly grant the intended existing directory. |
@@ -73,6 +74,8 @@ If a provider or command effect may have started and the daemon loses durable ou
 | Disk exhaustion | Output spooling or atomic state writes can fail and make the outcome indeterminate. Free space without deleting active/undelivered runner evidence, then reconcile. There is no silent truncation fallback. |
 
 The daemon retries retryable terminal and artifact delivery from durable evidence. It may reclaim a backend fence for terminal submission only. It does not replay provider or command execution. Restart recovery redelivers a durable exit/result or converts a nonterminal journal to an indeterminate terminal error.
+
+Start acceptance is durable in the backend database. Redis only wakes workflow workers; a failed wake-up does not change a committed Start receipt. The runner's `runs.start_handoff.get` reconciles an uncertain local handoff through `v2/executions/commit-outcome/` using the original preparation, digest and idempotency key. A completed receipt restores the local run binding and follow record. `not_found`, `pending` and transport failure retain `ambiguous` without a second commit. Inspect `details.reconciliationStatus` for the observation state. Redis outage warnings are rate limited per backend process; service stdout and stderr still need bounded rotation in the host's logging setup.
 
 ## Output, artifacts, and retention
 

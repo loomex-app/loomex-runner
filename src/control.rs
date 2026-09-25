@@ -179,6 +179,7 @@ impl Daemon {
             && write
             && ![
                 "auth.login",
+                "auth.open_browser",
                 "auth.cancel",
                 "auth.recover",
                 "auth.logout",
@@ -445,6 +446,9 @@ impl Daemon {
                         key.unwrap(),
                     )
                     .await;
+            }
+            "auth.open_browser" => {
+                return self.auth.open_browser(required(p, "flowId")?).await;
             }
             "auth.cancel" => return self.auth.cancel_login(required(p, "flowId")?).await,
             "auth.recover" => return self.auth.reconcile().await,
@@ -1727,6 +1731,11 @@ impl Daemon {
                 projection["result"] = result;
             }
         }
+        if lifecycle == "ambiguous" {
+            projection["details"] = json!({
+                "reconciliationStatus":record["reconciliationStatus"].as_str().unwrap_or("not_checked"),
+            });
+        }
         Ok(projection)
     }
 
@@ -1853,8 +1862,129 @@ impl Daemon {
     /// a preparation, so callers can inspect a failed or ambiguous lifecycle.
     async fn get_run_start_handoff(&self, org: &str, p: &Value) -> Result<Value> {
         let handoff_ref = required(p, "handoffRef")?;
-        let (_, record) = self.load_start_handoff(org, handoff_ref).await?;
+        let lock = self.start_handoff_lock(handoff_ref)?;
+        let _guard = lock.lock().await;
+        let (path, mut record) = self.load_start_handoff(org, handoff_ref).await?;
+        if matches!(
+            Self::start_handoff_lifecycle(&record),
+            "committing" | "ambiguous"
+        ) {
+            let preparation_lock = self.preparation_handoff_lock(&record)?;
+            let _preparation_guard = preparation_lock.lock().await;
+            self.reconcile_start_handoff(org, &path, &mut record)
+                .await?;
+        }
+        if record["schemaVersion"] == "loomex.run-start-handoff/v2"
+            && Self::start_handoff_lifecycle(&record) == "committed"
+            && record["followActivationState"] != "active"
+        {
+            self.finish_committed_start_handoff(org, &path, &mut record)
+                .await?;
+        }
         self.start_handoff_projection(&record)
+    }
+
+    /// Look up the original backend receipt. This path never sends a commit or
+    /// obtains fresh execution authority, including for an expired review.
+    async fn reconcile_start_handoff(
+        &self,
+        org: &str,
+        path: &Path,
+        record: &mut Value,
+    ) -> Result<()> {
+        if record["schemaVersion"] != "loomex.run-start-handoff/v2" {
+            return Ok(());
+        }
+        let commit = &record["commit"];
+        let preparation = required(commit, "preparationId")?;
+        let digest = required(commit, "bindingDigest")?;
+        let key = required(commit, "idempotencyKey")?;
+        ensure!(
+            record["preparationId"] == preparation && record["bindingDigest"] == digest,
+            "START_HANDOFF_STALE"
+        );
+        let outcome = match self.backend(
+            org,
+            "POST",
+            "v2/executions/commit-outcome/",
+            Some(json!({"preparationId":preparation,"bindingDigest":digest,"idempotencyKey":key})),
+            None,
+        ).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if error.downcast_ref::<ApiError>().is_some_and(|api| {
+                    matches!(
+                        api.code.as_str(),
+                        "IDEMPOTENCY_KEY_CONFLICT"
+                            | "EXECUTION_BINDING_CONFLICT"
+                            | "PREPARATION_NOT_FOUND"
+                            | "EXECUTION_RECEIPT_INVALID"
+                    )
+                }) {
+                    return Err(error);
+                }
+                // An unavailable lookup provides no proof that the original
+                // commit failed. Keep the journal and its exact key intact.
+                record["lifecycle"] = json!("ambiguous");
+                record["lastError"] = json!(error.to_string());
+                record["reconciliationStatus"] = json!("unavailable");
+                state::write_json(path, record)?;
+                return Ok(());
+            }
+        };
+        match outcome["status"].as_str() {
+            Some("not_found" | "pending") => {
+                record["lifecycle"] = json!("ambiguous");
+                record["reconciliationStatus"] = outcome["status"].clone();
+                state::write_json(path, record)?;
+                return Ok(());
+            }
+            Some("completed") => {}
+            _ => bail!("BACKEND_PROTOCOL_ERROR"),
+        }
+        let result = outcome
+            .get("response")
+            .filter(|value| value.is_object())
+            .cloned()
+            .context("BACKEND_PROTOCOL_ERROR")?;
+        let run = result
+            .pointer("/execution/id")
+            .and_then(Value::as_str)
+            .or_else(|| result.get("executionId").and_then(Value::as_str))
+            .filter(|value| Uuid::parse_str(value).is_ok())
+            .context("BACKEND_PROTOCOL_ERROR")?
+            .to_owned();
+        ensure!(
+            result["preparationId"] == preparation && result["executionPolicy"] == "host_user/v1",
+            "BACKEND_PROTOCOL_ERROR"
+        );
+        let preparation_path = self
+            .dir
+            .join("preparations")
+            .join(format!("{preparation}.json"));
+        let mut local_preparation: Value = state::read_json(&preparation_path)
+            .map_err(|_| anyhow::anyhow!("PRECONDITION_FAILED"))?;
+        ensure!(
+            local_preparation["bindingDigest"] == digest
+                && local_preparation["organizationId"] == org
+                && local_preparation["commitAuthorization"]["idempotencyKey"] == key,
+            "PRECONDITION_FAILED"
+        );
+        state::write_json(
+            &self.dir.join("run-bindings").join(format!("{run}.json")),
+            &local_preparation,
+        )?;
+        local_preparation["commitResult"] = result.clone();
+        state::write_json(&preparation_path, &local_preparation)?;
+        record["lifecycle"] = json!("committed");
+        record["result"] = result;
+        record["runId"] = json!(run);
+        record["followActivationState"] = json!("pending");
+        record["updatedAt"] = json!(state::now());
+        state::write_json(path, record)?;
+        self.finish_committed_start_handoff(org, path, record)
+            .await?;
+        Ok(())
     }
 
     /// Reconcile an interrupted app-side issue using the original issue key.
@@ -1923,6 +2053,20 @@ impl Daemon {
                 record["lastError"] = json!(error.to_string());
                 record["updatedAt"] = json!(state::now());
                 state::write_json(&path, &record)?;
+                // A failed HTTP acknowledgement may arrive after the backend
+                // has committed. Resolve the receipt before returning doubt.
+                if self
+                    .reconcile_start_handoff(org, &path, &mut record)
+                    .await
+                    .is_ok()
+                    && Self::start_handoff_lifecycle(&record) == "committed"
+                {
+                    let result = record
+                        .get("result")
+                        .cloned()
+                        .context("BACKEND_PROTOCOL_ERROR")?;
+                    return self.committed_start_handoff_result(&record, result);
+                }
                 return Err(error);
             }
         };
@@ -3994,6 +4138,104 @@ mod conformance {
         );
         let durable: Value = state::read_json(&path).unwrap();
         assert_eq!(durable["followActivationState"], "active");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_start_handoff_reads_exact_receipt_without_recommitting() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = fixture(temp.path(), api);
+        let org = "11111111-1111-4111-8111-111111111111";
+        let account = "22222222-2222-4222-8222-222222222222";
+        let installation = "00000000-0000-4000-8000-000000000001";
+        let ticket = Uuid::new_v4().to_string();
+        let preparation = Uuid::new_v4().to_string();
+        let run = Uuid::new_v4().to_string();
+        let key = Uuid::new_v4().to_string();
+        let result = json!({"execution":{"id":run},"executionId":run,"preparationId":preparation,"executionPolicy":"host_user/v1"});
+        let prep_path = temp
+            .path()
+            .join("preparations")
+            .join(format!("{preparation}.json"));
+        state::write_json(
+            &prep_path,
+            &json!({
+                "organizationId":org,"accountSubject":account,"installationId":installation,
+                "bindingDigest":"digest","commitAuthorization":{"idempotencyKey":key},
+            }),
+        )
+        .unwrap();
+        let handoff_path = temp
+            .path()
+            .join("start-handoffs")
+            .join(format!("{ticket}.json"));
+        state::write_json(&handoff_path, &json!({
+            "schemaVersion":"loomex.run-start-handoff/v2","handoffRef":ticket,
+            "organizationId":org,"accountSubject":account,"installationId":installation,
+            "preparationId":preparation,"bindingDigest":"digest","lifecycle":"ambiguous",
+            "approvalObserved":true,
+            "commit":{"preparationId":preparation,"bindingDigest":"digest","idempotencyKey":key},
+        })).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, head) = receive_http(&listener).await;
+            assert!(head.starts_with(
+                "POST /api/v1/runner-control/runner/v2/executions/commit-outcome/ HTTP/1.1"
+            ));
+            reply_http(stream, 200, json!({"status":"completed","response":result})).await;
+            // A second commit would require another HTTP connection and fail
+            // this test if the runner attempted one.
+        });
+        let projected = daemon
+            .get_run_start_handoff(org, &json!({"handoffRef":ticket}))
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(projected["lifecycle"], "committed");
+        assert_eq!(projected["runId"], run);
+        assert_eq!(
+            state::read_json::<Value>(&handoff_path).unwrap()["followActivationState"],
+            "active"
+        );
+        assert_eq!(
+            state::read_json::<Value>(&prep_path).unwrap()["commitResult"]["executionId"],
+            run
+        );
+        assert_eq!(
+            daemon
+                .get_run_start_handoff(org, &json!({"handoffRef":ticket}))
+                .await
+                .unwrap()["runId"],
+            run
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_start_outcome_stays_ambiguous_and_never_replays_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = fixture(
+            temp.path(),
+            Api::for_test_origin("http://127.0.0.1:9").unwrap(),
+        );
+        let org = "11111111-1111-4111-8111-111111111111";
+        let ticket = Uuid::new_v4().to_string();
+        let preparation = Uuid::new_v4().to_string();
+        state::write_json(&temp.path().join("start-handoffs").join(format!("{ticket}.json")), &json!({
+            "schemaVersion":"loomex.run-start-handoff/v2","handoffRef":ticket,
+            "organizationId":org,"accountSubject":"22222222-2222-4222-8222-222222222222",
+            "installationId":"00000000-0000-4000-8000-000000000001",
+            "preparationId":preparation,"bindingDigest":"digest","lifecycle":"ambiguous",
+            "approvalObserved":true,
+            "commit":{"preparationId":preparation,"bindingDigest":"digest","idempotencyKey":Uuid::new_v4()},
+        })).unwrap();
+        let status = daemon
+            .get_run_start_handoff(org, &json!({"handoffRef":ticket}))
+            .await
+            .unwrap();
+        assert_eq!(status["lifecycle"], "ambiguous");
+        assert_eq!(status["nextAction"], "reconcile");
+        assert!(status.get("runId").is_none());
     }
     #[tokio::test]
     async fn run_start_handoff_requires_app_only_approval_and_keeps_the_review_immutable() {
