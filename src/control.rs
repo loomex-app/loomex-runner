@@ -2769,7 +2769,13 @@ pub fn provider_diagnostics() -> Value {
         };
         providers.insert(
             provider.into(),
-            json!({"adapter":adapter,"available":available,"reason":reason,"configured":configured}),
+            json!({
+                "adapter":adapter,"available":available,"reason":reason,"configured":configured,
+                // CLI discovery proves executable identity, never this account's
+                // right to use a particular model. Do not infer it from a
+                // product catalog or an unrelated Codex chat session.
+                "modelAccess":"unknown"
+            }),
         );
     }
     Value::Object(providers)

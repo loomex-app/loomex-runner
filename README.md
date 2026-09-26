@@ -106,6 +106,14 @@ Refresh expirations are absolute. Protected pending rotation state is persisted
 before transmission and permits only the backend's explicit recovery protocol.
 Provider login stores remain owned by Codex, Claude, and Gemini CLI.
 
+`loomex diagnostics` distinguishes provider executable availability from model
+access. The installed executable can be verified without using credentials,
+but these CLIs do not provide a stable account-scoped model entitlement list;
+`modelAccess: unknown` is therefore the honest discovery result. A workflow's
+catalog model resolution is not proof that the signed-in provider account can
+run it. A model rejected during execution is reported with a stable, safe
+provider error and requires a newly prepared run with a supported model.
+
 The local newline-JSON socket is `~/.local/share/loomex/runner/control.sock`.
 `LOOMEX_STATE_DIR`, when present, names that exact runner state directory. The
 socket is owner-only and checks the peer UID; it carries no bearer token or proof.

@@ -30,6 +30,25 @@ static TEST_DRAIN_HAS_ACTIVE_WORK: AtomicBool = AtomicBool::new(false);
 static TEST_CANDIDATE_HEALTH_FAIL: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+#[cfg(test)]
+static TEST_RECOVERY_STATUS: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_RECOVERY_FAULT: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_RESTART_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn recovery_fault(stage: &str) -> Result<()> {
+    if TEST_RECOVERY_FAULT
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|value| *value == stage)
+    {
+        bail!("injected recovery interruption: {stage}");
+    }
+    Ok(())
+}
 
 fn lifecycle_test_mode() -> bool {
     #[cfg(test)]
@@ -557,6 +576,14 @@ async fn launchctl(action: &str, agent: &Path) -> Result<()> {
         bail!("injected lifecycle service failure")
     }
     if lifecycle_test_mode() {
+        #[cfg(test)]
+        if action == "kickstart" {
+            recovery_fault("restart_failed")?;
+            TEST_RESTART_COUNT.fetch_add(1, Ordering::SeqCst);
+            if let Some(status) = TEST_RECOVERY_STATUS.lock().unwrap().as_mut() {
+                status["draining"] = json!(false);
+            }
+        }
         return Ok(());
     }
     let uid = unsafe { libc::geteuid() };
@@ -573,6 +600,14 @@ async fn launchctl(action: &str, agent: &Path) -> Result<()> {
                 .arg("bootstrap")
                 .arg(format!("gui/{uid}"))
                 .arg(agent)
+                .status()
+                .await?
+        }
+        "kickstart" => {
+            tokio::process::Command::new(NATIVE_EXECUTABLES[0])
+                .arg("kickstart")
+                .arg("-k")
+                .arg(format!("gui/{uid}/app.loomex.runner"))
                 .status()
                 .await?
         }
@@ -630,6 +665,10 @@ async fn launchctl_label_absent() -> Result<bool> {
 }
 
 async fn daemon_status(paths: &Paths) -> Result<Value> {
+    #[cfg(test)]
+    if let Some(status) = TEST_RECOVERY_STATUS.lock().unwrap().clone() {
+        return Ok(status);
+    }
     let response =
         crate::control::lifecycle_client(&paths.state_dir, "status.get", json!({})).await?;
     response
@@ -778,6 +817,26 @@ async fn reconcile_matching_operation(
     };
     existing.validate()?;
     if terminal(&existing.phase) {
+        if existing.phase == "completed"
+            && existing.kind == kind
+            && existing.package.as_ref() == Some(package)
+        {
+            let resources = existing
+                .resources
+                .as_ref()
+                .context("completed lifecycle operation has no resources")?;
+            ensure!(
+                current_target(paths)?.as_ref() == Some(&package.target)
+                    && regular_digest(&resources.launch_agent)?.as_deref()
+                        == Some(&resources.staged_launch_agent_sha256),
+                "LIFECYCLE_COMPLETED_STATE_MISMATCH"
+            );
+            verify_owned_version(paths, &package.target)?;
+            if candidate_health_check_required() {
+                healthy_candidate(paths, &package.version).await?;
+            }
+            return Ok(Some(json!({"reconciled":true,"operation":existing})));
+        }
         return Ok(None);
     }
     if existing.kind != kind || existing.package.as_ref() != Some(package) {
@@ -884,10 +943,36 @@ async fn reconcile_activation(paths: &Paths, operation: &mut Operation) -> Resul
     let plist_digest = regular_digest(&resources.launch_agent)?;
     let candidate_plist_matches =
         plist_digest.as_deref() == Some(&resources.staged_launch_agent_sha256);
+    if operation.phase == "recovery_required"
+        && pointer.as_ref() == Some(&package.target)
+        && candidate_plist_matches
+    {
+        let status = daemon_status(paths).await?;
+        if candidate_drain_can_be_released(&status, &package.version) {
+            // A failed retry can leave the already-activated candidate drained.
+            // Only the exact journaled candidate, with no managed work, may be
+            // returned to service while the lifecycle lock is held.
+            #[cfg(test)]
+            recovery_fault("before_drain_removal")?;
+            let drain = paths.state_dir.join("drain.json");
+            if drain.exists() || drain.is_symlink() {
+                remove_regular_and_sync(&drain)?;
+            }
+            #[cfg(test)]
+            recovery_fault("after_drain_removal")?;
+            // The daemon also holds its draining state in memory. Restart the
+            // exact registered service after proving it has no managed jobs.
+            launchctl("kickstart", &resources.launch_agent).await?;
+            #[cfg(test)]
+            recovery_fault("after_restart")?;
+        }
+    }
     if pointer.as_ref() == Some(&package.target)
         && candidate_plist_matches
         && healthy_candidate(paths, &package.version).await.is_ok()
     {
+        #[cfg(test)]
+        recovery_fault("before_completion")?;
         set_checkpoint(
             paths,
             operation,
@@ -934,6 +1019,12 @@ async fn reconcile_activation(paths: &Paths, operation: &mut Operation) -> Resul
     // exact saved resources and verifies the previous version.
     restore_activation(paths, operation).await?;
     Ok(json!({"resumed":true,"state":"previous_restored","operation":operation}))
+}
+
+fn candidate_drain_can_be_released(status: &Value, version: &str) -> bool {
+    status["version"] == version
+        && status["activeJobs"].as_u64() == Some(0)
+        && status["draining"] == true
 }
 
 /// `pending_active_work` is an intentional pause before any service switch.
@@ -1801,6 +1892,118 @@ mod tests {
         );
         let saved: Operation = state::read_json(&paths.operation()).unwrap();
         assert_eq!(saved.package.unwrap().manifest_sha256, "a".repeat(64));
+    }
+
+    #[tokio::test]
+    async fn completed_matching_install_reconciles_without_reactivating() {
+        let _serial = TEST_SERIAL.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        make_compatible_target(&paths);
+        let target = paths.versions().join("1.2.3");
+        std::os::unix::fs::symlink(&target, paths.current()).unwrap();
+        fs::write(launch_agent(&paths), b"candidate-plist").unwrap();
+        let package = PackageIdentity {
+            version: "1.2.3".into(),
+            target: target.clone(),
+            manifest_sha256: "a".repeat(64),
+        };
+        let mut operation = Operation::new(OperationKind::Update, "completed", None);
+        operation.package = Some(package.clone());
+        operation.resources = Some(OperationResources {
+            launch_agent: launch_agent(&paths),
+            staged_launch_agent: paths.state_dir.join("staged.plist"),
+            staged_launch_agent_sha256: state::digest(b"candidate-plist"),
+            launch_agent_backup: paths.state_dir.join("backup.plist"),
+            launch_agent_backup_sha256: None,
+            owned_versions: vec![target],
+        });
+        save_operation(&paths, &operation).unwrap();
+        TEST_MODE.store(true, Ordering::SeqCst);
+        let result = preflight_package(&paths, OperationKind::Update, package).await;
+        TEST_MODE.store(false, Ordering::SeqCst);
+        assert_eq!(result.unwrap()["reconciled"], true);
+        assert_eq!(
+            state::read_json::<Operation>(&paths.operation())
+                .unwrap()
+                .phase,
+            "completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_candidate_drain_recovery_resumes_exact_operation() {
+        let _serial = TEST_SERIAL.lock().await;
+        for stage in [
+            "before_drain_removal",
+            "after_drain_removal",
+            "restart_failed",
+            "after_restart",
+            "before_completion",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            make_compatible_target(&paths);
+            let target = paths.versions().join("1.2.3");
+            std::os::unix::fs::symlink(&target, paths.current()).unwrap();
+            fs::write(launch_agent(&paths), b"candidate-plist").unwrap();
+            let mut operation = Operation::new(OperationKind::Update, "recovery_required", None);
+            operation.package = Some(PackageIdentity {
+                version: "1.2.3".into(),
+                target: target.clone(),
+                manifest_sha256: "a".repeat(64),
+            });
+            operation.resources = Some(OperationResources {
+                launch_agent: launch_agent(&paths),
+                staged_launch_agent: paths.state_dir.join("staged.plist"),
+                staged_launch_agent_sha256: state::digest(b"candidate-plist"),
+                launch_agent_backup: paths.state_dir.join("backup.plist"),
+                launch_agent_backup_sha256: None,
+                owned_versions: vec![target],
+            });
+            state::write_json(
+                &paths.state_dir.join("drain.json"),
+                &json!({"draining":true}),
+            )
+            .unwrap();
+            save_operation(&paths, &operation).unwrap();
+            TEST_MODE.store(true, Ordering::SeqCst);
+            TEST_RESTART_COUNT.store(0, Ordering::SeqCst);
+            *TEST_RECOVERY_STATUS.lock().unwrap() =
+                Some(json!({"version":"1.2.3","activeJobs":0,"draining":true}));
+            *TEST_RECOVERY_FAULT.lock().unwrap() = Some(stage);
+            let failed = reconcile_activation(&paths, &mut operation).await;
+            *TEST_RECOVERY_FAULT.lock().unwrap() = None;
+            let mut restored: Operation = state::read_json(&paths.operation()).unwrap();
+            let resumed = reconcile_activation(&paths, &mut restored).await;
+            let restarts = TEST_RESTART_COUNT.load(Ordering::SeqCst);
+            *TEST_RECOVERY_STATUS.lock().unwrap() = None;
+            TEST_MODE.store(false, Ordering::SeqCst);
+            assert!(failed.is_err(), "{stage}");
+            assert!(resumed.is_ok(), "{stage}: {resumed:?}");
+            assert_eq!(restored.id, operation.id);
+            assert_eq!(restored.phase, "completed");
+            assert_eq!(
+                restarts, 1,
+                "a recovered healthy candidate must not restart twice"
+            );
+        }
+    }
+
+    #[test]
+    fn only_idle_exact_candidate_may_release_a_stale_drain() {
+        assert!(candidate_drain_can_be_released(
+            &json!({"version":"1.2.3","activeJobs":0,"draining":true}),
+            "1.2.3"
+        ));
+        for status in [
+            json!({"version":"1.2.4","activeJobs":0,"draining":true}),
+            json!({"version":"1.2.3","activeJobs":1,"draining":true}),
+            json!({"version":"1.2.3","activeJobs":0,"draining":false}),
+            json!({"version":"1.2.3","draining":true}),
+        ] {
+            assert!(!candidate_drain_can_be_released(&status, "1.2.3"));
+        }
     }
 
     #[tokio::test]

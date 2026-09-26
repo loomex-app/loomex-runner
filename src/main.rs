@@ -309,6 +309,7 @@ mod tests {
         for provider in value["providers"].as_object().unwrap().values() {
             assert!(provider["available"].is_boolean());
             assert!(provider["reason"].is_string());
+            assert_eq!(provider["modelAccess"], "unknown");
             assert!(provider.get("path").is_none());
             assert!(provider.get("checksumSha256").is_none());
         }
