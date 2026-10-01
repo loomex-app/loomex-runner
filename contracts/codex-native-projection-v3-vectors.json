@@ -1,0 +1,372 @@
+{
+  "schemaVersion": "codex.native-projection-test-v1",
+  "vectors": [
+    {
+      "accept": true,
+      "authored": {
+        "$defs": {
+          "question": {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "سؤال ✓",
+                "type": "string"
+              },
+              "text": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "text"
+            ],
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "detail": {
+            "minLength": 2,
+            "type": "string"
+          },
+          "files": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "question": {
+            "$ref": "#/$defs/question"
+          },
+          "summary": {
+            "minLength": 0,
+            "type": "string"
+          }
+        },
+        "required": [
+          "summary",
+          "detail",
+          "files",
+          "question"
+        ],
+        "type": "object"
+      },
+      "authoredDigest": "582c5dc2e6611be4ca4f0f6c910f13ad0bb7841145626646816e88bce6d67ba6",
+      "hint": {
+        "$defs": {
+          "question": {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "enum": [
+                  "سؤال ✓"
+                ],
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "text"
+            ],
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "detail": {
+            "type": "string"
+          },
+          "files": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "question": {
+            "$ref": "#/$defs/question"
+          },
+          "summary": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "summary",
+          "detail",
+          "files",
+          "question"
+        ],
+        "type": "object"
+      },
+      "hintDigest": "eee3cde3cde9543ceb8d48ac54d7d0c89347cdb8f8c88b37fa900816e73551a6",
+      "id": "nested_unicode_const_and_lengths"
+    },
+    {
+      "accept": false,
+      "authored": {
+        "$defs": {
+          "question": {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "سؤال ✓",
+                "type": "string"
+              },
+              "text": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "text"
+            ],
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "detail": {
+            "minLength": 2,
+            "type": "string"
+          },
+          "files": {
+            "items": {
+              "type": "string"
+            },
+            "minLength": 1,
+            "type": "array"
+          },
+          "question": {
+            "$ref": "#/$defs/question"
+          },
+          "summary": {
+            "minLength": 0,
+            "type": "string"
+          }
+        },
+        "required": [
+          "summary",
+          "detail",
+          "files",
+          "question"
+        ],
+        "type": "object"
+      },
+      "authoredDigest": "f3fd32fa1230519ee6f887b1926abc9523ba7d5cde0c82d8c1a9b4a3dff6ef82",
+      "id": "reject_nonstring_minlength"
+    },
+    {
+      "accept": false,
+      "authored": {
+        "$defs": {
+          "question": {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "سؤال ✓",
+                "enum": [
+                  "سؤال ✓"
+                ],
+                "type": "string"
+              },
+              "text": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "text"
+            ],
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "detail": {
+            "minLength": 2,
+            "type": "string"
+          },
+          "files": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "question": {
+            "$ref": "#/$defs/question"
+          },
+          "summary": {
+            "minLength": 0,
+            "type": "string"
+          }
+        },
+        "required": [
+          "summary",
+          "detail",
+          "files",
+          "question"
+        ],
+        "type": "object"
+      },
+      "authoredDigest": "e0085104183d3f91ae3f56fa82bc00f59e9dc3937b3e1095aa28ac8297a6eebc",
+      "id": "reject_const_with_enum"
+    },
+    {
+      "accept": false,
+      "authored": {
+        "$defs": {
+          "question": {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "سؤال ✓",
+                "type": "string"
+              },
+              "text": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "text"
+            ],
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "detail": {
+            "minLength": 2,
+            "patternProperties": {
+              "x": {
+                "type": "string"
+              }
+            },
+            "type": "string"
+          },
+          "files": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "question": {
+            "$ref": "#/$defs/question"
+          },
+          "summary": {
+            "minLength": 0,
+            "type": "string"
+          }
+        },
+        "required": [
+          "summary",
+          "detail",
+          "files",
+          "question"
+        ],
+        "type": "object"
+      },
+      "authoredDigest": "816da83efcfdd789bee190da3c7e7304728dbe580849bf31afd21f49e7d385a5",
+      "id": "reject_unsupported_keyword"
+    },
+    {
+      "accept": false,
+      "authored": {
+        "$defs": {
+          "question": {
+            "$ref": "#/$defs/question"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "detail": {
+            "minLength": 2,
+            "type": "string"
+          },
+          "files": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "question": {
+            "$ref": "#/$defs/question"
+          },
+          "summary": {
+            "minLength": 0,
+            "type": "string"
+          }
+        },
+        "required": [
+          "summary",
+          "detail",
+          "files",
+          "question"
+        ],
+        "type": "object"
+      },
+      "authoredDigest": "7cfc2d4961c259da90de2d86f65b167007a9620e52b056ee0c58daaf9dc028c7",
+      "id": "reject_cyclic_ref"
+    },
+    {
+      "accept": false,
+      "authored": {
+        "$defs": {
+          "question": {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "سؤال ✓",
+                "type": "string"
+              },
+              "text": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "text"
+            ],
+            "type": "object"
+          }
+        },
+        "additionalProperties": false,
+        "properties": {
+          "detail": {
+            "minLength": -1,
+            "type": "string"
+          },
+          "files": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "question": {
+            "$ref": "#/$defs/question"
+          },
+          "summary": {
+            "minLength": 0,
+            "type": "string"
+          }
+        },
+        "required": [
+          "summary",
+          "detail",
+          "files",
+          "question"
+        ],
+        "type": "object"
+      },
+      "authoredDigest": "13f003cb912977d695eec982b807907af2bb238cc1310ef698b745e812928407",
+      "id": "reject_invalid_minlength"
+    }
+  ]
+}

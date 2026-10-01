@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use loomex_runner::{control, lifecycle, state};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -11,10 +11,14 @@ fn main() {
     }
 }
 fn entry() -> Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(run())
+        .build()?;
+    let result = runtime.block_on(run());
+    // A started native call cannot be canceled. Bound runtime disposal only;
+    // its worker retains singleton ownership until completion or process exit.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    result
 }
 async fn run() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -67,7 +71,7 @@ async fn run() -> Result<()> {
         }
         "--help" | "help" => {
             println!(
-                "loomex status | diagnostics | login | logout [--offline] | drain | lifecycle {{status|resume|rollback|repair}} [--json] | rpc METHOD JSON | --version"
+                "loomex status | diagnostics | login | logout [--offline] | drain | lifecycle {{status|resume|rollback|repair|prune}} [--json] | rpc METHOD JSON | --version"
             );
             return Ok(());
         }
@@ -209,6 +213,9 @@ async fn run_lifecycle(arguments: Vec<String>) -> Result<()> {
     let mut state_dir = None;
     let mut launch_agents_dir = None;
     let mut version = None;
+    let mut remove_versions = Vec::new();
+    let mut retain_versions = Vec::new();
+    let mut expected_operation = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--json" => json_output = true,
@@ -228,6 +235,17 @@ async fn run_lifecycle(arguments: Vec<String>) -> Result<()> {
                 ))
             }
             "--to" => version = Some(args.next().context("--to requires a version")?),
+            "--remove" => remove_versions.push(args.next().context("--remove requires a version")?),
+            "--retain" => retain_versions.push(args.next().context("--retain requires a version")?),
+            "--expected-operation" => {
+                ensure!(expected_operation.is_none(), "INVALID_REQUEST");
+                expected_operation = Some(
+                    uuid::Uuid::parse_str(
+                        &args.next().context("--expected-operation requires UUID")?,
+                    )
+                    .context("INVALID_REQUEST")?,
+                );
+            }
             _ => bail!("invalid lifecycle argument"),
         }
     }
@@ -235,11 +253,17 @@ async fn run_lifecycle(arguments: Vec<String>) -> Result<()> {
     // not misreported as an installation or service failure.
     if !matches!(
         action.as_str(),
-        "status" | "resume" | "rollback" | "repair" | "--help" | "help"
+        "status" | "resume" | "rollback" | "repair" | "prune" | "--help" | "help"
     ) {
         bail!("INVALID_REQUEST");
     }
-    if action == "rollback" && version.is_none() {
+    if (action == "rollback" && version.is_none())
+        || (action != "rollback" && expected_operation.is_some())
+        || (action != "prune" && !remove_versions.is_empty())
+        || (action != "prune" && !retain_versions.is_empty())
+        || (action == "prune"
+            && (remove_versions.is_empty() || retain_versions.is_empty() || version.is_some()))
+    {
         bail!("INVALID_REQUEST");
     }
     let mut paths = lifecycle::Paths::from_environment()?;
@@ -257,16 +281,18 @@ async fn run_lifecycle(arguments: Vec<String>) -> Result<()> {
         "status" => lifecycle::status(&paths)?,
         "resume" => lifecycle::resume(&paths).await?,
         "rollback" => {
-            lifecycle::rollback(
+            lifecycle::rollback_with_expected(
                 &paths,
                 &version.context("lifecycle rollback requires --to VERSION")?,
+                expected_operation,
             )
             .await?
         }
         "repair" => lifecycle::repair(&paths).await?,
+        "prune" => lifecycle::prune(&paths, &remove_versions, &retain_versions).await?,
         "--help" | "help" => {
             println!(
-                "loomex lifecycle status [--json] [--install-base DIR --state-dir DIR --launch-agents-dir DIR]\nloomex lifecycle resume|repair [--json] [directories]\nloomex lifecycle rollback --to VERSION [--json] [directories]"
+                "loomex lifecycle status [--json] [--install-base DIR --state-dir DIR --launch-agents-dir DIR]\nloomex lifecycle resume|repair [--json] [directories]\nloomex lifecycle rollback --to VERSION [--expected-operation UUID] [--json] [directories]\nloomex lifecycle prune --remove VERSION [--remove VERSION ...] --retain ROLLBACK_VERSION [--json] [directories]"
             );
             return Ok(());
         }
@@ -283,6 +309,39 @@ async fn run_lifecycle(arguments: Vec<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn expected_operation_flag_is_typed_and_rollback_only() {
+        for args in [
+            vec![
+                "resume",
+                "--expected-operation",
+                "00000000-0000-0000-0000-000000000001",
+            ],
+            vec![
+                "rollback",
+                "--to",
+                "0.3.64",
+                "--expected-operation",
+                "invalid",
+            ],
+            vec![
+                "rollback",
+                "--to",
+                "0.3.64",
+                "--expected-operation",
+                "00000000-0000-0000-0000-000000000001",
+                "--expected-operation",
+                "00000000-0000-0000-0000-000000000001",
+            ],
+        ] {
+            assert!(
+                run_lifecycle(args.into_iter().map(str::to_owned).collect())
+                    .await
+                    .is_err()
+            );
+        }
+    }
 
     #[test]
     fn status_output_excludes_extended_diagnostics() {

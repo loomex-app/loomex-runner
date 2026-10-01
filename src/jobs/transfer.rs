@@ -67,17 +67,16 @@ pub(super) async fn stream_events(
                 events.push(json!({"eventType":"ai.progress.v1","stream":"","message":"","payload":progress}));
             }
         }
-        let mut body = fence(&current);
-        body["events"] = Value::Array(events);
-        daemon
-            .backend(
-                &j.organization,
-                "POST",
-                &format!("v1/jobs/{}/events/", j.job["id"].as_str().unwrap()),
-                Some(body),
-                None,
-            )
-            .await?;
+        let route = format!("v1/jobs/{}/events/", j.job["id"].as_str().unwrap());
+        transfer_request_with(journal, &j, |lease| {
+            let mut body = fence(lease);
+            body["events"] = Value::Array(events.clone());
+            Some(body)
+        }, |lease, body| {
+            let route = route.clone();
+            async move { backend_job(daemon, journal, &lease, "POST", &route, body, None).await }
+        })
+        .await?;
         let mut locked = journal.lock().unwrap();
         if stream == "stdout" {
             locked.stdout_pending = None;
@@ -89,6 +88,25 @@ pub(super) async fn stream_events(
         }
         persist(path, &locked)?;
         sent = true;
+    }
+    // Public statuses have their own durable event identity and can be sent
+    // while stdout is quiet. The same sender lock serializes lease-fenced
+    // event POSTs for this job.
+    // A public status is advisory. Its exact event remains journaled for a
+    // later authorized attempt, but a failed status POST cannot turn a valid
+    // process result into a failed terminal result. Required output and
+    // terminal delivery still enforce their own lease fences.
+    // The budget covers credential acquisition as well as transport. A
+    // canceled/ambiguous attempt leaves the journaled event ID unchanged so
+    // the backend can deduplicate a later attempt; it must not consume the
+    // lease needed by required artifact and terminal delivery.
+    if let Ok(Ok(delivered)) = tokio::time::timeout(
+        Duration::from_secs(3),
+        send_pending_status(daemon, path, journal),
+    )
+    .await
+    {
+        sent |= delivered;
     }
     Ok(sent)
 }
@@ -136,8 +154,16 @@ pub(super) async fn materialize_terminal(
             // transfer's complete endpoint returns its artifact id. If this
             // process stops mid-upload, `upload` resumes from the backend's
             // offset using its stable job/body idempotency key.
-            let artifact =
-                upload(daemon, &j, &path, &name, content_type, "http-response-body").await?;
+            let artifact = upload(
+                daemon,
+                journal,
+                &j,
+                &path,
+                &name,
+                content_type,
+                "http-response-body",
+            )
+            .await?;
             result
                 .as_object_mut()
                 .context("BACKEND_PROTOCOL_ERROR")?
@@ -174,6 +200,7 @@ pub(super) async fn materialize_terminal(
         );
         let artifact = upload(
             daemon,
+            journal,
             &j,
             &local,
             &format!("{}-{stream}.log", j.job["id"].as_str().unwrap()),
@@ -230,6 +257,7 @@ pub(super) async fn materialize_terminal(
                     .unwrap_or("application/octet-stream");
                 let mut artifact = upload(
                     daemon,
+                    journal,
                     &j,
                     &resolved,
                     name,
@@ -251,6 +279,7 @@ pub(super) async fn materialize_terminal(
 }
 pub(super) async fn upload(
     daemon: &Daemon,
+    journal: &Arc<Mutex<Journal>>,
     j: &Journal,
     path: &Path,
     name: &str,
@@ -273,15 +302,27 @@ pub(super) async fn upload(
     let id = j.job["id"].as_str().context("BACKEND_PROTOCOL_ERROR")?;
     let key = format!("job-{id}-{tag}");
     let body = json!({"executionId":j.job["createdByExecutionId"],"nodeExecutionId":j.job["createdByNodeExecutionId"],"jobId":id,"name":name,"contentType":content_type,"sizeBytes":size,"checksumSha256":hash,"idempotencyKey":key});
-    let response = daemon
-        .backend(
-            &j.organization,
-            "POST",
-            "v2/artifact-transfers/",
-            Some(body),
-            Some(&key),
-        )
-        .await?;
+    let response = transfer_request_with(
+        journal,
+        j,
+        |_| Some(body.clone()),
+        |lease, body| {
+            let key = key.clone();
+            async move {
+                backend_job(
+                    daemon,
+                    journal,
+                    &lease,
+                    "POST",
+                    "v2/artifact-transfers/",
+                    body,
+                    Some(&key),
+                )
+                .await
+            }
+        },
+    )
+    .await?;
     let transfer = response["transferId"]
         .as_str()
         .context("BACKEND_PROTOCOL_ERROR")?;
@@ -298,15 +339,18 @@ pub(super) async fn upload(
         if n == 0 {
             bail!("SPOOL_CHANGED")
         };
-        let response = daemon
-            .backend(
-                &j.organization,
-                "PUT",
-                &format!("v2/artifact-transfers/{transfer}/"),
-                Some(json!({"offset":offset,"dataBase64":STANDARD.encode(&buf[..n])})),
-                None,
-            )
-            .await?;
+        let route = format!("v2/artifact-transfers/{transfer}/");
+        let chunk = json!({"offset":offset,"dataBase64":STANDARD.encode(&buf[..n])});
+        let response = transfer_request_with(
+            journal,
+            j,
+            |_| Some(chunk.clone()),
+            |lease, body| {
+                let route = route.clone();
+                async move { backend_job(daemon, journal, &lease, "PUT", &route, body, None).await }
+            },
+        )
+        .await?;
         let next = response["offset"]
             .as_u64()
             .context("BACKEND_PROTOCOL_ERROR")?;
@@ -315,16 +359,73 @@ pub(super) async fn upload(
         };
         offset = next;
     }
-    let response = daemon
-        .backend(
-            &j.organization,
-            "POST",
-            &format!("v2/artifact-transfers/{transfer}/complete/"),
-            Some(json!({})),
-            None,
-        )
-        .await?;
+    let route = format!("v2/artifact-transfers/{transfer}/complete/");
+    let response = transfer_request_with(
+        journal,
+        j,
+        |_| Some(json!({})),
+        |lease, body| {
+            let route = route.clone();
+            async move { backend_job(daemon, journal, &lease, "POST", &route, body, None).await }
+        },
+    )
+    .await?;
     Ok(
         json!({"artifactId":response["artifactId"].as_str().context("BACKEND_PROTOCOL_ERROR")?,"name":name,"contentType":content_type,"sizeBytes":size,"checksumSha256":hash}),
     )
+}
+
+/// A lease renewal may land after output was durably prepared but before the
+/// API's pre-send authority check. Rebuild only the lease fence in that case.
+/// `request_job_with_stale_proof_retry` returns a status-less conflict only
+/// before sending, or after an explicit pre-handler stale-proof rejection;
+/// an HTTP fence rejection or an ambiguous transport result is never retried.
+pub(super) async fn transfer_request_with<B, S, Fut>(
+    journal: &Arc<Mutex<Journal>>,
+    original: &Journal,
+    body: B,
+    mut send: S,
+) -> Result<Value>
+where
+    B: Fn(&Journal) -> Option<Value>,
+    S: FnMut(Journal, Option<Value>) -> Fut,
+    Fut: Future<Output = Result<Value>>,
+{
+    for _ in 0..3 {
+        let current = transfer_authority(original, journal)?;
+        anyhow::ensure!(
+            current.job["leasedUntilEpochMs"].as_u64().unwrap_or(0) > now_millis(),
+            "RUNNER_JOB_LEASE_EXPIRED"
+        );
+        let request_body = body(&current);
+        match send(current, request_body).await {
+            Ok(response) => return Ok(response),
+            Err(error) if local_pre_send_lease_change(&error) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    bail!("RUNNER_JOB_LOCAL_LEASE_CHANGED")
+}
+
+pub(super) fn local_pre_send_lease_change(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::api::ApiError>()
+        .is_some_and(|api| api.code == "RUNNER_JOB_LEASE_CONFLICT" && api.status.is_none())
+}
+
+fn transfer_authority(original: &Journal, journal: &Arc<Mutex<Journal>>) -> Result<Journal> {
+    let current = snapshot(journal)?;
+    anyhow::ensure!(
+        current.organization == original.organization
+            && current.session == original.session
+            && current.recovery_session == original.recovery_session
+            && current.phase == original.phase
+            && current.terminal_key == original.terminal_key
+            && current.job["id"] == original.job["id"]
+            && current.job["runnerId"] == original.job["runnerId"]
+            && current.job["connectionGeneration"] == original.job["connectionGeneration"]
+            && current.job["payloadDigest"] == original.job["payloadDigest"],
+        "RUNNER_JOB_LOCAL_AUTHORITY_CHANGED"
+    );
+    Ok(current)
 }

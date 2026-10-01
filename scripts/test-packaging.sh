@@ -40,6 +40,22 @@ PATH="$no_python:/usr/bin:/bin" LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_INSTALL
 test -L "$base/current"
 test -f "$state/install-receipt.json"
 test -f "$state/lifecycle-operation.json"
+
+# An ad-hoc binary with different bytes has a different CDHash identity. The
+# rejection must happen before an update intent, drain, or pointer change.
+different_payload="$fixture/different-payload"
+cp -R "$payload" "$different_payload"
+cp "$repo/target/debug/loomex" "$different_payload/bin/loomex-runner"
+different_release="$fixture/different-release"
+SOURCE_DATE_EPOCH=1 python3 "$repo/scripts/artifact.py" create --payload "$different_payload" --output "$different_release" --project loomex-runner --version "$version" --platform darwin-arm64 --source-revision packaging-fixture --unsigned-development --bootstrap "$different_payload/bin/loomex-lifecycle-bootstrap"
+before_receipt="$(/usr/bin/shasum -a 256 "$state/install-receipt.json" | /usr/bin/awk '{print $1}')"
+if PATH="$no_python:/usr/bin:/bin" LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 LOOMEX_INSTALL_TEST_MODE=1 "$launcher" "$different_release" --allow-unsigned-development --development-api-origin http://127.0.0.1:9 --install-base "$base" --state-dir "$state" --launch-agents-dir "$agents" >"$fixture/different-install.log" 2>&1; then
+  echo "development upgrade accepted a changed ad-hoc identity" >&2
+  exit 1
+fi
+/usr/bin/grep -q 'development signing identity changed; upgrade refused' "$fixture/different-install.log"
+test "$(/usr/bin/shasum -a 256 "$state/install-receipt.json" | /usr/bin/awk '{print $1}')" == "$before_receipt"
+test "$(cd "$base/current" && pwd -P)" == "$(cd "$base/versions/$version" && pwd -P)"
 python3 - "$state/install-receipt.json" <<'PY'
 import json,sys
 receipt=json.load(open(sys.argv[1]))

@@ -42,11 +42,13 @@ struct Arguments {
     install_base: Option<PathBuf>,
     state_dir: Option<PathBuf>,
     launch_agents_dir: Option<PathBuf>,
+    settled_abandonment: Option<Uuid>,
+    authorize_keychain_transition: bool,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: loomex-lifecycle-bootstrap install RELEASE [--public-key FILE | --allow-unsigned-development --development-api-origin LOOPBACK_URL] [--provider-executable PROVIDER=/absolute/path] [--install-base DIR --state-dir DIR --launch-agents-dir DIR]\n       loomex-lifecycle-bootstrap uninstall [--install-base DIR --state-dir DIR --launch-agents-dir DIR]"
+        "usage: loomex-lifecycle-bootstrap install RELEASE [--public-key FILE | --allow-unsigned-development --development-api-origin LOOPBACK_URL] [--authorize-keychain-transition] [--settled-abandonment UUID] [--provider-executable PROVIDER=/absolute/path] [--install-base DIR --state-dir DIR --launch-agents-dir DIR]\n       loomex-lifecycle-bootstrap uninstall [--install-base DIR --state-dir DIR --launch-agents-dir DIR]"
     );
     std::process::exit(2)
 }
@@ -64,10 +66,25 @@ fn parse() -> (String, Arguments) {
     }
     while let Some(value) = values.next() {
         match value.to_string_lossy().as_ref() {
+            "--settled-abandonment" => {
+                if command != "install" || parsed.settled_abandonment.is_some() {
+                    usage();
+                }
+                parsed.settled_abandonment = Some(
+                    Uuid::parse_str(&values.next().unwrap_or_else(|| usage()).to_string_lossy())
+                        .unwrap_or_else(|_| usage()),
+                );
+            }
             "--public-key" => {
                 parsed.public_key = Some(PathBuf::from(values.next().unwrap_or_else(|| usage())))
             }
             "--allow-unsigned-development" => parsed.allow_unsigned_development = true,
+            "--authorize-keychain-transition" => {
+                if command != "install" || parsed.authorize_keychain_transition {
+                    usage();
+                }
+                parsed.authorize_keychain_transition = true;
+            }
             "--development-api-origin" => {
                 parsed.development_api_origin = Some(
                     values
@@ -166,7 +183,10 @@ async fn verify_release(release: &Path, manifest: &Value, args: &Arguments) -> R
             bail!("unsigned development release requires explicit opt-in")
         }
     } else {
-        if args.allow_unsigned_development || args.development_api_origin.is_some() {
+        if args.allow_unsigned_development
+            || args.development_api_origin.is_some()
+            || args.authorize_keychain_transition
+        {
             bail!("production release rejects development options")
         }
         let key = args
@@ -194,6 +214,262 @@ async fn verify_release(release: &Path, manifest: &Value, args: &Arguments) -> R
         bail!("release payload digest mismatch")
     }
     Ok(())
+}
+
+fn stable_development_requirement(requirement: &str, name: &str) -> bool {
+    let prefix = format!("identifier \"app.loomex.runner.{name}\" and ");
+    let Some(policy) = requirement.strip_prefix(&prefix) else {
+        return false;
+    };
+    if requirement.contains("cdhash ") {
+        return false;
+    }
+    if policy.starts_with("anchor ") {
+        return true;
+    }
+    // Keychain Access emits this designated requirement for a self-signed
+    // Code Signing identity. The certificate hash pins the signer across
+    // rebuilds while leaving system and user trust settings unchanged.
+    policy
+        .strip_prefix("certificate leaf = H\"")
+        .and_then(|hash| hash.strip_suffix('"'))
+        .is_some_and(|hash| hash.len() == 40 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn signing_requirement(binary: &Path) -> Result<Option<String>> {
+    let verified = std::process::Command::new("/usr/bin/codesign")
+        .args(["--verify", "--strict"])
+        .arg(binary)
+        .stdin(Stdio::null())
+        .output()?;
+    if !verified.status.success() {
+        bail!("development code signature is invalid")
+    }
+    let details = std::process::Command::new("/usr/bin/codesign")
+        .args(["-dv", "--verbose=4"])
+        .arg(binary)
+        .stdin(Stdio::null())
+        .output()?;
+    if !details.status.success() {
+        bail!("development code signature is unavailable")
+    }
+    let ad_hoc = String::from_utf8_lossy(&details.stderr).contains("Signature=adhoc");
+    let output = std::process::Command::new("/usr/bin/codesign")
+        .args(["-dr", "-"])
+        .arg(binary)
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        bail!("development designated requirement is unavailable")
+    }
+    let display = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requirements = display
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("designated => ")
+                .or_else(|| line.strip_prefix("# designated => "))
+        })
+        .collect::<Vec<_>>();
+    if requirements.len() != 1 {
+        bail!("development designated requirement is invalid")
+    }
+    if ad_hoc {
+        return Ok(None);
+    }
+    let requirement = requirements[0];
+    let name = binary
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("development binary name is invalid")?;
+    if !stable_development_requirement(requirement, name) {
+        bail!("development designated requirement is not stable")
+    }
+    Ok(Some(requirement.to_owned()))
+}
+
+async fn credential_probe(binary: &Path, interactive: bool) -> Result<()> {
+    let flag = if interactive {
+        "--credential-store-authorize"
+    } else {
+        "--credential-store-probe"
+    };
+    let child = tokio::process::Command::new(binary)
+        .arg(flag)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let budget = if interactive { 120 } else { 4 };
+    let result = tokio::time::timeout(std::time::Duration::from_secs(budget), child)
+        .await
+        .map_err(|_| anyhow::anyhow!("credential authorization probe timed out"))??;
+    if !result.status.success() || result.stdout != b"AUTHORIZED\n" {
+        bail!("credential authorization probe did not succeed")
+    }
+    Ok(())
+}
+
+#[derive(PartialEq, Eq, Debug)]
+enum SigningTransition {
+    Ready,
+    ForegroundAuthorizationRequired,
+}
+
+fn signing_transition(
+    previous: Option<&str>,
+    candidate: Option<&str>,
+    same_binary: bool,
+    authorize_transition: bool,
+) -> Result<SigningTransition> {
+    match (previous, candidate) {
+        (Some(old), Some(new)) if old == new && !authorize_transition => {
+            Ok(SigningTransition::Ready)
+        }
+        (None, None) if same_binary && !authorize_transition => Ok(SigningTransition::Ready),
+        (None, Some(_)) if authorize_transition => {
+            Ok(SigningTransition::ForegroundAuthorizationRequired)
+        }
+        _ => bail!("development signing identity changed; upgrade refused"),
+    }
+}
+
+async fn verify_development_signing(
+    payload: &Path,
+    paths: &lifecycle::Paths,
+    args: &Arguments,
+) -> Result<()> {
+    let metadata = payload.join("metadata/development-signing.json");
+    let candidate = payload.join("bin/loomex-runner");
+    let candidate_requirement = signing_requirement(&candidate)?;
+    if metadata.exists() {
+        let bytes = fs::read(&metadata)?;
+        let value: Value = serde_json::from_slice(&bytes)?;
+        let mut canonical = serde_json::to_vec(&value)?;
+        canonical.push(b'\n');
+        if bytes != canonical || value["schema"] != "app.loomex.runner.development-signing/v1" {
+            bail!("development signing manifest is invalid")
+        }
+        let requirements = value["requirements"]
+            .as_object()
+            .context("development signing requirements are missing")?;
+        if requirements.len() != 3 {
+            bail!("development signing requirements are incomplete")
+        }
+        for name in ["loomex", "loomex-runner", "loomex-lifecycle-bootstrap"] {
+            let expected = requirements
+                .get(name)
+                .and_then(Value::as_str)
+                .context("development signing requirement is missing")?;
+            if signing_requirement(&payload.join("bin").join(name))?.as_deref() != Some(expected)
+                || !expected.contains(&format!("identifier \"app.loomex.runner.{name}\""))
+            {
+                bail!("development signing requirement does not match package")
+            }
+        }
+    } else if candidate_requirement.is_some() {
+        bail!("signed development package lacks signing manifest")
+    }
+    let current = paths.install_base.join("current");
+    if fs::symlink_metadata(&current).is_err() {
+        if args.authorize_keychain_transition {
+            bail!("credential transition requires an installed daemon")
+        }
+        return Ok(());
+    }
+    let previous = current.join("bin/loomex-runner");
+    let previous_requirement = signing_requirement(&previous)?;
+    match signing_transition(
+        previous_requirement.as_deref(),
+        candidate_requirement.as_deref(),
+        fs::read(&previous)? == fs::read(&candidate)?,
+        args.authorize_keychain_transition,
+    )? {
+        SigningTransition::Ready => {}
+        SigningTransition::ForegroundAuthorizationRequired => {
+            credential_probe(&candidate, true).await?;
+            credential_probe(&candidate, false).await?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod signing_tests {
+    use super::*;
+
+    #[test]
+    fn self_signed_requirement_pins_exact_certificate_and_identifier() {
+        let hash = "3a552832d7ae3cced399130fe1fa5b0f26a417c5";
+        let requirement = format!(
+            "identifier \"app.loomex.runner.loomex-runner\" and certificate leaf = H\"{hash}\""
+        );
+        assert!(stable_development_requirement(
+            &requirement,
+            "loomex-runner"
+        ));
+        assert!(!stable_development_requirement(&requirement, "loomex"));
+        for invalid in [
+            "identifier \"app.loomex.runner.loomex-runner\" and cdhash H\"1234\"",
+            "identifier \"app.loomex.runner.loomex-runner\" and certificate leaf = H\"1234\"",
+            "identifier \"app.loomex.runner.loomex-runner\" and certificate leaf = H\"3a552832d7ae3cced399130fe1fa5b0f26a417c5\" or true",
+            "identifier \"wrong\" and certificate leaf = H\"3a552832d7ae3cced399130fe1fa5b0f26a417c5\"",
+        ] {
+            assert!(!stable_development_requirement(invalid, "loomex-runner"));
+        }
+    }
+
+    #[test]
+    fn signed_upgrade_requires_the_exact_same_designated_requirement() {
+        let pinned = "identifier \"app.loomex.runner.loomex-runner\" and certificate leaf = H\"3a552832d7ae3cced399130fe1fa5b0f26a417c5\"";
+        let changed = "identifier \"app.loomex.runner.loomex-runner\" and certificate leaf = H\"4a552832d7ae3cced399130fe1fa5b0f26a417c5\"";
+        assert_eq!(
+            signing_transition(Some(pinned), Some(pinned), false, false).unwrap(),
+            SigningTransition::Ready
+        );
+        assert!(signing_transition(Some(pinned), Some(changed), false, true).is_err());
+        assert_eq!(
+            signing_transition(
+                Some("identifier daemon and anchor A"),
+                Some("identifier daemon and anchor A"),
+                false,
+                false
+            )
+            .unwrap(),
+            SigningTransition::Ready
+        );
+        assert!(
+            signing_transition(
+                Some("identifier daemon and anchor A"),
+                Some("identifier daemon and anchor B"),
+                false,
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            signing_transition(Some("identifier daemon and anchor A"), None, false, false).is_err()
+        );
+    }
+
+    #[test]
+    fn ad_hoc_upgrade_needs_explicit_foreground_transition() {
+        assert!(signing_transition(None, None, false, false).is_err());
+        assert_eq!(
+            signing_transition(None, None, true, false).unwrap(),
+            SigningTransition::Ready
+        );
+        assert!(
+            signing_transition(None, Some("identifier daemon and anchor A"), false, false).is_err()
+        );
+        assert_eq!(
+            signing_transition(None, Some("identifier daemon and anchor A"), false, true).unwrap(),
+            SigningTransition::ForegroundAuthorizationRequired
+        );
+    }
 }
 
 fn parse_origin(value: &str) -> Result<String> {
@@ -411,6 +687,19 @@ async fn install(args: Arguments) -> Result<()> {
     } else {
         None
     };
+    if manifest["developmentOnly"] == true {
+        // Verify the inventoried candidate and its exact code identity before
+        // any lifecycle intent, drain, pointer change, or version retirement.
+        let signing_stage =
+            std::env::temp_dir().join(format!("loomex-development-signing-{}", Uuid::new_v4()));
+        let result = async {
+            let payload = extract(&release, &manifest, &signing_stage).await?;
+            verify_development_signing(&payload, &paths, &args).await
+        }
+        .await;
+        let _ = fs::remove_dir_all(&signing_stage);
+        result?;
+    }
     let mut providers = providers(&args.providers)?;
     // Updating a running installation without provider flags preserves the
     // existing, receipt-bound executable selection.  This prevents a retry or
@@ -443,7 +732,22 @@ async fn install(args: Arguments) -> Result<()> {
     // No competing lifecycle writer can change the namespace between those
     // observations and mutations.
     let _lifecycle_lock = lifecycle::LifecycleLock::acquire(&paths)?;
-    if bootstrap_journal.exists() && state::read_json::<Value>(&bootstrap_journal)? != configuration
+    if let Some(receipt) = lifecycle::reconcile_bootstrap_abandonment_locked(
+        &paths,
+        &configuration,
+        args.settled_abandonment,
+    )
+    .await?
+    {
+        println!("{}", serde_json::to_string(&receipt)?);
+        return Ok(());
+    }
+    let successor_envelope = bootstrap_journal.exists()
+        && state::read_json::<Value>(&bootstrap_journal)?["schema"]
+            == "app.loomex.runner.bootstrap-install/v2";
+    if bootstrap_journal.exists()
+        && !successor_envelope
+        && state::read_json::<Value>(&bootstrap_journal)? != configuration
     {
         // A bootstrap journal binds retries of an unfinished installation to
         // its exact configuration.  It must not, however, turn a completed
@@ -478,7 +782,7 @@ async fn install(args: Arguments) -> Result<()> {
         // The matching native transaction retained the staged package and
         // rollback/update intent.  It has not activated, so do not write a
         // receipt or report installation success.
-        println!("Loomex runner update is pending until active work completes.");
+        println!("{}", pending_update_message(&preflight));
         return Ok(());
     }
     if preflight["reconciled"] == true {
@@ -500,7 +804,9 @@ async fn install(args: Arguments) -> Result<()> {
     }
     fs::create_dir_all(paths.install_base.join("versions"))?;
     fs::create_dir_all(&paths.launch_agents_dir)?;
-    state::write_json(&bootstrap_journal, &configuration)?;
+    if !successor_envelope {
+        state::write_json(&bootstrap_journal, &configuration)?;
+    }
     let stage = paths
         .install_base
         .join(format!(".stage.{}", Uuid::new_v4()));
@@ -567,7 +873,7 @@ async fn install(args: Arguments) -> Result<()> {
         )
         .await?;
         if activation["pending"] == true {
-            println!("Loomex runner update is pending until active work completes.");
+            println!("{}", pending_update_message(&activation));
             return Ok::<bool, anyhow::Error>(false);
         }
         let bootstrap = target.join("bin/loomex-lifecycle-bootstrap");
@@ -586,9 +892,18 @@ async fn install(args: Arguments) -> Result<()> {
     Ok(())
 }
 
+fn pending_update_message(value: &Value) -> &'static str {
+    if value["reason"] == "service_stop" {
+        "Loomex runner update is pending verified service stop. Resume the same lifecycle operation after checking its status."
+    } else {
+        "Loomex runner update is pending until active work completes."
+    }
+}
+
 async fn uninstall(args: Arguments) -> Result<()> {
     let paths = paths(&args)?;
     let _lock = lifecycle::LifecycleLock::acquire(&paths)?;
+    lifecycle::require_terminal_before_uninstall(&paths)?;
     let journal_path = paths.state_dir.join("bootstrap-uninstall.json");
     let mut journal: Value = if journal_path.exists() {
         let value: Value = state::read_json(&journal_path)?;
@@ -873,5 +1188,21 @@ async fn run() -> Result<()> {
         "install" => install(args).await,
         "uninstall" => uninstall(args).await,
         _ => usage(),
+    }
+}
+
+#[cfg(test)]
+mod pending_stop_tests {
+    use super::*;
+    #[test]
+    fn pending_stop_copy_distinguishes_service_observation_from_active_work() {
+        assert!(
+            pending_update_message(&json!({"pending":true,"reason":"service_stop"}))
+                .contains("verified service stop")
+        );
+        assert!(
+            pending_update_message(&json!({"pending":true,"reason":"active_work"}))
+                .contains("active work")
+        );
     }
 }

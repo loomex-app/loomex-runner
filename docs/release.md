@@ -21,6 +21,35 @@ This Mac currently reports zero valid code-signing identities. Production signin
 
 For explicitly authorized local development testing, `scripts/build-release.sh --unsigned-development` produces a native debug-profile artifact marked `developmentOnly`. The script inventories every tracked path and every nonignored untracked path, including each file's content digest, size, executable mode, source class, and symlink target where applicable. It builds from a temporary snapshot of that exact inventory, embeds the canonical source-content manifest, and binds its digest into the release envelope. `artifact.py verify --source-root PATH` can then prove that a candidate matches the complete selected source content and rejects a content edit even when the filename is unchanged. This preserves the compile-time development class that permits a loopback-only API origin; production binaries use the release profile, a pinned HTTPS origin, and reject that override. Development installation requires `--allow-unsigned-development`, `LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1`, and an explicit `--development-api-origin http://127.0.0.1:PORT`. The installer accepts only a root HTTP(S) URL whose host is `localhost` or a loopback IP address; credentials, paths, queries, fragments, and non-loopback hosts are rejected. It canonicalizes the value and writes it only to this LaunchAgent's environment and its derived installation receipt so stopped-daemon offline revocation can use the same origin. It never changes the global launchd environment. This artifact remains unsigned development output and is not a production claim or distributable release.
 
+For repeated development upgrades that must retain access to the same macOS
+Keychain item, set `LOOMEX_DEVELOPMENT_CODESIGN_IDENTITY` to one persistent local
+code-signing identity before building. The optional
+`LOOMEX_DEVELOPMENT_CODESIGN_KEYCHAIN` selects a specific signing keychain; the
+build never creates or exports an identity. All three native binaries are
+signed after stripping, and the inventoried
+`metadata/development-signing.json` records their exact designated
+requirements. This is still a `developmentOnly` release with an unsigned
+release envelope, and is not a substitute for production Developer ID signing
+or notarization. A development upgrade compares the verified candidate
+daemon's requirement with the installed daemon before any lifecycle intent or
+drain. Identical signed requirements can proceed. A changed identity, an
+unsigned downgrade, or different ad-hoc binary fails closed. Repeating the
+exact same ad-hoc binary is permitted for idempotent repair.
+
+The first upgrade from an existing ad-hoc daemon to a stably signed development
+daemon is a separate, explicit trust transition. Run the installer with
+`--authorize-keychain-transition` only in a foreground user session after
+reviewing the candidate package and signer. The bootstrap runs the exact
+candidate daemon binary in a read-only probe that may display macOS Keychain
+authorization UI, then requires that same binary to pass a normal
+noninteractive read before it can enter the lifecycle transaction. The probe
+returns only a fixed status; it never prints, saves, deletes, copies or exports
+the credential. If the user declines, the item is unavailable, the prompt
+times out, or the noninteractive recheck fails, installation stops before
+service changes. Subsequent upgrades use requirement equality without UI.
+The consent behavior of a particular macOS Keychain ACL must be qualified with
+a disposable fixture before relying on this transition for an installed item.
+
 All newly created artifacts require the canonical source-content manifest. Verification also requires that provenance by default. The explicit `--allow-legacy-source-provenance` option on `artifact.py verify` or `extract`, paired with the same option on `validate_package.py`, is reserved for inspecting historical envelopes created before source-content binding existed; it does not make a legacy artifact eligible for production publication or installation.
 
 The installer verifies signature policy, project/platform provenance, payload digest, every file digest/mode/size, safe archive members, native code signatures and Gatekeeper acceptance for production, project metadata, and the signed LaunchAgent template before moving a staged version into place. A first install refuses any preexisting runner-owned state namespace, while retries after rejected artifact verification remain clean. Before staging bytes, it writes an exact verified-release installation journal; an interrupted first install can resume only with that same release, then retains the journal and owned-version inventory through activation before removing the journal at terminal success or a proved rollback. It derives the installation-local absolute daemon/state paths and any authenticated development-only loopback origin in the generated plist after verification; the plist keeps the lexical stable `current` path across upgrades. Optional repeated `--provider-executable PROVIDER=/absolute/path` arguments support `codex`, `claude`, `gemini`, and `antigravity` (the `agy` executable): the installer canonicalizes and validates each executable, persists the map in its owned receipt, and renders explicit provider-specific LaunchAgent environment variables. Omitting these arguments on an update preserves the installed map; providers with no explicit entry retain standard discovery. Every version moved into place is recorded immediately in a durable owned-version inventory. Activation switches the stable `current` symlink and LaunchAgent plist, then requires the new CLI to report the expected healthy daemon version before retiring old bytes. It restores the previous target and plist only after proving the candidate has zero active jobs and unloading it; otherwise it retains the current service and every version byte for safe recovery. After confirmed activation all superseded inventoried versions are removed.

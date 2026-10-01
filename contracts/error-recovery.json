@@ -38,6 +38,18 @@
       "recovery": "correct_input",
       "outcome": "rejected"
     },
+    "WORKFLOW_PATCH_INVALID": {
+      "recovery": "correct_input",
+      "outcome": "rejected"
+    },
+    "WORKFLOW_PATCH_VALIDATION_FAILED": {
+      "recovery": "correct_input",
+      "outcome": "rejected"
+    },
+    "WORKFLOW_PATCH_STALE": {
+      "recovery": "refresh_authority",
+      "outcome": "rejected"
+    },
     "VERSION_NOT_OWNED": {
       "recovery": "correct_input",
       "outcome": "rejected"
@@ -71,6 +83,10 @@
       "outcome": "rejected"
     },
     "VIEW_SESSION_NOT_FOUND": {
+      "recovery": "refresh_authority",
+      "outcome": "rejected"
+    },
+    "WORKFLOW_NOT_FOUND": {
       "recovery": "refresh_authority",
       "outcome": "rejected"
     },
@@ -137,6 +153,42 @@
     "DELIVERY_ATTEMPT_CONFLICT": {
       "recovery": "refresh_authority",
       "outcome": "rejected"
+    },
+    "START_HANDOFF_PREPARATION_RESERVED": {
+      "recovery": "refresh_authority",
+      "outcome": "rejected"
+    },
+    "HUMAN_RESUME_RECOVERY_INVALID": {
+      "recovery": "correct_input",
+      "outcome": "rejected"
+    },
+    "HUMAN_RESUME_RECOVERY_CONFLICT": {
+      "recovery": "refresh_authority",
+      "outcome": "rejected"
+    },
+    "IDEMPOTENCY_KEY_CONFLICT": {
+      "recovery": "correct_input",
+      "outcome": "rejected"
+    },
+    "STORE_ACCESS_REQUIRED": {
+      "recovery": "unavailable",
+      "outcome": "not_dispatched"
+    },
+    "STORE_ACCESS_DENIED": {
+      "recovery": "unavailable",
+      "outcome": "not_dispatched"
+    },
+    "STORE_UNAVAILABLE": {
+      "recovery": "unavailable",
+      "outcome": "not_dispatched"
+    },
+    "STORE_OPERATION_PENDING": {
+      "recovery": "reconcile_outcome",
+      "outcome": "unknown"
+    },
+    "RUNNER_RESPONSE_UNAVAILABLE": {
+      "recovery": "reconcile_outcome",
+      "outcome": "unknown"
     }
   }
 }

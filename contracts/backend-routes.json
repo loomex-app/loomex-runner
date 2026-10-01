@@ -201,6 +201,12 @@
       "source": "src/control.rs"
     },
     {
+      "id": "execution.continuation.requeue",
+      "method": "POST",
+      "pathTemplate": "v2/executions/{executionId}/continuations/{deliveryId}/requeue/",
+      "source": "src/control.rs"
+    },
+    {
       "id": "execution.cancel",
       "method": "POST",
       "pathTemplate": "v1/executions/{executionId}/cancel/",
@@ -483,6 +489,11 @@
       ]
     },
     {
+      "method": "workflows.patch",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
       "method": "workflow.operations.get",
       "classification": "backend-proxy",
       "routeIds": [
@@ -661,6 +672,13 @@
       "classification": "backend-proxy",
       "routeIds": [
         "execution.detail"
+      ]
+    },
+    {
+      "method": "runs.continuation.requeue",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "execution.continuation.requeue"
       ]
     },
     {
@@ -855,6 +873,11 @@
     },
     {
       "method": "connection.views.update",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "runs.start_handoff.approve_headless",
       "classification": "local-control",
       "routeIds": []
     }

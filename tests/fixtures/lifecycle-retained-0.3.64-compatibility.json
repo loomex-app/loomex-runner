@@ -106,7 +106,7 @@
       "path": "contracts/backend-routes.json"
     },
     "methodCatalog": {
-      "digest": "sha256:6029087f6f9263b23663d3f1899b4aa41f2843aa6d1379abb0a010d9409772ee",
+      "digest": "sha256:c2c851d2ab462a2d0b73b0a0689e42e189f7323afdc36bdc2bce7fb1a2abd1f4",
       "path": "contracts/method-catalog.json"
     }
   },
@@ -115,7 +115,7 @@
     {
       "classification": "backend-proxy",
       "idempotent": true,
-      "inputSchemaDigest": "sha256:1a4aa50fa21e48214a49e5e09671bcd392770e172668da3c6276edc68213190d",
+      "inputSchemaDigest": "sha256:abfe619ea4c70aabe7be95ab6a7d954d0914e462318990dddde43a32589a8c45",
       "mutating": true,
       "name": "artifacts.download",
       "outputSchemaDigest": "sha256:6537798ab0a9ce9421698f615761ad72678e89d06053aa82a06bb37b4711ef54",
@@ -139,7 +139,7 @@
     {
       "classification": "backend-proxy",
       "idempotent": true,
-      "inputSchemaDigest": "sha256:96716a9f9cdec9bb40f3ca7edfef5dfdc7d6f8f4f988b7bcac81fb6adbb7e5d5",
+      "inputSchemaDigest": "sha256:57e56fbf244b7580cfaaab5ca1758334d51b572bfb46adedc6bff7f004e9ade4",
       "mutating": false,
       "name": "artifacts.read",
       "outputSchemaDigest": "sha256:645955b2453d39ea09d5d73ecbe1cb87aea75c748d9f6dcdfde664951ed38eb8",

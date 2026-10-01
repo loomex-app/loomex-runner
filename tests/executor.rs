@@ -9,7 +9,7 @@ use std::{
     os::unix::fs::{PermissionsExt, symlink},
     path::Path,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -25,17 +25,45 @@ const MAX_DIAGNOSTIC_BYTES: usize = 4096;
 struct Observer {
     intent: AtomicBool,
     spawned: AtomicBool,
+    identity: Mutex<Option<ProcessIdentity>>,
 }
 impl ExecutionObserver for Observer {
     fn before_spawn(&self, _: &ExecutionRequest) -> Result<()> {
         self.intent.store(true, Ordering::SeqCst);
         Ok(())
     }
-    fn spawned(&self, _: &ProcessIdentity) -> Result<()> {
+    fn spawned(&self, identity: &ProcessIdentity) -> Result<()> {
         assert!(self.intent.load(Ordering::SeqCst));
+        *self.identity.lock().unwrap() = Some(identity.clone());
         self.spawned.store(true, Ordering::SeqCst);
         Ok(())
     }
+}
+
+fn live_group_member(pgid: i32) -> bool {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pgid=,stat="])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .any(|line| {
+            let mut fields = line.split_whitespace();
+            fields.next().and_then(|value| value.parse::<i32>().ok()) == Some(pgid)
+                && fields.next().is_some_and(|state| !state.starts_with('Z'))
+        })
+}
+
+async fn wait_for_group_stop(pgid: i32) {
+    for _ in 0..100 {
+        if !live_group_member(pgid) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("owned guardian group remained active after cleanup");
 }
 
 fn request(root: &Path, script: &str) -> ExecutionRequest {
@@ -474,6 +502,57 @@ async fn failed_identity_journal_does_not_authorize_target_spawn() {
     let mut req = request(root.path(), "touch should-not-exist");
     req.observer = Arc::new(RejectIdentity);
     assert!(run(req, Arc::new(AtomicBool::new(false))).await.is_err());
+    assert!(!root.path().join("should-not-exist").exists());
+}
+
+#[tokio::test]
+async fn dropping_execution_future_kills_only_its_owned_group() {
+    let root = tempfile::tempdir().unwrap();
+    let observer = Arc::new(Observer::default());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut req = request(root.path(), "printf ready > ready; /bin/sleep 30");
+    req.observer = observer.clone();
+    let mut task = tokio::spawn(run(req, cancel.clone()));
+    wait_for_readiness(
+        &mut task,
+        &cancel,
+        root.path(),
+        &[&root.path().join("ready")],
+    )
+    .await
+    .unwrap();
+    let pgid = observer.identity.lock().unwrap().as_ref().unwrap().pgid;
+    assert!(live_group_member(pgid));
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    wait_for_group_stop(pgid).await;
+}
+
+struct PanicAfterSpawn {
+    identity: Mutex<Option<ProcessIdentity>>,
+}
+impl ExecutionObserver for PanicAfterSpawn {
+    fn before_spawn(&self, _: &ExecutionRequest) -> Result<()> {
+        Ok(())
+    }
+    fn spawned(&self, identity: &ProcessIdentity) -> Result<()> {
+        *self.identity.lock().unwrap() = Some(identity.clone());
+        panic!("injected post-spawn observer panic");
+    }
+}
+
+#[tokio::test]
+async fn post_spawn_panic_cleans_up_owned_guardian_without_target_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let observer = Arc::new(PanicAfterSpawn {
+        identity: Mutex::new(None),
+    });
+    let mut req = request(root.path(), "touch should-not-exist");
+    req.observer = observer.clone();
+    let task = tokio::spawn(run(req, Arc::new(AtomicBool::new(false))));
+    assert!(task.await.unwrap_err().is_panic());
+    let pgid = observer.identity.lock().unwrap().as_ref().unwrap().pgid;
+    wait_for_group_stop(pgid).await;
     assert!(!root.path().join("should-not-exist").exists());
 }
 

@@ -186,6 +186,18 @@ mod tests {
             safe_error("RUNNER_UNAVAILABLE", true)["recovery"],
             "unavailable"
         );
+        assert_eq!(
+            safe_error("WORKFLOW_NOT_FOUND", false)["outcome"],
+            "rejected"
+        );
+        assert_eq!(
+            safe_error("WORKFLOW_NOT_FOUND", false)["recovery"],
+            "refresh_authority"
+        );
+        assert_eq!(
+            safe_error("RUNNER_RESPONSE_UNAVAILABLE", true)["outcome"],
+            "unknown"
+        );
     }
     #[test]
     fn grant_rejects_org_and_replaced_directory() {

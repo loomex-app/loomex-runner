@@ -240,6 +240,10 @@ impl Drop for OwnedWork {
     }
 }
 
+async fn drain_owned_workers(workers: &mut tokio::task::JoinSet<()>) {
+    while workers.join_next().await.is_some() {}
+}
+
 pub async fn run(daemon: Arc<Daemon>) {
     let mut last_sweep = 0;
     let mut running = HashSet::new();
@@ -334,10 +338,16 @@ pub(super) async fn session(daemon: Arc<Daemon>, org: String) -> Result<()> {
         }
     }));
     let mut workers = tokio::task::JoinSet::new();
+    let reconnect_requested = Arc::new(AtomicBool::new(false));
     let result: Result<()> = async {
-        while !daemon.execution.is_draining() {
+        while !daemon.execution.is_draining()
+            && !reconnect_requested.load(Ordering::SeqCst)
+        {
             let Some(_lease_admission)=admit(&daemon)? else{break};
             while workers.try_join_next().is_some() {}
+            if reconnect_requested.load(Ordering::SeqCst) {
+                break;
+            }
             let response = daemon
                 .backend(
                     &org,
@@ -372,6 +382,8 @@ pub(super) async fn session(daemon: Arc<Daemon>, org: String) -> Result<()> {
                     terminal_key: Uuid::new_v4().to_string(),
                     started_at: state::now(),
                     acknowledged_at: None,
+        delivery_diagnostic: None,
+        first_failure_diagnostic: None,
                     event_sender:Default::default(),
                     stdout_pending: None,
                     stderr_pending: None,
@@ -379,6 +391,10 @@ pub(super) async fn session(daemon: Arc<Daemon>, org: String) -> Result<()> {
                     progress_buffer_offset: 0,
                     progress_discarding: false,
                     progress_pending: None,
+        public_status_latest: None,
+        public_status_pending: None,
+        public_status_next_sequence: 0,
+        public_status_last_sent_at_ms: 0,
                     stdout_offset: 0,
                     stderr_offset: 0,
                 };
@@ -387,6 +403,7 @@ pub(super) async fn session(daemon: Arc<Daemon>, org: String) -> Result<()> {
                 daemon.execution.register_cancellation(id.clone(), cancellation.clone()).await?;
 
                 let d = daemon.clone();
+                let worker_reconnect = reconnect_requested.clone();
                 let active = ActiveJob::new(d.clone());
                 workers.spawn(async move {
                     let _registration=registration;
@@ -402,6 +419,9 @@ pub(super) async fn session(daemon: Arc<Daemon>, org: String) -> Result<()> {
                         work(worker_daemon, worker_path, journal, cancellation, worker_scope).await
                     }));
                     let outcome = (&mut worker.0).await;
+                    if matches!(&outcome, Ok(Err(error)) if error.to_string() == "RUNNER_JOB_RECOVERY_SESSION_REQUIRED") {
+                        worker_reconnect.store(true, Ordering::SeqCst);
+                    }
                     // Even on panic, join every helper before writing a terminal record.
                     scope.stop().await;
                     if outcome.is_err() {
@@ -425,7 +445,7 @@ pub(super) async fn session(daemon: Arc<Daemon>, org: String) -> Result<()> {
         Ok(())
     }
     .await;
-    while workers.join_next().await.is_some() {}
+    drain_owned_workers(&mut workers).await;
     stop.store(true, Ordering::SeqCst);
     heartbeat.0.abort();
     let _ = daemon
@@ -443,6 +463,37 @@ pub(super) async fn session(daemon: Arc<Daemon>, org: String) -> Result<()> {
 #[cfg(test)]
 mod ownership_tests {
     use super::*;
+    #[tokio::test]
+    async fn reconnect_drain_preserves_healthy_sibling_until_it_finishes() {
+        let reconnect = Arc::new(AtomicBool::new(false));
+        let healthy_finished = Arc::new(AtomicBool::new(false));
+        let healthy_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut workers = tokio::task::JoinSet::new();
+        let stale_flag = reconnect.clone();
+        workers.spawn(async move {
+            stale_flag.store(true, Ordering::SeqCst);
+        });
+        let sibling_release = healthy_release.clone();
+        let sibling_finished = healthy_finished.clone();
+        workers.spawn(async move {
+            sibling_release.acquire().await.unwrap().forget();
+            sibling_finished.store(true, Ordering::SeqCst);
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !reconnect.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let drain = tokio::spawn(async move { drain_owned_workers(&mut workers).await });
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished());
+        assert!(!healthy_finished.load(Ordering::SeqCst));
+        healthy_release.add_permits(1);
+        drain.await.unwrap();
+        assert!(healthy_finished.load(Ordering::SeqCst));
+    }
     #[tokio::test]
     async fn one_job_owner_releases_cancellation_on_drop() {
         let s = Arc::new(ExecutionSupervisor::new(false));

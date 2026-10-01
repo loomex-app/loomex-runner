@@ -30,6 +30,85 @@ const SUPERVISOR: &str = "__loomex_execution_supervisor";
 const TERM_GRACE: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(50);
 
+/// Holds Tokio's child reaping ownership and the active-work power assertion
+/// together. An early return or future cancellation signals the owned group,
+/// then moves the sole Child owner into bounded asynchronous cleanup.
+struct OwnedGroupGuard {
+    child: Option<tokio::process::Child>,
+    pid: u32,
+    active: bool,
+    idle_sleep: Option<crate::power::IdleSleepGuard>,
+}
+impl OwnedGroupGuard {
+    fn new(
+        child: tokio::process::Child,
+        pid: u32,
+        idle_sleep: crate::power::IdleSleepGuard,
+    ) -> Self {
+        Self {
+            child: Some(child),
+            pid,
+            active: true,
+            idle_sleep: Some(idle_sleep),
+        }
+    }
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+impl std::ops::Deref for OwnedGroupGuard {
+    type Target = tokio::process::Child;
+    fn deref(&self) -> &Self::Target {
+        self.child
+            .as_ref()
+            .expect("owned child exists until guard drop")
+    }
+}
+impl std::ops::DerefMut for OwnedGroupGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.child
+            .as_mut()
+            .expect("owned child exists until guard drop")
+    }
+}
+impl Drop for OwnedGroupGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let idle_sleep = self.idle_sleep.take();
+        // `Child::id` becomes None once Tokio has reaped it. Signal only while
+        // this exact unreaped child still reserves the PID/PGID.
+        if child.id() == Some(self.pid) {
+            let signaled = unsafe { libc::kill(-(self.pid as i32), libc::SIGKILL) };
+            if signaled != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+            {
+                eprintln!("OWNED_GROUP_SIGNAL_INDETERMINATE");
+            }
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if tokio::time::timeout(Duration::from_secs(2), child.wait())
+                    .await
+                    .is_err()
+                {
+                    eprintln!("OWNED_GROUP_CLEANUP_INDETERMINATE");
+                    let _ = child.start_kill();
+                }
+                drop(idle_sleep);
+            });
+        } else {
+            eprintln!("OWNED_GROUP_CLEANUP_INDETERMINATE");
+            // `kill_on_drop` remains a second direct-child safeguard.
+            drop(child);
+            drop(idle_sleep);
+        }
+    }
+}
+
 pub trait ExecutionObserver: Send + Sync {
     /// Persist and sync execution intent before any process is created.
     fn before_spawn(&self, request: &ExecutionRequest) -> Result<()>;
@@ -157,6 +236,7 @@ pub async fn execute_with_supervisor(
     program: &Path,
 ) -> Result<ExecutionOutcome> {
     let cwd = checked_cwd(&request)?;
+    let idle_sleep = crate::power::IdleSleepGuard::acquire();
     prepare_output(&request.output_dir)?;
     let output_dir = request.output_dir.canonicalize()?;
     let stdout_path = output_dir.join("stdout");
@@ -167,7 +247,6 @@ pub async fn execute_with_supervisor(
     private_file(&status_path)?.sync_all()?;
     File::open(&request.output_dir)?.sync_all()?;
     request.observer.before_spawn(&request)?;
-
     let mut command = tokio::process::Command::new(program);
     command
         .arg(SUPERVISOR)
@@ -181,8 +260,10 @@ pub async fn execute_with_supervisor(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command.as_std_mut().process_group(0);
-    let mut child = command.spawn().context("spawn execution guardian")?;
+    command.kill_on_drop(true);
+    let child = command.spawn().context("spawn execution guardian")?;
     let pid = child.id().context("guardian has no PID")?;
+    let mut child = OwnedGroupGuard::new(child, pid, idle_sleep);
     let identity = ProcessIdentity {
         pid,
         pgid: pid as i32,
@@ -295,6 +376,7 @@ pub async fn execute_with_supervisor(
     }
     // Only now reap the guardian, releasing its PID/PGID reservation.
     let guardian_status = child.wait().await.context("reap execution guardian")?;
+    child.disarm();
     let _ = drain.send(true);
     if stdout_result.is_none() {
         stdout_result = Some(stdout_task.await.context("stdout spool task")?);

@@ -1,16 +1,19 @@
 //! Native runner administration state.
 //!
-//! This module deliberately does not take the daemon lock.  A lifecycle
-//! operation may drain or replace the daemon, while workflow execution keeps
-//! using `daemon.lock`; the two ownership domains must remain independent.
+//! Lifecycle writers have a distinct lock. After authoritative service/process
+//! exit only, replacement briefly holds the existing daemon singleton lock;
+//! it is released before bootstrap so the new daemon can acquire ownership.
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     fs::{self, File, OpenOptions},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-    path::{Path, PathBuf},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
+    path::{Component, Path, PathBuf},
     time::Duration,
 };
 use uuid::Uuid;
@@ -25,6 +28,8 @@ static TEST_MODE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static TEST_BOOTOUT_FAIL: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
+static TEST_STOP_WAIT_UNCONFIRMED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
 static TEST_DRAIN_HAS_ACTIVE_WORK: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static TEST_CANDIDATE_HEALTH_FAIL: AtomicBool = AtomicBool::new(false);
@@ -33,9 +38,33 @@ static TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 #[cfg(test)]
 static TEST_RECOVERY_STATUS: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
 #[cfg(test)]
+static TEST_AUTH_STATUS: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
+#[cfg(test)]
 static TEST_RECOVERY_FAULT: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
 #[cfg(test)]
 static TEST_RESTART_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_STATUS_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_ABANDONMENT_RESTART: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_LABEL_PRESENT: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_DELAYED_SERVICE_STOP: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_LABEL_OBSERVATION: std::sync::Mutex<Option<LabelObservation>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_PROCESS_OBSERVATION: std::sync::Mutex<Option<ProcessObservation>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+static TEST_STOP_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_STATUS_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_PRUNE_IN_USE: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+static TEST_PRUNE_FAULT: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
 fn recovery_fault(stage: &str) -> Result<()> {
@@ -58,10 +87,40 @@ fn lifecycle_test_mode() -> bool {
     std::env::var_os("LOOMEX_INSTALL_TEST_MODE").as_deref() == Some(std::ffi::OsStr::new("1"))
 }
 
-pub const OPERATION_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v1";
+// New records use schemas unknown to pre-auth-gate lifecycle owners. In
+// particular, an older runner must reject rather than ignore authBaseline.
+pub const OPERATION_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v4";
+// Prune has different recovery semantics. Older lifecycle owners must reject
+// an interrupted prune instead of interpreting it as an activation journal.
+const PRUNE_OPERATION_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v6";
+const ABANDONMENT_OPERATION_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v5";
+const PRE_AUTH_OPERATION_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v2";
+const PRE_AUTH_ABANDONMENT_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v3";
+const LEGACY_OPERATION_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v1";
+// Exact supported checkpoint meanings from the frozen v1 owner. Without a
+// captured stop identity, newer/unknown meanings must not enter legacy repair.
+const LEGACY_CHECKPOINTS: &[&str] = &[
+    "resources_captured",
+    "daemon_drained",
+    "old_service_stopped",
+    "pointer_and_plist_switched",
+    "candidate_bootstrapped",
+    "candidate_healthy",
+    "daemon_has_active_work",
+    "candidate_or_previous_service_not_safe_to_restore",
+    "candidate_healthy_after_reconciliation",
+    "previous_service_healthy_after_reconciliation",
+    "previous_service_restored",
+    "candidate_drain_release_pending",
+    "previous_drain_release_pending",
+    "daemon_drained_after_pending",
+    "candidate_healthy_after_pending",
+    "observed state could not be reconciled safely",
+    "legacy_journal_retained",
+];
 const LOCK_NAME: &str = "lifecycle.lock";
 const OPERATION_NAME: &str = "lifecycle-operation.json";
-const NATIVE_EXECUTABLES: &[&str] = &["launchctl"];
+const NATIVE_EXECUTABLES: &[&str] = &["/bin/launchctl"];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -71,6 +130,7 @@ pub enum OperationKind {
     Uninstall,
     Repair,
     Rollback,
+    Prune,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -92,6 +152,74 @@ pub struct Operation {
     pub resources: Option<OperationResources>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_stops: Vec<ServiceStopIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abandonment: Option<PendingUpdateAbandonment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_baseline: Option<AuthBaseline>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prune: Option<PruneIntent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PruneIntent {
+    pub targets: Vec<PathBuf>,
+    pub retain: Vec<PathBuf>,
+    pub moved: Vec<PathBuf>,
+    pub deleting_started: Vec<PathBuf>,
+    pub current_target: PathBuf,
+    pub original_inventory_digest: String,
+    pub result_inventory_digest: String,
+    pub receipt_digest: String,
+    pub drain_key: Uuid,
+    pub launch_agent_digest: String,
+    pub auth_baseline: AuthBaseline,
+}
+
+/// Only public auth.status fields. The Keychain remains the credential authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "state",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum AuthBaseline {
+    Initial,
+    SignedOut {
+        installation_id: Option<Uuid>,
+    },
+    Authenticated {
+        installation_id: Uuid,
+        active_organization: Option<Uuid>,
+    },
+}
+
+// Private abandonment schemas prevent older lifecycle owners from treating an
+// abort as an executable Update. The UUID/package remain its transaction owner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingUpdateAbandonment {
+    operation_id: Uuid,
+    package: PackageIdentity,
+    previous_target: PathBuf,
+    receipt_digest: String,
+    inventory_digest: String,
+    plist_digest: String,
+    drain_digest: String,
+    bootstrap_configuration_digest: String,
+    process: ProcessIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    successor: Option<BootstrapSuccessor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BootstrapSuccessor {
+    package: PackageIdentity,
+    configuration_digest: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -129,12 +257,142 @@ impl Operation {
             previous_target: None,
             resources: None,
             checkpoint: None,
+            service_stops: Vec::new(),
+            abandonment: None,
+            auth_baseline: None,
+            prune: None,
         }
     }
 
     fn validate(&self) -> Result<()> {
-        if self.schema != OPERATION_SCHEMA || self.phase.is_empty() || self.phase.len() > 128 {
+        if !matches!(
+            self.schema.as_str(),
+            OPERATION_SCHEMA
+                | PRUNE_OPERATION_SCHEMA
+                | LEGACY_OPERATION_SCHEMA
+                | PRE_AUTH_OPERATION_SCHEMA
+                | PRE_AUTH_ABANDONMENT_SCHEMA
+                | ABANDONMENT_OPERATION_SCHEMA
+        ) || self.phase.is_empty()
+            || self.phase.len() > 128
+        {
             bail!("invalid lifecycle operation")
+        }
+        ensure!(
+            (self.schema == PRUNE_OPERATION_SCHEMA)
+                == (self.kind == OperationKind::Prune && self.prune.is_some()),
+            "invalid prune journal schema"
+        );
+        if let Some(prune) = &self.prune {
+            ensure!(
+                matches!(
+                    self.phase.as_str(),
+                    "prepared"
+                        | "draining"
+                        | "deleting"
+                        | "metadata"
+                        | "drain_release_pending"
+                        | "completed"
+                ) && self.package.is_none()
+                    && self.previous_target.is_none()
+                    && self.resources.is_none()
+                    && self.checkpoint.is_none()
+                    && self.service_stops.is_empty()
+                    && self.abandonment.is_none()
+                    && self.auth_baseline.is_none()
+                    && !prune.targets.is_empty()
+                    && !prune.retain.is_empty()
+                    && prune.targets.len() <= 256
+                    && prune.retain.len() <= 256
+                    && valid_digest(&prune.original_inventory_digest)
+                    && valid_digest(&prune.result_inventory_digest)
+                    && valid_digest(&prune.receipt_digest)
+                    && valid_digest(&prune.launch_agent_digest)
+                    && prune.current_target.is_absolute()
+                    && prune.targets.iter().all(|path| path.is_absolute())
+                    && prune.retain.iter().all(|path| path.is_absolute())
+                    && prune.moved.iter().all(|path| prune.targets.contains(path))
+                    && prune
+                        .deleting_started
+                        .iter()
+                        .all(|path| prune.moved.contains(path))
+                    && prune
+                        .deleting_started
+                        .iter()
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        == prune.deleting_started.len()
+                    && prune
+                        .targets
+                        .iter()
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        == prune.targets.len()
+                    && prune
+                        .retain
+                        .iter()
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        == prune.retain.len(),
+                "invalid prune journal binding"
+            );
+        }
+        ensure!(
+            matches!(
+                self.schema.as_str(),
+                ABANDONMENT_OPERATION_SCHEMA | PRE_AUTH_ABANDONMENT_SCHEMA
+            ) == self.abandonment.is_some(),
+            "invalid abandonment journal schema"
+        );
+        if let Some(intent) = &self.abandonment {
+            ensure!(
+                self.kind == OperationKind::Update
+                    && intent.operation_id == self.id
+                    && self.package.as_ref() == Some(&intent.package)
+                    && self.previous_target.as_ref() == Some(&intent.previous_target)
+                    && intent.previous_target.is_absolute()
+                    && [
+                        &intent.receipt_digest,
+                        &intent.inventory_digest,
+                        &intent.plist_digest,
+                        &intent.drain_digest,
+                        &intent.bootstrap_configuration_digest
+                    ]
+                    .iter()
+                    .all(|digest| valid_digest(digest))
+                    && intent.process.uid == unsafe { libc::geteuid() }
+                    && intent.process.pid > 0
+                    && intent.process.started_seconds > 0
+                    && intent.process.started_micros < 1_000_000
+                    && intent.process.executable
+                        == intent.previous_target.join("bin/loomex-runner")
+                    && matches!(
+                        self.phase.as_str(),
+                        "abandonment_pending"
+                            | "service_stop_pending"
+                            | "service_stopped"
+                            | "pointer_switched"
+                            | "candidate_started"
+                            | "recovery_required"
+                            | "rolled_back"
+                    )
+                    && (self.service_stops.is_empty() == (self.phase == "abandonment_pending"))
+                    && self
+                        .service_stops
+                        .iter()
+                        .all(|stop| stop.direction == StopDirection::RestorePrevious),
+                "invalid abandonment transaction binding"
+            );
+            if let Some(successor) = &intent.successor {
+                ensure!(
+                    self.phase == "rolled_back"
+                        && valid_digest(&successor.configuration_digest)
+                        && successor.configuration_digest != intent.bootstrap_configuration_digest
+                        && successor.package.target.is_absolute()
+                        && valid_digest(&successor.package.manifest_sha256),
+                    "invalid abandonment successor binding"
+                );
+            }
         }
         if let Some(package) = &self.package {
             if !package.target.is_absolute()
@@ -146,6 +404,33 @@ impl Operation {
             {
                 bail!("invalid lifecycle package identity")
             }
+        }
+        if self.auth_baseline.is_some() {
+            ensure!(
+                matches!(
+                    self.schema.as_str(),
+                    OPERATION_SCHEMA | ABANDONMENT_OPERATION_SCHEMA
+                ) && self.kind != OperationKind::Uninstall,
+                "invalid lifecycle auth baseline"
+            );
+            ensure!(
+                matches!(self.auth_baseline, Some(AuthBaseline::Initial))
+                    == self.previous_target.is_none(),
+                "lifecycle auth baseline differs from previous installation"
+            );
+        }
+        if matches!(
+            self.schema.as_str(),
+            OPERATION_SCHEMA | ABANDONMENT_OPERATION_SCHEMA
+        ) && matches!(
+            self.kind,
+            OperationKind::Install | OperationKind::Update | OperationKind::Rollback
+        ) && self.resources.is_some()
+        {
+            ensure!(
+                self.auth_baseline.is_some(),
+                "lifecycle auth baseline is missing"
+            );
         }
         if let Some(resources) = &self.resources {
             if !resources.launch_agent.is_absolute()
@@ -166,8 +451,133 @@ impl Operation {
                 bail!("invalid lifecycle LaunchAgent backup digest")
             }
         }
+        ensure!(
+            self.schema != LEGACY_OPERATION_SCHEMA
+                || (self.service_stops.is_empty() && self.phase != "service_stop_pending"),
+            "legacy lifecycle operation cannot carry service-stop intent"
+        );
+        ensure!(
+            self.service_stops.len() <= 2,
+            "invalid service-stop history"
+        );
+        ensure!(
+            self.phase != "service_stop_pending" || !self.service_stops.is_empty(),
+            "pending service stop has no recorded identity"
+        );
+        ensure!(
+            self.abandonment.is_some()
+                || !self.service_stops.is_empty()
+                || self
+                    .checkpoint
+                    .as_deref()
+                    .is_none_or(|checkpoint| LEGACY_CHECKPOINTS.contains(&checkpoint)),
+            "lifecycle checkpoint requires captured service-stop identity or supported legacy meaning"
+        );
+        for (index, stop) in self.service_stops.iter().enumerate() {
+            ensure!(
+                stop.operation_id == self.id
+                    && self.package.as_ref() == Some(&stop.package)
+                    && stop.uid == unsafe { libc::geteuid() }
+                    && stop.label == format!("gui/{}/app.loomex.runner", stop.uid)
+                    && stop
+                        .target
+                        .as_ref()
+                        .is_none_or(|target| target.is_absolute())
+                    && stop
+                        .plist_digest
+                        .as_ref()
+                        .is_none_or(|digest| valid_digest(digest))
+                    && stop
+                        .receipt_digest
+                        .as_ref()
+                        .is_none_or(|digest| valid_digest(digest))
+                    && valid_digest(&stop.inventory_digest)
+                    && stop
+                        .drain_digest
+                        .as_ref()
+                        .is_none_or(|digest| valid_digest(digest)),
+                "invalid lifecycle service-stop binding"
+            );
+            if let Some(process) = &stop.process {
+                ensure!(
+                    process.pid > 0
+                        && process.uid == stop.uid
+                        && process.started_seconds > 0
+                        && process.started_micros < 1_000_000
+                        && stop.target.as_ref().is_some_and(
+                            |target| process.executable == target.join("bin/loomex-runner")
+                        ),
+                    "invalid lifecycle stopped-process identity"
+                );
+            }
+            ensure!(
+                index + 1 == self.service_stops.len()
+                    || stop.request == StopRequest::ObservedStopped,
+                "unresolved stop intent cannot be superseded"
+            );
+        }
         Ok(())
     }
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|value| value.is_ascii_hexdigit())
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StopDirection {
+    ActivateCandidate,
+    RestorePrevious,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StopRequest {
+    Prepared,
+    Accepted,
+    Unconfirmed,
+    ObservedStopped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessIdentity {
+    pid: i32,
+    uid: u32,
+    started_seconds: u64,
+    started_micros: u64,
+    executable: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ServiceStopIntent {
+    operation_id: Uuid,
+    direction: StopDirection,
+    package: PackageIdentity,
+    uid: u32,
+    label: String,
+    target: Option<PathBuf>,
+    plist_digest: Option<String>,
+    receipt_digest: Option<String>,
+    inventory_digest: String,
+    drain_digest: Option<String>,
+    process: Option<ProcessIdentity>,
+    request: StopRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LabelObservation {
+    Loaded { pid: i32, program: PathBuf },
+    Absent,
+    Unknown,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProcessObservation {
+    Present(ProcessIdentity),
+    Exited,
+    Unknown,
 }
 
 #[derive(Debug, Clone)]
@@ -347,6 +757,10 @@ pub fn verify_owned_version_from_inventory(target: &Path, owned: &Value) -> Resu
         .find(|entry| entry["path"].as_str() == Some(target.to_string_lossy().as_ref()))
         .and_then(|entry| entry["files"].as_array())
         .context("owned version has no signed file inventory")?;
+    verify_directory_against_files(target, expected)
+}
+
+fn verify_directory_against_files(target: &Path, expected: &[Value]) -> Result<()> {
     let mut actual = Vec::new();
     fn visit(root: &Path, directory: &Path, output: &mut Vec<Value>) -> Result<()> {
         for entry in fs::read_dir(directory)? {
@@ -368,7 +782,7 @@ pub fn verify_owned_version_from_inventory(target: &Path, owned: &Value) -> Resu
     }
     visit(target, target, &mut actual)?;
     actual.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
-    if &actual != expected {
+    if actual != expected {
         bail!("owned version no longer matches the release inventory")
     }
     Ok(())
@@ -381,7 +795,7 @@ fn verify_all_owned_versions(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-fn validate_rollback_target(target: &Path, version: &str) -> Result<()> {
+fn validate_retained_target_metadata(target: &Path, version: &str) -> Result<()> {
     let metadata = fs::symlink_metadata(target)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         bail!("unsafe rollback target")
@@ -393,16 +807,11 @@ fn validate_rollback_target(target: &Path, version: &str) -> Result<()> {
     {
         bail!("rollback target metadata does not match requested version")
     }
-    if fs::read(target.join("metadata/compatibility-manifest.json"))?
-        != include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/contracts/compatibility-manifest.json"
-        ))
-    {
-        bail!("rollback target compatibility manifest differs from this CLI")
-    }
-    let binary = target.join("bin/loomex");
-    let metadata = fs::symlink_metadata(binary)?;
+    Ok(())
+}
+
+fn validate_retained_target_cli(target: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(target.join("bin/loomex"))?;
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
         || metadata.permissions().mode() & 0o111 == 0
@@ -410,6 +819,53 @@ fn validate_rollback_target(target: &Path, version: &str) -> Result<()> {
         bail!("rollback target CLI is not executable")
     }
     Ok(())
+}
+
+fn validate_rollback_target(target: &Path, version: &str) -> Result<()> {
+    validate_retained_target_metadata(target, version)?;
+    ensure!(
+        fs::read(target.join("metadata/compatibility-manifest.json"))?
+            == include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/contracts/compatibility-manifest.json"
+            )),
+        "LIFECYCLE_ROLLBACK_COMPATIBILITY_MISMATCH"
+    );
+    validate_retained_target_cli(target)
+}
+
+// This is not general rollback compatibility negotiation. An abort restores
+// only the already-running current package, exactly captured by its Update and
+// verified against that package's own immutable inventory. A newer CLI's
+// product catalog need not be byte-identical to the daemon it is preserving.
+fn validate_abandonment_current_previous(
+    paths: &Paths,
+    operation: &Operation,
+    previous: &Path,
+    version: &str,
+) -> Result<()> {
+    ensure!(
+        operation.kind == OperationKind::Update
+            && operation.previous_target.as_deref() == Some(previous)
+            && current_target(paths)?.as_deref() == Some(previous),
+        "LIFECYCLE_ABANDONMENT_CURRENT_TARGET_MISMATCH"
+    );
+    let resources = operation
+        .resources
+        .as_ref()
+        .context("LIFECYCLE_ABANDONMENT_RESOURCE_MISSING")?;
+    ensure!(
+        resources
+            .owned_versions
+            .iter()
+            .any(|target| target == previous),
+        "LIFECYCLE_ABANDONMENT_PREVIOUS_NOT_CAPTURED"
+    );
+    validate_retained_target_metadata(previous, version)
+        .context("LIFECYCLE_ABANDONMENT_PREVIOUS_METADATA_MISMATCH")?;
+    validate_retained_target_cli(previous).context("LIFECYCLE_ABANDONMENT_PREVIOUS_CLI_INVALID")?;
+    verify_owned_version(paths, previous)
+        .context("LIFECYCLE_ABANDONMENT_PREVIOUS_INVENTORY_MISMATCH")
 }
 
 fn validate_rollback_status(response: &Value) -> Result<()> {
@@ -558,6 +1014,615 @@ fn write_pointer(paths: &Paths, target: &Path, operation: &Operation) -> Result<
     Ok(())
 }
 
+// Only fixed, read-only launchd observations are parsed. Unknown command exits,
+// truncated output and malformed identities never mean absence.
+fn classify_label_output(
+    uid: u32,
+    code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> LabelObservation {
+    let Ok(stdout) = std::str::from_utf8(stdout) else {
+        return LabelObservation::Unknown;
+    };
+    let Ok(stderr) = std::str::from_utf8(stderr) else {
+        return LabelObservation::Unknown;
+    };
+    let missing =
+        format!("Could not find service \"app.loomex.runner\" in domain for user gui: {uid}");
+    let lines: Vec<_> = stderr.lines().collect();
+    if code == Some(113)
+        && stdout.is_empty()
+        && (lines == [missing.as_str()] || lines == ["Bad request.", missing.as_str()])
+    {
+        return LabelObservation::Absent;
+    }
+    if code != Some(0) || !stdout.starts_with(&format!("gui/{uid}/app.loomex.runner = {{\n")) {
+        return LabelObservation::Unknown;
+    }
+    let mut pid = None;
+    let mut program = None;
+    for line in stdout.lines() {
+        if let Some(value) = line.strip_prefix("\tpid = ") {
+            if pid.is_some() {
+                return LabelObservation::Unknown;
+            }
+            let Some(value) = value.parse::<i32>().ok().filter(|pid| *pid > 0) else {
+                return LabelObservation::Unknown;
+            };
+            pid = Some(value);
+        }
+        if let Some(value) = line.strip_prefix("\tprogram = ") {
+            if program.is_some() {
+                return LabelObservation::Unknown;
+            }
+            let path = PathBuf::from(value);
+            if !path.is_absolute() {
+                return LabelObservation::Unknown;
+            }
+            program = Some(path);
+        }
+    }
+    match (pid, program) {
+        (Some(pid), Some(program)) => LabelObservation::Loaded { pid, program },
+        _ => LabelObservation::Unknown,
+    }
+}
+
+async fn observe_label(_paths: &Paths) -> LabelObservation {
+    if lifecycle_test_mode() {
+        #[cfg(test)]
+        {
+            if let Some(value) = TEST_LABEL_OBSERVATION.lock().unwrap().clone() {
+                return value;
+            }
+            if TEST_LABEL_PRESENT.load(Ordering::SeqCst) {
+                return LabelObservation::Loaded {
+                    pid: 111111,
+                    program: _paths.current().join("bin/loomex-runner"),
+                };
+            }
+        }
+        return LabelObservation::Absent;
+    }
+    use tokio::io::AsyncReadExt;
+    let uid = unsafe { libc::geteuid() };
+    let child = tokio::process::Command::new("/bin/launchctl")
+        .arg("print")
+        .arg(format!("gui/{uid}/app.loomex.runner"))
+        .env("LC_ALL", "C")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn();
+    let Ok(mut child) = child else {
+        return LabelObservation::Unknown;
+    };
+    let Some(stdout) = child.stdout.take() else {
+        return LabelObservation::Unknown;
+    };
+    let Some(stderr) = child.stderr.take() else {
+        return LabelObservation::Unknown;
+    };
+    let read = async {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut stdout = stdout.take(65537);
+        let mut stderr = stderr.take(65537);
+        let (status, out_result, err_result) = tokio::join!(
+            child.wait(),
+            stdout.read_to_end(&mut out),
+            stderr.read_to_end(&mut err)
+        );
+        match (status, out_result, err_result) {
+            (Ok(status), Ok(_), Ok(_)) if out.len() <= 65536 && err.len() <= 65536 => {
+                classify_label_output(uid, status.code(), &out, &err)
+            }
+            _ => LabelObservation::Unknown,
+        }
+    };
+    // This kills only our read-only inspection child on timeout, never the
+    // service or a stop request. No unbounded output or retained reader task.
+    tokio::time::timeout(Duration::from_millis(250), read)
+        .await
+        .unwrap_or(LabelObservation::Unknown)
+}
+
+#[cfg(target_os = "macos")]
+fn inspect_process(pid: i32) -> ProcessObservation {
+    if pid <= 0 {
+        return ProcessObservation::Unknown;
+    }
+    // Signal 0 is only a presence probe. EPERM/inspection failure is unknown.
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            ProcessObservation::Exited
+        } else {
+            ProcessObservation::Unknown
+        };
+    }
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    if unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size as i32,
+        )
+    } != size as i32
+    {
+        return ProcessObservation::Unknown;
+    }
+    let mut buffer = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let len = unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+    if len <= 0 {
+        return ProcessObservation::Unknown;
+    }
+    let bytes = buffer.split(|byte| *byte == 0).next().unwrap_or_default();
+    use std::os::unix::ffi::OsStrExt;
+    let executable = PathBuf::from(std::ffi::OsStr::from_bytes(bytes));
+    if !executable.is_absolute() || info.pbi_pid != pid as u32 {
+        return ProcessObservation::Unknown;
+    }
+    ProcessObservation::Present(ProcessIdentity {
+        pid,
+        uid: info.pbi_uid,
+        started_seconds: info.pbi_start_tvsec,
+        started_micros: info.pbi_start_tvusec,
+        executable,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn inspect_process(_pid: i32) -> ProcessObservation {
+    ProcessObservation::Unknown
+}
+
+fn observe_recorded_process(process: &ProcessIdentity) -> ProcessObservation {
+    #[cfg(test)]
+    if lifecycle_test_mode() {
+        if let Some(value) = TEST_PROCESS_OBSERVATION.lock().unwrap().clone() {
+            return value;
+        }
+        return if TEST_LABEL_PRESENT.load(Ordering::SeqCst) {
+            ProcessObservation::Present(process.clone())
+        } else {
+            ProcessObservation::Exited
+        };
+    }
+    inspect_process(process.pid)
+}
+
+fn stopped_singleton(paths: &Paths, first_install: bool) -> Result<File> {
+    // Cooperative server authority is bound to this installation's state
+    // namespace. control::serve acquires this same secure lock before socket
+    // bind/admission and retains it through managed drain and native workers.
+    // This does not classify unknown same-user processes or alternate manual
+    // state directories as absent. Exact old PID/label proofs remain separate.
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(first_install || lifecycle_test_mode())
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(paths.state_dir.join("daemon.lock"))?;
+    let metadata = lock.metadata()?;
+    ensure!(
+        metadata.is_file()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.permissions().mode() & 0o077 == 0,
+        "unsafe daemon singleton"
+    );
+    lock.try_lock_exclusive()
+        .context("daemon ownership remains unavailable")?;
+    Ok(lock)
+}
+
+fn verify_stop_binding(
+    paths: &Paths,
+    operation: &Operation,
+    stop: &ServiceStopIntent,
+    permit_switch: bool,
+) -> Result<()> {
+    operation.validate()?;
+    let resources = operation
+        .resources
+        .as_ref()
+        .context("activation resources missing")?;
+    ensure!(
+        resources.launch_agent == launch_agent(paths),
+        "service-stop LaunchAgent namespace changed"
+    );
+    match stop.direction {
+        StopDirection::ActivateCandidate => ensure!(
+            stop.target == operation.previous_target
+                && stop.plist_digest == resources.launch_agent_backup_sha256,
+            "activation stop differs from captured previous service"
+        ),
+        StopDirection::RestorePrevious => ensure!(
+            (stop.target.as_ref() == Some(&stop.package.target)
+                && stop.plist_digest.as_ref() == Some(&resources.staged_launch_agent_sha256))
+                || (stop.target == operation.previous_target
+                    && stop.plist_digest == resources.launch_agent_backup_sha256),
+            "rollback stop differs from captured service"
+        ),
+    }
+
+    ensure!(
+        regular_digest(&paths.state_dir.join("install-receipt.json"))? == stop.receipt_digest
+            && regular_digest(&paths.state_dir.join("owned-versions.json"))?.as_deref()
+                == Some(&stop.inventory_digest),
+        "service-stop receipt or inventory changed"
+    );
+    verify_all_owned_versions(paths)?;
+    ensure!(
+        resources.owned_versions.contains(&stop.package.target)
+            && owned_versions(paths)?.contains(&stop.package.target),
+        "service-stop candidate ownership changed"
+    );
+    validate_rollback_target(&stop.package.target, &stop.package.version)?;
+    ensure!(
+        regular_digest(&resources.staged_launch_agent)?.as_deref()
+            == Some(&resources.staged_launch_agent_sha256)
+            && regular_digest(&resources.launch_agent_backup)?
+                == resources.launch_agent_backup_sha256,
+        "service-stop recovery configuration changed"
+    );
+    let pointer = current_target(paths)?;
+    let plist = regular_digest(&resources.launch_agent)?;
+    let desired = match stop.direction {
+        StopDirection::ActivateCandidate => Some(&stop.package.target),
+        StopDirection::RestorePrevious => operation.previous_target.as_ref(),
+    };
+    let desired_plist = match stop.direction {
+        StopDirection::ActivateCandidate => Some(&resources.staged_launch_agent_sha256),
+        StopDirection::RestorePrevious => resources.launch_agent_backup_sha256.as_ref(),
+    };
+    ensure!(
+        (pointer == stop.target || (permit_switch && pointer.as_ref() == desired))
+            && (plist == stop.plist_digest || (permit_switch && plist.as_ref() == desired_plist)),
+        "service-stop pointer or configuration changed"
+    );
+    if !permit_switch {
+        ensure!(
+            regular_digest(&paths.state_dir.join("drain.json"))? == stop.drain_digest,
+            "service-stop drain changed"
+        );
+    }
+    if let Some(target) = &stop.target {
+        ensure!(
+            resources.owned_versions.contains(target) && owned_versions(paths)?.contains(target),
+            "service-stop prior ownership changed"
+        );
+        verify_owned_version(paths, target)?;
+    }
+    Ok(())
+}
+
+fn service_stop_pending(operation: &Operation) -> Value {
+    json!({"activated":false,"resumed":false,"pending":true,"reason":"service_stop","operation":operation})
+}
+
+async fn prepare_service_stop(
+    paths: &Paths,
+    operation: &mut Operation,
+    direction: StopDirection,
+) -> Result<()> {
+    ensure!(
+        operation
+            .service_stops
+            .last()
+            .is_none_or(|stop| stop.request == StopRequest::ObservedStopped),
+        "unresolved stop cannot be replaced"
+    );
+    let target = current_target(paths)?;
+    let plist_digest = regular_digest(&launch_agent(paths))?;
+    let uid = unsafe { libc::geteuid() };
+    let process = match observe_label(paths).await {
+        LabelObservation::Loaded { pid, program } => {
+            let target = target
+                .as_ref()
+                .context("loaded service has no owned current target")?;
+            let digest = plist_digest
+                .as_ref()
+                .context("loaded service has no configuration")?;
+            let version = verify_recovery_service(paths, operation, target, digest)?;
+            ensure!(
+                program == paths.current().join("bin/loomex-runner")
+                    || program == target.join("bin/loomex-runner"),
+                "loaded service program differs from owned target"
+            );
+            let status = daemon_status(paths).await?;
+            ensure!(
+                candidate_drain_can_be_released(&status, &version),
+                "service stop requires the exact drained idle daemon"
+            );
+            let process = if lifecycle_test_mode() {
+                ProcessIdentity {
+                    pid,
+                    uid,
+                    started_seconds: 1,
+                    started_micros: 0,
+                    executable: target.join("bin/loomex-runner"),
+                }
+            } else {
+                match inspect_process(pid) {
+                    ProcessObservation::Present(process) => process,
+                    _ => bail!("service process identity unavailable"),
+                }
+            };
+            ensure!(
+                process.uid == uid && process.executable == target.join("bin/loomex-runner"),
+                "service process identity differs from owned target"
+            );
+            Some(process)
+        }
+        LabelObservation::Absent => {
+            // Label absence is not server exclusivity. The exact bound state
+            // directory's secure singleton fences every supported server
+            // before socket bind/admission, including retained native workers.
+            let _singleton = stopped_singleton(paths, target.is_none())?;
+            None
+        }
+        LabelObservation::Unknown => bail!("service label identity unavailable"),
+    };
+    if operation.abandonment.is_none() {
+        operation.schema = if operation.auth_baseline.is_some() {
+            OPERATION_SCHEMA
+        } else {
+            PRE_AUTH_OPERATION_SCHEMA
+        }
+        .into();
+    }
+    operation.service_stops.push(ServiceStopIntent {
+        operation_id: operation.id,
+        direction,
+        package: operation
+            .package
+            .clone()
+            .context("activation package missing")?,
+        uid,
+        label: format!("gui/{uid}/app.loomex.runner"),
+        target,
+        plist_digest,
+        receipt_digest: regular_digest(&paths.state_dir.join("install-receipt.json"))?,
+        inventory_digest: regular_digest(&paths.state_dir.join("owned-versions.json"))?
+            .context("owned inventory unavailable")?,
+        drain_digest: regular_digest(&paths.state_dir.join("drain.json"))?,
+        process,
+        request: StopRequest::Prepared,
+    });
+    set_checkpoint(
+        paths,
+        operation,
+        "service_stop_pending",
+        "service_stop_intent_prepared",
+    )
+}
+
+// A failed spawn proves no child received the request. Only that definitive
+// outcome may reset a v3 dispatch intent. A failed/ambiguous reset leaves the
+// caller uncertain and never authorizes another stop in this invocation.
+fn record_stop_not_dispatched(paths: &Paths, operation: &mut Operation) -> Result<()> {
+    if operation.abandonment.is_some() {
+        let uncertain = operation.clone();
+        #[cfg(test)]
+        recovery_fault("before_stop_not_dispatched_checkpoint")?;
+        operation
+            .service_stops
+            .last_mut()
+            .context("service-stop intent missing")?
+            .request = StopRequest::Prepared;
+        if let Err(error) = set_checkpoint(
+            paths,
+            operation,
+            "service_stop_pending",
+            "service_stop_intent_prepared",
+        ) {
+            *operation = uncertain;
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+async fn request_service_stop(paths: &Paths, operation: &mut Operation) -> Result<()> {
+    let stop = operation
+        .service_stops
+        .last()
+        .context("service-stop intent missing")?
+        .clone();
+    verify_stop_binding(paths, operation, &stop, false)?;
+    let Some(process) = &stop.process else {
+        return Ok(());
+    };
+    let label = observe_label(paths).await;
+    ensure!(
+        matches!(label, LabelObservation::Loaded { pid, program } if pid == process.pid && (program == process.executable || program == paths.current().join("bin/loomex-runner"))),
+        "service label changed before stop"
+    );
+    ensure!(
+        observe_recorded_process(process) == ProcessObservation::Present(process.clone()),
+        "service process changed before stop"
+    );
+    let version = stop
+        .target
+        .as_ref()
+        .and_then(|target| target.file_name())
+        .and_then(|name| name.to_str())
+        .context("stop target version missing")?;
+    ensure!(
+        candidate_drain_can_be_released(&daemon_status(paths).await?, version),
+        "service stop requires fresh drained zero managed work"
+    );
+    #[cfg(test)]
+    recovery_fault("after_stop_intent")?;
+    if operation.abandonment.is_some() {
+        // v3 records uncertain dispatch BEFORE its effect. A Prepared v3 intent
+        // is therefore safe to dispatch after interruption; Unconfirmed is
+        // observation-only, including a crash before spawn actually occurred.
+        operation.service_stops.last_mut().unwrap().request = StopRequest::Unconfirmed;
+        set_checkpoint(
+            paths,
+            operation,
+            "service_stop_pending",
+            "service_stop_dispatching",
+        )?;
+        #[cfg(test)]
+        recovery_fault("after_abandonment_stop_dispatch_intent")?;
+    }
+    let request = if lifecycle_test_mode() {
+        #[cfg(test)]
+        {
+            TEST_STOP_COUNT.fetch_add(1, Ordering::SeqCst);
+            if TEST_BOOTOUT_FAIL.load(Ordering::SeqCst) {
+                record_stop_not_dispatched(paths, operation)?;
+                bail!("injected stop spawn failure");
+            }
+            if TEST_STOP_WAIT_UNCONFIRMED.load(Ordering::SeqCst) {
+                operation.service_stops.last_mut().unwrap().request = StopRequest::Unconfirmed;
+                return set_checkpoint(
+                    paths,
+                    operation,
+                    "service_stop_pending",
+                    "service_stop_requested",
+                );
+            }
+            if !TEST_DELAYED_SERVICE_STOP.load(Ordering::SeqCst) {
+                TEST_LABEL_PRESENT.store(false, Ordering::SeqCst);
+            }
+        }
+        StopRequest::Accepted
+    } else {
+        let spawn = tokio::process::Command::new("/bin/launchctl")
+            .arg("bootout")
+            .arg(&stop.label)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let mut child = match spawn {
+            Ok(child) => child,
+            Err(error) => {
+                record_stop_not_dispatched(paths, operation)?;
+                return Err(error).context("service-stop request was not dispatched");
+            }
+        };
+        // An expired caller budget does not terminate this mutating child and
+        // does not authorize replay. The same sealed intent observes only.
+        match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+            Ok(Ok(status)) if status.success() => StopRequest::Accepted,
+            _ => StopRequest::Unconfirmed,
+        }
+    };
+    operation.service_stops.last_mut().unwrap().request = request;
+    set_checkpoint(
+        paths,
+        operation,
+        "service_stop_pending",
+        "service_stop_requested",
+    )?;
+    #[cfg(test)]
+    recovery_fault("after_stop_request")?;
+    Ok(())
+}
+
+// Return the singleton guard only after actual absence AND old-process exit.
+// A later caller resumes this same intent; it never reissues bootout.
+async fn observe_service_stop(
+    paths: &Paths,
+    operation: &mut Operation,
+    bounded: bool,
+) -> Result<Option<File>> {
+    let stop = operation
+        .service_stops
+        .last()
+        .context("service-stop intent missing")?
+        .clone();
+    let switched = stop.request == StopRequest::ObservedStopped;
+    verify_stop_binding(paths, operation, &stop, switched)?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    for _ in 0..if bounded { 20 } else { 1 } {
+        let interval = tokio::time::Instant::now() + Duration::from_millis(250);
+        match observe_label(paths).await {
+            LabelObservation::Loaded { pid, program } => {
+                ensure!(
+                    stop.process.as_ref().is_some_and(|old| old.pid == pid
+                        && (program == old.executable
+                            || program == paths.current().join("bin/loomex-runner"))),
+                    "service label was replaced while stop pending"
+                );
+                if let Some(old) = &stop.process {
+                    match observe_recorded_process(old) {
+                        ProcessObservation::Present(actual) => ensure!(
+                            actual == *old,
+                            "service process was replaced while stop pending"
+                        ),
+                        ProcessObservation::Exited => {
+                            bail!("loaded service process identity conflicts with recorded exit")
+                        }
+                        ProcessObservation::Unknown => {}
+                    }
+                }
+            }
+            LabelObservation::Absent => {
+                let exited = match &stop.process {
+                    None => true,
+                    Some(old) => match observe_recorded_process(old) {
+                        ProcessObservation::Exited => true,
+                        ProcessObservation::Present(actual) => {
+                            ensure!(actual == *old, "recorded service PID was reused");
+                            false
+                        }
+                        ProcessObservation::Unknown => false,
+                    },
+                };
+                if exited && let Ok(singleton) = stopped_singleton(paths, stop.target.is_none()) {
+                    // Verify the label again while singleton ownership fences
+                    // a competing daemon. Unknown/loaded still cannot switch.
+                    if observe_label(paths).await == LabelObservation::Absent {
+                        operation.service_stops.last_mut().unwrap().request =
+                            StopRequest::ObservedStopped;
+                        set_checkpoint(
+                            paths,
+                            operation,
+                            "service_stopped",
+                            "old_service_stop_verified",
+                        )?;
+                        return Ok(Some(singleton));
+                    }
+                }
+            }
+            LabelObservation::Unknown => {}
+        }
+        if bounded && !lifecycle_test_mode() {
+            tokio::time::sleep_until(interval.min(deadline)).await;
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+    }
+    set_checkpoint(
+        paths,
+        operation,
+        "service_stop_pending",
+        "old_service_stop_unconfirmed",
+    )?;
+    Ok(None)
+}
+
+async fn stop_for_direction(
+    paths: &Paths,
+    operation: &mut Operation,
+    direction: StopDirection,
+) -> Result<Option<File>> {
+    prepare_service_stop(paths, operation, direction).await?;
+    request_service_stop(paths, operation).await?;
+    observe_service_stop(paths, operation, true).await
+}
+
 async fn launchctl(action: &str, agent: &Path) -> Result<()> {
     if (action == "bootout"
         && (std::env::var_os("LOOMEX_LIFECYCLE_TEST_BOOTOUT_FAIL").is_some() || {
@@ -577,9 +1642,20 @@ async fn launchctl(action: &str, agent: &Path) -> Result<()> {
     }
     if lifecycle_test_mode() {
         #[cfg(test)]
-        if action == "kickstart" {
+        if action == "bootout" && TEST_DELAYED_SERVICE_STOP.load(Ordering::SeqCst) {
+            // Faithful isolated seam: request accepted, but the old label was
+            // still present at the original bounded observation deadline.
+            bail!("launchctl service remained loaded after bootout");
+        }
+        #[cfg(test)]
+        if action == "kickstart"
+            || (action == "bootstrap" && TEST_ABANDONMENT_RESTART.load(Ordering::SeqCst))
+        {
             recovery_fault("restart_failed")?;
             TEST_RESTART_COUNT.fetch_add(1, Ordering::SeqCst);
+            if action == "bootstrap" {
+                TEST_LABEL_PRESENT.store(true, Ordering::SeqCst);
+            }
             if let Some(status) = TEST_RECOVERY_STATUS.lock().unwrap().as_mut() {
                 status["draining"] = json!(false);
             }
@@ -645,26 +1721,35 @@ async fn launchctl(action: &str, agent: &Path) -> Result<()> {
 
 async fn launchctl_label_absent() -> Result<bool> {
     if lifecycle_test_mode() {
+        #[cfg(test)]
+        return Ok(!TEST_LABEL_PRESENT.load(Ordering::SeqCst));
+        #[cfg(not(test))]
         return Ok(true);
     }
-    let uid = unsafe { libc::geteuid() };
-    // launchd can acknowledge bootout before `print` observes the final
-    // teardown.  This is bounded observation, not a blind delay.
+    let paths = Paths::from_environment()?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     for _ in 0..20 {
-        let status = tokio::process::Command::new(NATIVE_EXECUTABLES[0])
-            .arg("print")
-            .arg(format!("gui/{uid}/app.loomex.runner"))
-            .status()
-            .await?;
-        if !status.success() {
-            return Ok(true);
+        let interval = tokio::time::Instant::now() + Duration::from_millis(250);
+        match observe_label(&paths).await {
+            LabelObservation::Absent => return Ok(true),
+            LabelObservation::Unknown => bail!("service label observation unavailable"),
+            LabelObservation::Loaded { .. } => {}
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep_until(interval.min(deadline)).await;
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
     }
     Ok(false)
 }
 
 async fn daemon_status(paths: &Paths) -> Result<Value> {
+    #[cfg(test)]
+    TEST_STATUS_COUNT.fetch_add(1, Ordering::SeqCst);
+    #[cfg(test)]
+    if TEST_STATUS_UNAVAILABLE.load(Ordering::SeqCst) {
+        bail!("injected unavailable daemon status");
+    }
     #[cfg(test)]
     if let Some(status) = TEST_RECOVERY_STATUS.lock().unwrap().clone() {
         return Ok(status);
@@ -675,6 +1760,101 @@ async fn daemon_status(paths: &Paths) -> Result<Value> {
         .get("result")
         .cloned()
         .context("lifecycle status is unavailable")
+}
+
+async fn local_auth_status(paths: &Paths) -> Result<Value> {
+    #[cfg(test)]
+    if let Some(status) = TEST_AUTH_STATUS.lock().unwrap().clone() {
+        return Ok(status);
+    }
+    let response =
+        crate::control::lifecycle_client(&paths.state_dir, "auth.status", json!({})).await?;
+    ensure!(
+        response.get("error").is_none(),
+        "candidate auth status is unavailable"
+    );
+    response
+        .get("result")
+        .cloned()
+        .context("candidate auth status is unavailable")
+}
+
+fn parse_auth_baseline(status: &Value) -> Result<AuthBaseline> {
+    ensure!(
+        status["loginPending"] == false,
+        "authentication flow state is unconfirmed"
+    );
+    match (status["code"].as_str(), status["authenticated"].as_bool()) {
+        (Some("AUTHENTICATED"), Some(true)) => Ok(AuthBaseline::Authenticated {
+            installation_id: Uuid::parse_str(
+                status["installationId"]
+                    .as_str()
+                    .context("auth installation is unavailable")?,
+            )?,
+            active_organization: status["activeOrganization"]
+                .as_str()
+                .map(Uuid::parse_str)
+                .transpose()?,
+        }),
+        (Some("AUTH_REQUIRED"), Some(false)) => Ok(AuthBaseline::SignedOut {
+            installation_id: status["installationId"]
+                .as_str()
+                .map(Uuid::parse_str)
+                .transpose()?,
+        }),
+        (Some("AUTH_RECOVERY_PENDING" | "LOGOUT_PENDING"), _) => {
+            bail!("prior authentication recovery is pending")
+        }
+        _ => bail!("prior authentication state is unconfirmed"),
+    }
+}
+
+async fn capture_auth_baseline(
+    paths: &Paths,
+    previous_target: Option<&Path>,
+) -> Result<AuthBaseline> {
+    if previous_target.is_none() {
+        return Ok(AuthBaseline::Initial);
+    }
+    #[cfg(test)]
+    if lifecycle_test_mode() && TEST_AUTH_STATUS.lock().unwrap().is_none() {
+        return Ok(AuthBaseline::SignedOut {
+            installation_id: None,
+        });
+    }
+    parse_auth_baseline(&local_auth_status(paths).await?)
+}
+
+async fn require_auth_continuity(paths: &Paths, baseline: &AuthBaseline) -> Result<()> {
+    let candidate = parse_auth_baseline(&local_auth_status(paths).await?)
+        .context("candidate authentication is unconfirmed")?;
+    let matched = match (baseline, candidate) {
+        (AuthBaseline::Initial, _) => true,
+        (
+            AuthBaseline::SignedOut {
+                installation_id: before,
+            },
+            AuthBaseline::SignedOut {
+                installation_id: after,
+            },
+        ) => before.is_none_or(|id| Some(id) == after),
+        (
+            AuthBaseline::Authenticated {
+                installation_id: before_id,
+                active_organization: before_org,
+            },
+            AuthBaseline::Authenticated {
+                installation_id: after_id,
+                active_organization: after_org,
+            },
+        ) => before_id == &after_id && before_org == &after_org,
+        _ => false,
+    };
+    ensure!(
+        matched,
+        "candidate authentication scope differs from previous service"
+    );
+    Ok(())
 }
 
 async fn drain_and_require_idle(paths: &Paths, required: bool) -> Result<()> {
@@ -704,7 +1884,30 @@ async fn drain_and_require_idle(paths: &Paths, required: bool) -> Result<()> {
     validate_rollback_status(&json!({"result":status}))
 }
 
-async fn healthy_candidate(paths: &Paths, version: &str) -> Result<()> {
+async fn healthy_candidate(
+    paths: &Paths,
+    version: &str,
+    baseline: Option<&AuthBaseline>,
+) -> Result<()> {
+    healthy_service(paths, version, baseline, false).await
+}
+
+// Only an exact restoration of the journal's prior target may use the
+// pre-auth-gate journal's legacy status proof. A switched candidate may not.
+async fn healthy_restored_previous(
+    paths: &Paths,
+    version: &str,
+    baseline: Option<&AuthBaseline>,
+) -> Result<()> {
+    healthy_service(paths, version, baseline, true).await
+}
+
+async fn healthy_service(
+    paths: &Paths,
+    version: &str,
+    baseline: Option<&AuthBaseline>,
+    restoring_previous: bool,
+) -> Result<()> {
     #[cfg(test)]
     if TEST_CANDIDATE_HEALTH_FAIL.load(Ordering::SeqCst) {
         bail!("candidate health is unconfirmed")
@@ -715,6 +1918,16 @@ async fn healthy_candidate(paths: &Paths, version: &str) -> Result<()> {
             && status["activeJobs"].as_u64().is_some()
             && status["draining"] == false
         {
+            if let Some(baseline) = baseline {
+                #[cfg(test)]
+                if lifecycle_test_mode() && TEST_AUTH_STATUS.lock().unwrap().is_none() {
+                    return Ok(());
+                }
+                require_auth_continuity(paths, baseline).await?;
+            } else if !restoring_previous && !lifecycle_test_mode() {
+                // An older journal cannot prove which authenticated scope it replaced.
+                bail!("lifecycle auth baseline is unavailable");
+            }
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -774,6 +1987,15 @@ pub fn operation_is_terminal(operation: &Operation) -> Result<bool> {
     Ok(terminal(&operation.phase))
 }
 
+/// Must run under LifecycleLock before uninstall writes, drain or logout.
+pub fn require_terminal_before_uninstall(paths: &Paths) -> Result<()> {
+    if let Some(operation) = read_optional::<Operation>(&paths.operation())? {
+        operation.validate()?;
+        ensure!(terminal(&operation.phase), "LIFECYCLE_OPERATION_PENDING");
+    }
+    Ok(())
+}
+
 /// Reconcile an interrupted install before a bootstrap stages another package
 /// or changes the ownership inventory.  The caller supplies the release-bound
 /// identity; differing identities are never allowed to share a journal.
@@ -795,7 +2017,9 @@ pub async fn preflight_package_locked(
 ) -> Result<Value> {
     if let Some(value) = reconcile_matching_operation(paths, kind, &package).await? {
         if value["pending"] == true {
-            return Ok(json!({"reconciled":false,"pending":true,"transaction":value}));
+            return Ok(
+                json!({"reconciled":false,"pending":true,"reason":value["reason"],"transaction":value}),
+            );
         }
         return Ok(json!({"reconciled":true,"transaction":value}));
     }
@@ -816,6 +2040,27 @@ async fn reconcile_matching_operation(
         return Ok(None);
     };
     existing.validate()?;
+    if let Some(intent) = &existing.abandonment {
+        ensure!(
+            existing.phase == "rolled_back",
+            "LIFECYCLE_OPERATION_PENDING"
+        );
+        let successor = intent
+            .successor
+            .as_ref()
+            .context("LIFECYCLE_ABANDONMENT_ACKNOWLEDGEMENT_REQUIRED")?;
+        let journal: Value = state::read_json(&paths.state_dir.join("bootstrap-install.json"))?;
+        ensure!(
+            &successor.package == package
+                && journal["schema"] == "app.loomex.runner.bootstrap-install/v2"
+                && journal["operationId"] == existing.id.to_string()
+                && journal["successorConfigurationDigest"] == successor.configuration_digest
+                && bootstrap_configuration_digest(&journal["successorConfiguration"])?
+                    == successor.configuration_digest,
+            "LIFECYCLE_ABANDONMENT_SUCCESSOR_MISMATCH"
+        );
+        abandonment_bootstrap_configuration(paths, &existing)?;
+    }
     if terminal(&existing.phase) {
         if existing.phase == "completed"
             && existing.kind == kind
@@ -833,7 +2078,7 @@ async fn reconcile_matching_operation(
             );
             verify_owned_version(paths, &package.target)?;
             if candidate_health_check_required() {
-                healthy_candidate(paths, &package.version).await?;
+                healthy_candidate(paths, &package.version, existing.auth_baseline.as_ref()).await?;
             }
             return Ok(Some(json!({"reconciled":true,"operation":existing})));
         }
@@ -861,67 +2106,292 @@ async fn reconcile_matching_operation(
     bail!("LIFECYCLE_OPERATION_PENDING")
 }
 
-async fn restore_activation(paths: &Paths, operation: &mut Operation) -> Result<()> {
+async fn restarted_service_identity_matches(paths: &Paths, target: &Path) -> bool {
+    let LabelObservation::Loaded { pid, program } = observe_label(paths).await else {
+        return false;
+    };
+    if program != target.join("bin/loomex-runner")
+        && program != paths.current().join("bin/loomex-runner")
+    {
+        return false;
+    }
+    let actual = if lifecycle_test_mode() {
+        #[cfg(test)]
+        if let Some(value) = TEST_PROCESS_OBSERVATION.lock().unwrap().clone() {
+            value
+        } else {
+            ProcessObservation::Present(ProcessIdentity {
+                pid,
+                uid: unsafe { libc::geteuid() },
+                started_seconds: 1,
+                started_micros: 0,
+                executable: target.join("bin/loomex-runner"),
+            })
+        }
+        #[cfg(not(test))]
+        {
+            ProcessObservation::Unknown
+        }
+    } else {
+        inspect_process(pid)
+    };
+    matches!(actual, ProcessObservation::Present(actual) if actual.pid == pid && actual.uid == unsafe {libc::geteuid()} && actual.executable == target.join("bin/loomex-runner"))
+}
+
+async fn complete_stopped_transition(
+    paths: &Paths,
+    operation: &mut Operation,
+    singleton: File,
+) -> Result<Value> {
+    let stop = operation
+        .service_stops
+        .last()
+        .context("service-stop intent missing")?
+        .clone();
+    ensure!(
+        stop.request == StopRequest::ObservedStopped,
+        "service stop has not been verified"
+    );
+    verify_stop_binding(paths, operation, &stop, true)?;
     let resources = operation
         .resources
-        .as_ref()
+        .clone()
         .context("activation resources missing")?;
+    let target = match stop.direction {
+        StopDirection::ActivateCandidate => Some(stop.package.target.clone()),
+        StopDirection::RestorePrevious => operation.previous_target.clone(),
+    };
+    let (source, digest) = match stop.direction {
+        StopDirection::ActivateCandidate => (
+            &resources.staged_launch_agent,
+            Some(&resources.staged_launch_agent_sha256),
+        ),
+        StopDirection::RestorePrevious => (
+            &resources.launch_agent_backup,
+            resources.launch_agent_backup_sha256.as_ref(),
+        ),
+    };
+    #[cfg(test)]
+    recovery_fault("after_stop_verified")?;
+    if current_target(paths)? != target {
+        if let Some(target) = &target {
+            write_pointer(paths, target, operation)?;
+        } else if paths.current().is_symlink() {
+            fs::remove_file(paths.current())?;
+            File::open(&paths.install_base)?.sync_all()?;
+        }
+    }
+    #[cfg(test)]
+    recovery_fault("after_stop_pointer")?;
+    if regular_digest(&resources.launch_agent)?.as_ref() != digest {
+        if digest.is_some() {
+            replace_regular_atomically(source, &resources.launch_agent, operation)?;
+        } else {
+            remove_regular_and_sync(&resources.launch_agent)?;
+        }
+    }
+    set_checkpoint(
+        paths,
+        operation,
+        "pointer_switched",
+        "stopped_pointer_and_plist_switched",
+    )?;
+    #[cfg(test)]
+    recovery_fault("after_stop_configuration")?;
+    remove_regular_and_sync(&paths.state_dir.join("drain.json"))?;
+    // Holding this guard through file replacement prevents another native
+    // owner. Release only for the exact authorized daemon bootstrap.
+    drop(singleton);
+    #[cfg(test)]
+    recovery_fault("before_stop_bootstrap")?;
+    if target.is_some() {
+        ensure!(
+            observe_label(paths).await == LabelObservation::Absent,
+            "service appeared before candidate bootstrap"
+        );
+        if let Err(error) = launchctl("bootstrap", &resources.launch_agent).await {
+            set_checkpoint(
+                paths,
+                operation,
+                "recovery_required",
+                "stopped_service_start_failed",
+            )?;
+            return Err(error);
+        }
+        set_checkpoint(
+            paths,
+            operation,
+            "candidate_started",
+            "stopped_service_bootstrapped",
+        )?;
+        if candidate_health_check_required() {
+            let version = target
+                .as_ref()
+                .and_then(|target| target.file_name())
+                .and_then(|name| name.to_str())
+                .context("restart version missing")?;
+            let health = if stop.direction == StopDirection::RestorePrevious {
+                healthy_restored_previous(paths, version, operation.auth_baseline.as_ref()).await
+            } else {
+                healthy_candidate(paths, version, operation.auth_baseline.as_ref()).await
+            };
+            if let Err(error) = health {
+                set_checkpoint(
+                    paths,
+                    operation,
+                    "recovery_required",
+                    "stopped_service_health_failed",
+                )?;
+                return Err(error);
+            }
+            ensure!(
+                restarted_service_identity_matches(paths, target.as_ref().unwrap()).await,
+                "started service process identity is unconfirmed"
+            );
+        }
+    }
+    #[cfg(test)]
+    recovery_fault("after_stop_bootstrap")?;
+    let phase = match stop.direction {
+        StopDirection::ActivateCandidate => "completed",
+        StopDirection::RestorePrevious => "rolled_back",
+    };
+    set_checkpoint(paths, operation, phase, "stopped_service_healthy")?;
+    Ok(
+        json!({"activated":stop.direction == StopDirection::ActivateCandidate,"resumed":true,"operation":operation}),
+    )
+}
+
+async fn reconcile_service_stop(paths: &Paths, operation: &mut Operation) -> Result<Value> {
+    let stop = operation
+        .service_stops
+        .last()
+        .context("service-stop intent missing")?
+        .clone();
+    verify_stop_binding(
+        paths,
+        operation,
+        &stop,
+        stop.request == StopRequest::ObservedStopped,
+    )?;
+    if stop.request == StopRequest::ObservedStopped
+        && stop.direction == StopDirection::ActivateCandidate
+        && matches!(
+            operation.checkpoint.as_deref(),
+            Some("stopped_service_start_failed" | "stopped_service_health_failed")
+        )
+    {
+        match restore_activation(paths, operation).await {
+            Ok(()) => return Ok(json!({"resumed":true,"operation":operation})),
+            Err(_) if operation.phase == "service_stop_pending" => {
+                return Ok(service_stop_pending(operation));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if stop.request == StopRequest::ObservedStopped {
+        let resources = operation
+            .resources
+            .as_ref()
+            .context("activation resources missing")?;
+        let (target, digest) = match stop.direction {
+            StopDirection::ActivateCandidate => (
+                Some(&stop.package.target),
+                Some(&resources.staged_launch_agent_sha256),
+            ),
+            StopDirection::RestorePrevious => (
+                operation.previous_target.as_ref(),
+                resources.launch_agent_backup_sha256.as_ref(),
+            ),
+        };
+        if current_target(paths)?.as_ref() == target
+            && regular_digest(&resources.launch_agent)?.as_ref() == digest
+        {
+            if let Some(target) = target {
+                let version = target
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("restart version missing")?;
+                // Real health also verifies loaded label + exact native process
+                // identity before accepting an interrupted bootstrap.
+                let health = if stop.direction == StopDirection::RestorePrevious {
+                    healthy_restored_previous(paths, version, operation.auth_baseline.as_ref())
+                        .await
+                } else {
+                    healthy_candidate(paths, version, operation.auth_baseline.as_ref()).await
+                };
+                if health.is_ok() {
+                    if !restarted_service_identity_matches(paths, target).await {
+                        ensure!(
+                            observe_label(paths).await == LabelObservation::Absent,
+                            "restarted service identity is unconfirmed"
+                        );
+                    } else {
+                        let phase = if stop.direction == StopDirection::ActivateCandidate {
+                            "completed"
+                        } else {
+                            "rolled_back"
+                        };
+                        set_checkpoint(
+                            paths,
+                            operation,
+                            phase,
+                            "stopped_service_healthy_after_reconciliation",
+                        )?;
+                        return Ok(json!({"resumed":true,"operation":operation}));
+                    }
+                }
+            }
+        }
+    }
+    match observe_service_stop(paths, operation, false).await? {
+        Some(singleton) => complete_stopped_transition(paths, operation, singleton).await,
+        None => Ok(service_stop_pending(operation)),
+    }
+}
+
+async fn restore_activation(paths: &Paths, operation: &mut Operation) -> Result<()> {
     // The candidate must be visibly idle before a prior daemon can be restored.
     // If it never reached launchd (for example bootstrap failed), launchd must
     // still prove the label absent.  We never infer that from an operation
     // phase alone.
     match daemon_status(paths).await {
-        Ok(_) => {
-            let drained = crate::control::lifecycle_client(
-                &paths.state_dir,
-                "daemon.drain",
-                json!({"idempotencyKey":Uuid::new_v4()}),
-            )
-            .await?;
+        Ok(status) => {
+            let target = current_target(paths)?.context("rollback current target missing")?;
+            let plist =
+                regular_digest(&launch_agent(paths))?.context("rollback configuration missing")?;
+            let version = verify_recovery_service(paths, operation, &target, &plist)?;
             ensure!(
-                drained["result"]["draining"] == true,
-                "LIFECYCLE_DRAIN_REJECTED"
+                status["version"] == version && status["activeJobs"].as_u64().is_some(),
+                "rollback daemon identity is unconfirmed"
             );
-            validate_rollback_status(&json!({"result":daemon_status(paths).await?}))?;
+            if lifecycle_test_mode() {
+                drain_and_require_idle(paths, true).await?;
+                validate_rollback_status(&json!({"result":daemon_status(paths).await?}))?;
+            } else {
+                let drained = crate::control::lifecycle_client(
+                    &paths.state_dir,
+                    "daemon.drain",
+                    json!({"idempotencyKey":Uuid::new_v4()}),
+                )
+                .await?;
+                ensure!(
+                    drained["result"]["draining"] == true,
+                    "LIFECYCLE_DRAIN_REJECTED"
+                );
+                validate_rollback_status(&json!({"result":daemon_status(paths).await?}))?;
+            }
         }
         Err(_) if launchctl_label_absent().await? => {}
         Err(error) => return Err(error.context("candidate state cannot be proven safe")),
     }
-    launchctl("bootout", &resources.launch_agent).await?;
-    match &operation.previous_target {
-        Some(previous) => write_pointer(paths, previous, operation)?,
-        None => {
-            if paths.current().exists() || paths.current().is_symlink() {
-                fs::remove_file(paths.current())?;
-            }
-        }
-    }
-    if resources.launch_agent_backup.exists() {
-        checked_regular(&resources.launch_agent_backup)?;
-        if let Some(expected) = &resources.launch_agent_backup_sha256
-            && state::digest(&fs::read(&resources.launch_agent_backup)?) != *expected
-        {
-            bail!("stored LaunchAgent backup changed during recovery")
-        }
-        replace_regular_atomically(
-            &resources.launch_agent_backup,
-            &resources.launch_agent,
-            operation,
-        )?;
-    } else if resources.launch_agent.exists() {
-        remove_regular_and_sync(&resources.launch_agent)?;
-    }
-    if let Some(previous) = &operation.previous_target {
-        launchctl("bootstrap", &resources.launch_agent).await?;
-        if candidate_health_check_required() {
-            let version = previous
-                .file_name()
-                .and_then(|value| value.to_str())
-                .context("previous runner version is invalid")?;
-            healthy_candidate(paths, version).await?;
-        }
-    }
-    set_checkpoint(paths, operation, "rolled_back", "previous_service_restored")
+    let Some(singleton) =
+        stop_for_direction(paths, operation, StopDirection::RestorePrevious).await?
+    else {
+        bail!("SERVICE_STOP_PENDING");
+    };
+    complete_stopped_transition(paths, operation, singleton).await?;
+    Ok(())
 }
 
 /// Reconcile from the observable pointer, plist and launchd/control state.
@@ -936,6 +2406,9 @@ async fn reconcile_activation(paths: &Paths, operation: &mut Operation) -> Resul
         .resources
         .clone()
         .context("activation resources missing")?;
+    if !operation.service_stops.is_empty() {
+        return reconcile_service_stop(paths, operation).await;
+    }
     if operation.phase == "pending_active_work" {
         return continue_pending_activation(paths, operation, &package, &resources).await;
     }
@@ -948,28 +2421,26 @@ async fn reconcile_activation(paths: &Paths, operation: &mut Operation) -> Resul
         && candidate_plist_matches
     {
         let status = daemon_status(paths).await?;
-        if candidate_drain_can_be_released(&status, &package.version) {
-            // A failed retry can leave the already-activated candidate drained.
-            // Only the exact journaled candidate, with no managed work, may be
-            // returned to service while the lifecycle lock is held.
-            #[cfg(test)]
-            recovery_fault("before_drain_removal")?;
-            let drain = paths.state_dir.join("drain.json");
-            if drain.exists() || drain.is_symlink() {
-                remove_regular_and_sync(&drain)?;
-            }
-            #[cfg(test)]
-            recovery_fault("after_drain_removal")?;
-            // The daemon also holds its draining state in memory. Restart the
-            // exact registered service after proving it has no managed jobs.
-            launchctl("kickstart", &resources.launch_agent).await?;
-            #[cfg(test)]
-            recovery_fault("after_restart")?;
+        ensure!(
+            status["version"] == package.version,
+            "candidate daemon version differs from this operation"
+        );
+        if status["draining"] == true {
+            release_service_drain(
+                paths,
+                operation,
+                &package.target,
+                &resources.staged_launch_agent_sha256,
+                "candidate_drain_release_pending",
+            )
+            .await?;
         }
     }
     if pointer.as_ref() == Some(&package.target)
         && candidate_plist_matches
-        && healthy_candidate(paths, &package.version).await.is_ok()
+        && healthy_candidate(paths, &package.version, operation.auth_baseline.as_ref())
+            .await
+            .is_ok()
     {
         #[cfg(test)]
         recovery_fault("before_completion")?;
@@ -982,29 +2453,18 @@ async fn reconcile_activation(paths: &Paths, operation: &mut Operation) -> Resul
         return Ok(json!({"resumed":true,"state":"candidate_healthy","operation":operation}));
     }
 
-    // If the old target and its exact plist are already visible, bootstrap and
-    // health-check it before declaring rollback.  This repairs a crash between
-    // replacement steps without assuming the phase describes reality.
+    // An earlier bootout may finish after its bounded absence probe. Reconcile
+    // the exact previous service before attempting a wider restore transaction.
     let previous_plist_matches = match &resources.launch_agent_backup_sha256 {
         Some(expected) => plist_digest.as_deref() == Some(expected),
         None => plist_digest.is_none(),
     };
     if pointer == operation.previous_target && previous_plist_matches {
-        if let Some(previous) = &operation.previous_target {
-            let version = previous
-                .file_name()
-                .and_then(|value| value.to_str())
-                .context("previous runner version is invalid")?;
-            if healthy_candidate(paths, version).await.is_err() {
-                if !launchctl_label_absent().await? {
-                    bail!("previous runner health is unconfirmed and launchd label remains loaded")
-                }
-                launchctl("bootstrap", &resources.launch_agent).await?;
-                if candidate_health_check_required() {
-                    healthy_candidate(paths, version).await?;
-                }
-            }
+        if let Some(previous) = &operation.previous_target.clone() {
+            recover_previous_service(paths, operation, previous, &resources).await?;
         }
+        #[cfg(test)]
+        recovery_fault("before_completion")?;
         set_checkpoint(
             paths,
             operation,
@@ -1017,8 +2477,173 @@ async fn reconcile_activation(paths: &Paths, operation: &mut Operation) -> Resul
     // A pointer/plist mismatch cannot be repaired by merely starting a daemon.
     // `restore_activation` first proves the candidate safe, then restores the
     // exact saved resources and verifies the previous version.
-    restore_activation(paths, operation).await?;
-    Ok(json!({"resumed":true,"state":"previous_restored","operation":operation}))
+    match restore_activation(paths, operation).await {
+        Ok(()) => Ok(json!({"resumed":true,"state":"previous_restored","operation":operation})),
+        Err(_) if operation.phase == "service_stop_pending" => Ok(service_stop_pending(operation)),
+        Err(error) => Err(error),
+    }
+}
+
+// The captured operation inventory binds the service being reconciled; the
+// live immutable inventory additionally proves its bytes have not changed.
+fn verify_recovery_service(
+    paths: &Paths,
+    operation: &Operation,
+    target: &Path,
+    plist_digest: &str,
+) -> Result<String> {
+    let resources = operation
+        .resources
+        .as_ref()
+        .context("activation resources missing")?;
+    ensure!(
+        resources.owned_versions.iter().any(|owned| owned == target),
+        "recovery target is not captured by this operation"
+    );
+    ensure!(
+        resources.launch_agent == launch_agent(paths),
+        "recovery LaunchAgent is outside this lifecycle namespace"
+    );
+    ensure!(
+        owned_versions(paths)?.iter().any(|owned| owned == target),
+        "recovery target is no longer owned"
+    );
+    ensure!(
+        current_target(paths)?.as_deref() == Some(target),
+        "recovery target pointer differs from this operation"
+    );
+    ensure!(
+        regular_digest(&resources.launch_agent)?.as_deref() == Some(plist_digest),
+        "recovery LaunchAgent differs from this operation"
+    );
+    let metadata = fs::symlink_metadata(target)?;
+    ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "recovery target is not a regular owned directory"
+    );
+    verify_owned_version(paths, target)?;
+    let version = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("recovery version is invalid")?;
+    let project: Value = state::read_json(&target.join("metadata/project.json"))?;
+    ensure!(
+        project["project"] == "loomex-runner"
+            && project["version"] == version
+            && project["platform"] == "darwin-arm64",
+        "recovery version metadata differs from its target"
+    );
+    Ok(version.into())
+}
+
+async fn release_service_drain(
+    paths: &Paths,
+    operation: &mut Operation,
+    target: &Path,
+    plist_digest: &str,
+    checkpoint: &str,
+) -> Result<()> {
+    let version = verify_recovery_service(paths, operation, target, plist_digest)?;
+    let status = daemon_status(paths).await?;
+    ensure!(
+        candidate_drain_can_be_released(&status, &version),
+        "recovery requires the exact drained idle service"
+    );
+    let drain = paths.state_dir.join("drain.json");
+    // Only this operation's durable removal intent explains a missing file.
+    // Fresh daemon identity and drained/zero status are still required above.
+    ensure!(
+        regular_digest(&drain)?.is_some() || operation.checkpoint.as_deref() == Some(checkpoint),
+        "recovery drain is absent without a journaled removal intent"
+    );
+    set_checkpoint(paths, operation, "recovery_required", checkpoint)?;
+    #[cfg(test)]
+    recovery_fault("before_drain_removal")?;
+    remove_regular_and_sync(&drain)?;
+    #[cfg(test)]
+    recovery_fault("after_drain_removal")?;
+    let agent = operation
+        .resources
+        .as_ref()
+        .context("activation resources missing")?
+        .launch_agent
+        .clone();
+    // Removing the file does not release the running daemon's in-memory drain.
+    // The existing restart is allowed only by the exact managed-zero proof.
+    launchctl("kickstart", &agent).await?;
+    #[cfg(test)]
+    recovery_fault("after_restart")?;
+    if operation.previous_target.as_deref() == Some(target) {
+        healthy_restored_previous(paths, &version, operation.auth_baseline.as_ref()).await
+    } else {
+        healthy_candidate(paths, &version, operation.auth_baseline.as_ref()).await
+    }
+}
+
+async fn recover_previous_service(
+    paths: &Paths,
+    operation: &mut Operation,
+    previous: &Path,
+    resources: &OperationResources,
+) -> Result<()> {
+    let expected = resources
+        .launch_agent_backup_sha256
+        .as_deref()
+        .context("previous LaunchAgent has no captured digest")?;
+    let version = verify_recovery_service(paths, operation, previous, expected)?;
+    match daemon_status(paths).await {
+        Ok(status) => {
+            ensure!(
+                status["version"] == version,
+                "previous daemon version differs from this operation"
+            );
+            if status["draining"] == true {
+                release_service_drain(
+                    paths,
+                    operation,
+                    previous,
+                    expected,
+                    "previous_drain_release_pending",
+                )
+                .await?;
+            } else {
+                ensure!(
+                    status["draining"] == false,
+                    "previous daemon drain state is unavailable"
+                );
+            }
+            healthy_restored_previous(paths, &version, operation.auth_baseline.as_ref()).await
+        }
+        Err(error) => {
+            // Unavailable status never licenses replacement of a loaded daemon.
+            if !launchctl_label_absent().await? {
+                return Err(error.context(
+                    "previous runner health is unconfirmed and launchd label remains loaded",
+                ));
+            }
+            launchctl("bootstrap", &resources.launch_agent).await?;
+            if candidate_health_check_required() {
+                let status = daemon_status(paths).await?;
+                ensure!(
+                    status["version"] == version,
+                    "previous daemon version differs from this operation"
+                );
+                if status["draining"] == true {
+                    release_service_drain(
+                        paths,
+                        operation,
+                        previous,
+                        expected,
+                        "previous_drain_release_pending",
+                    )
+                    .await?;
+                }
+                healthy_restored_previous(paths, &version, operation.auth_baseline.as_ref())
+                    .await?;
+            }
+            Ok(())
+        }
+    }
 }
 
 fn candidate_drain_can_be_released(status: &Value, version: &str) -> bool {
@@ -1048,37 +2673,15 @@ async fn continue_pending_activation(
         return Err(error);
     }
     set_checkpoint(paths, operation, "draining", "daemon_drained_after_pending")?;
-    launchctl("bootout", &resources.launch_agent).await?;
-    set_checkpoint(paths, operation, "service_stopped", "old_service_stopped")?;
-    write_pointer(paths, &package.target, operation)?;
-    if state::digest(&fs::read(&resources.staged_launch_agent)?)
-        != resources.staged_launch_agent_sha256
-    {
-        bail!("staged LaunchAgent changed during pending update")
-    }
-    replace_regular_atomically(
-        &resources.staged_launch_agent,
-        &resources.launch_agent,
-        operation,
-    )?;
-    set_checkpoint(
-        paths,
-        operation,
-        "pointer_switched",
-        "pointer_and_plist_switched",
-    )?;
-    remove_regular_and_sync(&paths.state_dir.join("drain.json"))?;
-    launchctl("bootstrap", &resources.launch_agent).await?;
-    if candidate_health_check_required() {
-        healthy_candidate(paths, &package.version).await?;
-    }
-    set_checkpoint(
-        paths,
-        operation,
-        "completed",
-        "candidate_healthy_after_pending",
-    )?;
-    Ok(json!({"resumed":true,"state":"candidate_healthy_after_pending","operation":operation}))
+    let Some(singleton) =
+        stop_for_direction(paths, operation, StopDirection::ActivateCandidate).await?
+    else {
+        return Ok(service_stop_pending(operation));
+    };
+    let _ = (package, resources);
+    let mut value = complete_stopped_transition(paths, operation, singleton).await?;
+    value["state"] = json!("candidate_healthy_after_pending");
+    Ok(value)
 }
 
 /// Performs the service half of a verified installation/update after the
@@ -1173,7 +2776,7 @@ async fn activate_as_locked(
     if let Some(value) = reconcile_matching_operation(paths, kind, &package).await? {
         if value["pending"] == true {
             return Ok(
-                json!({"activated":false,"pending":true,"resumed":true,"transaction":value}),
+                json!({"activated":false,"pending":true,"reason":value["reason"],"resumed":true,"transaction":value}),
             );
         }
         return Ok(json!({"activated":true,"resumed":true,"transaction":value}));
@@ -1190,6 +2793,9 @@ async fn activate_as_locked(
     );
     operation.package = Some(package);
     operation.previous_target = previous_target;
+    // The journal owns this non-secret pre-switch scope through crash recovery.
+    operation.auth_baseline =
+        Some(capture_auth_baseline(paths, operation.previous_target.as_deref()).await?);
     // Resource names are bound to this operation before any bytes are copied.
     // A crash after the journal write is therefore recoverable (or remains a
     // protected repair state) rather than leaving a staged file attributed to
@@ -1222,55 +2828,19 @@ async fn activate_as_locked(
             .launch_agent_backup_sha256 = Some(state::digest(&fs::read(&backup)?));
         save_operation(paths, &operation)?;
     }
-    let staged_launch_agent_sha256 = operation
-        .resources
-        .as_ref()
-        .context("activation resources missing")?
-        .staged_launch_agent_sha256
-        .clone();
-
-    let result: Result<()> = async {
+    let result: Result<Value> = async {
         drain_and_require_idle(paths, operation.previous_target.is_some()).await?;
         set_checkpoint(paths, &mut operation, "draining", "daemon_drained")?;
-        launchctl("bootout", &agent).await?;
-        set_checkpoint(
-            paths,
-            &mut operation,
-            "service_stopped",
-            "old_service_stopped",
-        )?;
-        write_pointer(paths, &target, &operation)?;
-        if staged_copy != agent {
-            if state::digest(&fs::read(&staged_copy)?) != staged_launch_agent_sha256 {
-                bail!("staged LaunchAgent changed after lifecycle preparation")
-            }
-            replace_regular_atomically(&staged_copy, &agent, &operation)?;
-        }
-        set_checkpoint(
-            paths,
-            &mut operation,
-            "pointer_switched",
-            "pointer_and_plist_switched",
-        )?;
-        let drain = paths.state_dir.join("drain.json");
-        if drain.exists() && !fs::symlink_metadata(&drain)?.file_type().is_symlink() {
-            fs::remove_file(drain)?;
-        }
-        launchctl("bootstrap", &agent).await?;
-        set_checkpoint(
-            paths,
-            &mut operation,
-            "candidate_started",
-            "candidate_bootstrapped",
-        )?;
-        if candidate_health_check_required() {
-            healthy_candidate(paths, &version).await?;
-        }
-        set_checkpoint(paths, &mut operation, "completed", "candidate_healthy")
+        let Some(singleton) =
+            stop_for_direction(paths, &mut operation, StopDirection::ActivateCandidate).await?
+        else {
+            return Ok(service_stop_pending(&operation));
+        };
+        complete_stopped_transition(paths, &mut operation, singleton).await
     }
     .await;
     match result {
-        Ok(()) => Ok(json!({"activated":true,"operation":operation})),
+        Ok(value) => Ok(value),
         Err(error) => {
             if error
                 .to_string()
@@ -1286,18 +2856,58 @@ async fn activate_as_locked(
                     json!({"activated":false,"pending":true,"reason":"active_work","operation":operation}),
                 );
             }
-            if restore_activation(paths, &mut operation).await.is_err() {
+            if matches!(
+                operation.checkpoint.as_deref(),
+                Some("stopped_service_start_failed" | "stopped_service_health_failed")
+            ) && operation.service_stops.last().is_some_and(|stop| {
+                stop.direction == StopDirection::ActivateCandidate
+                    && stop.request == StopRequest::ObservedStopped
+            }) {
+                match restore_activation(paths, &mut operation).await {
+                    Ok(()) => {
+                        return Err(error.context("activation failed; previous service restored"));
+                    }
+                    Err(_) if operation.phase == "service_stop_pending" => {
+                        return Ok(service_stop_pending(&operation));
+                    }
+                    Err(restore_error) => {
+                        set_checkpoint(
+                            paths,
+                            &mut operation,
+                            "recovery_required",
+                            "previous_service_restore_unconfirmed",
+                        )?;
+                        return Err(restore_error
+                            .context("activation failed; previous service is unconfirmed"));
+                    }
+                }
+            }
+            if !operation.service_stops.is_empty() {
+                // Preserve both uncertain requests and stopped transition
+                // interruptions. No speculative previous-service restart.
                 set_checkpoint(
                     paths,
                     &mut operation,
                     "recovery_required",
-                    "candidate_or_previous_service_not_safe_to_restore",
+                    "service_stop_reconciliation_required",
                 )?;
-                return Err(
-                    error.context("activation failed; service state requires lifecycle repair")
-                );
+                return Err(error.context("service-stop state retained for exact lifecycle resume"));
             }
-            Err(error.context("activation failed; previous service restored"))
+            match restore_activation(paths, &mut operation).await {
+                Ok(()) => Err(error.context("activation failed; previous service restored")),
+                Err(_) if operation.phase == "service_stop_pending" => {
+                    Ok(service_stop_pending(&operation))
+                }
+                Err(_) => {
+                    set_checkpoint(
+                        paths,
+                        &mut operation,
+                        "recovery_required",
+                        "candidate_or_previous_service_not_safe_to_restore",
+                    )?;
+                    Err(error.context("activation failed; service state requires lifecycle repair"))
+                }
+            }
         }
     }
 }
@@ -1386,6 +2996,12 @@ pub async fn resume(paths: &Paths) -> Result<Value> {
     let _lock = LifecycleLock::acquire(paths)?;
     if let Some(mut operation) = read_optional::<Operation>(&paths.operation())? {
         operation.validate()?;
+        if operation.kind == OperationKind::Prune {
+            return reconcile_prune(paths, &mut operation).await;
+        }
+        if operation.abandonment.is_some() {
+            return reconcile_abandonment(paths, &mut operation).await;
+        }
         if terminal(&operation.phase) {
             let snapshot = status(paths)?;
             if snapshot["legacyJournal"]["install"] == true
@@ -1406,12 +3022,17 @@ pub async fn resume(paths: &Paths) -> Result<Value> {
             match reconcile_activation(paths, &mut operation).await {
                 Ok(value) => return Ok(value),
                 Err(error) => {
-                    set_checkpoint(
-                        paths,
-                        &mut operation,
-                        "recovery_required",
-                        "observed state could not be reconciled safely",
-                    )?;
+                    // A removal may already have happened. Keep its exact
+                    // durable intent so the same operation can finish restart;
+                    // fresh identity/status are still revalidated on resume.
+                    let checkpoint = match operation.checkpoint.as_deref() {
+                        Some("candidate_drain_release_pending") => {
+                            "candidate_drain_release_pending"
+                        }
+                        Some("previous_drain_release_pending") => "previous_drain_release_pending",
+                        _ => "observed state could not be reconciled safely",
+                    };
+                    set_checkpoint(paths, &mut operation, "recovery_required", checkpoint)?;
                     return Ok(json!({
                         "resumed":false,
                         "operation":operation,
@@ -1446,6 +3067,1087 @@ pub async fn resume(paths: &Paths) -> Result<Value> {
         );
     }
     Ok(json!({"resumed":false,"reason":"no pending lifecycle operation"}))
+}
+
+fn prune_version_name(value: &str) -> bool {
+    let parts: Vec<_> = value.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn prune_inventory_without(owned: &Value, targets: &[PathBuf]) -> Result<Value> {
+    ensure!(
+        owned["schema"] == "app.loomex.runner.owned-versions/v1",
+        "invalid owned versions inventory"
+    );
+    let paths = owned["paths"]
+        .as_array()
+        .context("invalid owned version paths")?;
+    let inventories = owned["inventories"]
+        .as_array()
+        .context("invalid owned version inventories")?;
+    let removed: std::collections::HashSet<_> = targets
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    let path_names: Vec<_> = paths
+        .iter()
+        .map(|entry| entry.as_str().context("invalid owned version path"))
+        .collect::<Result<_>>()?;
+    let inventory_names: Vec<_> = inventories
+        .iter()
+        .map(|entry| {
+            entry["path"]
+                .as_str()
+                .context("invalid owned inventory path")
+        })
+        .collect::<Result<_>>()?;
+    ensure!(
+        path_names.len() == inventory_names.len()
+            && path_names
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                == path_names.len()
+            && path_names.iter().collect::<std::collections::HashSet<_>>()
+                == inventory_names
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+            && removed
+                .iter()
+                .all(|target| path_names.contains(&target.as_str())),
+        "owned version inventory is inconsistent"
+    );
+    let mut result = owned.clone();
+    result["paths"] = Value::Array(
+        paths
+            .iter()
+            .filter(|entry| !removed.contains(entry.as_str().unwrap()))
+            .cloned()
+            .collect(),
+    );
+    result["inventories"] = Value::Array(
+        inventories
+            .iter()
+            .filter(|entry| !removed.contains(entry["path"].as_str().unwrap()))
+            .cloned()
+            .collect(),
+    );
+    ensure!(
+        result["paths"]
+            .as_array()
+            .is_some_and(|entries| !entries.is_empty()),
+        "prune would remove every owned version"
+    );
+    Ok(result)
+}
+
+fn prune_quarantine(paths: &Paths, operation: &Operation, target: &Path) -> Result<PathBuf> {
+    let version = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("invalid prune target")?;
+    ensure!(
+        prune_version_name(version) && target.parent() == Some(paths.versions().as_path()),
+        "unsafe prune target"
+    );
+    Ok(paths
+        .versions()
+        .join(format!(".prune-{}", operation.id))
+        .join(version))
+}
+
+fn prune_quarantine_inventory(
+    root: &Path,
+    expected: &[Value],
+    allow_missing: bool,
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let meta = fs::symlink_metadata(root)?;
+    ensure!(
+        meta.is_dir() && !meta.file_type().is_symlink(),
+        "unsafe prune quarantine"
+    );
+    let mut files = std::collections::BTreeMap::<PathBuf, &Value>::new();
+    let mut dirs = std::collections::HashSet::<PathBuf>::new();
+    for entry in expected {
+        let relative = PathBuf::from(
+            entry["path"]
+                .as_str()
+                .context("invalid prune file inventory")?,
+        );
+        ensure!(
+            !relative.as_os_str().is_empty()
+                && relative
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(_)))
+                && files.insert(relative.clone(), entry).is_none(),
+            "invalid prune file inventory"
+        );
+        let mut parent = relative.parent();
+        while let Some(dir) = parent {
+            if dir.as_os_str().is_empty() {
+                break;
+            }
+            dirs.insert(dir.to_path_buf());
+            parent = dir.parent();
+        }
+    }
+    let mut present_files = Vec::new();
+    fn walk(
+        root: &Path,
+        directory: &Path,
+        expected_files: &std::collections::BTreeMap<PathBuf, &Value>,
+        expected_dirs: &std::collections::HashSet<PathBuf>,
+        present_files: &mut Vec<PathBuf>,
+    ) -> Result<()> {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let relative = path.strip_prefix(root)?.to_path_buf();
+            let meta = fs::symlink_metadata(&path)?;
+            ensure!(!meta.file_type().is_symlink(), "unsafe prune quarantine");
+            if meta.is_dir() {
+                ensure!(
+                    expected_dirs.contains(&relative),
+                    "PRUNE_QUARANTINE_UNOWNED_ENTRY"
+                );
+                walk(root, &path, expected_files, expected_dirs, present_files)?;
+            } else if meta.is_file() {
+                let expected = expected_files
+                    .get(&relative)
+                    .context("PRUNE_QUARANTINE_UNOWNED_ENTRY")?;
+                ensure!(
+                    expected["size"].as_u64() == Some(meta.len())
+                        && expected["mode"].as_u64()
+                            == Some(u64::from(meta.permissions().mode() & 0o777))
+                        && expected["sha256"] == state::digest(&fs::read(&path)?),
+                    "PRUNE_QUARANTINE_CONTENT_MISMATCH"
+                );
+                present_files.push(relative);
+            } else {
+                bail!("PRUNE_QUARANTINE_UNOWNED_ENTRY");
+            }
+        }
+        Ok(())
+    }
+    walk(root, root, &files, &dirs, &mut present_files)?;
+    ensure!(
+        allow_missing || present_files.len() == files.len(),
+        "PRUNE_QUARANTINE_CONTENT_MISMATCH"
+    );
+    let mut sorted_dirs: Vec<_> = dirs.into_iter().collect();
+    sorted_dirs.sort_by(|a, b| {
+        b.components()
+            .count()
+            .cmp(&a.components().count())
+            .then_with(|| b.cmp(a))
+    });
+    Ok((present_files, sorted_dirs))
+}
+
+fn prune_remove_quarantine_exact(root: &Path, expected: &[Value]) -> Result<()> {
+    let (files, dirs) = prune_quarantine_inventory(root, expected, true)?;
+    for relative in files {
+        fs::remove_file(root.join(relative))?;
+        prune_fault("during_delete")?;
+    }
+    for relative in dirs {
+        let path = root.join(relative);
+        if path.exists() {
+            fs::remove_dir(path)?;
+        }
+    }
+    fs::remove_dir(root)?;
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+async fn prune_in_use(targets: &[PathBuf]) -> Result<()> {
+    #[cfg(test)]
+    if lifecycle_test_mode() {
+        let references = TEST_PRUNE_IN_USE.lock().unwrap();
+        ensure!(
+            !targets.iter().any(|target| references
+                .iter()
+                .any(|path| path == target || path.starts_with(target))),
+            "PRUNE_VERSION_IN_USE"
+        );
+        return Ok(());
+    }
+    let output = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::process::Command::new("/usr/sbin/lsof")
+            .args(["-n", "-F", "n"])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("PRUNE_PROCESS_OBSERVATION_UNAVAILABLE")??;
+    ensure!(
+        output.stdout.len() <= 16 * 1024 * 1024
+            && output.stderr.is_empty()
+            && (output.status.success()
+                || (output.status.code() == Some(1) && output.stdout.is_empty())),
+        "PRUNE_PROCESS_OBSERVATION_UNAVAILABLE"
+    );
+    for line in output.stdout.split(|byte| *byte == b'\n') {
+        let Some(name) = line.strip_prefix(b"n") else {
+            continue;
+        };
+        let path = Path::new(std::ffi::OsStr::from_bytes(name));
+        ensure!(
+            !targets
+                .iter()
+                .any(|target| path == target || path.starts_with(target)),
+            "PRUNE_VERSION_IN_USE"
+        );
+    }
+    Ok(())
+}
+
+fn prune_fault(stage: &str) -> Result<()> {
+    #[cfg(test)]
+    if TEST_PRUNE_FAULT
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|fault| *fault == stage)
+    {
+        bail!("injected prune interruption: {stage}");
+    }
+    let _ = stage;
+    Ok(())
+}
+
+fn prune_drain_marker(paths: &Paths, plan: &PruneIntent) -> Result<bool> {
+    let drain = paths.state_dir.join("drain.json");
+    let Some(marker) = read_optional::<Value>(&drain)? else {
+        return Ok(false);
+    };
+    ensure!(
+        marker["idempotencyKey"] == plan.drain_key.to_string(),
+        "PRUNE_DRAIN_IDENTITY_MISMATCH"
+    );
+    Ok(true)
+}
+
+async fn prune_acquire_drain(paths: &Paths, plan: &PruneIntent) -> Result<()> {
+    let marker_exists = prune_drain_marker(paths, plan)?;
+    #[cfg(test)]
+    if !marker_exists && lifecycle_test_mode() {
+        state::write_json(
+            &paths.state_dir.join("drain.json"),
+            &json!({"requestedAt":state::now(),"idempotencyKey":plan.drain_key}),
+        )?;
+        if let Some(status) = TEST_RECOVERY_STATUS.lock().unwrap().as_mut() {
+            status["draining"] = json!(true);
+        }
+    }
+    if !marker_exists && !lifecycle_test_mode() {
+        let response = crate::control::lifecycle_client(
+            &paths.state_dir,
+            "daemon.drain",
+            json!({"idempotencyKey":plan.drain_key}),
+        )
+        .await?;
+        ensure!(
+            response["result"]["draining"] == true,
+            "PRUNE_DRAIN_REJECTED"
+        );
+    }
+    ensure!(
+        prune_drain_marker(paths, plan)?,
+        "PRUNE_DRAIN_IDENTITY_MISMATCH"
+    );
+    let status = daemon_status(paths).await?;
+    ensure!(
+        status["version"]
+            == plan
+                .current_target
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+            && status["draining"] == true
+            && status["activeJobs"] == 0,
+        "PRUNE_REQUIRES_DRAINED_IDLE_DAEMON"
+    );
+    Ok(())
+}
+
+async fn prune_release_drain(paths: &Paths, plan: &PruneIntent) -> Result<()> {
+    ensure!(
+        regular_digest(&launch_agent(paths))?.as_deref() == Some(&plan.launch_agent_digest),
+        "PRUNE_SERVICE_IDENTITY_MISMATCH"
+    );
+    let version = plan.current_target.file_name().unwrap().to_string_lossy();
+    let status = daemon_status(paths).await?;
+    ensure!(
+        status["version"] == version.as_ref() && status["activeJobs"] == 0,
+        "PRUNE_SERVICE_IDENTITY_MISMATCH"
+    );
+    if status["draining"] == true {
+        if prune_drain_marker(paths, plan)? {
+            remove_regular_and_sync(&paths.state_dir.join("drain.json"))?;
+        }
+        prune_fault("after_drain_removal")?;
+        launchctl("kickstart", &launch_agent(paths)).await?;
+        prune_fault("after_restart")?;
+    } else {
+        ensure!(
+            status["draining"] == false && !prune_drain_marker(paths, plan)?,
+            "PRUNE_SERVICE_IDENTITY_MISMATCH"
+        );
+    }
+    healthy_candidate(paths, &version, Some(&plan.auth_baseline)).await?;
+    Ok(())
+}
+
+pub async fn prune(paths: &Paths, remove: &[String], retain: &[String]) -> Result<Value> {
+    ensure!(
+        !remove.is_empty() && !retain.is_empty() && remove.len() <= 256 && retain.len() <= 256,
+        "INVALID_REQUEST"
+    );
+    ensure!(
+        remove
+            .iter()
+            .chain(retain)
+            .all(|name| prune_version_name(name)),
+        "INVALID_REQUEST"
+    );
+    ensure!(
+        remove
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            == remove.len()
+            && retain
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                == retain.len(),
+        "INVALID_REQUEST"
+    );
+    let _lock = LifecycleLock::acquire(paths)?;
+    if let Some(mut existing) = read_optional::<Operation>(&paths.operation())? {
+        existing.validate()?;
+        ensure!(terminal(&existing.phase), "LIFECYCLE_OPERATION_PENDING");
+        if existing.kind == OperationKind::Prune {
+            reconcile_prune(paths, &mut existing).await?;
+        }
+    }
+    ensure!(
+        !paths.state_dir.join("bootstrap-install.json").exists()
+            && !paths.state_dir.join("bootstrap-uninstall.json").exists()
+            && !paths.state_dir.join("install-operation.json").exists()
+            && !paths.state_dir.join("uninstall-operation.json").exists(),
+        "LIFECYCLE_OPERATION_PENDING"
+    );
+    if let Some(repair) = read_optional::<Value>(&paths.state_dir.join("receipt-repair.json"))? {
+        ensure!(
+            repair["schema"] == "loomex.receipt-repair/v1" && repair["phase"] == "completed",
+            "LIFECYCLE_OPERATION_PENDING"
+        );
+    }
+    let current = current_target(paths)?.context("runner current target is absent")?;
+    let owned_paths = owned_versions(paths)?;
+    let named = |name: &str| -> Result<PathBuf> {
+        let target = paths.versions().join(name);
+        ensure!(
+            owned_paths.contains(&target),
+            "requested prune version is not owned"
+        );
+        validate_version_path(&paths.versions(), &target.to_string_lossy())
+    };
+    let targets = remove
+        .iter()
+        .map(|name| named(name))
+        .collect::<Result<Vec<_>>>()?;
+    let retained = retain
+        .iter()
+        .map(|name| named(name))
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        !targets.contains(&current)
+            && !retained.contains(&current)
+            && targets.iter().all(|target| !retained.contains(target)),
+        "PRUNE_PROTECTED_VERSION"
+    );
+    for target in targets.iter().chain(&retained) {
+        verify_owned_version(paths, target)?;
+    }
+    for target in &retained {
+        validate_rollback_target(target, target.file_name().unwrap().to_str().unwrap())?;
+    }
+    verify_owned_version(paths, &current)?;
+    let status = daemon_status(paths).await?;
+    ensure!(
+        status["version"] == current.file_name().unwrap().to_string_lossy().as_ref()
+            && status["activeJobs"] == 0
+            && status["draining"] == false,
+        "PRUNE_REQUIRES_IDLE_DAEMON"
+    );
+    ensure!(
+        regular_digest(&paths.state_dir.join("drain.json"))?.is_none(),
+        "PRUNE_DRAIN_ALREADY_ACTIVE"
+    );
+    let auth_baseline = capture_auth_baseline(paths, Some(&current)).await?;
+    checked_regular(&launch_agent(paths))?;
+    let launch_agent_digest = state::digest(&fs::read(launch_agent(paths))?);
+    prune_in_use(&targets).await?;
+    let receipt_path = paths.state_dir.join("install-receipt.json");
+    let receipt: Value = state::read_json(&receipt_path)?;
+    ensure!(
+        receipt["versionPath"] == current.to_string_lossy().as_ref()
+            && receipt["version"] == current.file_name().unwrap().to_string_lossy().as_ref(),
+        "PRUNE_RECEIPT_IDENTITY_MISMATCH"
+    );
+    let original: Value = state::read_json(&paths.state_dir.join("owned-versions.json"))?;
+    let result = prune_inventory_without(&original, &targets)?;
+    // The previous terminal journal may own two small LaunchAgent recovery
+    // copies. Release only those exact files before superseding it.
+    release_terminal_operation_resources_before_supersede(paths)?;
+    let mut operation = Operation::new(OperationKind::Prune, "prepared", None);
+    operation.schema = PRUNE_OPERATION_SCHEMA.into();
+    operation.prune = Some(PruneIntent {
+        targets,
+        retain: retained,
+        moved: Vec::new(),
+        deleting_started: Vec::new(),
+        current_target: current,
+        original_inventory_digest: state::json_digest(&original),
+        result_inventory_digest: state::json_digest(&result),
+        receipt_digest: state::digest(&fs::read(receipt_path)?),
+        drain_key: Uuid::new_v4(),
+        launch_agent_digest,
+        auth_baseline,
+    });
+    save_operation(paths, &operation)?;
+    prune_fault("after_plan")?;
+    reconcile_prune(paths, &mut operation).await
+}
+
+async fn reconcile_prune(paths: &Paths, operation: &mut Operation) -> Result<Value> {
+    operation.validate()?;
+    let plan = operation.prune.clone().context("prune plan missing")?;
+    let current = current_target(paths)?.context("runner current target is absent")?;
+    ensure!(
+        current == plan.current_target
+            && !plan.targets.contains(&current)
+            && plan.retain.iter().all(|path| !plan.targets.contains(path)),
+        "PRUNE_PROTECTED_VERSION"
+    );
+    let versions = paths.versions();
+    for target in plan
+        .targets
+        .iter()
+        .chain(&plan.retain)
+        .chain(std::iter::once(&current))
+    {
+        let version = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("invalid prune version")?;
+        ensure!(
+            prune_version_name(version) && target.parent() == Some(versions.as_path()),
+            "unsafe prune version path"
+        );
+    }
+    let receipt_path = paths.state_dir.join("install-receipt.json");
+    ensure!(
+        state::digest(&fs::read(&receipt_path)?) == plan.receipt_digest,
+        "PRUNE_RECEIPT_IDENTITY_MISMATCH"
+    );
+    ensure!(
+        regular_digest(&launch_agent(paths))?.as_deref() == Some(&plan.launch_agent_digest),
+        "PRUNE_SERVICE_IDENTITY_MISMATCH"
+    );
+    if operation.phase == "prepared" {
+        prune_acquire_drain(paths, &plan).await?;
+        prune_fault("after_drain_before_checkpoint")?;
+        operation.phase = "draining".into();
+        save_operation(paths, operation)?;
+        prune_fault("after_drain_checkpoint")?;
+    }
+    if !matches!(
+        operation.phase.as_str(),
+        "drain_release_pending" | "completed"
+    ) {
+        ensure!(
+            prune_drain_marker(paths, &plan)?,
+            "PRUNE_DRAIN_IDENTITY_MISMATCH"
+        );
+        let status = daemon_status(paths).await?;
+        ensure!(
+            status["version"] == current.file_name().unwrap().to_string_lossy().as_ref()
+                && status["activeJobs"] == 0
+                && status["draining"] == true,
+            "PRUNE_REQUIRES_DRAINED_IDLE_DAEMON"
+        );
+    }
+    prune_in_use(&plan.targets).await?;
+    let inventory_path = paths.state_dir.join("owned-versions.json");
+    let original: Value = state::read_json(&inventory_path)?;
+    let inventory_digest = state::json_digest(&original);
+    ensure!(
+        inventory_digest == plan.original_inventory_digest
+            || inventory_digest == plan.result_inventory_digest,
+        "PRUNE_INVENTORY_IDENTITY_MISMATCH"
+    );
+    let metadata_done = inventory_digest == plan.result_inventory_digest;
+    if !metadata_done {
+        let result = prune_inventory_without(&original, &plan.targets)?;
+        ensure!(
+            state::json_digest(&result) == plan.result_inventory_digest,
+            "PRUNE_INVENTORY_IDENTITY_MISMATCH"
+        );
+        for path in plan.retain.iter().chain(std::iter::once(&current)) {
+            verify_owned_version_from_inventory(path, &original)?;
+        }
+        let quarantine_root = versions.join(format!(".prune-{}", operation.id));
+        match fs::symlink_metadata(&quarantine_root) {
+            Ok(meta) => ensure!(
+                meta.is_dir() && !meta.file_type().is_symlink(),
+                "unsafe prune quarantine"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&quarantine_root)?;
+                sync_directory(&versions)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        for target in &plan.targets {
+            let quarantine = prune_quarantine(paths, operation, target)?;
+            let expected = original["inventories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["path"] == target.to_string_lossy().as_ref())
+                .and_then(|entry| entry["files"].as_array())
+                .context("prune inventory entry missing")?;
+            let latest_status = daemon_status(paths).await?;
+            ensure!(
+                latest_status["version"] == current.file_name().unwrap().to_string_lossy().as_ref()
+                    && latest_status["activeJobs"] == 0
+                    && latest_status["draining"] == true
+                    && prune_drain_marker(paths, &plan)?,
+                "PRUNE_REQUIRES_DRAINED_IDLE_DAEMON"
+            );
+            prune_in_use(&[target.clone(), quarantine.clone()]).await?;
+            let source = fs::symlink_metadata(target);
+            let quarantined = fs::symlink_metadata(&quarantine);
+            let moved = operation.prune.as_ref().unwrap().moved.contains(target);
+            match (source, quarantined, moved) {
+                (Ok(source), Err(error), false) if error.kind() == std::io::ErrorKind::NotFound => {
+                    ensure!(
+                        source.is_dir() && !source.file_type().is_symlink(),
+                        "unsafe prune target"
+                    );
+                    verify_owned_version_from_inventory(target, &original)?;
+                    prune_in_use(std::slice::from_ref(target)).await?;
+                    fs::rename(target, &quarantine)?;
+                    sync_directory(&versions)?;
+                    sync_directory(&quarantine_root)?;
+                    prune_fault("after_move")?;
+                    operation.prune.as_mut().unwrap().moved.push(target.clone());
+                    operation.phase = "deleting".into();
+                    save_operation(paths, operation)?;
+                }
+                (Err(error), Ok(meta), false) if error.kind() == std::io::ErrorKind::NotFound => {
+                    ensure!(
+                        meta.is_dir() && !meta.file_type().is_symlink(),
+                        "unsafe prune quarantine"
+                    );
+                    verify_directory_against_files(&quarantine, expected)?;
+                    operation.prune.as_mut().unwrap().moved.push(target.clone());
+                    operation.phase = "deleting".into();
+                    save_operation(paths, operation)?;
+                }
+                (Err(error), Ok(meta), true)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && meta.is_dir()
+                        && !meta.file_type().is_symlink() => {}
+                (Err(source_error), Err(quarantine_error), true)
+                    if source_error.kind() == std::io::ErrorKind::NotFound
+                        && quarantine_error.kind() == std::io::ErrorKind::NotFound
+                        && operation
+                            .prune
+                            .as_ref()
+                            .unwrap()
+                            .deleting_started
+                            .contains(target) =>
+                {
+                    continue;
+                }
+                _ => bail!("PRUNE_TARGET_STATE_AMBIGUOUS"),
+            }
+            let deleting_started = operation
+                .prune
+                .as_ref()
+                .unwrap()
+                .deleting_started
+                .contains(target);
+            prune_quarantine_inventory(&quarantine, expected, deleting_started)?;
+            if !deleting_started {
+                operation
+                    .prune
+                    .as_mut()
+                    .unwrap()
+                    .deleting_started
+                    .push(target.clone());
+                save_operation(paths, operation)?;
+            }
+            prune_remove_quarantine_exact(&quarantine, expected)?;
+            sync_directory(&quarantine_root)?;
+            prune_fault("after_delete")?;
+        }
+        operation.phase = "metadata".into();
+        save_operation(paths, operation)?;
+        prune_fault("before_metadata")?;
+        state::write_json(&inventory_path, &result)?;
+        prune_fault("after_metadata")?;
+    }
+    let final_inventory: Value = state::read_json(&inventory_path)?;
+    ensure!(
+        state::json_digest(&final_inventory) == plan.result_inventory_digest,
+        "PRUNE_INVENTORY_IDENTITY_MISMATCH"
+    );
+    for target in &plan.targets {
+        match fs::symlink_metadata(target) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => bail!("PRUNE_TARGET_STATE_AMBIGUOUS"),
+        }
+    }
+    for target in plan.retain.iter().chain(std::iter::once(&current)) {
+        verify_owned_version_from_inventory(target, &final_inventory)?;
+    }
+    let quarantine_root = versions.join(format!(".prune-{}", operation.id));
+    match fs::symlink_metadata(&quarantine_root) {
+        Ok(meta) => {
+            ensure!(
+                meta.is_dir()
+                    && !meta.file_type().is_symlink()
+                    && fs::read_dir(&quarantine_root)?.next().is_none(),
+                "PRUNE_TARGET_STATE_AMBIGUOUS"
+            );
+            fs::remove_dir(&quarantine_root)?;
+            sync_directory(&versions)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    if operation.phase != "completed" {
+        operation.phase = "drain_release_pending".into();
+        save_operation(paths, operation)?;
+        prune_fault("before_drain_release")?;
+        prune_release_drain(paths, &plan).await?;
+        operation.phase = "completed".into();
+        save_operation(paths, operation)?;
+    }
+    prune_fault("before_journal_clear")?;
+    fs::remove_file(paths.operation())?;
+    sync_directory(&paths.state_dir)?;
+    Ok(
+        json!({"schema":"app.loomex.runner.lifecycle-prune/v1", "completed":true,
+        "removed":plan.targets.iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>(),
+        "retained":plan.retain.iter().map(|path| path.file_name().unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>(),
+        "current":current.file_name().unwrap().to_string_lossy()}),
+    )
+}
+
+fn bootstrap_configuration_digest(configuration: &Value) -> Result<String> {
+    ensure!(
+        configuration["schema"] == "app.loomex.runner.bootstrap-install/v1",
+        "unsupported bootstrap configuration"
+    );
+    Ok(state::digest(&serde_json::to_vec(configuration)?))
+}
+
+fn abandonment_bootstrap_configuration(paths: &Paths, operation: &Operation) -> Result<Value> {
+    let intent = operation
+        .abandonment
+        .as_ref()
+        .context("abandonment missing")?;
+    let journal: Value = state::read_json(&paths.state_dir.join("bootstrap-install.json"))?;
+    let configuration = if journal["schema"] == "app.loomex.runner.bootstrap-install/v2" {
+        ensure!(
+            journal["phase"] == "aborted"
+                && journal["operationId"] == operation.id.to_string()
+                && journal["configurationDigest"] == intent.bootstrap_configuration_digest,
+            "LIFECYCLE_ABANDONMENT_CONFIGURATION_MISMATCH"
+        );
+        journal["configuration"].clone()
+    } else {
+        journal
+    };
+    ensure!(
+        bootstrap_configuration_digest(&configuration)? == intent.bootstrap_configuration_digest
+            && configuration["version"] == intent.package.version
+            && configuration["target"] == intent.package.target.to_string_lossy().as_ref()
+            && configuration["manifestSha256"] == intent.package.manifest_sha256,
+        "LIFECYCLE_ABANDONMENT_CONFIGURATION_MISMATCH"
+    );
+    Ok(configuration)
+}
+
+async fn reconcile_abandonment(paths: &Paths, operation: &mut Operation) -> Result<Value> {
+    operation.validate()?;
+    let intent = operation
+        .abandonment
+        .clone()
+        .context("abandonment missing")?;
+    let configuration = abandonment_bootstrap_configuration(paths, operation)?;
+    ensure!(
+        current_target(paths)?.as_ref() == Some(&intent.previous_target)
+            && regular_digest(&launch_agent(paths))?.as_ref() == Some(&intent.plist_digest)
+            && regular_digest(&paths.state_dir.join("install-receipt.json"))?.as_ref()
+                == Some(&intent.receipt_digest)
+            && regular_digest(&paths.state_dir.join("owned-versions.json"))?.as_ref()
+                == Some(&intent.inventory_digest),
+        "LIFECYCLE_ABANDONMENT_IDENTITY_MISMATCH"
+    );
+    if operation.phase != "rolled_back" {
+        if operation.service_stops.is_empty() {
+            ensure!(
+                operation.phase == "abandonment_pending"
+                    && regular_digest(&paths.state_dir.join("drain.json"))?.as_ref()
+                        == Some(&intent.drain_digest),
+                "LIFECYCLE_ABANDONMENT_PHASE_MISMATCH"
+            );
+            let version = intent
+                .previous_target
+                .file_name()
+                .and_then(|v| v.to_str())
+                .context("previous version missing")?;
+            ensure!(
+                candidate_drain_can_be_released(&daemon_status(paths).await?, version),
+                "abandonment requires fresh drained zero managed work"
+            );
+            ensure!(
+                matches!(observe_label(paths).await, LabelObservation::Loaded {pid, program}
+                if pid == intent.process.pid && (program == paths.current().join("bin/loomex-runner") || program == intent.process.executable))
+                    && observe_recorded_process(&intent.process)
+                        == ProcessObservation::Present(intent.process.clone()),
+                "LIFECYCLE_ABANDONMENT_PROCESS_MISMATCH"
+            );
+            if let Some(singleton) =
+                stop_for_direction(paths, operation, StopDirection::RestorePrevious).await?
+            {
+                complete_stopped_transition(paths, operation, singleton).await?;
+            }
+        } else {
+            if operation
+                .service_stops
+                .last()
+                .is_some_and(|stop| stop.request == StopRequest::Prepared)
+            {
+                request_service_stop(paths, operation).await?;
+            }
+            reconcile_service_stop(paths, operation).await?;
+        }
+    }
+    if operation.phase != "rolled_back" {
+        return Ok(service_stop_pending(operation));
+    }
+    // A crash after service restoration must never make the original bootstrap
+    // configuration executable again. Verify health before recording its tombstone.
+    let version = verify_recovery_service(
+        paths,
+        operation,
+        &intent.previous_target,
+        &intent.plist_digest,
+    )?;
+    healthy_restored_previous(paths, &version, operation.auth_baseline.as_ref()).await?;
+    ensure!(
+        restarted_service_identity_matches(paths, &intent.previous_target).await,
+        "LIFECYCLE_ABANDONMENT_RESTORATION_MISMATCH"
+    );
+    #[cfg(test)]
+    recovery_fault("before_abandonment_tombstone")?;
+    // An explicit retry of the original config revokes an unconsumed successor
+    // intent before rewriting the tombstone, never authorizing its activation.
+    operation.abandonment.as_mut().unwrap().successor = None;
+    save_operation(paths, operation)?;
+    state::write_json(
+        &paths.state_dir.join("bootstrap-install.json"),
+        &json!({
+            "schema":"app.loomex.runner.bootstrap-install/v2", "phase":"aborted",
+            "operationId":operation.id, "configurationDigest":intent.bootstrap_configuration_digest,
+            "configuration":configuration
+        }),
+    )?;
+    Ok(
+        json!({"schema":"app.loomex.runner.lifecycle-rollback/v1", "rolledBack":true,
+        "abandoned":true, "resumed":true, "operation":operation}),
+    )
+}
+
+/// Called under the same lifecycle lock, before bootstrap preflight/staging.
+/// Same-configuration retries settle the abort; a different configuration needs
+/// explicit acknowledgement of that exact terminal transaction before a new intent.
+fn configuration_package(configuration: &Value) -> Result<PackageIdentity> {
+    bootstrap_configuration_digest(configuration)?;
+    let package = PackageIdentity {
+        version: configuration["version"]
+            .as_str()
+            .context("invalid bootstrap version")?
+            .into(),
+        target: PathBuf::from(
+            configuration["target"]
+                .as_str()
+                .context("invalid bootstrap target")?,
+        ),
+        manifest_sha256: configuration["manifestSha256"]
+            .as_str()
+            .context("invalid bootstrap manifest")?
+            .into(),
+    };
+    ensure!(
+        package.target.is_absolute() && valid_digest(&package.manifest_sha256),
+        "invalid bootstrap package"
+    );
+    Ok(package)
+}
+
+pub async fn reconcile_bootstrap_abandonment_locked(
+    paths: &Paths,
+    configuration: &Value,
+    settled_abandonment: Option<Uuid>,
+) -> Result<Option<Value>> {
+    let operation = read_optional::<Operation>(&paths.operation())?;
+    if let Some(mut operation) = operation {
+        operation.validate()?;
+        if let Some(intent) = &operation.abandonment {
+            let digest = bootstrap_configuration_digest(configuration)?;
+            if digest == intent.bootstrap_configuration_digest {
+                return reconcile_abandonment(paths, &mut operation).await.map(Some);
+            }
+            ensure!(
+                settled_abandonment == Some(operation.id) && operation.phase == "rolled_back",
+                "LIFECYCLE_ABANDONMENT_ACKNOWLEDGEMENT_REQUIRED"
+            );
+            let original = abandonment_bootstrap_configuration(paths, &operation)?;
+            let journal: Value = state::read_json(&paths.state_dir.join("bootstrap-install.json"))?;
+            ensure!(
+                journal["schema"] == "app.loomex.runner.bootstrap-install/v2"
+                    && journal["phase"] == "aborted",
+                "LIFECYCLE_ABANDONMENT_SETTLEMENT_REQUIRED"
+            );
+            let previous = intent.previous_target.clone();
+            let plist = intent.plist_digest.clone();
+            let version = verify_recovery_service(paths, &operation, &previous, &plist)?;
+            healthy_restored_previous(paths, &version, operation.auth_baseline.as_ref()).await?;
+            ensure!(
+                restarted_service_identity_matches(paths, &previous).await,
+                "LIFECYCLE_ABANDONMENT_RESTORATION_MISMATCH"
+            );
+            let package = configuration_package(configuration)?;
+            operation.abandonment.as_mut().unwrap().successor = Some(BootstrapSuccessor {
+                package,
+                configuration_digest: digest.clone(),
+            });
+            save_operation(paths, &operation)?;
+            #[cfg(test)]
+            recovery_fault("after_abandonment_successor_intent")?;
+            state::write_json(
+                &paths.state_dir.join("bootstrap-install.json"),
+                &json!({
+                    "schema":"app.loomex.runner.bootstrap-install/v2", "phase":"aborted",
+                    "operationId":operation.id, "configurationDigest":bootstrap_configuration_digest(&original)?,
+                    "configuration":original, "successorConfiguration":configuration,
+                    "successorConfigurationDigest":digest
+                }),
+            )?;
+            return Ok(None);
+        }
+        // After successor activation writes its fresh Update UUID, the same
+        // existing retry envelope still binds only the corrected configuration.
+        if let Some(journal) =
+            read_optional::<Value>(&paths.state_dir.join("bootstrap-install.json"))?
+        {
+            if journal["schema"] == "app.loomex.runner.bootstrap-install/v2" {
+                ensure!(
+                    journal["phase"] == "aborted"
+                        && journal["operationId"]
+                            .as_str()
+                            .and_then(|id| Uuid::parse_str(id).ok())
+                            .is_some()
+                        && journal["configurationDigest"]
+                            == bootstrap_configuration_digest(&journal["configuration"])?
+                        && journal["successorConfigurationDigest"]
+                            == bootstrap_configuration_digest(configuration)?
+                        && journal["successorConfiguration"] == *configuration
+                        && operation.kind == OperationKind::Update
+                        && operation.package.as_ref()
+                            == Some(&configuration_package(configuration)?),
+                    "LIFECYCLE_ABANDONMENT_SUCCESSOR_MISMATCH"
+                );
+                return Ok(None);
+            }
+        }
+    }
+    ensure!(
+        settled_abandonment.is_none(),
+        "LIFECYCLE_ABANDONMENT_IDENTITY_MISMATCH"
+    );
+    if let Some(journal) = read_optional::<Value>(&paths.state_dir.join("bootstrap-install.json"))?
+    {
+        ensure!(
+            journal["schema"] == "app.loomex.runner.bootstrap-install/v1",
+            "LIFECYCLE_ABANDONMENT_IDENTITY_MISMATCH"
+        );
+    }
+    Ok(None)
+}
+
+pub async fn rollback_with_expected(
+    paths: &Paths,
+    version: &str,
+    expected_operation: Option<Uuid>,
+) -> Result<Value> {
+    {
+        let _lock = LifecycleLock::acquire(paths)?;
+        if let Some(mut operation) = read_optional::<Operation>(&paths.operation())? {
+            operation.validate()?;
+            if operation.abandonment.is_some() || !terminal(&operation.phase) {
+                ensure!(
+                    expected_operation == Some(operation.id),
+                    "LIFECYCLE_EXPECTED_OPERATION_REQUIRED_OR_MISMATCH"
+                );
+                let previous = operation
+                    .previous_target
+                    .clone()
+                    .context("LIFECYCLE_ABANDONMENT_TARGET_MISSING")?;
+                ensure!(
+                    previous.file_name().is_some_and(|v| v == version),
+                    "LIFECYCLE_ABANDONMENT_TARGET_MISMATCH"
+                );
+                validate_abandonment_current_previous(paths, &operation, &previous, version)?;
+                if operation.abandonment.is_none() {
+                    ensure!(
+                        operation.kind == OperationKind::Update
+                            && operation.phase == "pending_active_work"
+                            && operation.checkpoint.as_deref() == Some("daemon_has_active_work")
+                            && operation.service_stops.is_empty(),
+                        "LIFECYCLE_ABANDONMENT_PHASE_MISMATCH"
+                    );
+                    let resources = operation
+                        .resources
+                        .as_ref()
+                        .context("LIFECYCLE_ABANDONMENT_RESOURCE_MISSING")?;
+                    let plist = resources
+                        .launch_agent_backup_sha256
+                        .clone()
+                        .context("LIFECYCLE_ABANDONMENT_PREVIOUS_CONFIGURATION_MISSING")?;
+                    verify_recovery_service(paths, &operation, &previous, &plist)
+                        .context("LIFECYCLE_ABANDONMENT_PREVIOUS_IDENTITY_MISMATCH")?;
+                    ensure!(
+                        candidate_drain_can_be_released(&daemon_status(paths).await?, version),
+                        "LIFECYCLE_ABANDONMENT_REQUIRES_DRAINED_IDLE_DAEMON"
+                    );
+                    let receipt: Value =
+                        state::read_json(&paths.state_dir.join("install-receipt.json"))
+                            .context("LIFECYCLE_ABANDONMENT_RECEIPT_UNAVAILABLE")?;
+                    ensure!(
+                        receipt["version"] == version
+                            && receipt["versionPath"] == previous.to_string_lossy().as_ref()
+                            && receipt["launchAgent"]
+                                == launch_agent(paths).to_string_lossy().as_ref(),
+                        "LIFECYCLE_ABANDONMENT_RECEIPT_MISMATCH"
+                    );
+                    let process = match observe_label(paths).await {
+                        LabelObservation::Loaded { pid, program }
+                            if program == paths.current().join("bin/loomex-runner")
+                                || program == previous.join("bin/loomex-runner") =>
+                        {
+                            if lifecycle_test_mode() {
+                                ProcessIdentity {
+                                    pid,
+                                    uid: unsafe { libc::geteuid() },
+                                    started_seconds: 1,
+                                    started_micros: 0,
+                                    executable: previous.join("bin/loomex-runner"),
+                                }
+                            } else {
+                                match inspect_process(pid) {
+                                    ProcessObservation::Present(process) => process,
+                                    _ => bail!("LIFECYCLE_ABANDONMENT_PROCESS_UNAVAILABLE"),
+                                }
+                            }
+                        }
+                        _ => bail!("LIFECYCLE_ABANDONMENT_PROCESS_UNAVAILABLE"),
+                    };
+                    let configuration: Value =
+                        state::read_json(&paths.state_dir.join("bootstrap-install.json"))
+                            .context("LIFECYCLE_ABANDONMENT_CONFIGURATION_UNAVAILABLE")?;
+                    let package = operation
+                        .package
+                        .clone()
+                        .context("LIFECYCLE_ABANDONMENT_PACKAGE_MISSING")?;
+                    verify_all_owned_versions(paths)
+                        .context("LIFECYCLE_ABANDONMENT_OWNERSHIP_MISMATCH")?;
+                    ensure!(
+                        configuration["version"] == package.version
+                            && configuration["target"] == package.target.to_string_lossy().as_ref()
+                            && configuration["manifestSha256"] == package.manifest_sha256,
+                        "LIFECYCLE_ABANDONMENT_CONFIGURATION_MISMATCH"
+                    );
+                    operation.abandonment = Some(PendingUpdateAbandonment {
+                        operation_id: operation.id,
+                        package,
+                        previous_target: previous,
+                        receipt_digest: regular_digest(
+                            &paths.state_dir.join("install-receipt.json"),
+                        )?
+                        .context("receipt missing")?,
+                        inventory_digest: regular_digest(
+                            &paths.state_dir.join("owned-versions.json"),
+                        )?
+                        .context("inventory missing")?,
+                        plist_digest: plist,
+                        drain_digest: regular_digest(&paths.state_dir.join("drain.json"))?
+                            .context("drain missing")?,
+                        bootstrap_configuration_digest: bootstrap_configuration_digest(
+                            &configuration,
+                        )?,
+                        process,
+                        successor: None,
+                    });
+                    operation.schema = if operation.auth_baseline.is_some() {
+                        ABANDONMENT_OPERATION_SCHEMA
+                    } else {
+                        PRE_AUTH_ABANDONMENT_SCHEMA
+                    }
+                    .into();
+                    set_checkpoint(
+                        paths,
+                        &mut operation,
+                        "abandonment_pending",
+                        "pending_update_abandonment_intent",
+                    )?;
+                    #[cfg(test)]
+                    recovery_fault("after_abandonment_intent")?;
+                }
+                return reconcile_abandonment(paths, &mut operation).await;
+            }
+            ensure!(
+                expected_operation.is_none(),
+                "LIFECYCLE_EXPECTED_OPERATION_MISMATCH"
+            );
+        } else {
+            ensure!(
+                expected_operation.is_none(),
+                "LIFECYCLE_EXPECTED_OPERATION_MISMATCH"
+            );
+        }
+    }
+    rollback(paths, version).await
 }
 
 pub async fn rollback(paths: &Paths, version: &str) -> Result<Value> {
@@ -1909,6 +4611,7 @@ mod tests {
             manifest_sha256: "a".repeat(64),
         };
         let mut operation = Operation::new(OperationKind::Update, "completed", None);
+        operation.schema = PRE_AUTH_OPERATION_SCHEMA.into();
         operation.package = Some(package.clone());
         operation.resources = Some(OperationResources {
             launch_agent: launch_agent(&paths),
@@ -1931,6 +4634,1215 @@ mod tests {
         );
     }
 
+    fn previous_drained_recovery_fixture(paths: &Paths) -> Operation {
+        make_compatible_target(paths);
+        make_compatible_version(paths, "1.2.4");
+        let candidate = paths.versions().join("1.2.3");
+        let previous = paths.versions().join("1.2.4");
+        std::os::unix::fs::symlink(&previous, paths.current()).unwrap();
+        fs::write(launch_agent(paths), b"previous-plist").unwrap();
+        let backup = paths.state_dir.join("previous-backup.plist");
+        fs::write(&backup, b"previous-plist").unwrap();
+        let mut operation = Operation::new(OperationKind::Update, "recovery_required", None);
+        operation.schema = PRE_AUTH_OPERATION_SCHEMA.into();
+        operation.package = Some(PackageIdentity {
+            version: "1.2.3".into(),
+            target: candidate.clone(),
+            manifest_sha256: "a".repeat(64),
+        });
+        operation.previous_target = Some(previous.clone());
+        operation.resources = Some(OperationResources {
+            launch_agent: launch_agent(paths),
+            staged_launch_agent: paths.state_dir.join("candidate-staged.plist"),
+            staged_launch_agent_sha256: state::digest(b"candidate-plist"),
+            launch_agent_backup: backup,
+            launch_agent_backup_sha256: Some(state::digest(b"previous-plist")),
+            owned_versions: vec![candidate, previous],
+        });
+        state::write_json(
+            &paths.state_dir.join("drain.json"),
+            &json!({"draining":true}),
+        )
+        .unwrap();
+        save_operation(paths, &operation).unwrap();
+        operation
+    }
+
+    #[tokio::test]
+    async fn accepted_stop_at_observation_deadline_preserves_pending_activation() {
+        let _serial = TEST_SERIAL.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let original = previous_drained_recovery_fixture(&paths);
+        fs::remove_file(paths.operation()).unwrap();
+        let staged = temp.path().join("candidate.plist");
+        fs::write(&staged, b"candidate-plist").unwrap();
+        TEST_MODE.store(true, Ordering::SeqCst);
+        TEST_DELAYED_SERVICE_STOP.store(true, Ordering::SeqCst);
+        TEST_LABEL_PRESENT.store(true, Ordering::SeqCst);
+        TEST_RESTART_COUNT.store(0, Ordering::SeqCst);
+        *TEST_RECOVERY_STATUS.lock().unwrap() =
+            Some(json!({"version":"1.2.4","activeJobs":0,"draining":true}));
+        let result = activate(
+            &paths,
+            paths.versions().join("1.2.3"),
+            "1.2.3".into(),
+            "a".repeat(64),
+            staged,
+        )
+        .await;
+        let restarts = TEST_RESTART_COUNT.load(Ordering::SeqCst);
+        TEST_DELAYED_SERVICE_STOP.store(false, Ordering::SeqCst);
+        TEST_LABEL_PRESENT.store(false, Ordering::SeqCst);
+        *TEST_RECOVERY_STATUS.lock().unwrap() = None;
+        TEST_MODE.store(false, Ordering::SeqCst);
+        let result = result.unwrap_or_else(|error| json!({"error":error.to_string()}));
+        assert_eq!(result["pending"], true, "{result}");
+        assert_eq!(result["reason"], "service_stop");
+        let retained: Operation = state::read_json(&paths.operation()).unwrap();
+        assert_eq!(retained.phase, "service_stop_pending");
+        assert_eq!(
+            fs::read_link(paths.current()).unwrap(),
+            original.previous_target.unwrap()
+        );
+        assert_eq!(fs::read(launch_agent(&paths)).unwrap(), b"previous-plist");
+        assert!(paths.state_dir.join("drain.json").exists());
+        assert_eq!(restarts, 0);
+    }
+
+    struct StopTestScope;
+    impl StopTestScope {
+        fn start() -> Self {
+            TEST_MODE.store(true, Ordering::SeqCst);
+            TEST_LABEL_PRESENT.store(true, Ordering::SeqCst);
+            TEST_DELAYED_SERVICE_STOP.store(true, Ordering::SeqCst);
+            TEST_STOP_COUNT.store(0, Ordering::SeqCst);
+            TEST_STATUS_COUNT.store(0, Ordering::SeqCst);
+            TEST_RESTART_COUNT.store(0, Ordering::SeqCst);
+            *TEST_RECOVERY_STATUS.lock().unwrap() =
+                Some(json!({"version":"1.2.4","activeJobs":0,"draining":true}));
+            Self
+        }
+    }
+    impl Drop for StopTestScope {
+        fn drop(&mut self) {
+            TEST_MODE.store(false, Ordering::SeqCst);
+            TEST_LABEL_PRESENT.store(false, Ordering::SeqCst);
+            TEST_DELAYED_SERVICE_STOP.store(false, Ordering::SeqCst);
+            *TEST_LABEL_OBSERVATION.lock().unwrap() = None;
+            *TEST_PROCESS_OBSERVATION.lock().unwrap() = None;
+            *TEST_RECOVERY_FAULT.lock().unwrap() = None;
+            *TEST_RECOVERY_STATUS.lock().unwrap() = None;
+            *TEST_AUTH_STATUS.lock().unwrap() = None;
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_health_preserves_captured_auth_scope_after_journal_reload() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = StopTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let installation = Uuid::new_v4();
+        let organization = Uuid::new_v4();
+        let prior = json!({"authenticated":true,"code":"AUTHENTICATED","installationId":installation,"activeOrganization":organization,"loginPending":false});
+        *TEST_AUTH_STATUS.lock().unwrap() = Some(prior);
+        let mut operation = previous_drained_recovery_fixture(&paths);
+        operation.auth_baseline = Some(
+            capture_auth_baseline(&paths, operation.previous_target.as_deref())
+                .await
+                .unwrap(),
+        );
+        operation.schema = OPERATION_SCHEMA.into();
+        save_operation(&paths, &operation).unwrap();
+        let saved = fs::read_to_string(paths.operation()).unwrap();
+        assert!(saved.contains(&installation.to_string()));
+        assert!(saved.contains(&organization.to_string()));
+        assert!(!saved.contains("privateKey"));
+        let recovered: Operation = state::read_json(&paths.operation()).unwrap();
+        assert_eq!(recovered.schema, OPERATION_SCHEMA);
+        assert_ne!(recovered.schema, PRE_AUTH_OPERATION_SCHEMA);
+        assert!(recovered.validate().is_ok());
+        let mut downgraded = recovered.clone();
+        downgraded.schema = PRE_AUTH_OPERATION_SCHEMA.into();
+        assert!(downgraded.validate().is_err());
+        downgraded.schema = LEGACY_OPERATION_SCHEMA.into();
+        assert!(downgraded.validate().is_err());
+        downgraded = recovered.clone();
+        downgraded.auth_baseline = None;
+        assert!(downgraded.validate().is_err());
+        *TEST_RECOVERY_STATUS.lock().unwrap() =
+            Some(json!({"version":"1.2.3","activeJobs":0,"draining":false}));
+        healthy_candidate(&paths, "1.2.3", recovered.auth_baseline.as_ref())
+            .await
+            .unwrap();
+        *TEST_AUTH_STATUS.lock().unwrap() = Some(
+            json!({"authenticated":true,"code":"AUTHENTICATED","installationId":Uuid::new_v4(),"activeOrganization":organization,"loginPending":false}),
+        );
+        assert!(
+            healthy_candidate(&paths, "1.2.3", recovered.auth_baseline.as_ref())
+                .await
+                .is_err()
+        );
+        *TEST_AUTH_STATUS.lock().unwrap() = Some(
+            json!({"authenticated":true,"code":"AUTHENTICATED","installationId":installation,"activeOrganization":Uuid::new_v4(),"loginPending":false}),
+        );
+        assert!(
+            healthy_candidate(&paths, "1.2.3", recovered.auth_baseline.as_ref())
+                .await
+                .is_err()
+        );
+        *TEST_AUTH_STATUS.lock().unwrap() =
+            Some(json!({"authenticated":false,"code":"STORE_UNAVAILABLE"}));
+        assert!(
+            healthy_candidate(&paths, "1.2.3", recovered.auth_baseline.as_ref())
+                .await
+                .is_err()
+        );
+        TEST_MODE.store(false, Ordering::SeqCst);
+        assert!(healthy_candidate(&paths, "1.2.3", None).await.is_err());
+        healthy_restored_previous(&paths, "1.2.3", None)
+            .await
+            .unwrap();
+        TEST_MODE.store(true, Ordering::SeqCst);
+    }
+
+    #[tokio::test]
+    async fn auth_baseline_distinguishes_signed_out_initial_and_pending() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = StopTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let previous = temp.path().join("previous");
+        let installation = Uuid::new_v4();
+        *TEST_AUTH_STATUS.lock().unwrap() = Some(
+            json!({"authenticated":false,"code":"AUTH_REQUIRED","installationId":installation,"loginPending":false}),
+        );
+        assert_eq!(
+            capture_auth_baseline(&paths, None).await.unwrap(),
+            AuthBaseline::Initial
+        );
+        let signed_out = capture_auth_baseline(&paths, Some(&previous))
+            .await
+            .unwrap();
+        assert_eq!(
+            signed_out,
+            AuthBaseline::SignedOut {
+                installation_id: Some(installation)
+            }
+        );
+        *TEST_RECOVERY_STATUS.lock().unwrap() =
+            Some(json!({"version":"1.2.3","activeJobs":0,"draining":false}));
+        healthy_candidate(&paths, "1.2.3", Some(&signed_out))
+            .await
+            .unwrap();
+        healthy_candidate(&paths, "1.2.3", Some(&AuthBaseline::Initial))
+            .await
+            .unwrap();
+        *TEST_AUTH_STATUS.lock().unwrap() = Some(
+            json!({"authenticated":false,"code":"AUTH_REQUIRED","installationId":Uuid::new_v4(),"loginPending":false}),
+        );
+        assert!(
+            healthy_candidate(&paths, "1.2.3", Some(&signed_out))
+                .await
+                .is_err()
+        );
+        for code in [
+            "AUTH_RECOVERY_PENDING",
+            "LOGOUT_PENDING",
+            "STORE_UNAVAILABLE",
+            "UNEXPECTED",
+        ] {
+            *TEST_AUTH_STATUS.lock().unwrap() = Some(json!({"authenticated":false,"code":code}));
+            assert!(
+                capture_auth_baseline(&paths, Some(&previous))
+                    .await
+                    .is_err(),
+                "{code}"
+            );
+            assert!(
+                healthy_candidate(&paths, "1.2.3", Some(&signed_out))
+                    .await
+                    .is_err(),
+                "{code}"
+            );
+            assert!(
+                healthy_candidate(&paths, "1.2.3", Some(&AuthBaseline::Initial))
+                    .await
+                    .is_err(),
+                "{code}"
+            );
+        }
+        *TEST_AUTH_STATUS.lock().unwrap() =
+            Some(json!({"authenticated":false,"code":"AUTH_REQUIRED","loginPending":true}));
+        assert!(
+            capture_auth_baseline(&paths, Some(&previous))
+                .await
+                .is_err()
+        );
+        for login_pending in [Value::Null, json!("false"), json!(0)] {
+            *TEST_AUTH_STATUS.lock().unwrap() = Some(
+                json!({"authenticated":false,"code":"AUTH_REQUIRED","loginPending":login_pending}),
+            );
+            assert!(
+                capture_auth_baseline(&paths, Some(&previous))
+                    .await
+                    .is_err()
+            );
+        }
+    }
+    async fn pending_stop_fixture(paths: &Paths) -> Operation {
+        let mut operation = previous_drained_recovery_fixture(paths);
+        fs::write(
+            &operation.resources.as_ref().unwrap().staged_launch_agent,
+            b"candidate-plist",
+        )
+        .unwrap();
+        prepare_service_stop(paths, &mut operation, StopDirection::ActivateCandidate)
+            .await
+            .unwrap();
+        request_service_stop(paths, &mut operation).await.unwrap();
+        assert!(
+            observe_service_stop(paths, &mut operation, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        operation
+    }
+
+    #[tokio::test]
+    async fn pending_stop_late_absence_resumes_exact_operation_without_reissuing_stop() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = StopTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let original = pending_stop_fixture(&paths).await;
+        assert_eq!(resume(&paths).await.unwrap()["pending"], true);
+        let preflight = preflight_package(&paths, original.kind, original.package.clone().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(preflight["reason"], "service_stop");
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1);
+        TEST_LABEL_PRESENT.store(false, Ordering::SeqCst);
+        let result = resume(&paths).await.unwrap();
+        assert_eq!(result["operation"]["phase"], "completed", "{result}");
+        let saved: Operation = state::read_json(&paths.operation()).unwrap();
+        assert_eq!(saved.id, original.id);
+        assert_eq!(saved.package, original.package);
+        assert_eq!(
+            saved.service_stops[0].process,
+            original.service_stops[0].process
+        );
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fs::read_link(paths.current()).unwrap(),
+            paths.versions().join("1.2.3")
+        );
+        assert_eq!(fs::read(launch_agent(&paths)).unwrap(), b"candidate-plist");
+        assert!(!paths.state_dir.join("drain.json").exists());
+        assert_eq!(resume(&paths).await.unwrap()["resumed"], false);
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pending_stop_other_state_singleton_does_not_block_bound_installation() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = StopTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let original = pending_stop_fixture(&paths).await;
+        let outside = temp.path().join("different-state-directory");
+        fs::create_dir(&outside).unwrap();
+        let outside_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(outside.join("daemon.lock"))
+            .unwrap();
+        outside_lock.try_lock_exclusive().unwrap();
+        // This held namespace is outside the exact installed state directory.
+        // Its process identity/path availability is not an absence claim and
+        // does not grant or deny this installation's server admission lock.
+        TEST_LABEL_PRESENT.store(false, Ordering::SeqCst);
+        assert!(stopped_singleton(&paths, false).is_ok());
+        let result = resume(&paths).await.unwrap();
+        assert_eq!(result["operation"]["phase"], "completed", "{result}");
+        let saved: Operation = state::read_json(&paths.operation()).unwrap();
+        assert_eq!(saved.id, original.id);
+        assert_eq!(saved.package, original.package);
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1);
+        // A held lock for a different state namespace remains held; it is not
+        // evidence that this exact installation has a second admitted server.
+        let outside_contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(outside.join("daemon.lock"))
+            .unwrap();
+        assert!(outside_contender.try_lock_exclusive().is_err());
+    }
+
+    #[tokio::test]
+    async fn stopped_singleton_fences_second_cooperative_owner_until_guard_is_dropped() {
+        let _serial = TEST_SERIAL.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let lock_path = paths.state_dir.join("daemon.lock");
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&lock_path)
+            .unwrap();
+        // Exercise the production lock/file checks, not test-mode health.
+        TEST_MODE.store(false, Ordering::SeqCst);
+        let owner = stopped_singleton(&paths, false).unwrap();
+        assert!(contender.try_lock_exclusive().is_err());
+        assert!(!paths.current().exists());
+        assert!(!paths.operation().exists());
+        drop(owner);
+        contender.try_lock_exclusive().unwrap();
+        assert!(stopped_singleton(&paths, false).is_err());
+        drop(contender);
+        assert!(stopped_singleton(&paths, false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn stopped_singleton_production_file_safety_preserves_unsafe_namespace() {
+        let _serial = TEST_SERIAL.lock().await;
+        TEST_MODE.store(false, Ordering::SeqCst);
+        for case in [
+            "missing_upgrade_lock",
+            "symlink",
+            "directory",
+            "unsafe_mode",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let lock_path = paths.state_dir.join("daemon.lock");
+            let other = temp.path().join("untouched");
+            fs::write(&other, b"private unrelated fixture").unwrap();
+            match case {
+                "missing_upgrade_lock" => {}
+                "symlink" => std::os::unix::fs::symlink(&other, &lock_path).unwrap(),
+                "directory" => fs::create_dir(&lock_path).unwrap(),
+                "unsafe_mode" => {
+                    fs::write(&lock_path, b"unsafe fixture").unwrap();
+                    fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o666)).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(stopped_singleton(&paths, false).is_err(), "{case}");
+            assert_eq!(fs::read(&other).unwrap(), b"private unrelated fixture");
+            assert!(!paths.current().exists(), "{case}");
+            assert!(!paths.operation().exists(), "{case}");
+            assert!(!paths.state_dir.join("drain.json").exists(), "{case}");
+            if case == "missing_upgrade_lock" {
+                assert!(!lock_path.exists());
+            }
+            if case == "symlink" {
+                assert!(lock_path.is_symlink());
+            }
+            if case == "directory" {
+                assert!(lock_path.is_dir());
+            }
+            if case == "unsafe_mode" {
+                assert_eq!(fs::read(&lock_path).unwrap(), b"unsafe fixture");
+                assert_eq!(
+                    fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
+                    0o666
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_stop_unknown_live_reused_replacement_and_singleton_observations_fail_closed() {
+        let _serial = TEST_SERIAL.lock().await;
+        for case in [
+            "label_unknown",
+            "process_unknown",
+            "old_still_live",
+            "reused_pid",
+            "replacement_label",
+            "singleton_held",
+        ] {
+            let _scope = StopTestScope::start();
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let original = pending_stop_fixture(&paths).await;
+            let old = original.service_stops[0].process.clone().unwrap();
+            TEST_LABEL_PRESENT.store(false, Ordering::SeqCst);
+            let mut held = None;
+            match case {
+                "label_unknown" => {
+                    *TEST_LABEL_OBSERVATION.lock().unwrap() = Some(LabelObservation::Unknown)
+                }
+                "process_unknown" => {
+                    *TEST_PROCESS_OBSERVATION.lock().unwrap() = Some(ProcessObservation::Unknown)
+                }
+                "old_still_live" => {
+                    *TEST_PROCESS_OBSERVATION.lock().unwrap() =
+                        Some(ProcessObservation::Present(old.clone()))
+                }
+                "reused_pid" => {
+                    let mut reused = old;
+                    reused.started_seconds += 1;
+                    *TEST_PROCESS_OBSERVATION.lock().unwrap() =
+                        Some(ProcessObservation::Present(reused));
+                }
+                "replacement_label" => {
+                    *TEST_LABEL_OBSERVATION.lock().unwrap() = Some(LabelObservation::Loaded {
+                        pid: old.pid + 1,
+                        program: old.executable,
+                    })
+                }
+                "singleton_held" => held = Some(stopped_singleton(&paths, false).unwrap()),
+                _ => unreachable!(),
+            }
+            let result = resume(&paths).await.unwrap();
+            assert_ne!(
+                result["operation"]["phase"], "completed",
+                "{case}: {result}"
+            );
+            assert_eq!(
+                fs::read_link(paths.current()).unwrap(),
+                original.previous_target.unwrap(),
+                "{case}"
+            );
+            assert_eq!(
+                fs::read(launch_agent(&paths)).unwrap(),
+                b"previous-plist",
+                "{case}"
+            );
+            assert!(paths.state_dir.join("drain.json").exists(), "{case}");
+            assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1, "{case}");
+            assert_eq!(TEST_RESTART_COUNT.load(Ordering::SeqCst), 0, "{case}");
+            drop(held);
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_stop_tampered_configuration_receipt_inventory_and_unsafe_files_preserve_intent()
+     {
+        let _serial = TEST_SERIAL.lock().await;
+        for case in [
+            "plist",
+            "receipt",
+            "inventory",
+            "pointer",
+            "drain_symlink",
+            "singleton_symlink",
+            "staged",
+        ] {
+            let _scope = StopTestScope::start();
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let original = pending_stop_fixture(&paths).await;
+            TEST_LABEL_PRESENT.store(false, Ordering::SeqCst);
+            match case {
+                "plist" => fs::write(launch_agent(&paths), b"changed").unwrap(),
+                "receipt" => {
+                    fs::write(paths.state_dir.join("install-receipt.json"), b"{}").unwrap()
+                }
+                "inventory" => {
+                    let path = paths.state_dir.join("owned-versions.json");
+                    let mut owned: Value = state::read_json(&path).unwrap();
+                    owned["extra"] = json!(true);
+                    state::write_json(&path, &owned).unwrap();
+                }
+                "pointer" => {
+                    fs::remove_file(paths.current()).unwrap();
+                    std::os::unix::fs::symlink(paths.versions().join("1.2.3"), paths.current())
+                        .unwrap();
+                }
+                "drain_symlink" => {
+                    fs::remove_file(paths.state_dir.join("drain.json")).unwrap();
+                    std::os::unix::fs::symlink(
+                        temp.path().join("unrelated"),
+                        paths.state_dir.join("drain.json"),
+                    )
+                    .unwrap();
+                }
+                "singleton_symlink" => std::os::unix::fs::symlink(
+                    temp.path().join("unrelated"),
+                    paths.state_dir.join("daemon.lock"),
+                )
+                .unwrap(),
+                "staged" => fs::write(
+                    &original.resources.as_ref().unwrap().staged_launch_agent,
+                    b"changed",
+                )
+                .unwrap(),
+                _ => unreachable!(),
+            }
+            let result = resume(&paths).await.unwrap();
+            assert_ne!(
+                result["operation"]["phase"], "completed",
+                "{case}: {result}"
+            );
+            let saved: Operation = state::read_json(&paths.operation()).unwrap();
+            assert_eq!(saved.service_stops, original.service_stops, "{case}");
+            assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1, "{case}");
+            assert_eq!(TEST_RESTART_COUNT.load(Ordering::SeqCst), 0, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_stop_requires_exact_idle_fresh_status_before_dispatch() {
+        let _serial = TEST_SERIAL.lock().await;
+        for status in [
+            json!({"version":"1.2.4","activeJobs":1,"draining":true}),
+            json!({"version":"1.2.4","draining":true}),
+            json!({"version":"1.2.4","activeJobs":0,"draining":false}),
+            json!({"version":"different","activeJobs":0,"draining":true}),
+        ] {
+            let _scope = StopTestScope::start();
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let mut original = previous_drained_recovery_fixture(&paths);
+            fs::write(
+                &original.resources.as_ref().unwrap().staged_launch_agent,
+                b"candidate-plist",
+            )
+            .unwrap();
+            prepare_service_stop(&paths, &mut original, StopDirection::ActivateCandidate)
+                .await
+                .unwrap();
+            *TEST_RECOVERY_STATUS.lock().unwrap() = Some(status);
+            assert!(request_service_stop(&paths, &mut original).await.is_err());
+            assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 0);
+            assert!(paths.state_dir.join("drain.json").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_stop_prepared_and_requested_interruptions_never_replay_uncertain_request() {
+        let _serial = TEST_SERIAL.lock().await;
+        for stage in ["after_stop_intent", "after_stop_request"] {
+            let _scope = StopTestScope::start();
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let mut original = previous_drained_recovery_fixture(&paths);
+            fs::write(
+                &original.resources.as_ref().unwrap().staged_launch_agent,
+                b"candidate-plist",
+            )
+            .unwrap();
+            prepare_service_stop(&paths, &mut original, StopDirection::ActivateCandidate)
+                .await
+                .unwrap();
+            *TEST_RECOVERY_FAULT.lock().unwrap() = Some(stage);
+            assert!(request_service_stop(&paths, &mut original).await.is_err());
+            *TEST_RECOVERY_FAULT.lock().unwrap() = None;
+            let count = TEST_STOP_COUNT.load(Ordering::SeqCst);
+            assert_eq!(resume(&paths).await.unwrap()["pending"], true);
+            assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), count);
+            assert_eq!(
+                fs::read_link(paths.current()).unwrap(),
+                original.previous_target.clone().unwrap()
+            );
+            TEST_LABEL_PRESENT.store(false, Ordering::SeqCst);
+            assert_eq!(
+                resume(&paths).await.unwrap()["operation"]["phase"],
+                "completed"
+            );
+            assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), count);
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_stop_verified_transition_interruptions_resume_same_saved_resources() {
+        let _serial = TEST_SERIAL.lock().await;
+        for stage in [
+            "after_stop_verified",
+            "after_stop_pointer",
+            "after_stop_configuration",
+            "before_stop_bootstrap",
+            "after_stop_bootstrap",
+        ] {
+            let _scope = StopTestScope::start();
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let original = pending_stop_fixture(&paths).await;
+            TEST_LABEL_PRESENT.store(false, Ordering::SeqCst);
+            *TEST_RECOVERY_FAULT.lock().unwrap() = Some(stage);
+            let interrupted = resume(&paths).await.unwrap();
+            assert_eq!(
+                interrupted["operation"]["phase"], "recovery_required",
+                "{stage}: {interrupted}"
+            );
+            *TEST_RECOVERY_FAULT.lock().unwrap() = None;
+            *TEST_RECOVERY_STATUS.lock().unwrap() =
+                Some(json!({"version":"1.2.3","activeJobs":0,"draining":false}));
+            if stage == "after_stop_bootstrap" {
+                *TEST_LABEL_OBSERVATION.lock().unwrap() = Some(LabelObservation::Loaded {
+                    pid: 222222,
+                    program: paths.versions().join("1.2.3/bin/loomex-runner"),
+                });
+            }
+            let result = resume(&paths).await.unwrap();
+            assert_eq!(
+                result["operation"]["phase"], "completed",
+                "{stage}: {result}"
+            );
+            let saved: Operation = state::read_json(&paths.operation()).unwrap();
+            assert_eq!(saved.id, original.id);
+            assert_eq!(saved.package, original.package);
+            assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_stop_rollback_direction_preserves_history_and_resumes_only_previous_target() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = StopTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let mut original = pending_stop_fixture(&paths).await;
+        TEST_LABEL_PRESENT.store(false, Ordering::SeqCst);
+        let guard = observe_service_stop(&paths, &mut original, false)
+            .await
+            .unwrap()
+            .unwrap();
+        complete_stopped_transition(&paths, &mut original, guard)
+            .await
+            .unwrap();
+        TEST_LABEL_PRESENT.store(true, Ordering::SeqCst);
+        *TEST_RECOVERY_STATUS.lock().unwrap() =
+            Some(json!({"version":"1.2.3","activeJobs":0,"draining":true}));
+        state::write_json(
+            &paths.state_dir.join("drain.json"),
+            &json!({"draining":true}),
+        )
+        .unwrap();
+        prepare_service_stop(&paths, &mut original, StopDirection::RestorePrevious)
+            .await
+            .unwrap();
+        request_service_stop(&paths, &mut original).await.unwrap();
+        assert!(
+            observe_service_stop(&paths, &mut original, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(original.service_stops.len(), 2);
+        assert_eq!(resume(&paths).await.unwrap()["pending"], true);
+        TEST_LABEL_PRESENT.store(false, Ordering::SeqCst);
+        let result = resume(&paths).await.unwrap();
+        assert_eq!(result["operation"]["phase"], "rolled_back", "{result}");
+        assert_eq!(
+            fs::read_link(paths.current()).unwrap(),
+            paths.versions().join("1.2.4")
+        );
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn legitimate_persisted_v1_checkpoint_resumes_without_fabricating_stop_identity() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = StopTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let mut original = previous_drained_recovery_fixture(&paths);
+        original.schema = LEGACY_OPERATION_SCHEMA.into();
+        original.checkpoint = Some("previous_drain_release_pending".into());
+        save_operation(&paths, &original).unwrap();
+        let result = resume(&paths).await.unwrap();
+        assert_eq!(result["operation"]["phase"], "rolled_back", "{result}");
+        let saved: Operation = state::read_json(&paths.operation()).unwrap();
+        assert_eq!(saved.id, original.id);
+        assert_eq!(saved.schema, LEGACY_OPERATION_SCHEMA);
+        assert_eq!(saved.package, original.package);
+        assert_eq!(saved.previous_target, original.previous_target);
+        assert_eq!(saved.resources, original.resources);
+        assert!(saved.service_stops.is_empty());
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 0);
+        assert_eq!(TEST_RESTART_COUNT.load(Ordering::SeqCst), 1);
+        assert!(!paths.state_dir.join("drain.json").exists());
+        assert_eq!(resume(&paths).await.unwrap()["resumed"], false);
+        assert_eq!(TEST_RESTART_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn first_install_without_old_daemon_requires_absence_and_real_bound_singleton_proof() {
+        let _serial = TEST_SERIAL.lock().await;
+        for case in [
+            "unknown_label",
+            "singleton_held",
+            "singleton_symlink",
+            "healthy_absence",
+        ] {
+            let _scope = StopTestScope::start();
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            make_compatible_target(&paths);
+            TEST_LABEL_PRESENT.store(false, Ordering::SeqCst);
+            *TEST_RECOVERY_STATUS.lock().unwrap() = None;
+            let staged = temp.path().join("first-install.plist");
+            fs::write(&staged, b"candidate-plist").unwrap();
+            let mut held = None;
+            match case {
+                "unknown_label" => {
+                    *TEST_LABEL_OBSERVATION.lock().unwrap() = Some(LabelObservation::Unknown)
+                }
+                "singleton_held" => held = Some(stopped_singleton(&paths, true).unwrap()),
+                "singleton_symlink" => std::os::unix::fs::symlink(
+                    temp.path().join("unrelated"),
+                    paths.state_dir.join("daemon.lock"),
+                )
+                .unwrap(),
+                "healthy_absence" => {}
+                _ => unreachable!(),
+            }
+            let result = activate_as(
+                &paths,
+                OperationKind::Install,
+                paths.versions().join("1.2.3"),
+                "1.2.3".into(),
+                "a".repeat(64),
+                staged,
+            )
+            .await;
+            if case == "healthy_absence" {
+                let value = result.unwrap();
+                assert_eq!(value["activated"], true, "{value}");
+                let operation: Operation = state::read_json(&paths.operation()).unwrap();
+                assert_eq!(operation.kind, OperationKind::Install);
+                assert_eq!(operation.phase, "completed");
+                assert!(operation.previous_target.is_none());
+                assert!(operation.service_stops[0].process.is_none());
+                assert_eq!(
+                    operation.service_stops[0].request,
+                    StopRequest::ObservedStopped
+                );
+                assert_eq!(
+                    fs::read_link(paths.current()).unwrap(),
+                    paths.versions().join("1.2.3")
+                );
+                assert_eq!(fs::read(launch_agent(&paths)).unwrap(), b"candidate-plist");
+                // Real file ownership is released for the exact bootstrap.
+                assert!(stopped_singleton(&paths, false).is_ok());
+            } else {
+                assert!(result.is_err(), "{case}: {result:?}");
+                assert!(!paths.current().exists(), "{case}");
+                assert!(!launch_agent(&paths).exists(), "{case}");
+            }
+            assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 0, "{case}");
+            assert_eq!(TEST_RESTART_COUNT.load(Ordering::SeqCst), 0, "{case}");
+            assert!(!paths.state_dir.join("install-receipt.json").exists());
+            assert!(!paths.state_dir.join("bootstrap-uninstall.json").exists());
+            drop(held);
+        }
+    }
+
+    #[test]
+    fn checkpoint_decoder_preserves_frozen_v1_and_rejects_residual_new_meanings() {
+        let mut operation = Operation::new(OperationKind::Update, "recovery_required", None);
+        operation.schema = LEGACY_OPERATION_SCHEMA.into();
+        for checkpoint in LEGACY_CHECKPOINTS {
+            operation.checkpoint = Some((*checkpoint).into());
+            assert!(operation.validate().is_ok(), "{checkpoint}");
+        }
+        for schema in [LEGACY_OPERATION_SCHEMA, OPERATION_SCHEMA] {
+            operation.schema = schema.into();
+            for checkpoint in [
+                "service_stop_intent_prepared",
+                "service_stop_requested",
+                "old_service_stop_unconfirmed",
+                "old_service_stop_verified",
+                "stopped_pointer_and_plist_switched",
+                "stopped_service_bootstrapped",
+                "stopped_service_healthy",
+                "stopped_service_start_failed",
+                "stopped_service_health_failed",
+                "service_stop_reconciliation_required",
+                "unknown_historic_meaning",
+            ] {
+                operation.checkpoint = Some(checkpoint.into());
+                assert!(operation.validate().is_err(), "{schema}: {checkpoint}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn residual_stop_checkpoint_rejects_legacy_reentry_before_effects() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = StopTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let mut operation = previous_drained_recovery_fixture(&paths);
+        operation.schema = LEGACY_OPERATION_SCHEMA.into();
+        operation.service_stops.clear();
+        operation.checkpoint = Some("old_service_stop_unconfirmed".into());
+        // Read-path fixture deliberately bypasses writer validation: decoder
+        // rejection must precede legacy recovery even for persisted residuals.
+        state::write_json(&paths.operation(), &operation).unwrap();
+        let journal = fs::read(paths.operation()).unwrap();
+        let drain = fs::read(paths.state_dir.join("drain.json")).unwrap();
+        let result = resume(&paths).await;
+        assert!(
+            result.is_err(),
+            "residual stop meaning admitted legacy recovery: {result:?}"
+        );
+        assert_eq!(fs::read(paths.operation()).unwrap(), journal);
+        assert_eq!(fs::read(paths.state_dir.join("drain.json")).unwrap(), drain);
+        assert_eq!(
+            fs::read_link(paths.current()).unwrap(),
+            operation.previous_target.unwrap()
+        );
+        assert_eq!(fs::read(launch_agent(&paths)).unwrap(), b"previous-plist");
+        assert_eq!(TEST_RESTART_COUNT.load(Ordering::SeqCst), 0);
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 0);
+        assert_eq!(TEST_STATUS_COUNT.load(Ordering::SeqCst), 0);
+        assert!(!paths.state_dir.join("bootstrap-uninstall.json").exists());
+    }
+
+    #[tokio::test]
+    async fn pending_stop_private_v2_guard_rejects_downgrade_and_uninstall_before_mutation() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = StopTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let original = pending_stop_fixture(&paths).await;
+        assert!(require_terminal_before_uninstall(&paths).is_err());
+        let mut downgraded = original.clone();
+        downgraded.schema = LEGACY_OPERATION_SCHEMA.into();
+        assert!(save_operation(&paths, &downgraded).is_err());
+        let mut unrelated = original.clone();
+        unrelated.service_stops[0].operation_id = Uuid::new_v4();
+        assert!(save_operation(&paths, &unrelated).is_err());
+        let mut unresolved = original.clone();
+        unresolved
+            .service_stops
+            .push(unresolved.service_stops[0].clone());
+        assert!(save_operation(&paths, &unresolved).is_err());
+        let mut legacy = original.clone();
+        legacy.schema = LEGACY_OPERATION_SCHEMA.into();
+        legacy.service_stops.clear();
+        legacy.phase = "recovery_required".into();
+        assert!(legacy.validate().is_err());
+        legacy.checkpoint = Some("previous_drain_release_pending".into());
+        assert!(legacy.validate().is_ok());
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pending_stop_restarted_identity_requires_typed_label_uid_pid_and_executable() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = StopTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let target = paths.versions().join("1.2.3");
+        let mut actual = ProcessIdentity {
+            pid: 222222,
+            uid: unsafe { libc::geteuid() },
+            started_seconds: 1,
+            started_micros: 0,
+            executable: target.join("bin/loomex-runner"),
+        };
+        *TEST_LABEL_OBSERVATION.lock().unwrap() = Some(LabelObservation::Loaded {
+            pid: actual.pid,
+            program: actual.executable.clone(),
+        });
+        *TEST_PROCESS_OBSERVATION.lock().unwrap() =
+            Some(ProcessObservation::Present(actual.clone()));
+        assert!(restarted_service_identity_matches(&paths, &target).await);
+        actual.uid += 1;
+        *TEST_PROCESS_OBSERVATION.lock().unwrap() = Some(ProcessObservation::Present(actual));
+        assert!(!restarted_service_identity_matches(&paths, &target).await);
+        *TEST_PROCESS_OBSERVATION.lock().unwrap() = Some(ProcessObservation::Unknown);
+        assert!(!restarted_service_identity_matches(&paths, &target).await);
+        *TEST_LABEL_OBSERVATION.lock().unwrap() = Some(LabelObservation::Absent);
+        assert!(!restarted_service_identity_matches(&paths, &target).await);
+    }
+
+    #[test]
+    fn pending_stop_label_classifier_never_infers_absence_from_generic_failure_or_nested_fields() {
+        let uid = unsafe { libc::geteuid() };
+        let missing = format!(
+            "Bad request.\nCould not find service \"app.loomex.runner\" in domain for user gui: {uid}\n"
+        );
+        assert_eq!(
+            classify_label_output(uid, Some(113), b"", missing.as_bytes()),
+            LabelObservation::Absent
+        );
+        for code in [None, Some(1), Some(113)] {
+            assert_eq!(
+                classify_label_output(uid, code, b"", b"permission denied"),
+                LabelObservation::Unknown
+            );
+        }
+        let valid = format!(
+            "gui/{uid}/app.loomex.runner = {{\n\tprogram = /owned/bin/loomex-runner\n\tpid = 123\n\tenvironment = {{\n\t\tpid = 999\n\t}}\n}}\n"
+        );
+        assert_eq!(
+            classify_label_output(uid, Some(0), valid.as_bytes(), b""),
+            LabelObservation::Loaded {
+                pid: 123,
+                program: PathBuf::from("/owned/bin/loomex-runner")
+            }
+        );
+        assert_eq!(
+            classify_label_output(uid, Some(0), b"malformed", b""),
+            LabelObservation::Unknown
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn pending_stop_native_process_inspection_reads_only_this_disposable_test_process_identity() {
+        let pid = std::process::id() as i32;
+        let ProcessObservation::Present(actual) = inspect_process(pid) else {
+            panic!("native self-process metadata unavailable");
+        };
+        assert_eq!(actual.pid, pid);
+        assert_eq!(actual.uid, unsafe { libc::geteuid() });
+        assert!(actual.started_seconds > 0);
+        assert_eq!(
+            actual.executable,
+            fs::canonicalize(std::env::current_exe().unwrap()).unwrap()
+        );
+        assert_eq!(inspect_process(-1), ProcessObservation::Unknown);
+    }
+
+    #[tokio::test]
+    async fn previous_drained_resume_settles_same_operation_without_restarting_twice() {
+        let _serial = TEST_SERIAL.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let original = previous_drained_recovery_fixture(&paths);
+        TEST_MODE.store(true, Ordering::SeqCst);
+        TEST_RESTART_COUNT.store(0, Ordering::SeqCst);
+        *TEST_RECOVERY_STATUS.lock().unwrap() =
+            Some(json!({"version":"1.2.4","activeJobs":0,"draining":true}));
+        let result = resume(&paths).await;
+        let repeated = resume(&paths).await;
+        let restarts = TEST_RESTART_COUNT.load(Ordering::SeqCst);
+        *TEST_RECOVERY_STATUS.lock().unwrap() = None;
+        TEST_MODE.store(false, Ordering::SeqCst);
+        assert_eq!(result.unwrap()["resumed"], true);
+        assert_eq!(repeated.unwrap()["reason"], "operation is terminal");
+        let saved: Operation = state::read_json(&paths.operation()).unwrap();
+        assert_eq!(saved.id, original.id);
+        assert_eq!(saved.phase, "rolled_back");
+        assert_eq!(
+            fs::read_link(paths.current()).unwrap(),
+            original.previous_target.unwrap()
+        );
+        assert_eq!(fs::read(launch_agent(&paths)).unwrap(), b"previous-plist");
+        assert!(!paths.state_dir.join("drain.json").exists());
+        assert_eq!(restarts, 1);
+    }
+
+    #[tokio::test]
+    async fn interrupted_previous_drain_resume_preserves_intent_and_single_restart() {
+        let _serial = TEST_SERIAL.lock().await;
+        for stage in [
+            "before_drain_removal",
+            "after_drain_removal",
+            "restart_failed",
+            "after_restart",
+            "before_completion",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let original = previous_drained_recovery_fixture(&paths);
+            TEST_MODE.store(true, Ordering::SeqCst);
+            TEST_RESTART_COUNT.store(0, Ordering::SeqCst);
+            *TEST_RECOVERY_STATUS.lock().unwrap() =
+                Some(json!({"version":"1.2.4","activeJobs":0,"draining":true}));
+            *TEST_RECOVERY_FAULT.lock().unwrap() = Some(stage);
+            let failed = resume(&paths).await.unwrap();
+            *TEST_RECOVERY_FAULT.lock().unwrap() = None;
+            let retained: Operation = state::read_json(&paths.operation()).unwrap();
+            let resumed = resume(&paths).await;
+            let repeated = resume(&paths).await;
+            let restarts = TEST_RESTART_COUNT.load(Ordering::SeqCst);
+            *TEST_RECOVERY_STATUS.lock().unwrap() = None;
+            TEST_MODE.store(false, Ordering::SeqCst);
+            assert_eq!(failed["resumed"], false, "{stage}");
+            assert_eq!(retained.id, original.id, "{stage}");
+            assert_eq!(retained.phase, "recovery_required", "{stage}");
+            assert_eq!(
+                retained.checkpoint.as_deref(),
+                Some("previous_drain_release_pending"),
+                "{stage}"
+            );
+            assert_eq!(resumed.unwrap()["resumed"], true, "{stage}");
+            assert_eq!(
+                repeated.unwrap()["reason"],
+                "operation is terminal",
+                "{stage}"
+            );
+            assert_eq!(restarts, 1, "{stage}");
+            let saved: Operation = state::read_json(&paths.operation()).unwrap();
+            assert_eq!(saved.id, original.id);
+            assert_eq!(saved.phase, "rolled_back");
+            assert!(!paths.state_dir.join("drain.json").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn previous_drain_recovery_rejects_invalid_proof_before_removal() {
+        let _serial = TEST_SERIAL.lock().await;
+        for case in [
+            "active",
+            "wrong_version",
+            "missing_count",
+            "missing_drain_state",
+            "unavailable",
+            "tampered",
+            "unowned",
+            "plist_mismatch",
+            "pointer_mismatch",
+            "symlink",
+            "missing_without_intent",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let mut operation = previous_drained_recovery_fixture(&paths);
+            let previous = operation.previous_target.clone().unwrap();
+            let drain = paths.state_dir.join("drain.json");
+            let mut status = json!({"version":"1.2.4","activeJobs":0,"draining":true});
+            match case {
+                "active" => status["activeJobs"] = json!(1),
+                "wrong_version" => status["version"] = json!("1.2.3"),
+                "missing_count" => {
+                    status.as_object_mut().unwrap().remove("activeJobs");
+                }
+                "missing_drain_state" => {
+                    status.as_object_mut().unwrap().remove("draining");
+                }
+                "unavailable" => TEST_STATUS_UNAVAILABLE.store(true, Ordering::SeqCst),
+                "tampered" => fs::write(previous.join("bin/loomex"), b"tampered").unwrap(),
+                "unowned" => operation
+                    .resources
+                    .as_mut()
+                    .unwrap()
+                    .owned_versions
+                    .retain(|path| path != &previous),
+                "plist_mismatch" => fs::write(launch_agent(&paths), b"different").unwrap(),
+                "pointer_mismatch" => {
+                    fs::remove_file(paths.current()).unwrap();
+                    std::os::unix::fs::symlink(paths.versions().join("1.2.3"), paths.current())
+                        .unwrap();
+                }
+                "symlink" => {
+                    fs::remove_file(&drain).unwrap();
+                    fs::write(temp.path().join("protected"), b"protected").unwrap();
+                    std::os::unix::fs::symlink(temp.path().join("protected"), &drain).unwrap();
+                }
+                "missing_without_intent" => fs::remove_file(&drain).unwrap(),
+                _ => unreachable!(),
+            }
+            let before = fs::symlink_metadata(&drain).is_ok();
+            TEST_MODE.store(true, Ordering::SeqCst);
+            TEST_RESTART_COUNT.store(0, Ordering::SeqCst);
+            *TEST_RECOVERY_STATUS.lock().unwrap() = Some(status);
+            let result = release_service_drain(
+                &paths,
+                &mut operation,
+                &previous,
+                &state::digest(b"previous-plist"),
+                "previous_drain_release_pending",
+            )
+            .await;
+            let restarts = TEST_RESTART_COUNT.load(Ordering::SeqCst);
+            *TEST_RECOVERY_STATUS.lock().unwrap() = None;
+            TEST_STATUS_UNAVAILABLE.store(false, Ordering::SeqCst);
+            TEST_MODE.store(false, Ordering::SeqCst);
+            assert!(result.is_err(), "{case}");
+            assert_eq!(fs::symlink_metadata(&drain).is_ok(), before, "{case}");
+            assert_eq!(restarts, 0, "{case}");
+            assert_ne!(
+                operation.checkpoint.as_deref(),
+                Some("previous_drain_release_pending"),
+                "{case}"
+            );
+            if case == "symlink" {
+                assert_eq!(
+                    fs::read(temp.path().join("protected")).unwrap(),
+                    b"protected"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn removal_intent_does_not_replace_fresh_daemon_proof() {
+        let _serial = TEST_SERIAL.lock().await;
+        for case in ["active", "wrong_version", "unavailable"] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let original = previous_drained_recovery_fixture(&paths);
+            TEST_MODE.store(true, Ordering::SeqCst);
+            TEST_RESTART_COUNT.store(0, Ordering::SeqCst);
+            *TEST_RECOVERY_STATUS.lock().unwrap() =
+                Some(json!({"version":"1.2.4","activeJobs":0,"draining":true}));
+            *TEST_RECOVERY_FAULT.lock().unwrap() = Some("after_drain_removal");
+            let failed = resume(&paths).await.unwrap();
+            *TEST_RECOVERY_FAULT.lock().unwrap() = None;
+            assert_eq!(failed["resumed"], false);
+            assert!(!paths.state_dir.join("drain.json").exists());
+            match case {
+                "active" => {
+                    *TEST_RECOVERY_STATUS.lock().unwrap() =
+                        Some(json!({"version":"1.2.4","activeJobs":1,"draining":true}))
+                }
+                "wrong_version" => {
+                    *TEST_RECOVERY_STATUS.lock().unwrap() =
+                        Some(json!({"version":"1.2.3","activeJobs":0,"draining":true}))
+                }
+                "unavailable" => {
+                    TEST_STATUS_UNAVAILABLE.store(true, Ordering::SeqCst);
+                    TEST_LABEL_PRESENT.store(true, Ordering::SeqCst);
+                }
+                _ => unreachable!(),
+            }
+            let resumed = resume(&paths).await;
+            let restarts = TEST_RESTART_COUNT.load(Ordering::SeqCst);
+            *TEST_RECOVERY_STATUS.lock().unwrap() = None;
+            TEST_STATUS_UNAVAILABLE.store(false, Ordering::SeqCst);
+            TEST_LABEL_PRESENT.store(false, Ordering::SeqCst);
+            TEST_MODE.store(false, Ordering::SeqCst);
+            assert_eq!(resumed.unwrap()["resumed"], false, "{case}");
+            assert_eq!(restarts, 0, "{case}");
+            let saved: Operation = state::read_json(&paths.operation()).unwrap();
+            assert_eq!(saved.id, original.id);
+            assert_eq!(saved.phase, "recovery_required");
+            assert_eq!(
+                saved.checkpoint.as_deref(),
+                Some("previous_drain_release_pending")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_previous_loaded_service_remains_protected() {
+        let _serial = TEST_SERIAL.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let original = previous_drained_recovery_fixture(&paths);
+        TEST_MODE.store(true, Ordering::SeqCst);
+        TEST_STATUS_UNAVAILABLE.store(true, Ordering::SeqCst);
+        TEST_LABEL_PRESENT.store(true, Ordering::SeqCst);
+        TEST_RESTART_COUNT.store(0, Ordering::SeqCst);
+        let result = resume(&paths).await;
+        let restarts = TEST_RESTART_COUNT.load(Ordering::SeqCst);
+        TEST_STATUS_UNAVAILABLE.store(false, Ordering::SeqCst);
+        TEST_LABEL_PRESENT.store(false, Ordering::SeqCst);
+        TEST_MODE.store(false, Ordering::SeqCst);
+        assert_eq!(result.unwrap()["resumed"], false);
+        assert!(paths.state_dir.join("drain.json").exists());
+        assert_eq!(restarts, 0);
+        let saved: Operation = state::read_json(&paths.operation()).unwrap();
+        assert_eq!(saved.id, original.id);
+        assert_eq!(saved.phase, "recovery_required");
+    }
+
     #[tokio::test]
     async fn interrupted_candidate_drain_recovery_resumes_exact_operation() {
         let _serial = TEST_SERIAL.lock().await;
@@ -1948,6 +5860,7 @@ mod tests {
             std::os::unix::fs::symlink(&target, paths.current()).unwrap();
             fs::write(launch_agent(&paths), b"candidate-plist").unwrap();
             let mut operation = Operation::new(OperationKind::Update, "recovery_required", None);
+            operation.schema = PRE_AUTH_OPERATION_SCHEMA.into();
             operation.package = Some(PackageIdentity {
                 version: "1.2.3".into(),
                 target: target.clone(),
@@ -2045,6 +5958,737 @@ mod tests {
         assert_eq!(result["legacyJournal"]["uninstall"], true);
     }
 
+    fn abandonment_fixture(paths: &Paths) -> (Operation, Value) {
+        let mut operation = previous_drained_recovery_fixture(paths);
+        operation.phase = "pending_active_work".into();
+        operation.checkpoint = Some("daemon_has_active_work".into());
+        let resources = operation.resources.as_mut().unwrap();
+        let backup = paths
+            .state_dir
+            .join(format!("lifecycle-agent-{}.plist", operation.id));
+        fs::rename(&resources.launch_agent_backup, &backup).unwrap();
+        resources.launch_agent_backup = backup;
+        resources.staged_launch_agent = paths
+            .state_dir
+            .join(format!("lifecycle-staged-{}.plist", operation.id));
+        fs::write(
+            &operation.resources.as_ref().unwrap().staged_launch_agent,
+            b"candidate-plist",
+        )
+        .unwrap();
+        save_operation(paths, &operation).unwrap();
+        state::write_json(
+            &paths.state_dir.join("install-receipt.json"),
+            &json!({
+                "schema":"app.loomex.runner.install-receipt/v2", "version":"1.2.4",
+                "versionPath":paths.versions().join("1.2.4"), "launchAgent":launch_agent(paths)
+            }),
+        )
+        .unwrap();
+        let configuration = json!({"schema":"app.loomex.runner.bootstrap-install/v1",
+            "version":"1.2.3", "target":paths.versions().join("1.2.3"),
+            "manifestSha256":"a".repeat(64), "developmentApiOrigin":"http://127.0.0.1:8001/",
+            "providerExecutables":{}});
+        state::write_json(
+            &paths.state_dir.join("bootstrap-install.json"),
+            &configuration,
+        )
+        .unwrap();
+        (operation, configuration)
+    }
+
+    #[tokio::test]
+    async fn auth_bound_abandonment_keeps_its_private_schema() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = AbandonmentTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let (mut operation, _) = abandonment_fixture(&paths);
+        operation.schema = OPERATION_SCHEMA.into();
+        operation.auth_baseline = Some(AuthBaseline::SignedOut {
+            installation_id: None,
+        });
+        save_operation(&paths, &operation).unwrap();
+        rollback_with_expected(&paths, "1.2.4", Some(operation.id))
+            .await
+            .unwrap();
+        let saved: Operation = state::read_json(&paths.operation()).unwrap();
+        assert_eq!(saved.schema, ABANDONMENT_OPERATION_SCHEMA);
+        assert_eq!(saved.auth_baseline, operation.auth_baseline);
+        let mut downgraded = saved.clone();
+        downgraded.schema = PRE_AUTH_ABANDONMENT_SCHEMA.into();
+        assert!(downgraded.validate().is_err());
+    }
+
+    struct AbandonmentTestScope;
+    impl AbandonmentTestScope {
+        fn start() -> Self {
+            TEST_ABANDONMENT_RESTART.store(true, Ordering::SeqCst);
+            TEST_MODE.store(true, Ordering::SeqCst);
+            TEST_LABEL_PRESENT.store(true, Ordering::SeqCst);
+            TEST_STOP_COUNT.store(0, Ordering::SeqCst);
+            TEST_RESTART_COUNT.store(0, Ordering::SeqCst);
+            *TEST_RECOVERY_STATUS.lock().unwrap() =
+                Some(json!({"version":"1.2.4","activeJobs":0,"draining":true}));
+            Self
+        }
+    }
+    impl Drop for AbandonmentTestScope {
+        fn drop(&mut self) {
+            TEST_ABANDONMENT_RESTART.store(false, Ordering::SeqCst);
+            TEST_BOOTOUT_FAIL.store(false, Ordering::SeqCst);
+            TEST_STOP_WAIT_UNCONFIRMED.store(false, Ordering::SeqCst);
+            TEST_MODE.store(false, Ordering::SeqCst);
+            TEST_LABEL_PRESENT.store(false, Ordering::SeqCst);
+            TEST_DELAYED_SERVICE_STOP.store(false, Ordering::SeqCst);
+            *TEST_RECOVERY_STATUS.lock().unwrap() = None;
+            *TEST_RECOVERY_FAULT.lock().unwrap() = None;
+            *TEST_PROCESS_OBSERVATION.lock().unwrap() = None;
+        }
+    }
+
+    #[tokio::test]
+    async fn abandonment_interruption_resumes_same_previous_service_and_tombstone() {
+        let _serial = TEST_SERIAL.lock().await;
+        for fault in [
+            "after_abandonment_intent",
+            "after_stop_intent",
+            "after_stop_request",
+            "after_stop_verified",
+            "after_stop_pointer",
+            "after_stop_configuration",
+            "before_stop_bootstrap",
+            "after_stop_bootstrap",
+            "before_abandonment_tombstone",
+        ] {
+            let _scope = AbandonmentTestScope::start();
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let (operation, configuration) = abandonment_fixture(&paths);
+            let preserved = paths.state_dir.join("unrelated-job-journal-fixture");
+            fs::write(&preserved, b"unchanged").unwrap();
+            *TEST_RECOVERY_FAULT.lock().unwrap() = Some(fault);
+            assert!(
+                rollback_with_expected(&paths, "1.2.4", Some(operation.id))
+                    .await
+                    .is_err(),
+                "{fault}"
+            );
+            let retained: Operation = state::read_json(&paths.operation()).unwrap();
+            assert_eq!(retained.id, operation.id);
+            assert!(retained.abandonment.is_some());
+            *TEST_RECOVERY_FAULT.lock().unwrap() = None;
+            let result = resume(&paths).await.unwrap();
+            assert_eq!(result["abandoned"], true, "{fault}: {result}");
+            let result = resume(&paths).await.unwrap();
+            assert_eq!(result["abandoned"], true, "{fault}: {result}");
+            assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1, "{fault}");
+            assert_eq!(TEST_RESTART_COUNT.load(Ordering::SeqCst), 1, "{fault}");
+            assert_eq!(
+                fs::read_link(paths.current()).unwrap(),
+                operation.previous_target.unwrap()
+            );
+            assert_eq!(fs::read(&preserved).unwrap(), b"unchanged");
+            let tombstone: Value =
+                state::read_json(&paths.state_dir.join("bootstrap-install.json")).unwrap();
+            assert_eq!(tombstone["configuration"], configuration);
+            assert_eq!(tombstone["operationId"], operation.id.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn abandonment_exact_identity_phase_and_managed_work_fences_have_no_effects() {
+        let _serial = TEST_SERIAL.lock().await;
+        for case in [
+            "missing_uuid",
+            "different_uuid",
+            "different_previous",
+            "advanced_phase",
+            "stop_exists",
+            "receipt",
+            "plist",
+            "candidate",
+            "inventory",
+            "active_work",
+            "not_drained",
+            "process",
+        ] {
+            let _scope = AbandonmentTestScope::start();
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let (mut operation, _) = abandonment_fixture(&paths);
+            let mut expected = Some(operation.id);
+            let mut version = "1.2.4";
+            match case {
+                "missing_uuid" => expected = None,
+                "different_uuid" => expected = Some(Uuid::new_v4()),
+                "different_previous" => version = "1.2.3",
+                "advanced_phase" => {
+                    operation.phase = "pointer_switched".into();
+                    save_operation(&paths, &operation).unwrap();
+                }
+                "stop_exists" => {
+                    prepare_service_stop(&paths, &mut operation, StopDirection::ActivateCandidate)
+                        .await
+                        .unwrap();
+                }
+                "receipt" => state::write_json(
+                    &paths.state_dir.join("install-receipt.json"),
+                    &json!({"version":"1.2.3"}),
+                )
+                .unwrap(),
+                "plist" => fs::write(launch_agent(&paths), b"changed").unwrap(),
+                "candidate" => {
+                    fs::write(paths.versions().join("1.2.3/bin/loomex"), b"changed").unwrap()
+                }
+                "inventory" => {
+                    fs::remove_file(paths.state_dir.join("owned-versions.json")).unwrap()
+                }
+                "active_work" => {
+                    TEST_RECOVERY_STATUS.lock().unwrap().as_mut().unwrap()["activeJobs"] = json!(1)
+                }
+                "not_drained" => {
+                    TEST_RECOVERY_STATUS.lock().unwrap().as_mut().unwrap()["draining"] =
+                        json!(false)
+                }
+                "process" => {
+                    *TEST_PROCESS_OBSERVATION.lock().unwrap() = Some(ProcessObservation::Unknown)
+                }
+                _ => unreachable!(),
+            }
+            let before = fs::read(paths.operation()).unwrap();
+            assert!(
+                rollback_with_expected(&paths, version, expected)
+                    .await
+                    .is_err(),
+                "{case}"
+            );
+            // Process proof is checked again after durable intent; all other
+            // rejected initial bindings leave the original journal untouched.
+            if case != "process" {
+                assert_eq!(fs::read(paths.operation()).unwrap(), before, "{case}");
+            }
+            assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 0, "{case}");
+            assert_eq!(TEST_RESTART_COUNT.load(Ordering::SeqCst), 0, "{case}");
+            assert_eq!(
+                fs::read_link(paths.current()).unwrap(),
+                paths.versions().join("1.2.4")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn abandonment_bootstrap_retry_is_tombstoned_and_corrected_intent_requires_exact_ack() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = AbandonmentTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let (operation, configuration) = abandonment_fixture(&paths);
+        rollback_with_expected(&paths, "1.2.4", Some(operation.id))
+            .await
+            .unwrap();
+        let _lock = LifecycleLock::acquire(&paths).unwrap();
+        for ack in [None, Some(operation.id)] {
+            let receipt = reconcile_bootstrap_abandonment_locked(&paths, &configuration, ack)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt["abandoned"], true);
+        }
+        let mut corrected = configuration.clone();
+        corrected["developmentApiOrigin"] = json!("http://127.0.0.1:28080/");
+        assert!(
+            reconcile_bootstrap_abandonment_locked(&paths, &corrected, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            reconcile_bootstrap_abandonment_locked(&paths, &corrected, Some(Uuid::new_v4()))
+                .await
+                .is_err()
+        );
+        assert!(
+            reconcile_bootstrap_abandonment_locked(&paths, &corrected, Some(operation.id))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            preflight_package_locked(
+                &paths,
+                OperationKind::Update,
+                operation.package.clone().unwrap()
+            )
+            .await
+            .unwrap()["reconciled"],
+            false
+        );
+        assert!(
+            reconcile_bootstrap_abandonment_locked(&paths, &configuration, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            preflight_package_locked(
+                &paths,
+                OperationKind::Update,
+                operation.package.clone().unwrap()
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(TEST_RESTART_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn abandonment_corrected_same_package_stages_fresh_uuid_without_replaying_old_update() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = AbandonmentTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let (operation, configuration) = abandonment_fixture(&paths);
+        rollback_with_expected(&paths, "1.2.4", Some(operation.id))
+            .await
+            .unwrap();
+        let _lock = LifecycleLock::acquire(&paths).unwrap();
+        let mut corrected = configuration.clone();
+        corrected["developmentApiOrigin"] = json!("http://127.0.0.1:28080/");
+        assert!(
+            reconcile_bootstrap_abandonment_locked(&paths, &corrected, Some(operation.id))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let staged = paths.state_dir.join("new-corrected-config.plist");
+        fs::write(&staged, b"corrected-candidate-plist").unwrap();
+        TEST_DRAIN_HAS_ACTIVE_WORK.store(true, Ordering::SeqCst);
+        let package = operation.package.unwrap();
+        let result = activate_locked(
+            &paths,
+            package.target,
+            package.version,
+            package.manifest_sha256,
+            staged,
+        )
+        .await;
+        TEST_DRAIN_HAS_ACTIVE_WORK.store(false, Ordering::SeqCst);
+        assert_eq!(result.unwrap()["pending"], true);
+        let fresh: Operation = state::read_json(&paths.operation()).unwrap();
+        assert_ne!(fresh.id, operation.id);
+        assert_eq!(fresh.kind, OperationKind::Update);
+        assert_eq!(fresh.phase, "pending_active_work");
+        assert!(fresh.abandonment.is_none());
+        assert!(
+            reconcile_bootstrap_abandonment_locked(&paths, &corrected, Some(operation.id))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reconcile_bootstrap_abandonment_locked(&paths, &configuration, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_link(paths.current()).unwrap(),
+            paths.versions().join("1.2.4")
+        );
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    fn replace_fixture_previous_catalog(paths: &Paths) {
+        let target = paths.versions().join("1.2.4");
+        let relative = "metadata/compatibility-manifest.json";
+        let manifest =
+            include_bytes!("../tests/fixtures/lifecycle-retained-0.3.64-compatibility.json");
+        fs::write(target.join(relative), manifest).unwrap();
+        let inventory_path = paths.state_dir.join("owned-versions.json");
+        let mut inventory: Value = state::read_json(&inventory_path).unwrap();
+        let entry = inventory["inventories"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["path"] == json!(target))
+            .unwrap();
+        let file = entry["files"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|file| file["path"] == relative)
+            .unwrap();
+        file["sha256"] = json!(state::digest(manifest));
+        file["size"] = json!(manifest.len());
+        state::write_json(&inventory_path, &inventory).unwrap();
+    }
+
+    #[test]
+    fn abandonment_catalog_exception_is_production_scoped_to_current_captured_immutable_package() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let (operation, _) = abandonment_fixture(&paths);
+        let previous = paths.versions().join("1.2.4");
+        replace_fixture_previous_catalog(&paths);
+        // These pure production predicates do not use TEST_MODE or fake daemon
+        // observations. The differing manifest is the real retained .64 export.
+        validate_abandonment_current_previous(&paths, &operation, &previous, "1.2.4").unwrap();
+        let ordinary = validate_rollback_target(&previous, "1.2.4").unwrap_err();
+        assert_eq!(
+            crate::control::public_error(&ordinary).0,
+            "LIFECYCLE_ROLLBACK_COMPATIBILITY_MISMATCH"
+        );
+        fs::write(
+            previous.join("metadata/compatibility-manifest.json"),
+            b"tampered",
+        )
+        .unwrap();
+        let tampered =
+            validate_abandonment_current_previous(&paths, &operation, &previous, "1.2.4")
+                .unwrap_err();
+        assert_eq!(
+            crate::control::public_error(&tampered).0,
+            "LIFECYCLE_ABANDONMENT_PREVIOUS_INVENTORY_MISMATCH"
+        );
+        replace_fixture_previous_catalog(&paths);
+        fs::remove_file(paths.current()).unwrap();
+        std::os::unix::fs::symlink(paths.versions().join("1.2.3"), paths.current()).unwrap();
+        let noncurrent =
+            validate_abandonment_current_previous(&paths, &operation, &previous, "1.2.4")
+                .unwrap_err();
+        assert_eq!(
+            crate::control::public_error(&noncurrent).0,
+            "LIFECYCLE_ABANDONMENT_CURRENT_TARGET_MISMATCH"
+        );
+        assert_eq!(operation.phase, "pending_active_work");
+        assert!(
+            state::read_json::<Operation>(&paths.operation())
+                .unwrap()
+                .abandonment
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn abandonment_current_captured_previous_with_different_real_catalog_is_restored() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = AbandonmentTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let (operation, _) = abandonment_fixture(&paths);
+        replace_fixture_previous_catalog(&paths);
+        assert!(validate_rollback_target(&paths.versions().join("1.2.4"), "1.2.4").is_err());
+        let result = rollback_with_expected(&paths, "1.2.4", Some(operation.id)).await;
+        assert!(
+            result.is_ok(),
+            "exact already-current retained package must restore despite newer catalog: {result:?}"
+        );
+        assert_eq!(result.unwrap()["abandoned"], true);
+        assert_eq!(
+            fs::read_link(paths.current()).unwrap(),
+            paths.versions().join("1.2.4")
+        );
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(TEST_RESTART_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn abandonment_definitive_spawn_failure_resets_exact_stop_and_retries_safely() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = AbandonmentTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let (operation, _) = abandonment_fixture(&paths);
+        TEST_BOOTOUT_FAIL.store(true, Ordering::SeqCst);
+        assert!(
+            rollback_with_expected(&paths, "1.2.4", Some(operation.id))
+                .await
+                .is_err()
+        );
+        let failed: Operation = state::read_json(&paths.operation()).unwrap();
+        assert_eq!(failed.id, operation.id);
+        assert_eq!(failed.service_stops.len(), 1);
+        assert_eq!(failed.service_stops[0].request, StopRequest::Prepared);
+        assert_eq!(
+            failed.checkpoint.as_deref(),
+            Some("service_stop_intent_prepared")
+        );
+        assert_eq!(TEST_RESTART_COUNT.load(Ordering::SeqCst), 0);
+        assert!(TEST_LABEL_PRESENT.load(Ordering::SeqCst));
+        TEST_BOOTOUT_FAIL.store(false, Ordering::SeqCst);
+        assert_eq!(resume(&paths).await.unwrap()["abandoned"], true);
+        assert_eq!(resume(&paths).await.unwrap()["abandoned"], true);
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 2); // one undispatched attempt, one accepted stop
+        assert_eq!(TEST_RESTART_COUNT.load(Ordering::SeqCst), 1);
+        let completed: Operation = state::read_json(&paths.operation()).unwrap();
+        assert_eq!(completed.service_stops.len(), 1);
+        assert_eq!(
+            completed.service_stops[0].process,
+            failed.service_stops[0].process
+        );
+    }
+
+    #[tokio::test]
+    async fn abandonment_failed_spawn_reset_and_postspawn_wait_uncertainty_never_redispatch() {
+        let _serial = TEST_SERIAL.lock().await;
+        for case in ["reset_interrupted", "postspawn_wait"] {
+            let _scope = AbandonmentTestScope::start();
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let (operation, _) = abandonment_fixture(&paths);
+            if case == "reset_interrupted" {
+                TEST_BOOTOUT_FAIL.store(true, Ordering::SeqCst);
+                *TEST_RECOVERY_FAULT.lock().unwrap() =
+                    Some("before_stop_not_dispatched_checkpoint");
+                assert!(
+                    rollback_with_expected(&paths, "1.2.4", Some(operation.id))
+                        .await
+                        .is_err()
+                );
+            } else {
+                TEST_STOP_WAIT_UNCONFIRMED.store(true, Ordering::SeqCst);
+                assert_eq!(
+                    rollback_with_expected(&paths, "1.2.4", Some(operation.id))
+                        .await
+                        .unwrap()["pending"],
+                    true
+                );
+            }
+            TEST_BOOTOUT_FAIL.store(false, Ordering::SeqCst);
+            TEST_STOP_WAIT_UNCONFIRMED.store(false, Ordering::SeqCst);
+            *TEST_RECOVERY_FAULT.lock().unwrap() = None;
+            let retained: Operation = state::read_json(&paths.operation()).unwrap();
+            assert_eq!(retained.service_stops[0].request, StopRequest::Unconfirmed);
+            for _ in 0..2 {
+                assert_eq!(resume(&paths).await.unwrap()["pending"], true);
+            }
+            assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1, "{case}");
+            assert_eq!(TEST_RESTART_COUNT.load(Ordering::SeqCst), 0, "{case}");
+            assert_eq!(
+                fs::read_link(paths.current()).unwrap(),
+                paths.versions().join("1.2.4")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn abandonment_ambiguous_stop_dispatch_is_observation_only_and_new_work_blocks_stop() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = AbandonmentTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let (operation, _) = abandonment_fixture(&paths);
+        *TEST_RECOVERY_FAULT.lock().unwrap() = Some("after_abandonment_intent");
+        assert!(
+            rollback_with_expected(&paths, "1.2.4", Some(operation.id))
+                .await
+                .is_err()
+        );
+        *TEST_RECOVERY_FAULT.lock().unwrap() = None;
+        TEST_RECOVERY_STATUS.lock().unwrap().as_mut().unwrap()["activeJobs"] = json!(1);
+        assert!(resume(&paths).await.is_err());
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 0);
+        TEST_RECOVERY_STATUS.lock().unwrap().as_mut().unwrap()["activeJobs"] = json!(0);
+        *TEST_RECOVERY_FAULT.lock().unwrap() = Some("after_abandonment_stop_dispatch_intent");
+        assert!(resume(&paths).await.is_err());
+        *TEST_RECOVERY_FAULT.lock().unwrap() = None;
+        let pending = resume(&paths).await.unwrap();
+        assert_eq!(pending["pending"], true);
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 0);
+        assert_eq!(TEST_RESTART_COUNT.load(Ordering::SeqCst), 0);
+        TEST_LABEL_PRESENT.store(false, Ordering::SeqCst);
+        assert_eq!(resume(&paths).await.unwrap()["abandoned"], true);
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 0);
+        assert_eq!(TEST_RESTART_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn abandonment_successor_intent_interruption_requires_explicit_ack_and_exact_config() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = AbandonmentTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let (operation, configuration) = abandonment_fixture(&paths);
+        rollback_with_expected(&paths, "1.2.4", Some(operation.id))
+            .await
+            .unwrap();
+        let _lock = LifecycleLock::acquire(&paths).unwrap();
+        let mut corrected = configuration.clone();
+        corrected["developmentApiOrigin"] = json!("http://127.0.0.1:28080/");
+        *TEST_RECOVERY_FAULT.lock().unwrap() = Some("after_abandonment_successor_intent");
+        assert!(
+            reconcile_bootstrap_abandonment_locked(&paths, &corrected, Some(operation.id))
+                .await
+                .is_err()
+        );
+        *TEST_RECOVERY_FAULT.lock().unwrap() = None;
+        assert!(
+            preflight_package_locked(
+                &paths,
+                OperationKind::Update,
+                operation.package.clone().unwrap()
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            reconcile_bootstrap_abandonment_locked(&paths, &corrected, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            reconcile_bootstrap_abandonment_locked(&paths, &corrected, Some(operation.id))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            preflight_package_locked(
+                &paths,
+                OperationKind::Update,
+                operation.package.clone().unwrap()
+            )
+            .await
+            .unwrap()["reconciled"],
+            false
+        );
+        // The original configuration can revoke a not-yet-consumed corrected
+        // intent; it cannot regain activation authority itself.
+        assert!(
+            reconcile_bootstrap_abandonment_locked(&paths, &configuration, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            preflight_package_locked(&paths, OperationKind::Update, operation.package.unwrap())
+                .await
+                .is_err()
+        );
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn abandonment_changed_operation_and_native_identity_cannot_resume_or_activate() {
+        let _serial = TEST_SERIAL.lock().await;
+        for case in [
+            "uuid",
+            "package",
+            "receipt",
+            "process",
+            "v2_downgrade",
+            "missing_intent",
+            "lock",
+        ] {
+            let _scope = AbandonmentTestScope::start();
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let (operation, _) = abandonment_fixture(&paths);
+            *TEST_RECOVERY_FAULT.lock().unwrap() = Some("after_abandonment_intent");
+            assert!(
+                rollback_with_expected(&paths, "1.2.4", Some(operation.id))
+                    .await
+                    .is_err()
+            );
+            *TEST_RECOVERY_FAULT.lock().unwrap() = None;
+            let mut retained: Operation = state::read_json(&paths.operation()).unwrap();
+            let mut lock = None;
+            match case {
+                "uuid" => retained.id = Uuid::new_v4(),
+                "package" => retained.package.as_mut().unwrap().manifest_sha256 = "b".repeat(64),
+                "receipt" => {
+                    fs::write(paths.state_dir.join("install-receipt.json"), b"changed").unwrap()
+                }
+                "process" => {
+                    let mut process = retained.abandonment.as_ref().unwrap().process.clone();
+                    process.started_seconds += 1;
+                    *TEST_PROCESS_OBSERVATION.lock().unwrap() =
+                        Some(ProcessObservation::Present(process));
+                }
+                "v2_downgrade" => retained.schema = PRE_AUTH_OPERATION_SCHEMA.into(),
+                "missing_intent" => retained.abandonment = None,
+                "lock" => lock = Some(LifecycleLock::acquire(&paths).unwrap()),
+                _ => unreachable!(),
+            }
+            if matches!(case, "uuid" | "package" | "v2_downgrade" | "missing_intent") {
+                state::write_json(&paths.operation(), &retained).unwrap();
+            }
+            assert!(resume(&paths).await.is_err(), "{case}");
+            assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 0);
+            assert_eq!(TEST_RESTART_COUNT.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                fs::read_link(paths.current()).unwrap(),
+                paths.versions().join("1.2.4")
+            );
+            drop(lock);
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_pending_update_abandonment_restores_previous_without_candidate_activation() {
+        let _serial = TEST_SERIAL.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let mut operation = previous_drained_recovery_fixture(&paths);
+        operation.phase = "pending_active_work".into();
+        operation.checkpoint = Some("daemon_has_active_work".into());
+        fs::write(
+            &operation.resources.as_ref().unwrap().staged_launch_agent,
+            b"candidate-plist",
+        )
+        .unwrap();
+        save_operation(&paths, &operation).unwrap();
+        state::write_json(
+            &paths.state_dir.join("install-receipt.json"),
+            &json!({
+                "schema":"app.loomex.runner.install-receipt/v2", "version":"1.2.4",
+                "versionPath":paths.versions().join("1.2.4"), "launchAgent":launch_agent(&paths)
+            }),
+        )
+        .unwrap();
+        let configuration = json!({"schema":"app.loomex.runner.bootstrap-install/v1",
+            "version":"1.2.3", "target":paths.versions().join("1.2.3"),
+            "manifestSha256":"a".repeat(64), "developmentApiOrigin":"http://127.0.0.1:8001/",
+            "providerExecutables":{}});
+        state::write_json(
+            &paths.state_dir.join("bootstrap-install.json"),
+            &configuration,
+        )
+        .unwrap();
+        TEST_ABANDONMENT_RESTART.store(true, Ordering::SeqCst);
+        TEST_MODE.store(true, Ordering::SeqCst);
+        TEST_LABEL_PRESENT.store(true, Ordering::SeqCst);
+        *TEST_RECOVERY_STATUS.lock().unwrap() =
+            Some(json!({"version":"1.2.4","activeJobs":0,"draining":true}));
+        let result = rollback_with_expected(&paths, "1.2.4", Some(operation.id)).await;
+        TEST_ABANDONMENT_RESTART.store(false, Ordering::SeqCst);
+        TEST_MODE.store(false, Ordering::SeqCst);
+        TEST_LABEL_PRESENT.store(false, Ordering::SeqCst);
+        *TEST_RECOVERY_STATUS.lock().unwrap() = None;
+        assert!(
+            result.is_ok(),
+            "explicit abandonment must be supported: {result:?}"
+        );
+        assert_eq!(
+            fs::read_link(paths.current()).unwrap(),
+            paths.versions().join("1.2.4")
+        );
+        let saved: Operation = state::read_json(&paths.operation()).unwrap();
+        assert_eq!(saved.id, operation.id);
+        assert_eq!(saved.phase, "rolled_back");
+        assert!(
+            saved
+                .service_stops
+                .iter()
+                .all(|stop| stop.direction == StopDirection::RestorePrevious)
+        );
+        let tombstone: Value =
+            state::read_json(&paths.state_dir.join("bootstrap-install.json")).unwrap();
+        assert_eq!(tombstone["phase"], "aborted");
+        assert_eq!(tombstone["operationId"], operation.id.to_string());
+        assert_eq!(tombstone["configuration"], configuration);
+    }
+
     #[tokio::test]
     async fn pending_active_work_resumes_the_original_switch() {
         let _serial = TEST_SERIAL.lock().await;
@@ -2054,6 +6698,7 @@ mod tests {
         let staged = paths.state_dir.join("lifecycle-staged-pending.plist");
         fs::write(&staged, b"candidate").unwrap();
         let mut operation = Operation::new(OperationKind::Update, "pending_active_work", None);
+        operation.schema = PRE_AUTH_OPERATION_SCHEMA.into();
         operation.package = Some(PackageIdentity {
             version: "1.2.3".into(),
             target: paths.versions().join("1.2.3"),
@@ -2151,9 +6796,13 @@ mod tests {
     async fn injected_service_failure_leaves_pointer_unchanged_and_intent_durable() {
         let _serial = TEST_SERIAL.lock().await;
         let temp = tempfile::tempdir().unwrap();
-        assert_eq!(NATIVE_EXECUTABLES, ["launchctl"]);
+        assert_eq!(NATIVE_EXECUTABLES, ["/bin/launchctl"]);
         let paths = paths(temp.path());
-        make_compatible_target(&paths);
+        let _scope = StopTestScope::start();
+        let previous = previous_drained_recovery_fixture(&paths)
+            .previous_target
+            .unwrap();
+        fs::remove_file(paths.operation()).unwrap();
         let staged = temp.path().join("staged.plist");
         fs::write(&staged, b"plist").unwrap();
         TEST_MODE.store(true, Ordering::SeqCst);
@@ -2169,7 +6818,7 @@ mod tests {
         TEST_BOOTOUT_FAIL.store(false, Ordering::SeqCst);
         TEST_MODE.store(false, Ordering::SeqCst);
         assert!(result.is_err());
-        assert!(!paths.current().exists());
+        assert_eq!(fs::read_link(paths.current()).unwrap(), previous);
         let operation: Operation = state::read_json(&paths.operation()).unwrap();
         assert_eq!(operation.phase, "recovery_required");
         assert_eq!(operation.package.unwrap().manifest_sha256, "a".repeat(64));
@@ -2259,14 +6908,6 @@ mod tests {
         make_compatible_version(&paths, "1.2.4");
         let candidate = paths.versions().join("1.2.3");
         let previous = paths.versions().join("1.2.4");
-        state::write_json(
-            &paths.state_dir.join("owned-versions.json"),
-            &json!({
-                "schema":"app.loomex.runner.owned-versions/v1",
-                "paths":[candidate, previous]
-            }),
-        )
-        .unwrap();
         std::os::unix::fs::symlink(&previous, paths.current()).unwrap();
         let agent = launch_agent(&paths);
         fs::write(&agent, b"old-plist").unwrap();
@@ -2275,6 +6916,7 @@ mod tests {
         let staged = temp.path().join("candidate.plist");
         fs::write(&staged, b"candidate-plist").unwrap();
         let mut operation = Operation::new(OperationKind::Update, "service_stopped", None);
+        operation.schema = PRE_AUTH_OPERATION_SCHEMA.into();
         operation.package = Some(PackageIdentity {
             version: "1.2.3".into(),
             target: candidate.clone(),
@@ -2396,5 +7038,329 @@ mod tests {
                 .block_on(rollback(&paths, "2.0.0"))
                 .is_err()
         );
+    }
+
+    fn prune_fixture() -> (tempfile::TempDir, Paths) {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        for version in ["1.2.3", "1.2.4", "1.2.5"] {
+            make_compatible_version(&paths, version);
+        }
+        symlink(paths.versions().join("1.2.3"), paths.current()).unwrap();
+        fs::write(launch_agent(&paths), b"prune-fixture-plist").unwrap();
+        state::write_json(
+            &paths.state_dir.join("install-receipt.json"),
+            &json!({"version":"1.2.3","versionPath":paths.versions().join("1.2.3")}),
+        )
+        .unwrap();
+        *TEST_RECOVERY_STATUS.lock().unwrap() =
+            Some(json!({"version":"1.2.3","activeJobs":0,"draining":false}));
+        TEST_MODE.store(true, Ordering::SeqCst);
+        TEST_RESTART_COUNT.store(0, Ordering::SeqCst);
+        (temp, paths)
+    }
+
+    fn reset_prune_fixture() {
+        TEST_MODE.store(false, Ordering::SeqCst);
+        *TEST_RECOVERY_STATUS.lock().unwrap() = None;
+        TEST_PRUNE_IN_USE.lock().unwrap().clear();
+        *TEST_PRUNE_FAULT.lock().unwrap() = None;
+    }
+
+    #[tokio::test]
+    async fn prune_is_resumable_at_every_destructive_boundary() {
+        let _serial = TEST_SERIAL.lock().await;
+        for fault in [
+            "after_plan",
+            "after_drain_before_checkpoint",
+            "after_drain_checkpoint",
+            "after_move",
+            "during_delete",
+            "after_delete",
+            "before_metadata",
+            "after_metadata",
+            "before_drain_release",
+            "after_drain_removal",
+            "after_restart",
+            "before_journal_clear",
+        ] {
+            let (_temp, paths) = prune_fixture();
+            *TEST_PRUNE_FAULT.lock().unwrap() = Some(fault);
+            let first = prune(&paths, &["1.2.5".into()], &["1.2.4".into()]).await;
+            assert!(first.is_err(), "fault {fault} should interrupt");
+            assert!(
+                paths.operation().exists(),
+                "fault {fault} lost recovery journal"
+            );
+            *TEST_PRUNE_FAULT.lock().unwrap() = None;
+            let result = resume(&paths).await.unwrap();
+            assert_eq!(result["completed"], true, "fault {fault}");
+            assert!(
+                !paths.operation().exists(),
+                "fault {fault} retained new-schema journal"
+            );
+            assert!(
+                !paths.state_dir.join("drain.json").exists(),
+                "fault {fault} retained drain"
+            );
+            assert_eq!(
+                TEST_RECOVERY_STATUS.lock().unwrap().as_ref().unwrap()["draining"],
+                false
+            );
+            assert_eq!(
+                TEST_RESTART_COUNT.load(Ordering::SeqCst),
+                1,
+                "fault {fault} repeated or skipped service restart"
+            );
+            assert!(!paths.versions().join("1.2.5").exists());
+            assert!(paths.versions().join("1.2.3").exists());
+            assert!(paths.versions().join("1.2.4").exists());
+            assert_eq!(owned_versions(&paths).unwrap().len(), 2);
+            verify_all_owned_versions(&paths).unwrap();
+            reset_prune_fixture();
+        }
+    }
+
+    #[tokio::test]
+    async fn prune_rejects_active_work_in_use_and_protected_versions() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (_temp, paths) = prune_fixture();
+        *TEST_RECOVERY_STATUS.lock().unwrap() =
+            Some(json!({"version":"1.2.3","activeJobs":1,"draining":false}));
+        assert!(
+            prune(&paths, &["1.2.5".into()], &["1.2.4".into()])
+                .await
+                .is_err()
+        );
+        *TEST_RECOVERY_STATUS.lock().unwrap() =
+            Some(json!({"version":"1.2.3","activeJobs":0,"draining":false}));
+        TEST_PRUNE_IN_USE
+            .lock()
+            .unwrap()
+            .push(paths.versions().join("1.2.5/bin/loomex"));
+        assert!(
+            prune(&paths, &["1.2.5".into()], &["1.2.4".into()])
+                .await
+                .is_err()
+        );
+        TEST_PRUNE_IN_USE.lock().unwrap().clear();
+        assert!(
+            prune(&paths, &["1.2.3".into()], &["1.2.4".into()])
+                .await
+                .is_err()
+        );
+        assert!(
+            prune(&paths, &["1.2.4".into()], &["1.2.4".into()])
+                .await
+                .is_err()
+        );
+        assert!(paths.versions().join("1.2.5").exists());
+        assert!(!paths.operation().exists());
+        reset_prune_fixture();
+    }
+
+    #[tokio::test]
+    async fn prune_pauses_when_quarantined_files_are_in_use_or_drain_loses_idle_proof() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (_temp, paths) = prune_fixture();
+        *TEST_PRUNE_FAULT.lock().unwrap() = Some("after_move");
+        assert!(
+            prune(&paths, &["1.2.5".into()], &["1.2.4".into()])
+                .await
+                .is_err()
+        );
+        *TEST_PRUNE_FAULT.lock().unwrap() = None;
+        let operation: Operation = state::read_json(&paths.operation()).unwrap();
+        let quarantine =
+            prune_quarantine(&paths, &operation, &paths.versions().join("1.2.5")).unwrap();
+        TEST_PRUNE_IN_USE
+            .lock()
+            .unwrap()
+            .push(quarantine.join("bin/loomex"));
+        assert!(resume(&paths).await.is_err());
+        assert!(quarantine.exists());
+        TEST_PRUNE_IN_USE.lock().unwrap().clear();
+        TEST_RECOVERY_STATUS.lock().unwrap().as_mut().unwrap()["activeJobs"] = json!(1);
+        assert!(resume(&paths).await.is_err());
+        assert!(quarantine.exists());
+        TEST_RECOVERY_STATUS.lock().unwrap().as_mut().unwrap()["activeJobs"] = json!(0);
+        assert_eq!(resume(&paths).await.unwrap()["completed"], true);
+        reset_prune_fixture();
+    }
+
+    #[tokio::test]
+    async fn prune_rejects_post_checkpoint_quarantine_tampering() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (_temp, paths) = prune_fixture();
+        *TEST_PRUNE_FAULT.lock().unwrap() = Some("during_delete");
+        assert!(
+            prune(&paths, &["1.2.5".into()], &["1.2.4".into()])
+                .await
+                .is_err()
+        );
+        *TEST_PRUNE_FAULT.lock().unwrap() = None;
+        let operation: Operation = state::read_json(&paths.operation()).unwrap();
+        let target = paths.versions().join("1.2.5");
+        assert!(
+            operation
+                .prune
+                .as_ref()
+                .unwrap()
+                .deleting_started
+                .contains(&target)
+        );
+        let quarantine = prune_quarantine(&paths, &operation, &target).unwrap();
+        let unexpected = quarantine.join("unowned.txt");
+        fs::write(&unexpected, b"not part of installed inventory").unwrap();
+        assert!(resume(&paths).await.is_err());
+        assert!(unexpected.exists());
+        assert!(paths.operation().exists());
+        fs::remove_file(unexpected).unwrap();
+        let extra_dir = quarantine.join("unowned-empty-directory");
+        fs::create_dir(&extra_dir).unwrap();
+        assert!(resume(&paths).await.is_err());
+        assert!(extra_dir.exists());
+        fs::remove_dir(extra_dir).unwrap();
+        let remaining = [
+            "bin/loomex",
+            "metadata/project.json",
+            "metadata/compatibility-manifest.json",
+        ]
+        .into_iter()
+        .map(|relative| quarantine.join(relative))
+        .find(|path| path.exists())
+        .unwrap();
+        let original_bytes = fs::read(&remaining).unwrap();
+        fs::write(&remaining, b"tampered").unwrap();
+        assert!(resume(&paths).await.is_err());
+        assert!(remaining.exists());
+        fs::write(&remaining, original_bytes).unwrap();
+        assert_eq!(resume(&paths).await.unwrap()["completed"], true);
+        reset_prune_fixture();
+    }
+
+    #[tokio::test]
+    async fn prune_requires_delete_intent_for_missing_file_and_original_receipt_index() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (_temp, paths) = prune_fixture();
+        *TEST_PRUNE_FAULT.lock().unwrap() = Some("after_move");
+        assert!(
+            prune(&paths, &["1.2.5".into()], &["1.2.4".into()])
+                .await
+                .is_err()
+        );
+        *TEST_PRUNE_FAULT.lock().unwrap() = None;
+        let mut operation: Operation = state::read_json(&paths.operation()).unwrap();
+        let target = paths.versions().join("1.2.5");
+        let quarantine = prune_quarantine(&paths, &operation, &target).unwrap();
+        operation.prune.as_mut().unwrap().moved.push(target);
+        operation.phase = "deleting".into();
+        save_operation(&paths, &operation).unwrap();
+        let owned_file = quarantine.join("metadata/project.json");
+        let original_bytes = fs::read(&owned_file).unwrap();
+        let original_mode = fs::metadata(&owned_file).unwrap().permissions();
+        fs::remove_file(&owned_file).unwrap();
+        assert!(resume(&paths).await.is_err());
+        assert!(paths.operation().exists());
+        fs::write(&owned_file, original_bytes).unwrap();
+        fs::set_permissions(&owned_file, original_mode).unwrap();
+
+        let receipt_path = paths.state_dir.join("install-receipt.json");
+        let receipt_bytes = fs::read(&receipt_path).unwrap();
+        state::write_json(&receipt_path, &json!({"version":"1.2.9"})).unwrap();
+        assert!(resume(&paths).await.is_err());
+        fs::write(&receipt_path, receipt_bytes).unwrap();
+        let index_path = paths.state_dir.join("owned-versions.json");
+        let index_bytes = fs::read(&index_path).unwrap();
+        state::write_json(
+            &index_path,
+            &json!({"schema":"app.loomex.runner.owned-versions/v1","paths":[],"inventories":[]}),
+        )
+        .unwrap();
+        assert!(resume(&paths).await.is_err());
+        fs::write(&index_path, index_bytes).unwrap();
+        assert_eq!(resume(&paths).await.unwrap()["completed"], true);
+        reset_prune_fixture();
+    }
+
+    #[tokio::test]
+    async fn prune_metadata_checkpoint_rejects_reappearing_source_path() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (_temp, paths) = prune_fixture();
+        *TEST_PRUNE_FAULT.lock().unwrap() = Some("after_metadata");
+        assert!(
+            prune(&paths, &["1.2.5".into()], &["1.2.4".into()])
+                .await
+                .is_err()
+        );
+        *TEST_PRUNE_FAULT.lock().unwrap() = None;
+        let target = paths.versions().join("1.2.5");
+        fs::create_dir(&target).unwrap();
+        assert!(resume(&paths).await.is_err());
+        assert!(target.exists());
+        assert!(paths.operation().exists());
+        fs::remove_dir(&target).unwrap();
+        assert_eq!(resume(&paths).await.unwrap()["completed"], true);
+        reset_prune_fixture();
+    }
+
+    #[test]
+    fn prune_journal_uses_new_schema_and_old_operation_decoding_is_preserved() {
+        let mut prune = Operation::new(OperationKind::Prune, "prepared", None);
+        prune.prune = Some(PruneIntent {
+            targets: vec![PathBuf::from("/owned/versions/1.2.5")],
+            retain: vec![PathBuf::from("/owned/versions/1.2.4")],
+            moved: Vec::new(),
+            deleting_started: Vec::new(),
+            current_target: PathBuf::from("/owned/versions/1.2.3"),
+            original_inventory_digest: "a".repeat(64),
+            result_inventory_digest: "b".repeat(64),
+            receipt_digest: "c".repeat(64),
+            drain_key: Uuid::new_v4(),
+            launch_agent_digest: "d".repeat(64),
+            auth_baseline: AuthBaseline::SignedOut {
+                installation_id: None,
+            },
+        });
+        assert!(prune.validate().is_err());
+        prune.schema = PRUNE_OPERATION_SCHEMA.into();
+        prune.validate().unwrap();
+        let encoded = serde_json::to_vec(&prune).unwrap();
+        let decoded: Operation = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, prune);
+        let legacy = Operation::new(OperationKind::Repair, "completed", None);
+        legacy.validate().unwrap();
+        assert_eq!(legacy.schema, OPERATION_SCHEMA);
+    }
+
+    #[tokio::test]
+    async fn prune_fails_closed_for_unowned_symlink_and_pending_operation() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (_temp, paths) = prune_fixture();
+        assert!(
+            prune(&paths, &["1.2.6".into()], &["1.2.4".into()])
+                .await
+                .is_err()
+        );
+        let outside = paths.install_base.parent().unwrap().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::rename(paths.versions().join("1.2.5"), outside.join("1.2.5")).unwrap();
+        symlink(outside.join("1.2.5"), paths.versions().join("1.2.5")).unwrap();
+        assert!(
+            prune(&paths, &["1.2.5".into()], &["1.2.4".into()])
+                .await
+                .is_err()
+        );
+        fs::remove_file(paths.versions().join("1.2.5")).unwrap();
+        fs::rename(outside.join("1.2.5"), paths.versions().join("1.2.5")).unwrap();
+        let operation = Operation::new(OperationKind::Repair, "protected_repair_required", None);
+        save_operation(&paths, &operation).unwrap();
+        assert!(
+            prune(&paths, &["1.2.5".into()], &["1.2.4".into()])
+                .await
+                .is_err()
+        );
+        assert!(paths.versions().join("1.2.5").exists());
+        reset_prune_fixture();
     }
 }

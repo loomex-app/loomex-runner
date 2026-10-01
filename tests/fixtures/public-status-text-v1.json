@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "ai.public-status-text-fixture/v1",
+  "cases": [
+    {"name": "plain", "input": "  Planning the next step  ", "normalized": "Planning the next step"},
+    {"name": "astral-emoji", "input": "  Planning 😀  ", "normalized": "Planning 😀"},
+    {"name": "empty", "input": "", "normalized": null},
+    {"name": "whitespace", "input": "   ", "normalized": null},
+    {"name": "control", "input": "one\ntwo", "normalized": null},
+    {"name": "format", "input": "one\u200btwo", "normalized": null},
+    {"name": "private-use", "input": "one\ue000two", "normalized": null},
+    {"name": "unassigned", "input": "one\u0378two", "normalized": null},
+    {"name": "astral-private-use", "input": "one\udb80\udc00two", "normalized": null},
+    {"name": "astral-unassigned", "input": "one\udbff\udffftwo", "normalized": null},
+    {"name": "line-separator", "input": "one\u2028two", "normalized": null}
+  ]
+}

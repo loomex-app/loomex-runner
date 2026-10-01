@@ -34,3 +34,23 @@ When those prerequisites are available, run the approved provider checks
 outside this fixture suite and record each provider, executable version,
 authentication result, and signed-host result separately. Never copy provider
 credentials into Loomex state to satisfy the check.
+
+## Public AI status capability
+
+The runner implements a job-scoped `report_status` MCP tool and durable
+`ai.public-status.v1` delivery, but advertises `ai.public-status/v1: false` and
+does not inject that tool into provider jobs in this version. The initial live
+provider would be Codex only; Claude is unqualified. Fixed, content-free
+`ai.progress.v1` milestones remain available for all supported providers.
+
+Activation requires a new pinned runner/provider qualification: an installed
+Codex CLI must discover and call the per-invocation tool without replacing the
+user's configuration, the exact status must reach the backend with its stable
+event ID, and the same job must still produce valid strict final JSON. Record
+the CLI and runner binary hashes, bounded call/result evidence, and cleanup
+before changing `LIVE_PROVIDER_QUALIFIED` or advertising the capability. The
+current direct MCP probe passes, but a Codex run did not reach tool discovery:
+the normal configuration has an unrelated missing `fcp` executable and the
+isolated attempt timed out refreshing models. Neither qualifies live Codex
+status. Backend nodes that request public status continue with fixed progress
+when the runner does not advertise the capability.

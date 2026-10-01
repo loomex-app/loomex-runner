@@ -62,6 +62,17 @@ struct MutationKey {
     digest: String,
     lock: std::sync::Weak<Mutex<()>>,
 }
+struct PatchSubmission<'a> {
+    org: &'a str,
+    workflow_id: &'a str,
+    key: &'a str,
+    identity: &'a str,
+    path: &'a Path,
+    body: Value,
+    // Legacy patch journals predate notes preservation. Their exact submitted
+    // body omitted notes, so there is no historical expected note to assert.
+    expected_notes: Option<&'a str>,
+}
 pub struct Daemon {
     pub dir: PathBuf,
     pub api: Api,
@@ -208,6 +219,18 @@ impl Daemon {
             .find(|entry| entry["name"] == method)
             .context("METHOD_NOT_FOUND")?;
         validate_params(&params, &entry["inputSchema"])?;
+        if method == "runs.continuation.requeue" {
+            // Preserve the owner-issued checkpoint digest verbatim. Recovery
+            // is an explicit mutation; reads and monitoring never reach it.
+            let digest = required(&params, "expectedContinuationDigest")?;
+            ensure!(
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "INVALID_REQUEST"
+            );
+        }
         let write = entry["mutating"] == true;
         // A reviewed-run ticket is a runner-issued, one-use idempotency
         // boundary. Use it as the local singleflight and receipt key because
@@ -274,7 +297,9 @@ impl Daemon {
         let operation = (!method.starts_with("recovery.")
             && !matches!(
                 method,
-                "runs.start_handoff.issue" | "runs.start_handoff.approve"
+                "runs.start_handoff.issue"
+                    | "runs.start_handoff.approve"
+                    | "runs.start_handoff.approve_headless"
             ))
         .then(|| {
             journal_key
@@ -422,6 +447,67 @@ impl Daemon {
         Ok(
             json!({"responseRef":reference,"sizeBytes":bytes.len(),"encoding":"json","nextOffset":0,"checksumSha256":checksum}),
         )
+    }
+
+    /// A preparation's backend binding is sealed in the owner-checked local
+    /// record. The workflow closure contains full node snapshots and can be
+    /// much larger than a useful human review. Project only facts needed to
+    /// identify the reviewed version and its resolved provider models; the
+    /// original binding and digest remain untouched for commit/reconciliation.
+    fn preparation_review_projection(review: &Value) -> Value {
+        let mut projected = review.clone();
+        let Some(binding) = projected.get_mut("binding").and_then(Value::as_object_mut) else {
+            return projected;
+        };
+        let Some(closure) = binding.remove("workflowClosure") else {
+            return projected;
+        };
+        let root_workflow = binding.get("workflowId").and_then(Value::as_str);
+        let root_version = binding.get("versionId").and_then(Value::as_str);
+        let mut providers = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut providers_truncated = false;
+        let mut version = None;
+        if let Some(entries) = closure.as_array() {
+            for entry in entries {
+                if entry["workflowId"].as_str() == root_workflow
+                    && entry["workflowVersionId"].as_str() == root_version
+                {
+                    version = entry["version"].as_u64();
+                }
+                if let Some(dependencies) = entry["nodeDependencies"].as_object() {
+                    for snapshot in dependencies.values() {
+                        let resolution = &snapshot["modelResolution"];
+                        let Some(name) = resolution["provider"].as_str() else {
+                            continue;
+                        };
+                        let Some(model) = resolution["runtimeModel"].as_str() else {
+                            continue;
+                        };
+                        if seen.insert((name.to_owned(), model.to_owned())) {
+                            if name.len() <= 64 && model.len() <= 128 && providers.len() < 32 {
+                                providers.push(json!({"name":name,"model":model}));
+                            } else {
+                                providers_truncated = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Keep the projection bounded even for unusually large closures. A
+        // truncated provider list is explicitly marked and is not authority.
+        let provider_count = seen.len();
+        binding.insert(
+            "workflowClosureReview".into(),
+            json!({
+                "rootVersion":version,
+                "providers":providers,
+                "providerCount":provider_count,
+                "providersTruncated":providers_truncated,
+            }),
+        );
+        projected
     }
     async fn handle(&self, method: &str, p: &Value, scope: Option<&str>) -> Result<Value> {
         let key = p.get("idempotencyKey").and_then(Value::as_str);
@@ -587,6 +673,9 @@ impl Daemon {
             "runs.start_handoff.issue" => return self.issue_run_start_handoff(&org, p).await,
             "runs.start_handoff.restore" => return self.restore_run_start_handoff(&org, p).await,
             "runs.start_handoff.approve" => return self.approve_run_start_handoff(&org, p).await,
+            "runs.start_handoff.approve_headless" => {
+                return self.approve_headless_run_start_handoff(&org, p).await;
+            }
             "runs.start_handoff.get" => return self.get_run_start_handoff(&org, p).await,
             "runs.start_handoff.commit" => return self.commit_run_start_handoff(&org, p).await,
             "workspaces.grant" => {
@@ -620,7 +709,33 @@ impl Daemon {
             "runs.prepare" | "builder.prepare" | "editor.prepare" => {
                 return self.prepare(method, &org, p).await;
             }
+            "workflows.patch" => return self.patch_workflow_draft(&org, p).await,
             "runs.commit" | "builder.commit" | "editor.commit" => {
+                // Direct run commits and handoff commits share the same sealed
+                // preparation reservation. The handoff's internal commit already
+                // holds this lock and does not reenter this dispatch branch.
+                let reservation = if method == "runs.commit" {
+                    Some(
+                        json!({"organizationId":org,"accountSubject":self.auth.credential(&org).await?.subject,
+                        "installationId":self.auth.installation_id().await?,"preparationId":p["preparationId"],"bindingDigest":p["bindingDigest"]}),
+                    )
+                } else {
+                    None
+                };
+                let lock = reservation
+                    .as_ref()
+                    .map(|record| self.preparation_handoff_lock(record))
+                    .transpose()?;
+                let _guard = match lock {
+                    Some(lock) => Some(lock.lock_owned().await),
+                    None => None,
+                };
+                if let Some(reservation) = &reservation {
+                    ensure!(
+                        self.find_reserved_start_handoff(reservation)?.is_none(),
+                        "START_HANDOFF_PREPARATION_RESERVED"
+                    );
+                }
                 let mut result = self.commit(method, &org, p).await?;
                 if method == "runs.commit" {
                     self.attach_follow_continuation(&org, "run_commit", None, &mut result)
@@ -651,8 +766,45 @@ impl Daemon {
             self.wait_for_meaningful_run_update(&org, p).await?
         } else {
             let (verb, route, body) = backend_route(method, p)?;
-            self.backend(&org, &verb, &route, body, key).await?
+            self.backend(&org, &verb, &route, body, key)
+                .await
+                .map_err(|error| {
+                    // A lost mutation transport response does not establish
+                    // that the owner route never ran. Keep the exact journal
+                    // and require explicit same-key reconciliation, not retry.
+                    if method == "runs.continuation.requeue"
+                        && error.downcast_ref::<ApiError>().is_some_and(|api| {
+                            matches!(
+                                api.code.as_str(),
+                                "NETWORK_UNAVAILABLE" | "INVALID_API_RESPONSE"
+                            )
+                        })
+                    {
+                        anyhow::anyhow!("NETWORK_AMBIGUOUS")
+                    } else {
+                        error
+                    }
+                })?
         };
+        if method == "runs.continuation.requeue" {
+            ensure!(
+                result["executionId"] == p["runId"]
+                    && result["deliveryId"] == p["deliveryId"]
+                    && result["expectedContinuationDigest"] == p["expectedContinuationDigest"]
+                    && result["status"] == "pending"
+                    && result["requeued"].is_boolean(),
+                "BACKEND_PROTOCOL_ERROR"
+            );
+            // The receipt acknowledges this delivery only. Never propagate a
+            // backend closure, command, provider output or replay instruction.
+            result = json!({
+                "executionId":result["executionId"],
+                "deliveryId":result["deliveryId"],
+                "expectedContinuationDigest":result["expectedContinuationDigest"],
+                "requeued":result["requeued"],
+                "status":result["status"],
+            });
+        }
         if matches!(
             method,
             "runs.get" | "runs.wait" | "runs.events" | "runs.result"
@@ -1301,7 +1453,7 @@ impl Daemon {
             &record_path,
             &json!({"operation":method,"organizationId":org,"accountSubject":account,"installationId":install,"workspacePath":workspace,"bindingDigest":sealed["bindingDigest"],"binding":sealed["binding"],"confirmationKey":confirmation,"providers":providers,"review":sealed}),
         )?;
-        Ok(sealed)
+        Ok(Self::preparation_review_projection(&sealed))
     }
     async fn preparation_get(&self, org: &str, p: &Value) -> Result<Value> {
         let preparation = required(p, "preparationId")?;
@@ -1407,12 +1559,24 @@ impl Daemon {
         if !provider_snapshot().is_ok_and(|providers| providers == record["providers"]) {
             return Ok(stale("provider_changed", "prepare_again"));
         }
-        Ok(json!({"status":"valid","operation":operation,"preparation":review}))
+        Ok(
+            json!({"status":"valid","operation":operation,"preparation":Self::preparation_review_projection(&review)}),
+        )
     }
 
     /// Seal an exact preparation review.  Issuing a handoff deliberately does
     /// not authorize Start: only a subsequent UI approval records that gesture.
     async fn issue_run_start_handoff(&self, org: &str, p: &Value) -> Result<Value> {
+        self.issue_run_start_handoff_with_request(org, p, None)
+            .await
+    }
+
+    async fn issue_run_start_handoff_with_request(
+        &self,
+        org: &str,
+        p: &Value,
+        headless_request: Option<&Value>,
+    ) -> Result<Value> {
         let preparation = required(p, "preparationId")?;
         let account = self.auth.credential(org).await?.subject;
         let installation = self.auth.installation_id().await?;
@@ -1460,6 +1624,15 @@ impl Daemon {
             &state::json_digest(&reservation),
         )?;
         let _reservation_guard = reservation_lock.lock().await;
+        // Recheck after joining the reservation: a direct commit may have
+        // consumed the preparation while the initial review was being read.
+        let current = self
+            .preparation_get(org, &json!({"preparationId":preparation}))
+            .await?;
+        ensure!(
+            current["status"] == "valid" && current["preparation"] == status["preparation"],
+            "PRECONDITION_FAILED"
+        );
         if let Some((_, existing)) = self.find_start_handoff_by_issue_key(
             org,
             &account,
@@ -1483,10 +1656,18 @@ impl Daemon {
             if Self::start_handoff_lifecycle(&existing) != "prepared" {
                 bail!("START_HANDOFF_PREPARATION_RESERVED");
             }
+            if let Some(request) = headless_request {
+                // A pending app review or a different headless operation is
+                // already reserved. Do not promote it on another channel.
+                ensure!(
+                    existing.get("headlessRequest") == Some(request),
+                    "START_HANDOFF_PREPARATION_RESERVED"
+                );
+            }
             return self.start_handoff_projection(&existing);
         }
         let handoff_ref = Uuid::new_v4().to_string();
-        let record = json!({
+        let mut record = json!({
             "schemaVersion":"loomex.run-start-handoff/v2",
             "handoffRef":handoff_ref,
             "organizationId":org,
@@ -1512,6 +1693,9 @@ impl Daemon {
             "issueIdentity":issue_identity,
             "issuedAt":state::now(),
         });
+        if let Some(request) = headless_request {
+            record["headlessRequest"] = request.clone();
+        }
         state::write_json(
             &self
                 .dir
@@ -1759,7 +1943,26 @@ impl Daemon {
         let current = self
             .preparation_get(org, &json!({"preparationId":record["preparationId"]}))
             .await?;
-        Ok(current["status"] == "valid" && current["preparation"] == *review)
+        if current["status"] != "valid" {
+            return Ok(false);
+        }
+        // Historical handoffs contain the full closure. Compare those against
+        // the original private review so removing closure from the public
+        // projection cannot weaken their exact-binding check.
+        let preparation_id = required(record, "preparationId")?;
+        let sealed: Value = state::read_json(
+            &self
+                .dir
+                .join("preparations")
+                .join(format!("{preparation_id}.json")),
+        )?;
+        let expected = if review["binding"].get("workflowClosure").is_some() {
+            sealed["review"].clone()
+        } else {
+            Self::preparation_review_projection(&sealed["review"])
+        };
+        Ok(*review == expected
+            && current["preparation"] == Self::preparation_review_projection(&sealed["review"]))
     }
 
     async fn expire_start_handoff(&self, path: &Path, record: &mut Value) -> Result<()> {
@@ -1774,6 +1977,16 @@ impl Daemon {
     /// selected organization and sealed preparation. This avoids depending on
     /// an embedded browser's loopback-network policy for authorization.
     async fn approve_run_start_handoff(&self, org: &str, p: &Value) -> Result<Value> {
+        self.approve_run_start_handoff_with_request(org, p, None)
+            .await
+    }
+
+    async fn approve_run_start_handoff_with_request(
+        &self,
+        org: &str,
+        p: &Value,
+        headless_request: Option<&Value>,
+    ) -> Result<Value> {
         let handoff_ref = required(p, "handoffRef")?;
         let lock = self.start_handoff_lock(handoff_ref)?;
         let _guard = lock.lock().await;
@@ -1784,6 +1997,18 @@ impl Daemon {
             record["schemaVersion"] == "loomex.run-start-handoff/v2",
             "START_HANDOFF_APPROVAL_REJECTED"
         );
+        if let Some(request) = headless_request {
+            ensure!(
+                record.get("headlessRequest") == Some(request),
+                "IDEMPOTENCY_CONFLICT"
+            );
+            if matches!(
+                Self::start_handoff_lifecycle(&record),
+                "approved" | "committing" | "ambiguous" | "committed" | "expired"
+            ) {
+                return self.start_handoff_projection(&record);
+            }
+        }
         match Self::start_handoff_lifecycle(&record) {
             "prepared" => {
                 ensure!(
@@ -1798,7 +2023,7 @@ impl Daemon {
                 }
                 record["lifecycle"] = json!("approved");
                 record["approvalObserved"] = json!(true);
-                record["approval"] = json!({"approvedAt":state::now()});
+                record["approval"] = json!({"approvedAt":state::now(),"source":if headless_request.is_some() {"headless_mcp"} else {"app_ui"}});
                 record
                     .as_object_mut()
                     .context("START_HANDOFF_STALE")?
@@ -1816,6 +2041,67 @@ impl Daemon {
             "kind":"start", "schemaVersion":"loomex.start-continuation/v1", "handoffRef":handoff_ref
         }))?;
         self.start_handoff_projection(&record)
+    }
+
+    /// A model-callable delegated Start uses the same sealed preparation and
+    /// handoff journal. The key never crosses the public MCP boundary. A caller
+    /// must have an explicit user Start instruction; provenance is diagnostic,
+    /// and never substitutes for the exact-binding checks below.
+    async fn approve_headless_run_start_handoff(&self, org: &str, p: &Value) -> Result<Value> {
+        let digest = required(p, "bindingDigest")?;
+        ensure!(
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "INVALID_REQUEST"
+        );
+        let account = self.auth.credential(org).await?.subject;
+        let installation = self.auth.installation_id().await?;
+        let directory = self.dir.join("start-handoffs");
+        if directory.exists() {
+            for entry in std::fs::read_dir(&directory)? {
+                let path = entry?.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                    continue;
+                }
+                let record: Value = state::read_json(&path)?;
+                if record["organizationId"] == org
+                    && record["accountSubject"] == account
+                    && record["installationId"] == installation
+                    && record["headlessRequest"]["idempotencyKey"] == p["idempotencyKey"]
+                {
+                    ensure!(record["headlessRequest"] == *p, "IDEMPOTENCY_CONFLICT");
+                    let handoff = json!({"handoffRef":record["handoffRef"]});
+                    if Self::start_handoff_lifecycle(&record) == "prepared" {
+                        return self
+                            .approve_run_start_handoff_with_request(org, &handoff, Some(p))
+                            .await;
+                    }
+                    return self.get_run_start_handoff(org, &handoff).await;
+                }
+            }
+        }
+        let status = self
+            .preparation_get(org, &json!({"preparationId":p["preparationId"]}))
+            .await?;
+        ensure!(
+            status["status"] == "valid"
+                && status["operation"] == "runs.prepare"
+                && status["preparation"]["bindingDigest"] == p["bindingDigest"]
+                && status["preparation"]["binding"]["executionPolicy"] == "host_user/v1",
+            "PRECONDITION_FAILED"
+        );
+        let issued = self.issue_run_start_handoff_with_request(org, &json!({
+            "preparationId":p["preparationId"],"bindingDigest":p["bindingDigest"],
+            "confirmationKey":status["preparation"]["confirmationKey"],"idempotencyKey":p["idempotencyKey"],
+        }), Some(p)).await?;
+        self.approve_run_start_handoff_with_request(
+            org,
+            &json!({"handoffRef":issued["handoffRef"]}),
+            Some(p),
+        )
+        .await
     }
 
     fn other_active_start_handoff(&self, current_path: &Path, record: &Value) -> Result<bool> {
@@ -2210,6 +2496,11 @@ impl Daemon {
         {
             bail!("PRECONDITION_FAILED")
         }
+        if method == "runs.commit" && record.get("commitAuthorization").is_some() {
+            // Cached accepted operations are served by dispatch. An uncached
+            // or uncertain operation cannot replace a consumed authorization.
+            bail!("PRECONDITION_FAILED");
+        }
         self.granted(Path::new(required(&record, "workspacePath")?), org)
             .await?;
         if record["providers"] != provider_snapshot()? {
@@ -2252,6 +2543,8 @@ impl Daemon {
     }
     async fn download(&self, org: &str, p: &Value) -> Result<Value> {
         let id = required(p, "artifactId")?;
+        let execution = required(p, "executionId")?;
+        Uuid::parse_str(execution).context("INVALID_REQUEST")?;
         let requested = PathBuf::from(required(p, "destinationPath")?);
         if !requested.is_absolute() {
             bail!("VALIDATION_FAILED")
@@ -2281,15 +2574,13 @@ impl Daemon {
         let mut offset = 0u64;
         let mut expected_checksum: Option<String> = None;
         loop {
-            let page = self
-                .backend(
-                    org,
-                    "GET",
-                    &format!("v2/artifacts/{id}/content/?offset={offset}&limit=262144"),
-                    None,
-                    None,
-                )
-                .await?;
+            let (_, route, _) = backend_route(
+                "artifacts.read",
+                &json!({
+                    "artifactId":id,"executionId":execution,"offset":offset,"limit":262144
+                }),
+            )?;
+            let page = self.backend(org, "GET", &route, None, None).await?;
             let checksum = required(&page, "checksumSha256")?;
             if expected_checksum
                 .as_deref()
@@ -2328,6 +2619,273 @@ impl Daemon {
         }
         std::fs::File::open(parent)?.sync_all()?;
         Ok(json!({"artifactId":id,"path":dest,"sizeBytes":offset,"checksumSha256":checksum}))
+    }
+
+    /// Apply a small, reviewable edit to one exact owner-scoped draft. The
+    /// backend remains the authority for both validation and optimistic save.
+    async fn patch_workflow_draft(&self, org: &str, p: &Value) -> Result<Value> {
+        let workflow_id = required(p, "workflowId")?;
+        let key = required(p, "idempotencyKey")?;
+        let expected_revision = p["expectedVersion"].as_u64().context("INVALID_REQUEST")?;
+        let expected_checksum = required(p, "expectedDefinitionChecksum")?;
+        ensure!(
+            expected_checksum.len() == 64
+                && expected_checksum.bytes().all(|ch| ch.is_ascii_hexdigit()),
+            "INVALID_REQUEST"
+        );
+        let operations = p["operations"].as_array().context("INVALID_REQUEST")?;
+        let requested_notes = p
+            .get("notes")
+            .map(|notes| {
+                let notes = notes.as_str().context("INVALID_REQUEST")?;
+                ensure!(notes.chars().count() <= 4096, "INVALID_REQUEST");
+                Ok::<_, anyhow::Error>(notes)
+            })
+            .transpose()?;
+        let account = self.auth.credential(org).await?.subject;
+        let identity = state::json_digest(&json!({
+            "organizationId":org,"accountSubject":account,"workflowId":workflow_id,
+            "expectedVersion":expected_revision,"expectedDefinitionChecksum":expected_checksum,
+            "operations":operations,"requestedNotes":requested_notes,"idempotencyKey":key,
+        }));
+        let legacy_identity = requested_notes.is_none().then(|| {
+            state::json_digest(&json!({
+                "organizationId":org,"accountSubject":account,"workflowId":workflow_id,
+                "expectedVersion":expected_revision,"expectedDefinitionChecksum":expected_checksum,
+                "operations":operations,"idempotencyKey":key,
+            }))
+        });
+        let path = self.dir.join("workflow-patches").join(format!(
+            "{}.json",
+            state::json_digest(
+                &json!({"organizationId":org,"accountSubject":account,"idempotencyKey":key})
+            )
+        ));
+        if path.exists() {
+            let record: Value = state::read_json(&path)?;
+            let legacy = legacy_identity
+                .as_ref()
+                .is_some_and(|digest| record["identity"] == *digest);
+            ensure!(
+                record["identity"] == identity || legacy,
+                "IDEMPOTENCY_CONFLICT"
+            );
+            if record["status"] == "rejected" {
+                let code = record["code"].as_str().context("BACKEND_PROTOCOL_ERROR")?;
+                bail!("{code}");
+            }
+            ensure!(record["status"] == "submitted", "BACKEND_PROTOCOL_ERROR");
+            ensure!(
+                record["workflowId"] == workflow_id
+                    && record["expectedVersion"].as_u64() == Some(expected_revision)
+                    && record["expectedDefinitionChecksum"] == expected_checksum,
+                "IDEMPOTENCY_CONFLICT"
+            );
+            let body = record["updateBody"]
+                .as_object()
+                .context("BACKEND_PROTOCOL_ERROR")?;
+            // A pre-notes journal is identifiable only by its original
+            // identity digest. Never infer its prior notes from the current
+            // draft, which may already contain the old backend's default.
+            let notes_provided = if legacy {
+                ensure!(
+                    record.get("notesProvided").is_none() && record.get("expectedNotes").is_none(),
+                    "BACKEND_PROTOCOL_ERROR"
+                );
+                false
+            } else {
+                record["notesProvided"]
+                    .as_bool()
+                    .context("BACKEND_PROTOCOL_ERROR")?
+            };
+            let expected_notes = if legacy {
+                None
+            } else {
+                Some(
+                    record["expectedNotes"]
+                        .as_str()
+                        .context("BACKEND_PROTOCOL_ERROR")?,
+                )
+            };
+            ensure!(
+                body.len() == if notes_provided { 3 } else { 2 }
+                    && body["expectedVersion"].as_u64() == Some(expected_revision)
+                    && body["definition"].is_object()
+                    && (!notes_provided || body["notes"] == expected_notes.unwrap_or_default())
+                    && state::json_digest(&body["definition"]) == record["updateDigest"]
+                    && state::json_digest(&Value::Object(body.clone())) == record["payloadDigest"],
+                "BACKEND_PROTOCOL_ERROR"
+            );
+            // First reconcile the original key. A backend `not_found` is the
+            // only condition under which the exact journaled update may be
+            // resent with that same key and byte-equivalent JSON payload.
+            let receipt = self
+                .backend(
+                    org,
+                    "POST",
+                    "v2/workflow-operations/get/",
+                    Some(json!({"operation":"workflows.update","idempotencyKey":key})),
+                    None,
+                )
+                .await?;
+            if receipt["status"] == "completed" {
+                let result = receipt
+                    .get("response")
+                    .filter(|value| value.is_object())
+                    .context("BACKEND_PROTOCOL_ERROR")?;
+                ensure!(
+                    result["workflow"]["id"] == workflow_id,
+                    "IDEMPOTENCY_CONFLICT"
+                );
+                ensure!(
+                    result["draft"]["definition"].is_object()
+                        && state::json_digest(&result["draft"]["definition"])
+                            == record["updateDigest"]
+                        && result["draft"]["notes"].is_string()
+                        && expected_notes.is_none_or(|notes| result["draft"]["notes"] == notes),
+                    "IDEMPOTENCY_CONFLICT"
+                );
+                return Ok(result.clone());
+            }
+            if receipt["status"] == "not_found" {
+                return self
+                    .submit_workflow_patch_exact(PatchSubmission {
+                        org,
+                        workflow_id,
+                        key,
+                        identity: record["identity"]
+                            .as_str()
+                            .context("BACKEND_PROTOCOL_ERROR")?,
+                        path: &path,
+                        body: Value::Object(body.clone()),
+                        expected_notes,
+                    })
+                    .await;
+            }
+            bail!("NETWORK_AMBIGUOUS");
+        }
+        let detail = self
+            .backend(
+                org,
+                "GET",
+                &format!("v1/workflows/{workflow_id}/?version=draft"),
+                None,
+                None,
+            )
+            .await?;
+        let definition = crate::workflow_patch::verified_definition(
+            &detail,
+            workflow_id,
+            expected_revision,
+            expected_checksum,
+        )?;
+        let selected_notes = detail["selectedVersion"]["notes"]
+            .as_str()
+            .context("BACKEND_PROTOCOL_ERROR")?;
+        let expected_notes = requested_notes.unwrap_or(selected_notes);
+        let candidate = crate::workflow_patch::apply(definition, operations)?;
+        let validation = self
+            .backend(
+                org,
+                "POST",
+                "v1/workflows/validate/",
+                Some(json!({"definition":candidate})),
+                None,
+            )
+            .await?;
+        if validation["valid"] != true {
+            let issues = validation["issues"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .take(32)
+                .filter_map(|issue| {
+                    let code = issue["code"].as_str()?;
+                    let path = issue["path"].as_str()?;
+                    if code.len() > 80
+                        || path.len() > 256
+                        || !code.bytes().all(|c| c.is_ascii_uppercase() || c == b'_')
+                        || path.chars().any(char::is_control)
+                    {
+                        return None;
+                    }
+                    Some(json!({"code":code,"path":path,"message":"Workflow definition field is invalid."}))
+                })
+                .collect::<Vec<_>>();
+            return Err(ApiError {
+                code: "WORKFLOW_PATCH_VALIDATION_FAILED".into(),
+                retryable: false,
+                status: None,
+                data: Some(json!({"authoringIssueVersion":"v1","authoringIssues":issues})),
+                correlation_id: None,
+            }
+            .into());
+        }
+        let canonical = validation["workflow"]
+            .as_object()
+            .context("BACKEND_PROTOCOL_ERROR")?;
+        let mut body = json!({"definition":canonical,"expectedVersion":expected_revision});
+        if let Some(notes) = requested_notes {
+            body["notes"] = json!(notes);
+        }
+        // The patch intent is durable before the backend mutation is sent.
+        // An uncertain response can therefore only reconcile this exact key.
+        state::write_json(
+            &path,
+            &json!({"identity":identity,"workflowId":workflow_id,
+            "expectedVersion":expected_revision,"expectedDefinitionChecksum":expected_checksum,
+            "updateDigest":state::json_digest(&body["definition"]),
+            "payloadDigest":state::json_digest(&body),"updateBody":body,
+            "notesProvided":requested_notes.is_some(),"expectedNotes":expected_notes,"status":"submitted"}),
+        )?;
+        self.submit_workflow_patch_exact(PatchSubmission {
+            org,
+            workflow_id,
+            key,
+            identity: &identity,
+            path: &path,
+            body,
+            expected_notes: Some(expected_notes),
+        })
+        .await
+    }
+
+    async fn submit_workflow_patch_exact(&self, patch: PatchSubmission<'_>) -> Result<Value> {
+        let result = self
+            .backend(
+                patch.org,
+                "POST",
+                &format!("v1/workflows/{}/draft/", patch.workflow_id),
+                Some(patch.body.clone()),
+                Some(patch.key),
+            )
+            .await;
+        if let Err(error) = &result {
+            if let Some(api) = error.downcast_ref::<ApiError>() {
+                if api
+                    .status
+                    .is_some_and(|status| (400..500).contains(&status))
+                    && !api.retryable
+                {
+                    state::write_json(
+                        patch.path,
+                        &json!({"identity":patch.identity,"workflowId":patch.workflow_id,
+                        "status":"rejected","code":api.code}),
+                    )?;
+                }
+            }
+        }
+        let result = result?;
+        ensure!(
+            result["workflow"]["id"] == patch.workflow_id
+                && result["draft"]["definition"] == patch.body["definition"]
+                && result["draft"]["notes"].is_string()
+                && patch
+                    .expected_notes
+                    .is_none_or(|notes| result["draft"]["notes"] == notes),
+            "BACKEND_PROTOCOL_ERROR"
+        );
+        Ok(result)
     }
 }
 fn normalize_output(mut value: Value, schema: &Value) -> Result<Value> {
@@ -2423,6 +2981,15 @@ mod monitoring_wait_tests {
         });
         assert!(automated_progress_only(&progress));
 
+        // Deliberate, attributed public text must wake a waiting caller even
+        // when the backend groups it under automated progress.
+        let public_status = json!({
+            "execution":{"status":"running"}, "waitState":"automated_progress",
+            "humanRequest":null, "hasMoreEvents":false,
+            "events":[{"type":"ai.public-status.v1", "sequence":10}], "latestSequence":10
+        });
+        assert!(!automated_progress_only(&public_status));
+
         for changed in [
             json!({"execution":{"status":"running"}, "waitState":"automated_progress", "humanRequest":null, "hasMoreEvents":false, "events":[{"type":"node.completed", "sequence":9}]}),
             json!({"execution":{"status":"running"}, "waitState":"human_action_required", "humanRequest":{"id":"request"}, "hasMoreEvents":false, "events":[{"type":"ai.progress.v1", "sequence":9}]}),
@@ -2481,7 +3048,9 @@ fn account_scoped_method(method: &str) -> bool {
             method,
             "runs.prepare"
                 | "runs.commit"
+                | "runs.continuation.requeue"
                 | "runs.start_handoff.issue"
+                | "runs.start_handoff.approve_headless"
                 | "runs.start_handoff.restore"
                 | "runs.start_handoff.get"
                 | "runs.start_handoff.commit"
@@ -2493,6 +3062,7 @@ fn account_scoped_method(method: &str) -> bool {
                 | "editor.commit"
                 | "editor.respond"
                 | "editor.finalize"
+                | "workflows.patch"
                 | "interactions.respond"
                 | "interactions.decide"
         )
@@ -2513,13 +3083,21 @@ fn validate_params(p: &Value, schema: &Value) -> Result<()> {
             "string" => value.is_string(),
             "object" => value.is_object(),
             "integer" => value.as_u64().is_some(),
+            "number" => value.is_number(),
             "boolean" => value.is_boolean(),
             "null" => value.is_null(),
             "array" => value.as_array().is_some_and(|items| {
+                let item_schema = &s["items"];
                 items.len() >= s["minItems"].as_u64().unwrap_or(0) as usize
                     && items.iter().all(|item| {
-                        item.as_str()
-                            .is_some_and(|text| !text.is_empty() && text.len() <= 160)
+                        if item_schema["type"] == "object" {
+                            validate_params(item, item_schema).is_ok()
+                        } else if item_schema.is_null() {
+                            true
+                        } else {
+                            item.as_str()
+                                .is_some_and(|text| !text.is_empty() && text.len() <= 160)
+                        }
                     })
                     && (s["uniqueItems"] != true
                         || items
@@ -2580,6 +3158,12 @@ pub fn backend_route(method: &str, p: &Value) -> Result<(String, String, Option<
             .get("idempotencyKey")
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("INVALID_REQUEST"))?;
+    }
+    if method == "runs.continuation.requeue" {
+        body = json!({
+            "expectedContinuationDigest":p["expectedContinuationDigest"],
+            "idempotencyKey":p["idempotencyKey"],
+        });
     }
     let (verb, route) = match method {
         "workflows.list" => ("GET", "v1/workflows/".into()),
@@ -2664,6 +3248,14 @@ pub fn backend_route(method: &str, p: &Value) -> Result<(String, String, Option<
             "POST",
             format!("v1/executions/{}/delete/", required(p, "runId")?),
         ),
+        "runs.continuation.requeue" => (
+            "POST",
+            format!(
+                "v2/executions/{}/continuations/{}/requeue/",
+                required(p, "runId")?,
+                required(p, "deliveryId")?
+            ),
+        ),
         "interactions.list" => (
             "GET",
             if let Some(run) = p["runId"].as_str() {
@@ -2696,10 +3288,13 @@ pub fn backend_route(method: &str, p: &Value) -> Result<(String, String, Option<
             "GET",
             format!("v2/executions/{}/artifacts/", required(p, "runId")?),
         ),
-        "artifacts.read" => (
-            "GET",
-            format!("v2/artifacts/{}/content/", required(p, "artifactId")?),
-        ),
+        "artifacts.read" => {
+            Uuid::parse_str(required(p, "executionId")?).context("INVALID_REQUEST")?;
+            (
+                "GET",
+                format!("v2/artifacts/{}/content/", required(p, "artifactId")?),
+            )
+        }
         _ => bail!("METHOD_NOT_FOUND"),
     };
     if verb == "GET" {
@@ -2740,11 +3335,16 @@ pub fn provider_snapshot() -> Result<Value> {
 /// executable identity), but a CLI diagnostic should only say whether the
 /// executable can currently be used and why it cannot.
 pub fn provider_diagnostics() -> Value {
-    // Exercise the same discovery and validation path that preparation uses.
-    // A bad explicit provider binding makes `provider_snapshot` fail closed;
-    // resolve each adapter below so the operator can still see the state of
-    // the other providers.
-    let snapshot = provider_snapshot().ok();
+    provider_diagnostics_with(find_executable_result, |adapter| {
+        provider_executable_variable(adapter)
+            .is_some_and(|variable| std::env::var_os(variable).is_some())
+    })
+}
+
+fn provider_diagnostics_with(
+    mut resolve: impl FnMut(&str) -> Result<Option<PathBuf>>,
+    configured: impl Fn(&str) -> bool,
+) -> Value {
     let mut providers = serde_json::Map::new();
     for (provider, adapter) in [
         ("codex", "codex"),
@@ -2752,16 +3352,8 @@ pub fn provider_diagnostics() -> Value {
         ("gemini", "gemini"),
         ("antigravity", "agy"),
     ] {
-        let configured = provider_executable_variable(adapter)
-            .is_some_and(|variable| std::env::var_os(variable).is_some());
-        let (available, reason) = match find_executable_result(adapter) {
-            Ok(Some(_))
-                if snapshot
-                    .as_ref()
-                    .is_some_and(|value| value.get(provider).is_some()) =>
-            {
-                (true, "available")
-            }
+        let configured = configured(adapter);
+        let (available, reason) = match resolve(adapter) {
             Ok(Some(_)) => (true, "available"),
             Ok(None) => (false, "not_found"),
             Err(_) if configured => (false, "configured_path_invalid"),
@@ -2928,6 +3520,8 @@ pub async fn offline_logout(dir: &Path) -> Result<Value> {
 async fn finish_offline_logout(lock: std::fs::File, auth: Auth) -> Result<Value> {
     // The worker keeps exclusive ownership through native IO even if the caller
     // stops awaiting it. No later daemon may race protected credential cleanup.
+    let lock = Arc::new(lock);
+    auth.retain_store_owner(&lock);
     tokio::spawn(async move {
         let _lock = lock;
         auth.offline_logout().await
@@ -2936,7 +3530,8 @@ async fn finish_offline_logout(lock: std::fs::File, auth: Auth) -> Result<Value>
     .map_err(|_| anyhow::anyhow!("AUTH_LOGOUT_FAILED"))?
 }
 pub async fn serve(daemon: Arc<Daemon>) -> Result<()> {
-    let lock = daemon_lock(&daemon.dir)?;
+    let lock = Arc::new(daemon_lock(&daemon.dir)?);
+    daemon.auth.retain_store_owner(&lock);
     let socket = daemon.dir.join("control.sock");
     if let Ok(metadata) = std::fs::symlink_metadata(&socket) {
         use std::os::unix::fs::FileTypeExt;
@@ -3142,11 +3737,11 @@ pub async fn client(dir: &Path, method: &str, params: Value) -> Result<Value> {
 
 /// Lifecycle administration must be able to drain the previously installed
 /// daemon before activating a candidate with newer product capabilities.
-/// Limit this compatibility route to read-only status and the established
+/// Limit this compatibility route to local read-only status and the established
 /// drain operation; ordinary plugin and CLI calls retain full negotiation.
 pub(crate) async fn lifecycle_client(dir: &Path, method: &str, params: Value) -> Result<Value> {
     ensure!(
-        matches!(method, "status.get" | "daemon.drain"),
+        matches!(method, "status.get" | "auth.status" | "daemon.drain"),
         "INVALID_REQUEST"
     );
     client_with_semantics(dir, method, params, &[]).await
@@ -3245,6 +3840,46 @@ async fn exchange<R: tokio::io::AsyncBufRead + Unpin, W: tokio::io::AsyncWrite +
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn lifecycle_auth_status_uses_local_compatibility_route() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut read = BufReader::new(read);
+            let negotiation: Value =
+                serde_json::from_slice(&read_frame(&mut read).await.unwrap().unwrap()).unwrap();
+            assert_eq!(
+                negotiation["params"]["requiredCapabilities"],
+                json!(["method:auth.status"])
+            );
+            let mut bytes = serde_json::to_vec(
+                &json!({"protocol":PROTOCOL,"id":negotiation["id"],"result":{
+                "selectedProtocol":PROTOCOL,"serverVersion":"0.3.40","maxFrameBytes":MAX_FRAME,
+                "capabilities":["method:auth.status"]}}),
+            )
+            .unwrap();
+            bytes.push(b'\n');
+            write.write_all(&bytes).await.unwrap();
+            let request: Value =
+                serde_json::from_slice(&read_frame(&mut read).await.unwrap().unwrap()).unwrap();
+            assert_eq!(request["method"], "auth.status");
+            let mut bytes =
+                serde_json::to_vec(&json!({"protocol":PROTOCOL,"id":request["id"],"result":{
+                "authenticated":false,"code":"AUTH_REQUIRED"}}))
+                .unwrap();
+            bytes.push(b'\n');
+            write.write_all(&bytes).await.unwrap();
+        });
+        let status = lifecycle_client(temp.path(), "auth.status", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(status["result"]["code"], "AUTH_REQUIRED");
+        server.await.unwrap();
+    }
     #[tokio::test]
     async fn lifecycle_status_negotiates_across_a_new_auth_capability() {
         let temp = tempfile::tempdir().unwrap();
@@ -3382,6 +4017,30 @@ mod tests {
             assert!(provider.get("checksumSha256").is_none());
             assert!(provider.get("sizeBytes").is_none());
         }
+    }
+    #[test]
+    fn provider_diagnostics_uses_discovery_without_reading_executables() {
+        let mut resolved = Vec::new();
+        let diagnostics = provider_diagnostics_with(
+            |adapter| {
+                resolved.push(adapter.to_owned());
+                match adapter {
+                    // Discovery owns validation. Diagnostics must not open or hash
+                    // its returned path, which deliberately does not exist here.
+                    "codex" => Ok(Some(PathBuf::from("/nonexistent/loomex-codex"))),
+                    "claude" => Ok(None),
+                    "gemini" => Err(anyhow::anyhow!("PROVIDER_UNAVAILABLE")),
+                    "agy" => Err(anyhow::anyhow!("PROVIDER_UNAVAILABLE")),
+                    _ => unreachable!(),
+                }
+            },
+            |adapter| adapter == "gemini",
+        );
+        assert_eq!(resolved, ["codex", "claude", "gemini", "agy"]);
+        assert_eq!(diagnostics["codex"]["reason"], "available");
+        assert_eq!(diagnostics["claude"]["reason"], "not_found");
+        assert_eq!(diagnostics["gemini"]["reason"], "configured_path_invalid");
+        assert_eq!(diagnostics["antigravity"]["reason"], "unavailable");
     }
     #[test]
     fn public_errors_classify_local_validation_and_lifecycle_failures() {
@@ -3623,6 +4282,40 @@ mod tests {
         }
         assert!(!account_scoped_method("auth.login"));
         assert!(!account_scoped_method("organizations.select"));
+        assert!(account_scoped_method("workflows.patch"));
+    }
+    #[test]
+    fn patch_catalog_accepts_typed_operations_and_rejects_unknown_fields() {
+        let catalog: Value =
+            serde_json::from_str(include_str!("../contracts/method-catalog.json")).unwrap();
+        assert!(
+            catalog["capabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("workflows.patch.notes-preserve/v1"))
+        );
+        let schema = &catalog["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|method| method["name"] == "workflows.patch")
+            .unwrap()["inputSchema"];
+        let mut request = json!({"workflowId":Uuid::new_v4(),"expectedVersion":5,
+            "expectedDefinitionChecksum":"a".repeat(64),"idempotencyKey":Uuid::new_v4(),
+            "operations":[{"op":"replace","nodeKey":"review","path":"/config/rating","value":4}]});
+        assert!(validate_params(&request, schema).is_ok());
+        request["operations"][0]["value"] = json!(["a", "b"]);
+        assert!(validate_params(&request, schema).is_ok());
+        request["operations"][0]["unexpected"] = json!(true);
+        assert!(validate_params(&request, schema).is_err());
+        request["operations"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("unexpected");
+        request["notes"] = json!("");
+        assert!(validate_params(&request, schema).is_ok());
+        request["notes"] = Value::Null;
+        assert!(validate_params(&request, schema).is_err());
     }
     #[test]
     fn route_queries_are_encoded() {
@@ -3662,6 +4355,869 @@ mod conformance {
             ),
         )
         .unwrap()
+    }
+    fn continuation_requeue_input() -> Value {
+        json!({"runId":Uuid::new_v4(),"deliveryId":Uuid::new_v4(),
+            "expectedContinuationDigest":"a".repeat(64),"idempotencyKey":Uuid::new_v4()})
+    }
+    fn continuation_requeue_receipt(input: &Value) -> Value {
+        json!({"executionId":input["runId"],"deliveryId":input["deliveryId"],
+            "expectedContinuationDigest":input["expectedContinuationDigest"],
+            "requeued":true,"status":"pending"})
+    }
+    #[tokio::test]
+    async fn continuation_requeue_signed_exact_body_safe_receipt_and_cached_repeat() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = fixture(temp.path(), api.clone());
+        daemon.public.lock().await.active_organization =
+            Some("11111111-1111-4111-8111-111111111111".into());
+        let input = continuation_requeue_input();
+        let receipt = continuation_requeue_receipt(&input);
+        let backend = tokio::spawn({
+            let input = input.clone();
+            let receipt = receipt.clone();
+            async move {
+                let (stream, head, bytes) = receive_http_with_body(&listener).await;
+                assert!(head.starts_with(&format!("POST /api/v1/runner-control/runner/v2/executions/{}/continuations/{}/requeue/ HTTP/1.1",input["runId"].as_str().unwrap(),input["deliveryId"].as_str().unwrap())));
+                let headers = head.to_ascii_lowercase();
+                assert!(headers.contains("authorization: bearer lmxr_testprefix_testsecret"));
+                assert!(headers.contains("x-loomex-runner-proof: "));
+                assert!(headers.contains(&format!(
+                    "idempotency-key: {}",
+                    input["idempotencyKey"].as_str().unwrap()
+                )));
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&bytes).unwrap(),
+                    json!({"expectedContinuationDigest":input["expectedContinuationDigest"],"idempotencyKey":input["idempotencyKey"]})
+                );
+                let mut response = receipt;
+                response["providerOutput"] = json!("private-fixture-output");
+                response["details"] = json!({"command":"private-fixture-command"});
+                reply_http(stream, 200, response).await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                        .await
+                        .is_err()
+                );
+            }
+        });
+        assert_eq!(
+            daemon
+                .dispatch("runs.continuation.requeue", input.clone())
+                .await
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(
+            daemon
+                .dispatch("runs.continuation.requeue", input.clone())
+                .await
+                .unwrap(),
+            receipt
+        );
+        let restarted = fixture(temp.path(), api);
+        restarted.public.lock().await.active_organization =
+            Some("11111111-1111-4111-8111-111111111111".into());
+        assert_eq!(
+            restarted
+                .dispatch("runs.continuation.requeue", input.clone())
+                .await
+                .unwrap(),
+            receipt
+        );
+        restarted.public.lock().await.active_organization = Some(Uuid::new_v4().to_string());
+        assert_eq!(
+            restarted
+                .dispatch("runs.continuation.requeue", input.clone())
+                .await
+                .unwrap_err()
+                .to_string(),
+            "ORGANIZATION_NOT_ENROLLED"
+        );
+        restarted.public.lock().await.active_organization =
+            Some("11111111-1111-4111-8111-111111111111".into());
+        let mut changed = input;
+        changed["expectedContinuationDigest"] = json!("b".repeat(64));
+        assert_eq!(
+            restarted
+                .dispatch("runs.continuation.requeue", changed)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "IDEMPOTENCY_CONFLICT"
+        );
+        backend.await.unwrap();
+    }
+    #[tokio::test]
+    async fn continuation_requeue_lost_response_waits_for_explicit_same_key_reconciliation() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = fixture(temp.path(), api.clone());
+        daemon.public.lock().await.active_organization =
+            Some("11111111-1111-4111-8111-111111111111".into());
+        let input = continuation_requeue_input();
+        let receipt = continuation_requeue_receipt(&input);
+        let (quiet_tx, quiet_rx) = tokio::sync::oneshot::channel();
+        let backend = tokio::spawn({
+            let input = input.clone();
+            let receipt = receipt.clone();
+            async move {
+                let (stream, first_head, first_body) = receive_http_with_body(&listener).await;
+                drop(stream); // Backend accepted the operation but its response was lost.
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                        .await
+                        .is_err()
+                );
+                quiet_tx.send(()).unwrap();
+                let (stream, second_head, second_body) = receive_http_with_body(&listener).await;
+                assert_eq!(first_body, second_body);
+                for head in [first_head, second_head] {
+                    assert!(head.to_ascii_lowercase().contains(&format!(
+                        "idempotency-key: {}",
+                        input["idempotencyKey"].as_str().unwrap()
+                    )));
+                }
+                // The existing backend operation journal returns its original
+                // receipt, even when that continuation has since progressed.
+                reply_http(stream, 200, receipt).await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err()
+                );
+            }
+        });
+        let error = daemon
+            .dispatch("runs.continuation.requeue", input.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(public_error(&error).0, "NETWORK_AMBIGUOUS");
+        quiet_rx.await.unwrap();
+        let pending = std::fs::read_dir(temp.path().join("operations"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let journal: Value = state::read_json(&pending).unwrap();
+        assert_eq!(journal["status"], "pending");
+        assert_eq!(journal["method"], "runs.continuation.requeue");
+        assert!(journal.get("result").is_none());
+        let restarted = fixture(temp.path(), api);
+        restarted.public.lock().await.active_organization =
+            Some("11111111-1111-4111-8111-111111111111".into());
+        let mut changed = input.clone();
+        changed["deliveryId"] = json!(Uuid::new_v4());
+        assert_eq!(
+            restarted
+                .dispatch("runs.continuation.requeue", changed)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "IDEMPOTENCY_CONFLICT"
+        );
+        assert_eq!(
+            restarted
+                .dispatch("runs.continuation.requeue", input)
+                .await
+                .unwrap(),
+            receipt
+        );
+        backend.await.unwrap();
+    }
+    #[tokio::test]
+    async fn continuation_requeue_wrong_org_and_malformed_binding_never_dispatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = fixture(temp.path(), api);
+        let input = continuation_requeue_input();
+        assert_eq!(
+            daemon
+                .dispatch("runs.continuation.requeue", input.clone())
+                .await
+                .unwrap_err()
+                .to_string(),
+            "ORGANIZATION_REQUIRED"
+        );
+        daemon.public.lock().await.active_organization = Some(Uuid::new_v4().to_string());
+        assert_eq!(
+            daemon
+                .dispatch("runs.continuation.requeue", input.clone())
+                .await
+                .unwrap_err()
+                .to_string(),
+            "ORGANIZATION_NOT_ENROLLED"
+        );
+        daemon.public.lock().await.active_organization =
+            Some("11111111-1111-4111-8111-111111111111".into());
+        for digest in ["a".repeat(63), "A".repeat(64), "g".repeat(64)] {
+            let mut invalid = input.clone();
+            invalid["expectedContinuationDigest"] = json!(digest);
+            assert_eq!(
+                daemon
+                    .dispatch("runs.continuation.requeue", invalid)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "INVALID_REQUEST"
+            );
+        }
+        for field in ["runId", "deliveryId", "idempotencyKey"] {
+            let mut invalid = input.clone();
+            invalid[field] = json!("invalid");
+            assert_eq!(
+                daemon
+                    .dispatch("runs.continuation.requeue", invalid)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "INVALID_REQUEST"
+            );
+        }
+        let mut invalid = input;
+        invalid["organizationId"] = json!(Uuid::new_v4());
+        assert_eq!(
+            daemon
+                .dispatch("runs.continuation.requeue", invalid)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "INVALID_REQUEST"
+        );
+        assert!(!temp.path().join("operations").exists());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn continuation_requeue_backend_checkpoint_rejection_is_not_retried() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = fixture(temp.path(), api);
+        daemon.public.lock().await.active_organization =
+            Some("11111111-1111-4111-8111-111111111111".into());
+        let input = continuation_requeue_input();
+        let backend = tokio::spawn(async move {
+            let (stream, _) = receive_http(&listener).await;
+            reply_http(stream,409,json!({"error":{"code":"HUMAN_RESUME_RECOVERY_CONFLICT","message":"Private checkpoint explanation."}})).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let error = daemon
+            .dispatch("runs.continuation.requeue", input)
+            .await
+            .unwrap_err();
+        assert_eq!(public_error(&error).0, "HUMAN_RESUME_RECOVERY_CONFLICT");
+        assert_eq!(
+            state::error_recovery("HUMAN_RESUME_RECOVERY_CONFLICT"),
+            json!({"recovery":"refresh_authority","outcome":"rejected"})
+        );
+        backend.await.unwrap();
+    }
+    #[tokio::test]
+    async fn continuation_requeue_mismatched_receipt_never_enters_cache() {
+        for field in [
+            "executionId",
+            "deliveryId",
+            "expectedContinuationDigest",
+            "status",
+            "requeued",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api = Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+            let daemon = fixture(temp.path(), api);
+            daemon.public.lock().await.active_organization =
+                Some("11111111-1111-4111-8111-111111111111".into());
+            let input = continuation_requeue_input();
+            let mut receipt = continuation_requeue_receipt(&input);
+            receipt[field] = match field {
+                "expectedContinuationDigest" => json!("b".repeat(64)),
+                "status" => json!("completed"),
+                "requeued" => json!("true"),
+                _ => json!(Uuid::new_v4()),
+            };
+            let backend = tokio::spawn(async move {
+                let (stream, _) = receive_http(&listener).await;
+                reply_http(stream, 200, receipt).await;
+            });
+            assert_eq!(
+                daemon
+                    .dispatch("runs.continuation.requeue", input)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "BACKEND_PROTOCOL_ERROR"
+            );
+            backend.await.unwrap();
+            let pending = std::fs::read_dir(temp.path().join("operations"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            assert!(
+                state::read_json::<Value>(&pending)
+                    .unwrap()
+                    .get("result")
+                    .is_none()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn continuation_requeue_observation_is_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = fixture(temp.path(), api);
+        daemon.public.lock().await.active_organization =
+            Some("11111111-1111-4111-8111-111111111111".into());
+        let input = continuation_requeue_input();
+        let recovery = json!({"schemaVersion":"loomex.continuation-recovery/v1","executionId":input["runId"],"deliveryId":input["deliveryId"],"continuationDigest":input["expectedContinuationDigest"]});
+        let backend = tokio::spawn({
+            let input = input.clone();
+            let recovery = recovery.clone();
+            async move {
+                let (stream, head) = receive_http(&listener).await;
+                assert!(head.starts_with(&format!(
+                    "GET /api/v1/runner-control/runner/v1/executions/{}/",
+                    input["runId"].as_str().unwrap()
+                )));
+                reply_http(stream,200,json!({"execution":{"id":input["runId"],"status":"running"},"events":[],"latestSequence":7,"hasMoreEvents":false,"timedOut":false,"automation":{"recovery":recovery}})).await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                        .await
+                        .is_err()
+                );
+            }
+        });
+        let result = daemon
+            .dispatch("runs.get", json!({"runId":input["runId"]}))
+            .await
+            .unwrap();
+        assert_eq!(result["automation"]["recovery"], recovery);
+        assert!(!temp.path().join("operations").exists());
+        backend.await.unwrap();
+    }
+    #[test]
+    fn continuation_requeue_requires_capability_and_explicit_recovery_policy() {
+        let catalog: Value =
+            serde_json::from_str(include_str!("../contracts/method-catalog.json")).unwrap();
+        let method = catalog["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "runs.continuation.requeue")
+            .unwrap();
+        assert_eq!(method["transportRetry"], "never_after_send");
+        assert_eq!(
+            method["authorizationPolicy"],
+            "explicit_failed_continuation_recovery/v1"
+        );
+        assert_eq!(method["mutating"], true);
+        assert_eq!(method["idempotent"], true);
+        assert!(negotiate(&json!({"supportedProtocols":[PROTOCOL],"requiredCapabilities":["method:runs.continuation.requeue"]})).is_ok());
+        assert_eq!(negotiate(&json!({"supportedProtocols":[PROTOCOL],"requiredCapabilities":["method:runs.continuation.requeue","missing.continuation-recovery/v1"]})).unwrap_err().to_string(),"COMPATIBILITY_ERROR");
+        assert_eq!(
+            state::error_recovery("HUMAN_RESUME_RECOVERY_INVALID"),
+            json!({"recovery":"correct_input","outcome":"rejected"})
+        );
+        assert_eq!(
+            state::error_recovery("IDEMPOTENCY_KEY_CONFLICT"),
+            json!({"recovery":"correct_input","outcome":"rejected"})
+        );
+    }
+    #[tokio::test]
+    async fn continuation_requeue_failed_wire_negotiation_never_dispatches() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = Arc::new(fixture(temp.path(), api));
+        daemon.public.lock().await.active_organization =
+            Some("11111111-1111-4111-8111-111111111111".into());
+        let (client, server) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(connection(server, daemon));
+        let (read, mut write) = client.into_split();
+        let mut read = BufReader::new(read);
+        let rejected = exchange(
+            &mut read,
+            &mut write,
+            "protocol.negotiate",
+            json!({"supportedProtocols":[PROTOCOL],"requiredCapabilities":["method:runs.continuation.requeue","missing.continuation-recovery/v1"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rejected["error"]["code"], "COMPATIBILITY_ERROR");
+        let rejected = exchange(
+            &mut read,
+            &mut write,
+            "runs.continuation.requeue",
+            continuation_requeue_input(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rejected["error"]["code"], "COMPATIBILITY_ERROR");
+        assert!(!temp.path().join("operations").exists());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+        drop(write);
+        task.abort();
+    }
+    #[tokio::test]
+    async fn workflow_patch_reconciles_lost_update_response_without_resending() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = fixture(temp.path(), api);
+        daemon.public.lock().await.active_organization =
+            Some("11111111-1111-4111-8111-111111111111".into());
+        let workflow = Uuid::new_v4().to_string();
+        let key = Uuid::new_v4().to_string();
+        let checksum = "a".repeat(64);
+        let original = json!({"nodes":(0..21).map(|i|json!({"key":format!("n{i}"),"kind":"ai","config":{"prompt":"old"}})).collect::<Vec<_>>(),"transitions":[{"source":"n0","target":"n1"}]});
+        let mut canonical = original.clone();
+        canonical["nodes"][13]["config"]["prompt"] = json!("new");
+        let result = json!({"workflow":{"id":workflow},"draft":{"revision":6,"definition":canonical,"notes":"Keep this draft guidance"}});
+        let backend = tokio::spawn({
+            let workflow = workflow.clone();
+            let checksum = checksum.clone();
+            let original = original.clone();
+            let canonical = canonical.clone();
+            let result = result.clone();
+            let key = key.clone();
+            async move {
+                let (stream, head) = receive_http(&listener).await;
+                assert!(head.starts_with(&format!(
+                    "GET /api/v1/runner-control/runner/v1/workflows/{workflow}/?version=draft"
+                )));
+                reply_http(stream, 200, json!({"selectedVersion":{"workflowId":workflow,"status":"draft","revision":5,"definitionChecksum":checksum,"definition":original,"notes":"Keep this draft guidance"}})).await;
+                let (stream, head) = receive_http(&listener).await;
+                assert!(
+                    head.starts_with("POST /api/v1/runner-control/runner/v1/workflows/validate/")
+                );
+                reply_http(
+                    stream,
+                    200,
+                    json!({"valid":true,"workflow":canonical,"issues":[],"errors":[]}),
+                )
+                .await;
+                let (stream, head) = receive_http(&listener).await;
+                assert!(head.starts_with(&format!(
+                    "POST /api/v1/runner-control/runner/v1/workflows/{workflow}/draft/"
+                )));
+                drop(stream); // accepted outcome was lost before acknowledgement
+                let (stream, head) = receive_http(&listener).await;
+                assert!(
+                    head.starts_with(
+                        "POST /api/v1/runner-control/runner/v2/workflow-operations/get/"
+                    )
+                );
+                reply_http(stream, 200, json!({"operation":"workflows.update","idempotencyKey":key,"status":"completed","response":result})).await;
+            }
+        });
+        let input = json!({"workflowId":workflow,"expectedVersion":5,"expectedDefinitionChecksum":checksum,
+            "operations":[{"op":"replace","nodeKey":"n13","path":"/config/prompt","value":"new"}],"idempotencyKey":key});
+        assert!(
+            daemon
+                .dispatch("workflows.patch", input.clone())
+                .await
+                .is_err()
+        );
+        let reconciled = daemon.dispatch("workflows.patch", input).await.unwrap();
+        assert_eq!(reconciled, result);
+        backend.await.unwrap();
+    }
+
+    // The installed 0.3.56 runner wrote this journal shape before notes were
+    // part of the patch contract. In particular, its identity omitted the
+    // requestedNotes key and its exact update body omitted notes.
+    fn write_legacy_patch_journal(
+        daemon: &Daemon,
+        workflow: &str,
+        checksum: &str,
+        key: &str,
+        definition: &Value,
+    ) -> Value {
+        let org = "11111111-1111-4111-8111-111111111111";
+        let account = "22222222-2222-4222-8222-222222222222";
+        let operations =
+            json!([{"op":"replace","nodeKey":"n","path":"/config/prompt","value":"new"}]);
+        let body = json!({"definition":definition,"expectedVersion":5});
+        let identity = state::json_digest(&json!({
+            "organizationId":org,"accountSubject":account,"workflowId":workflow,
+            "expectedVersion":5,"expectedDefinitionChecksum":checksum,
+            "operations":operations,"idempotencyKey":key,
+        }));
+        let path = daemon.dir.join("workflow-patches").join(format!(
+            "{}.json",
+            state::json_digest(
+                &json!({"organizationId":org,"accountSubject":account,"idempotencyKey":key})
+            )
+        ));
+        state::write_json(
+            &path,
+            &json!({
+                "identity":identity,"workflowId":workflow,"expectedVersion":5,
+                "expectedDefinitionChecksum":checksum,
+                "updateDigest":state::json_digest(definition),
+                "payloadDigest":state::json_digest(&body),
+                "updateBody":body,"status":"submitted"
+            }),
+        )
+        .unwrap();
+        json!({"workflowId":workflow,"expectedVersion":5,"expectedDefinitionChecksum":checksum,
+            "operations":operations,"idempotencyKey":key})
+    }
+
+    #[tokio::test]
+    async fn installed_legacy_patch_journal_reconciles_completed_receipt_without_invented_notes() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = fixture(temp.path(), api);
+        let workflow = Uuid::new_v4().to_string();
+        let key = Uuid::new_v4().to_string();
+        let checksum = "a".repeat(64);
+        let definition = json!({"nodes":[{"key":"n","config":{"prompt":"new"}}],"transitions":[]});
+        let input = write_legacy_patch_journal(&daemon, &workflow, &checksum, &key, &definition);
+        let result = json!({"workflow":{"id":workflow},"draft":{"revision":6,"definition":definition,"notes":"runner draft save"}});
+        let backend = tokio::spawn({
+            let result = result.clone();
+            let key = key.clone();
+            async move {
+                let (stream, head) = receive_http(&listener).await;
+                assert!(head.contains("/v2/workflow-operations/get/"));
+                reply_http(stream, 200, json!({"operation":"workflows.update","idempotencyKey":key,"status":"completed","response":result})).await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err()
+                );
+            }
+        });
+        assert_eq!(
+            daemon
+                .patch_workflow_draft("11111111-1111-4111-8111-111111111111", &input)
+                .await
+                .unwrap(),
+            result
+        );
+        backend.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn installed_legacy_patch_journal_retries_only_original_body_after_not_found() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = fixture(temp.path(), api);
+        let workflow = Uuid::new_v4().to_string();
+        let key = Uuid::new_v4().to_string();
+        let checksum = "b".repeat(64);
+        let definition = json!({"nodes":[{"key":"n","config":{"prompt":"new"}}],"transitions":[]});
+        let input = write_legacy_patch_journal(&daemon, &workflow, &checksum, &key, &definition);
+        let result = json!({"workflow":{"id":workflow},"draft":{"revision":6,"definition":definition,"notes":"runner draft save"}});
+        let backend = tokio::spawn({
+            let workflow = workflow.clone();
+            let key = key.clone();
+            let definition = definition.clone();
+            let result = result.clone();
+            async move {
+                let (stream, head) = receive_http(&listener).await;
+                assert!(head.contains("/v2/workflow-operations/get/"));
+                reply_http(stream, 200, json!({"operation":"workflows.update","idempotencyKey":key,"status":"not_found"})).await;
+                let (stream, head, body) = receive_http_with_body(&listener).await;
+                assert!(head.contains(&format!("/v1/workflows/{workflow}/draft/")));
+                assert!(head.contains(&key));
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&body).unwrap(),
+                    json!({"definition":definition,"expectedVersion":5})
+                );
+                reply_http(stream, 200, result).await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err()
+                );
+            }
+        });
+        assert_eq!(
+            daemon
+                .patch_workflow_draft("11111111-1111-4111-8111-111111111111", &input)
+                .await
+                .unwrap(),
+            result
+        );
+        backend.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workflow_patch_retries_only_exact_journaled_update_after_receipt_not_found() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = fixture(temp.path(), api);
+        daemon.public.lock().await.active_organization =
+            Some("11111111-1111-4111-8111-111111111111".into());
+        let workflow = Uuid::new_v4().to_string();
+        let key = Uuid::new_v4().to_string();
+        let checksum = "d".repeat(64);
+        let original = json!({"nodes":[{"key":"n","config":{"prompt":"old"}}],"transitions":[]});
+        let canonical = json!({"nodes":[{"key":"n","config":{"prompt":"new"}}],"transitions":[]});
+        let result = json!({"workflow":{"id":workflow},"draft":{"revision":6,"definition":canonical,"notes":"Keep this draft guidance"}});
+        let backend = tokio::spawn({
+            let workflow = workflow.clone();
+            let key = key.clone();
+            let checksum = checksum.clone();
+            let original = original.clone();
+            let canonical = canonical.clone();
+            let result = result.clone();
+            async move {
+                let (stream, _) = receive_http(&listener).await;
+                reply_http(stream, 200, json!({"selectedVersion":{"workflowId":workflow,"status":"draft","revision":5,"definitionChecksum":checksum,"definition":original,"notes":"Keep this draft guidance"}})).await;
+                let (stream, _) = receive_http(&listener).await;
+                reply_http(
+                    stream,
+                    200,
+                    json!({"valid":true,"workflow":canonical,"issues":[],"errors":[]}),
+                )
+                .await;
+                let (stream, original_head, original_body) =
+                    receive_http_with_body(&listener).await;
+                assert!(original_head.contains(&format!("/v1/workflows/{workflow}/draft/")));
+                assert!(original_head.contains(&key));
+                drop(stream); // transport ended before backend committed any update
+                let (stream, head) = receive_http(&listener).await;
+                assert!(head.contains("/v2/workflow-operations/get/"));
+                reply_http(stream, 200, json!({"operation":"workflows.update","idempotencyKey":key,"status":"not_found"})).await;
+                let (stream, repeated_head, repeated_body) =
+                    receive_http_with_body(&listener).await;
+                assert!(repeated_head.contains(&format!("/v1/workflows/{workflow}/draft/")));
+                assert!(repeated_head.contains(&key));
+                assert_eq!(original_body, repeated_body);
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&repeated_body).unwrap(),
+                    json!({"definition":canonical,"expectedVersion":5})
+                );
+                reply_http(stream, 200, result).await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err()
+                );
+            }
+        });
+        let input = json!({"workflowId":workflow,"expectedVersion":5,"expectedDefinitionChecksum":checksum,
+            "operations":[{"op":"replace","nodeKey":"n","path":"/config/prompt","value":"new"}],"idempotencyKey":key});
+        assert!(
+            daemon
+                .dispatch("workflows.patch", input.clone())
+                .await
+                .is_err()
+        );
+        let recovered = daemon.dispatch("workflows.patch", input).await.unwrap();
+        assert_eq!(recovered, result);
+        backend.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplicate_workflow_patches_send_one_backend_update() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = fixture(temp.path(), api);
+        daemon.public.lock().await.active_organization =
+            Some("11111111-1111-4111-8111-111111111111".into());
+        let workflow = Uuid::new_v4().to_string();
+        let checksum = "e".repeat(64);
+        let canonical = json!({"nodes":[{"key":"n","config":{"prompt":"new"}}],"transitions":[]});
+        let result = json!({"workflow":{"id":workflow},"draft":{"revision":6,"definition":canonical,"notes":"Keep this draft guidance"}});
+        let backend = tokio::spawn({
+            let workflow = workflow.clone();
+            let checksum = checksum.clone();
+            let canonical = canonical.clone();
+            let result = result.clone();
+            async move {
+                let (stream, _) = receive_http(&listener).await;
+                reply_http(stream, 200, json!({"selectedVersion":{"workflowId":workflow,"status":"draft","revision":5,"definitionChecksum":checksum,"definition":{"nodes":[{"key":"n","config":{"prompt":"old"}}],"transitions":[]},"notes":"Keep this draft guidance"}})).await;
+                let (stream, _) = receive_http(&listener).await;
+                reply_http(
+                    stream,
+                    200,
+                    json!({"valid":true,"workflow":canonical,"issues":[],"errors":[]}),
+                )
+                .await;
+                let (stream, head) = receive_http(&listener).await;
+                assert!(head.contains(&format!("/v1/workflows/{workflow}/draft/")));
+                reply_http(stream, 200, result).await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err()
+                );
+            }
+        });
+        let input = json!({"workflowId":workflow,"expectedVersion":5,"expectedDefinitionChecksum":checksum,
+            "operations":[{"op":"replace","nodeKey":"n","path":"/config/prompt","value":"new"}],"idempotencyKey":Uuid::new_v4()});
+        let (first, second) = tokio::join!(
+            daemon.dispatch("workflows.patch", input.clone()),
+            daemon.dispatch("workflows.patch", input)
+        );
+        assert_eq!(first.unwrap(), result);
+        assert_eq!(second.unwrap(), result);
+        backend.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workflow_patch_explicit_empty_notes_are_sent_and_verified() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = fixture(temp.path(), api);
+        daemon.public.lock().await.active_organization =
+            Some("11111111-1111-4111-8111-111111111111".into());
+        let workflow = Uuid::new_v4().to_string();
+        let checksum = "f".repeat(64);
+        let canonical = json!({"nodes":[{"key":"n","config":{"prompt":"new"}}],"transitions":[]});
+        let result = json!({"workflow":{"id":workflow},"draft":{"revision":6,"definition":canonical,"notes":""}});
+        let backend = tokio::spawn({
+            let workflow = workflow.clone();
+            let checksum = checksum.clone();
+            let canonical = canonical.clone();
+            let result = result.clone();
+            async move {
+                let (stream, _) = receive_http(&listener).await;
+                reply_http(stream, 200, json!({"selectedVersion":{"workflowId":workflow,"status":"draft","revision":5,"definitionChecksum":checksum,"definition":{"nodes":[{"key":"n","config":{"prompt":"old"}}],"transitions":[]},"notes":"Prior guidance"}})).await;
+                let (stream, _) = receive_http(&listener).await;
+                reply_http(
+                    stream,
+                    200,
+                    json!({"valid":true,"workflow":canonical,"issues":[],"errors":[]}),
+                )
+                .await;
+                let (stream, _, body) = receive_http_with_body(&listener).await;
+                assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["notes"], "");
+                reply_http(stream, 200, result).await;
+            }
+        });
+        let input = json!({"workflowId":workflow,"expectedVersion":5,"expectedDefinitionChecksum":checksum,
+            "operations":[{"op":"replace","nodeKey":"n","path":"/config/prompt","value":"new"}],
+            "notes":"","idempotencyKey":Uuid::new_v4()});
+        assert_eq!(
+            daemon.dispatch("workflows.patch", input).await.unwrap(),
+            result
+        );
+        backend.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workflow_patch_validation_failure_never_sends_update() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = fixture(temp.path(), api);
+        daemon.public.lock().await.active_organization =
+            Some("11111111-1111-4111-8111-111111111111".into());
+        let workflow = Uuid::new_v4().to_string();
+        let checksum = "b".repeat(64);
+        let backend = tokio::spawn({
+            let workflow = workflow.clone();
+            let checksum = checksum.clone();
+            async move {
+                let (stream, _) = receive_http(&listener).await;
+                reply_http(stream, 200, json!({"selectedVersion":{"workflowId":workflow,"status":"draft","revision":5,"definitionChecksum":checksum,"definition":{"nodes":[{"key":"n","config":{"prompt":"old"}}],"transitions":[]},"notes":"Keep this draft guidance"}})).await;
+                let (stream, head) = receive_http(&listener).await;
+                assert!(head.contains("/v1/workflows/validate/"));
+                reply_http(stream, 200, json!({"valid":false,"issues":[{"code":"NODE_INVALID","path":"nodes[0].config"}],"errors":["invalid"]})).await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err()
+                );
+            }
+        });
+        let input = json!({"workflowId":workflow,"expectedVersion":5,"expectedDefinitionChecksum":checksum,
+            "operations":[{"op":"replace","nodeKey":"n","path":"/config/prompt","value":"bad"}],"idempotencyKey":Uuid::new_v4()});
+        let error = daemon.dispatch("workflows.patch", input).await.unwrap_err();
+        assert_eq!(public_error(&error).0, "WORKFLOW_PATCH_VALIDATION_FAILED");
+        assert_eq!(
+            public_error(&error).2.unwrap()["authoringIssues"][0]["code"],
+            "NODE_INVALID"
+        );
+        backend.await.unwrap();
+    }
+    #[tokio::test]
+    async fn workflow_patch_definitive_revision_conflict_is_not_resent() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = fixture(temp.path(), api);
+        daemon.public.lock().await.active_organization =
+            Some("11111111-1111-4111-8111-111111111111".into());
+        let workflow = Uuid::new_v4().to_string();
+        let checksum = "c".repeat(64);
+        let backend = tokio::spawn({
+            let workflow = workflow.clone();
+            let checksum = checksum.clone();
+            async move {
+                let (stream, _) = receive_http(&listener).await;
+                reply_http(stream, 200, json!({"selectedVersion":{"workflowId":workflow,"status":"draft","revision":5,"definitionChecksum":checksum,"definition":{"nodes":[{"key":"n","config":{"prompt":"old"}}],"transitions":[]},"notes":"Keep this draft guidance"}})).await;
+                let (stream, _) = receive_http(&listener).await;
+                reply_http(stream, 200, json!({"valid":true,"workflow":{"nodes":[{"key":"n","config":{"prompt":"new"}}],"transitions":[]},"issues":[],"errors":[]})).await;
+                let (stream, head) = receive_http(&listener).await;
+                assert!(head.contains(&format!("/v1/workflows/{workflow}/draft/")));
+                reply_http(
+                    stream,
+                    409,
+                    json!({"error":{"code":"REVISION_CONFLICT","message":"The draft changed."}}),
+                )
+                .await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err()
+                );
+            }
+        });
+        let input = json!({"workflowId":workflow,"expectedVersion":5,"expectedDefinitionChecksum":checksum,
+            "operations":[{"op":"replace","nodeKey":"n","path":"/config/prompt","value":"new"}],"idempotencyKey":Uuid::new_v4()});
+        let first = daemon
+            .dispatch("workflows.patch", input.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(public_error(&first).0, "REVISION_CONFLICT");
+        let repeated = daemon.dispatch("workflows.patch", input).await.unwrap_err();
+        assert_eq!(public_error(&repeated).0, "REVISION_CONFLICT");
+        backend.await.unwrap();
     }
     #[tokio::test]
     async fn workflow_operation_reconciliation_uses_mutation_key_without_replaying_local_mutation()
@@ -4243,6 +5799,419 @@ mod conformance {
         assert_eq!(status["nextAction"], "reconcile");
         assert!(status.get("runId").is_none());
     }
+    async fn headless_preparation_fixture(daemon: &Daemon, root: &Path) -> Value {
+        let org = "11111111-1111-4111-8111-111111111111";
+        daemon.public.lock().await.active_organization = Some(org.into());
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        daemon
+            .dispatch(
+                "workspaces.grant",
+                json!({"workspacePath":workspace,"idempotencyKey":Uuid::new_v4()}),
+            )
+            .await
+            .unwrap();
+        let preparation = Uuid::new_v4().to_string();
+        let confirmation = Uuid::new_v4().to_string();
+        let digest = "a".repeat(64);
+        let review = json!({
+            "preparationId":preparation,"bindingDigest":digest,
+            "binding":{"organizationId":org,"runnerId":"22222222-2222-4222-8222-222222222222","installationId":"00000000-0000-4000-8000-000000000001","workspacePath":workspace,"workflowId":Uuid::new_v4(),"versionId":Uuid::new_v4(),"executionPolicy":"host_user/v1","inputs":{"idea":"test"},"providerConfiguration":{}},
+            "limits":{},"expiresAt":null,"confirmationKey":confirmation,
+        });
+        state::write_json(&root.join("preparations").join(format!("{preparation}.json")), &json!({
+            "operation":"runs.prepare","organizationId":org,"accountSubject":"22222222-2222-4222-8222-222222222222","installationId":"00000000-0000-4000-8000-000000000001",
+            "workspacePath":workspace,"bindingDigest":digest,"binding":review["binding"],"confirmationKey":confirmation,"providers":provider_snapshot().unwrap(),"review":review,
+        })).unwrap();
+        json!({"preparationId":preparation,"bindingDigest":digest,"idempotencyKey":Uuid::new_v4()})
+    }
+
+    #[tokio::test]
+    async fn headless_start_and_direct_commit_share_one_backend_effect() {
+        for headless_first in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let daemon = fixture(
+                temp.path(),
+                Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                    .unwrap(),
+            );
+            let params = headless_preparation_fixture(&daemon, temp.path()).await;
+            let approved = if headless_first {
+                Some(
+                    daemon
+                        .dispatch("runs.start_handoff.approve_headless", params.clone())
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let prep: Value = state::read_json(&temp.path().join("preparations").join(format!(
+                "{}.json",
+                params["preparationId"].as_str().unwrap()
+            )))
+            .unwrap();
+            let run = Uuid::new_v4().to_string();
+            let result = json!({"execution":{"id":run,"status":"queued"},"executionId":run,"preparationId":params["preparationId"],"executionPolicy":"host_user/v1"});
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = calls.clone();
+            let (stop, mut stopped) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = &mut stopped => break,
+                        request = receive_http(&listener) => {let (stream,head)=request;
+                            assert!(head.starts_with("POST /api/v1/runner-control/runner/v2/executions/commit/ HTTP/1.1"));
+                            observed.fetch_add(1,Ordering::SeqCst);reply_http(stream,200,result.clone()).await;}
+                    }
+                }
+            });
+            let direct = json!({"preparationId":params["preparationId"],"bindingDigest":params["bindingDigest"],"confirmationKey":prep["confirmationKey"],"idempotencyKey":Uuid::new_v4()});
+            if let Some(approved) = approved {
+                let commit = json!({"handoffRef":approved["handoffRef"]});
+                let (handoff_result, direct_result) = tokio::join!(
+                    daemon.dispatch("runs.start_handoff.commit", commit.clone()),
+                    daemon.dispatch("runs.commit", direct)
+                );
+                assert!(handoff_result.is_ok());
+                assert!(direct_result.is_err());
+                assert_eq!(
+                    daemon
+                        .dispatch("runs.start_handoff.commit", commit)
+                        .await
+                        .unwrap()["runId"],
+                    run
+                );
+                assert_eq!(
+                    daemon
+                        .dispatch("runs.start_handoff.approve_headless", params)
+                        .await
+                        .unwrap()["runId"],
+                    run
+                );
+            } else {
+                let accepted = daemon
+                    .dispatch("runs.commit", direct.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    daemon
+                        .dispatch("runs.commit", direct.clone())
+                        .await
+                        .unwrap(),
+                    accepted
+                );
+                assert!(
+                    daemon
+                        .dispatch("runs.start_handoff.approve_headless", params)
+                        .await
+                        .is_err()
+                );
+                let mut replacement = direct;
+                replacement["idempotencyKey"] = json!(Uuid::new_v4());
+                assert!(daemon.dispatch("runs.commit", replacement).await.is_err());
+                assert!(!temp.path().join("start-handoffs").exists());
+            }
+            let _ = stop.send(());
+            server.await.unwrap();
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "one backend effect; headless_first={headless_first}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn headless_start_commit_rejects_review_changes_after_approval() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = fixture(
+            temp.path(),
+            Api::for_test_origin("http://127.0.0.1:9").unwrap(),
+        );
+        let params = headless_preparation_fixture(&daemon, temp.path()).await;
+        let approved = daemon
+            .dispatch("runs.start_handoff.approve_headless", params.clone())
+            .await
+            .unwrap();
+        let prep_path = temp.path().join("preparations").join(format!(
+            "{}.json",
+            params["preparationId"].as_str().unwrap()
+        ));
+        let handoff_path = temp
+            .path()
+            .join("start-handoffs")
+            .join(format!("{}.json", approved["handoffRef"].as_str().unwrap()));
+        let prep: Value = state::read_json(&prep_path).unwrap();
+        let handoff: Value = state::read_json(&handoff_path).unwrap();
+        for field in [
+            "executionPolicy",
+            "inputs",
+            "providerConfiguration",
+            "versionId",
+        ] {
+            let mut changed = prep.clone();
+            changed["binding"][field] = json!("changed");
+            changed["review"]["binding"] = changed["binding"].clone();
+            state::write_json(&prep_path, &changed).unwrap();
+            state::write_json(&handoff_path, &handoff).unwrap();
+            assert_eq!(
+                daemon
+                    .dispatch(
+                        "runs.start_handoff.commit",
+                        json!({"handoffRef":approved["handoffRef"]})
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "START_HANDOFF_STALE",
+                "{field}"
+            );
+        }
+        assert!(
+            state::read_json::<Value>(&prep_path)
+                .unwrap()
+                .get("commitAuthorization")
+                .is_none()
+        );
+        assert!(!temp.path().join("run-bindings").exists());
+    }
+
+    #[tokio::test]
+    async fn headless_start_rejects_stale_foreign_and_changed_reviews_before_approval() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = fixture(
+            temp.path(),
+            Api::for_test_origin("http://127.0.0.1:9").unwrap(),
+        );
+        let params = headless_preparation_fixture(&daemon, temp.path()).await;
+        let prep_path = temp.path().join("preparations").join(format!(
+            "{}.json",
+            params["preparationId"].as_str().unwrap()
+        ));
+        let original: Value = state::read_json(&prep_path).unwrap();
+        let changes = [
+            ("/review/expiresAt", json!(0)),
+            ("/review/bindingDigest", json!("b".repeat(64))),
+            ("/review/binding/inputs", json!({"idea":"changed"})),
+            (
+                "/review/binding/providerConfiguration",
+                json!({"requested":{"model":"changed"}}),
+            ),
+            ("/providers", json!({"changed":true})),
+            ("/organizationId", json!(Uuid::new_v4())),
+            ("/accountSubject", json!(Uuid::new_v4())),
+            ("/installationId", json!(Uuid::new_v4())),
+        ];
+        for (pointer, value) in changes {
+            let mut changed = original.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            state::write_json(&prep_path, &changed).unwrap();
+            assert!(
+                daemon
+                    .dispatch("runs.start_handoff.approve_headless", params.clone())
+                    .await
+                    .is_err(),
+                "{pointer}"
+            );
+        }
+        let mut changed = original.clone();
+        changed["binding"]["executionPolicy"] = json!("other/v1");
+        changed["review"]["binding"] = changed["binding"].clone();
+        state::write_json(&prep_path, &changed).unwrap();
+        assert!(
+            daemon
+                .dispatch("runs.start_handoff.approve_headless", params.clone())
+                .await
+                .is_err()
+        );
+        state::write_json(&prep_path, &original).unwrap();
+        let mut wrong_digest = params.clone();
+        wrong_digest["bindingDigest"] = json!("b".repeat(64));
+        assert!(
+            daemon
+                .dispatch("runs.start_handoff.approve_headless", wrong_digest)
+                .await
+                .is_err()
+        );
+        daemon.public.lock().await.grants.clear();
+        assert!(
+            daemon
+                .dispatch("runs.start_handoff.approve_headless", params.clone())
+                .await
+                .is_err()
+        );
+        std::fs::remove_file(prep_path).unwrap();
+        assert!(
+            daemon
+                .dispatch("runs.start_handoff.approve_headless", params)
+                .await
+                .is_err()
+        );
+        assert!(!temp.path().join("start-handoffs").exists());
+    }
+
+    #[tokio::test]
+    async fn headless_start_different_keys_and_app_reservations_never_duplicate_or_promote() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = fixture(
+            temp.path(),
+            Api::for_test_origin("http://127.0.0.1:9").unwrap(),
+        );
+        let params = headless_preparation_fixture(&daemon, temp.path()).await;
+        let prep: Value = state::read_json(&temp.path().join("preparations").join(format!(
+            "{}.json",
+            params["preparationId"].as_str().unwrap()
+        )))
+        .unwrap();
+        let app_issue = json!({"preparationId":params["preparationId"],"bindingDigest":params["bindingDigest"],"confirmationKey":prep["confirmationKey"],"idempotencyKey":Uuid::new_v4()});
+        let issued = daemon
+            .dispatch("runs.start_handoff.issue", app_issue)
+            .await
+            .unwrap();
+        assert_eq!(
+            daemon
+                .dispatch("runs.start_handoff.approve_headless", params.clone())
+                .await
+                .unwrap_err()
+                .to_string(),
+            "START_HANDOFF_PREPARATION_RESERVED"
+        );
+        let current = daemon
+            .dispatch(
+                "runs.start_handoff.get",
+                json!({"handoffRef":issued["handoffRef"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(current["lifecycle"], "prepared");
+        assert_eq!(current["approvalObserved"], false);
+        let temp2 = tempfile::tempdir().unwrap();
+        let daemon2 = fixture(
+            temp2.path(),
+            Api::for_test_origin("http://127.0.0.1:9").unwrap(),
+        );
+        let first = headless_preparation_fixture(&daemon2, temp2.path()).await;
+        let mut second = first.clone();
+        second["idempotencyKey"] = json!(Uuid::new_v4());
+        let (a, b) = tokio::join!(
+            daemon2.dispatch("runs.start_handoff.approve_headless", first.clone()),
+            daemon2.dispatch("runs.start_handoff.approve_headless", second)
+        );
+        assert_ne!(a.is_ok(), b.is_ok());
+        assert_eq!(
+            std::fs::read_dir(temp2.path().join("start-handoffs"))
+                .unwrap()
+                .count(),
+            1
+        );
+        if a.is_ok() {
+            let mut conflict = first.clone();
+            conflict["bindingDigest"] = json!("b".repeat(64));
+            assert_eq!(
+                daemon2
+                    .dispatch("runs.start_handoff.approve_headless", conflict)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "IDEMPOTENCY_CONFLICT"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn headless_start_restart_and_ui_race_preserve_original_approval() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = Api::for_test_origin("http://127.0.0.1:9").unwrap();
+        let daemon = fixture(temp.path(), api.clone());
+        let params = headless_preparation_fixture(&daemon, temp.path()).await;
+        let prep: Value = state::read_json(&temp.path().join("preparations").join(format!(
+            "{}.json",
+            params["preparationId"].as_str().unwrap()
+        )))
+        .unwrap();
+        let issued=daemon.issue_run_start_handoff_with_request("11111111-1111-4111-8111-111111111111",&json!({"preparationId":params["preparationId"],"bindingDigest":params["bindingDigest"],"confirmationKey":prep["confirmationKey"],"idempotencyKey":params["idempotencyKey"]}),Some(&params)).await.unwrap();
+        let handoff = issued["handoffRef"].as_str().unwrap();
+        let (a, b) = tokio::join!(
+            daemon.dispatch("runs.start_handoff.approve_headless", params.clone()),
+            daemon.dispatch(
+                "runs.start_handoff.approve",
+                json!({"handoffRef":handoff,"idempotencyKey":Uuid::new_v4()})
+            )
+        );
+        assert!(a.is_ok() || b.is_ok());
+        let path = temp
+            .path()
+            .join("start-handoffs")
+            .join(format!("{handoff}.json"));
+        let before: Value = state::read_json(&path).unwrap();
+        assert_eq!(before["lifecycle"], "approved");
+        drop(daemon);
+        let restarted = fixture(temp.path(), api);
+        restarted.public.lock().await.active_organization =
+            Some("11111111-1111-4111-8111-111111111111".into());
+        assert_eq!(
+            restarted
+                .dispatch("runs.start_handoff.approve_headless", params.clone())
+                .await
+                .unwrap()["handoffRef"],
+            handoff
+        );
+        assert_eq!(state::read_json::<Value>(&path).unwrap(), before);
+        let mut ambiguous = before.clone();
+        ambiguous["lifecycle"] = json!("ambiguous");
+        state::write_json(&path, &ambiguous).unwrap();
+        let current = restarted
+            .dispatch("runs.start_handoff.approve_headless", params)
+            .await
+            .unwrap();
+        assert_eq!(current["lifecycle"], "ambiguous");
+        assert_eq!(current["nextAction"], "reconcile");
+        assert_eq!(
+            state::read_json::<Value>(&path).unwrap()["approval"],
+            before["approval"]
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_start_approves_exact_review_without_disclosing_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = fixture(
+            temp.path(),
+            Api::for_test_origin("http://127.0.0.1:9").unwrap(),
+        );
+        let params = headless_preparation_fixture(&daemon, temp.path()).await;
+        let approved = daemon
+            .dispatch("runs.start_handoff.approve_headless", params.clone())
+            .await
+            .unwrap();
+        assert_eq!(approved["lifecycle"], "approved");
+        assert_eq!(approved["nextAction"], "commit");
+        let handoff = approved["handoffRef"].as_str().unwrap();
+        let record: Value = state::read_json(
+            &temp
+                .path()
+                .join("start-handoffs")
+                .join(format!("{handoff}.json")),
+        )
+        .unwrap();
+        assert_eq!(record["approval"]["source"], "headless_mcp");
+        assert!(
+            !approved
+                .to_string()
+                .contains(record["review"]["confirmationKey"].as_str().unwrap())
+        );
+        assert!(!temp.path().join("run-bindings").exists());
+        assert_eq!(
+            daemon
+                .dispatch("runs.start_handoff.approve_headless", params)
+                .await
+                .unwrap(),
+            approved
+        );
+    }
+
     #[tokio::test]
     async fn run_start_handoff_requires_app_only_approval_and_keeps_the_review_immutable() {
         let temp = tempfile::tempdir().unwrap();
@@ -4265,7 +6234,7 @@ mod conformance {
         let confirmation = Uuid::new_v4().to_string();
         let review = json!({
             "preparationId":preparation, "bindingDigest":"digest",
-            "binding":{"organizationId":org,"runnerId":"22222222-2222-4222-8222-222222222222","installationId":"00000000-0000-4000-8000-000000000001","workspacePath":workspace,"workflowId":Uuid::new_v4(),"versionId":Uuid::new_v4()},
+            "binding":{"organizationId":org,"runnerId":"22222222-2222-4222-8222-222222222222","installationId":"00000000-0000-4000-8000-000000000001","workspacePath":workspace,"workflowId":Uuid::new_v4(),"versionId":Uuid::new_v4(),"workflowClosure":[{"workflowId":Uuid::new_v4(),"workflowVersionId":Uuid::new_v4(),"version":1,"nodeDependencies":{}}]},
             "limits":{}, "expiresAt":null, "confirmationKey":confirmation,
         });
         state::write_json(&temp.path().join("preparations").join(format!("{preparation}.json")), &json!({
@@ -4299,6 +6268,38 @@ mod conformance {
                 .unwrap_err()
                 .to_string(),
             "START_HANDOFF_UNAPPROVED"
+        );
+        // New handoffs store the compact review. A handoff written by an
+        // earlier runner can still contain the full closure; both must check
+        // against the same sealed preparation, with no weaker comparison.
+        let handoff_path = temp
+            .path()
+            .join("start-handoffs")
+            .join(format!("{handoff_ref}.json"));
+        let mut historical: Value = state::read_json(&handoff_path).unwrap();
+        assert!(
+            daemon
+                .handoff_review_is_valid(org, &historical)
+                .await
+                .unwrap()
+        );
+        historical["review"] = review.clone();
+        historical["binding"] = review["binding"].clone();
+        state::write_json(&handoff_path, &historical).unwrap();
+        assert!(
+            daemon
+                .handoff_review_is_valid(org, &historical)
+                .await
+                .unwrap()
+        );
+        let mut tampered = historical.clone();
+        tampered["review"]["binding"]["workflowClosure"][0]["version"] = json!(2);
+        tampered["binding"] = tampered["review"]["binding"].clone();
+        assert!(
+            !daemon
+                .handoff_review_is_valid(org, &tampered)
+                .await
+                .unwrap()
         );
         let approved = daemon
             .dispatch(
@@ -4752,6 +6753,32 @@ mod conformance {
             }
         }
     }
+    async fn receive_http_with_body(
+        listener: &TcpListener,
+    ) -> (tokio::net::TcpStream, String, Vec<u8>) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        loop {
+            let mut buffer = [0; 8192];
+            let size = stream.read(&mut buffer).await.unwrap();
+            assert!(size > 0);
+            bytes.extend_from_slice(&buffer[..size]);
+            if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&bytes[..end]).into_owned();
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(|value| value.parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                if bytes.len() >= end + 4 + length {
+                    return (stream, head, bytes[end + 4..end + 4 + length].to_vec());
+                }
+            }
+        }
+    }
     async fn reply_http(mut stream: tokio::net::TcpStream, status: u16, value: Value) {
         let body = if status == 200 {
             json!({"data":value,"meta":{}})
@@ -4790,6 +6817,48 @@ mod conformance {
         task.abort();
         result
     }
+    #[test]
+    fn artifact_read_requires_explicit_execution_scope_and_forwards_it() {
+        let artifact = Uuid::new_v4().to_string();
+        let execution = Uuid::new_v4().to_string();
+        assert!(backend_route("artifacts.read", &json!({"artifactId":artifact})).is_err());
+        let (_, route, body) = backend_route(
+            "artifacts.read",
+            &json!({
+                "artifactId":artifact,"executionId":execution,"offset":7,"limit":13
+            }),
+        )
+        .unwrap();
+        let parsed = url::Url::parse(&format!("https://fixture.invalid/{route}")).unwrap();
+        let query: std::collections::BTreeMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(query.get("executionId"), Some(&execution));
+        assert_eq!(query.get("offset").map(String::as_str), Some("7"));
+        assert_eq!(query.get("limit").map(String::as_str), Some("13"));
+        assert!(body.is_none());
+        let catalog: Value =
+            serde_json::from_str(include_str!("../contracts/method-catalog.json")).unwrap();
+        for method in ["artifacts.read", "artifacts.download"] {
+            let schema = &catalog["methods"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["name"] == method)
+                .unwrap()["inputSchema"];
+            let mut params = json!({"artifactId":artifact});
+            if method == "artifacts.download" {
+                params["destinationPath"] = json!("/tmp/fixture");
+                params["idempotencyKey"] = json!(Uuid::new_v4());
+            }
+            assert!(
+                validate_params(&params, schema).is_err(),
+                "{method} requires explicit execution scope"
+            );
+            params["executionId"] = json!(execution);
+            assert!(validate_params(&params, schema).is_ok());
+            params["executionId"] = json!("not-an-execution-uuid");
+            assert!(validate_params(&params, schema).is_err());
+        }
+    }
     async fn download_fixture() -> (tempfile::TempDir, Arc<Daemon>, TcpListener, Value) {
         let temp = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4798,11 +6867,32 @@ mod conformance {
         let daemon = Arc::new(fixture(temp.path(), api));
         daemon.public.lock().await.active_organization =
             Some("11111111-1111-4111-8111-111111111111".into());
-        let params = json!({"artifactId":Uuid::new_v4(),"idempotencyKey":Uuid::new_v4(),"destinationPath":temp.path().join("download")});
+        let params = json!({"artifactId":Uuid::new_v4(),"executionId":Uuid::new_v4(),"idempotencyKey":Uuid::new_v4(),"destinationPath":temp.path().join("download")});
         (temp, daemon, listener, params)
     }
     fn download_page() -> Value {
         json!({"offset":0,"dataBase64":STANDARD.encode(b"abc"),"nextOffset":null,"sizeBytes":3,"checksumSha256":state::digest(b"abc")})
+    }
+    #[tokio::test]
+    async fn artifact_download_keeps_explicit_execution_scope_across_pages() {
+        let (temp, d, listener, params) = download_fixture().await;
+        let expected = params["executionId"].as_str().unwrap().to_string();
+        let task = tokio::spawn(async move { d.dispatch("artifacts.download", params).await });
+        for (offset, bytes, next) in [(0, b"ab".as_slice(), Some(2)), (2, b"c".as_slice(), None)] {
+            let (stream, head) = receive_http(&listener).await;
+            assert!(head.contains(&format!("executionId={expected}")));
+            assert!(head.contains(&format!("offset={offset}")));
+            reply_http(
+                stream,
+                200,
+                json!({"offset":offset,"dataBase64":STANDARD.encode(bytes),
+                "nextOffset":next,"sizeBytes":3,"checksumSha256":state::digest(b"abc")}),
+            )
+            .await;
+        }
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result["sizeBytes"], 3);
+        assert_eq!(std::fs::read(temp.path().join("download")).unwrap(), b"abc");
     }
     #[tokio::test]
     async fn offline_logout_requires_exclusive_daemon_ownership_and_retries_without_service() {
@@ -5350,6 +7440,15 @@ mod conformance {
                                 binding["organizationId"] =
                                     json!("11111111-1111-4111-8111-111111111111");
                                 binding["runnerId"] = json!("22222222-2222-4222-8222-222222222222");
+                                binding["workflowClosure"] = json!([{
+                                    "workflowId":binding["workflowId"],
+                                    "workflowVersionId":binding["versionId"],
+                                    "version":5,
+                                    "nodeDependencies":{"agent":{
+                                        "node":{"key":"agent","type":"ai_agent","config":{"prompt":"private-node-snapshot".repeat(8_000)}},
+                                        "modelResolution":{"provider":"codex","runtimeModel":"gpt-5.6-sol"}
+                                    }}
+                                }]);
                                 json!({"preparationId":prep_server,"bindingDigest":"digest","binding":binding,"limits":{},"expiresAt":null})
                             } else {
                                 assert_eq!(body["preparationId"], prep_server);
@@ -5392,6 +7491,16 @@ mod conformance {
         .unwrap();
         let prepared = d.dispatch("runs.prepare", p.clone()).await.unwrap();
         assert!(prepared["confirmationKey"].is_string());
+        assert!(serde_json::to_vec(&prepared).unwrap().len() < 12_000);
+        assert!(prepared["binding"].get("workflowClosure").is_none());
+        assert_eq!(
+            prepared["binding"]["workflowClosureReview"]["rootVersion"],
+            5
+        );
+        assert_eq!(
+            prepared["binding"]["workflowClosureReview"]["providers"][0]["name"],
+            "codex"
+        );
         let restored = d
             .dispatch("preparations.get", json!({"preparationId":prep}))
             .await
@@ -5401,6 +7510,8 @@ mod conformance {
         assert_eq!(restored["preparation"], prepared);
         let run_record_path = state_dir.join("preparations").join(format!("{prep}.json"));
         let run_record: Value = state::read_json(&run_record_path).unwrap();
+        assert!(serde_json::to_vec(&run_record["review"]).unwrap().len() > 100_000);
+        assert!(run_record["review"]["binding"]["workflowClosure"].is_array());
         for operation in ["builder.prepare", "editor.prepare"] {
             let id = Uuid::new_v4().to_string();
             let mut record = run_record.clone();
@@ -5417,7 +7528,10 @@ mod conformance {
                 .unwrap();
             assert_eq!(restored["status"], "valid");
             assert_eq!(restored["operation"], operation);
-            assert_eq!(restored["preparation"], record["review"]);
+            assert_eq!(
+                restored["preparation"],
+                Daemon::preparation_review_projection(&record["review"])
+            );
         }
         drop(d);
 

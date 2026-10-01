@@ -38,6 +38,8 @@ mod authorization;
 use authorization::*;
 mod provider;
 use provider::*;
+pub mod public_status;
+use public_status::*;
 mod http;
 use http::*;
 mod execution;
@@ -50,7 +52,7 @@ mod recovery;
 use recovery::*;
 
 fn runner_manifest() -> Value {
-    json!({"version":env!("CARGO_PKG_VERSION"),"executionPolicies":["host_user/v1"],"jobKinds":["shell.exec","command.run","http.request"],"capabilities":{"shell.exec":true,"command.run":true,"http.request":true},"httpResultContracts":[HTTP_RESULT_SCHEMA],"concurrency":null,"executionSeconds":null,"outputBytes":null,"artifactBytes":null})
+    json!({"version":env!("CARGO_PKG_VERSION"),"executionPolicies":["host_user/v1"],"jobKinds":["shell.exec","command.run","http.request"],"capabilities":{"shell.exec":true,"command.run":true,"http.request":true,"ai.public-status/v1":LIVE_PROVIDER_QUALIFIED,"codex.native-projected-json/v3":true},"httpResultContracts":[HTTP_RESULT_SCHEMA],"concurrency":null,"executionSeconds":null,"outputBytes":null,"artifactBytes":null})
 }
 async fn apply_cancellations(daemon: &Daemon, response: &Value) {
     if let Some(jobs) = response["cancellations"].as_array() {
@@ -64,6 +66,79 @@ async fn apply_cancellations(daemon: &Daemon, response: &Value) {
 fn fence(j: &Journal) -> Value {
     json!({"sessionId":j.session,"leaseVersion":j.job["leaseVersion"]})
 }
+
+fn job_authority_unchanged(
+    expected: &Journal,
+    journal: &Arc<Mutex<Journal>>,
+    require_live_lease: bool,
+) -> bool {
+    let Ok(current) = journal.lock() else {
+        return false;
+    };
+    let lease_until = current.job["leasedUntilEpochMs"].as_u64().unwrap_or(0);
+    expected.organization == current.organization
+        && expected.session == current.session
+        && expected.recovery_session == current.recovery_session
+        && expected.phase == current.phase
+        && expected.terminal_key == current.terminal_key
+        && expected.job["id"] == current.job["id"]
+        && expected.job["runnerId"] == current.job["runnerId"]
+        && expected.job["connectionGeneration"] == current.job["connectionGeneration"]
+        && expected.job["leaseVersion"] == current.job["leaseVersion"]
+        && expected.job["payloadDigest"] == current.job["payloadDigest"]
+        && lease_until == expected.job["leasedUntilEpochMs"].as_u64().unwrap_or(0)
+        && (!require_live_lease || lease_until > now_millis())
+}
+
+async fn backend_job(
+    daemon: &Daemon,
+    journal: &Arc<Mutex<Journal>>,
+    expected: &Journal,
+    method: &str,
+    route: &str,
+    body: Option<Value>,
+    key: Option<&str>,
+) -> Result<Value> {
+    let credential = daemon.auth.credential(&expected.organization).await?;
+    if expected.job["runnerId"]
+        .as_str()
+        .is_some_and(|id| id != credential.subject)
+    {
+        bail!("RUNNER_JOB_RUNNER_MISMATCH");
+    }
+    Ok(daemon
+        .api
+        .request_job_with_stale_proof_retry(method, route, body, &credential, key, || {
+            job_authority_unchanged(expected, journal, true)
+        })
+        .await?)
+}
+
+async fn initial_finalization(
+    daemon: &Daemon,
+    path: &Path,
+    journal: &Arc<Mutex<Journal>>,
+) -> Result<()> {
+    let outcome = match drain_events(daemon, path, journal).await {
+        Ok(()) => materialize_terminal(daemon, path, journal)
+            .await
+            .map_err(|error| (DeliveryDiagnosticCategory::ArtifactFinalization, error)),
+        Err(error) => Err((DeliveryDiagnosticCategory::OutputDelivery, error)),
+    };
+    if let Err((category, error)) = outcome {
+        {
+            let mut record = journal
+                .lock()
+                .map_err(|_| anyhow::anyhow!("journal lock"))?;
+            if record.first_failure_diagnostic.is_none() {
+                record.first_failure_diagnostic = Some(delivery_diagnostic(category, &error));
+            }
+        }
+        save(journal, path)?;
+        return Err(error);
+    }
+    Ok(())
+}
 async fn work(
     daemon: Arc<Daemon>,
     path: PathBuf,
@@ -75,6 +150,21 @@ async fn work(
     let result = execute_job(daemon.clone(), &path, shared.clone(), cancel, scope.clone()).await;
     scope.stop().await;
     if let Err(error) = result {
+        let finalization_category = {
+            let j = shared.lock().map_err(|_| anyhow::anyhow!("journal lock"))?;
+            if j.phase == JournalPhase::Exited && j.result.is_some() {
+                j.first_failure_diagnostic.as_ref().map(|d| d.category)
+            } else {
+                None
+            }
+        };
+        if let Some(category) = finalization_category {
+            // `execute_job` already attempted this exact finalization. Preserve
+            // its first error and do not blindly issue the same nonretryable
+            // artifact request a second time.
+            handle_finalization_error(&daemon, &path, &shared, category, error).await?;
+            return deliver(daemon, &path, shared).await;
+        }
         let typed_http_failure = error
             .downcast_ref::<HttpFailure>()
             .map(|failure| (failure.code, failure.stage, failure.dispatched));

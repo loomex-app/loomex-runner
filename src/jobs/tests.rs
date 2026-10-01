@@ -349,6 +349,171 @@ fn provider_payload(provider: &str, input: &str) -> (Value, Vec<String>) {
     (payload, argv)
 }
 
+fn projected_codex_payload() -> (Value, Vec<String>) {
+    let authored = json!({
+        "type":"object",
+        "properties":{
+            "summary":{"type":"string","minLength":1},
+            "verification":{"type":"array","items":{"type":"string"}},
+            "limitations":{"type":"array","items":{"type":"string"}},
+            "changedFiles":{"type":"array","items":{"type":"string"}},
+            "generatedArtifacts":{"type":"array","items":{"type":"string"}},
+            "relevantEarlierAnswers":{"type":"array","items":{"type":"string"}},
+            "questions":{"type":"array","items":{
+                "type":"object",
+                "properties":{"inputType":{"type":"string","const":"text"}},
+                "required":["inputType"],"additionalProperties":false,
+            }},
+        },
+        "required":["summary","verification","limitations","changedFiles","generatedArtifacts","relevantEarlierAnswers","questions"],
+        "additionalProperties":false,
+    });
+    let mut hint = authored.clone();
+    hint["properties"]["summary"]
+        .as_object_mut()
+        .unwrap()
+        .remove("minLength");
+    hint["properties"]["questions"]["items"]["properties"]["inputType"] =
+        json!({"type":"string","enum":["text"]});
+    let input = json!({
+        "schemaVersion":"loomex.provider-input/v1", "prompt":"fixture only",
+        "context":{"outputSchema":authored}, "persona":{},
+        "outputContract":"Return exactly the result JSON object requested by the prompt and context.outputSchema as native structured output."
+    }).to_string();
+    let (mut payload, argv) = provider_payload("codex", &input);
+    payload["providerOutputTransport"] = json!("codex.native-projected-json/v3");
+    payload["providerOutputSchema"] = hint.clone();
+    payload["providerOutputSchemaDigest"] = json!(state::json_digest(&hint));
+    payload["providerAuthoredOutputSchema"] = authored.clone();
+    payload["providerAuthoredOutputSchemaDigest"] = json!(state::json_digest(&authored));
+    (payload, argv)
+}
+
+#[test]
+fn codex_projected_transport_matches_canonical_backend_vectors() {
+    // This file is copied byte-for-byte into the backend tests. Its digests
+    // are computed by Python's canonical sort_keys JSON representation.
+    let vectors: Value = serde_json::from_str(include_str!(
+        "../../contracts/codex-native-projection-v3-vectors.json"
+    ))
+    .unwrap();
+    assert_eq!(vectors["schemaVersion"], "codex.native-projection-test-v1");
+    for vector in vectors["vectors"].as_array().unwrap() {
+        let id = vector["id"].as_str().unwrap();
+        let authored = &vector["authored"];
+        assert_eq!(
+            state::json_digest(authored),
+            vector["authoredDigest"],
+            "{id}"
+        );
+        let mut hint = authored.clone();
+        let projected =
+            project_codex_native_hint(&mut hint).and_then(|()| validate_native_hint_schema(&hint));
+        if vector["accept"] == true {
+            projected.unwrap_or_else(|error| panic!("{id}: {error}"));
+            assert_eq!(hint, vector["hint"], "{id}");
+            assert_eq!(state::json_digest(&hint), vector["hintDigest"], "{id}");
+        } else {
+            assert!(projected.is_err(), "{id} unexpectedly admitted");
+        }
+    }
+}
+
+#[test]
+fn codex_projected_transport_requires_exact_authored_and_hint_bindings() {
+    let (payload, argv) = projected_codex_payload();
+    validate_provider_input(&payload, &argv).unwrap();
+
+    let mut missing = payload.clone();
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("providerAuthoredOutputSchema");
+    assert_eq!(
+        validate_provider_input(&missing, &argv)
+            .unwrap_err()
+            .to_string(),
+        "PROVIDER_SCHEMA_INVALID"
+    );
+
+    let mut bad_authored_digest = payload.clone();
+    bad_authored_digest["providerAuthoredOutputSchemaDigest"] = json!("0".repeat(64));
+    assert_eq!(
+        validate_provider_input(&bad_authored_digest, &argv)
+            .unwrap_err()
+            .to_string(),
+        "PROVIDER_SCHEMA_INVALID"
+    );
+
+    let mut bad_hint_digest = payload.clone();
+    bad_hint_digest["providerOutputSchemaDigest"] = json!("0".repeat(64));
+    assert_eq!(
+        validate_provider_input(&bad_hint_digest, &argv)
+            .unwrap_err()
+            .to_string(),
+        "PROVIDER_SCHEMA_INVALID"
+    );
+
+    let mut wrong_context = payload.clone();
+    let mut parsed: Value =
+        serde_json::from_str(wrong_context["providerInput"].as_str().unwrap()).unwrap();
+    parsed["context"]["outputSchema"]["properties"]["summary"]["minLength"] = json!(2);
+    let input = parsed.to_string();
+    wrong_context["providerInput"] = json!(input.clone());
+    wrong_context["providerInputDigest"] = json!(state::digest(input.as_bytes()));
+    let mut wrong_argv = argv.clone();
+    *wrong_argv.last_mut().unwrap() = input;
+    assert_eq!(
+        validate_provider_input(&wrong_context, &wrong_argv)
+            .unwrap_err()
+            .to_string(),
+        "PROVIDER_SCHEMA_INVALID"
+    );
+
+    let mut weakened_array = payload.clone();
+    weakened_array["providerOutputSchema"]["properties"]["verification"] = json!({"type":"string"});
+    weakened_array["providerOutputSchemaDigest"] =
+        json!(state::json_digest(&weakened_array["providerOutputSchema"]));
+    assert_eq!(
+        validate_provider_input(&weakened_array, &argv)
+            .unwrap_err()
+            .to_string(),
+        "PROVIDER_SCHEMA_INVALID"
+    );
+
+    let mut wrong_const = payload.clone();
+    wrong_const["providerOutputSchema"]["properties"]["questions"]["items"]["properties"]["inputType"]
+        ["enum"] = json!(["radio"]);
+    wrong_const["providerOutputSchemaDigest"] =
+        json!(state::json_digest(&wrong_const["providerOutputSchema"]));
+    assert_eq!(
+        validate_provider_input(&wrong_const, &argv)
+            .unwrap_err()
+            .to_string(),
+        "PROVIDER_SCHEMA_INVALID"
+    );
+
+    let mut old_mode = payload.clone();
+    old_mode["providerOutputTransport"] = json!("codex.native-json/v2");
+    assert_eq!(
+        validate_provider_input(&old_mode, &argv)
+            .unwrap_err()
+            .to_string(),
+        "PROVIDER_SCHEMA_INVALID"
+    );
+}
+
+#[test]
+fn codex_projected_transport_materializes_only_the_bound_hint() {
+    let temp = tempfile::tempdir().unwrap();
+    let (payload, mut argv) = projected_codex_payload();
+    materialize_provider_output_schema(&payload, &mut argv, temp.path()).unwrap();
+    let written: Value = state::read_json(&temp.path().join("provider-schema.json")).unwrap();
+    assert_eq!(written, payload["providerOutputSchema"]);
+    assert_ne!(written, payload["providerAuthoredOutputSchema"]);
+    assert_ne!(argv[3], "{loomex:provider-schema}");
+}
+
 #[test]
 fn provider_adapters_require_exact_canonical_prepared_contracts() {
     for provider in ["codex", "claude", "gemini", "antigravity"] {
@@ -437,6 +602,8 @@ fn fence_preserves_exact_lease() {
         terminal_key: "t".into(),
         started_at: 0,
         acknowledged_at: None,
+        delivery_diagnostic: None,
+        first_failure_diagnostic: None,
         event_sender: Default::default(),
         stdout_pending: None,
         stderr_pending: None,
@@ -444,6 +611,10 @@ fn fence_preserves_exact_lease() {
         progress_buffer_offset: 0,
         progress_discarding: false,
         progress_pending: None,
+        public_status_latest: None,
+        public_status_pending: None,
+        public_status_next_sequence: 0,
+        public_status_last_sent_at_ms: 0,
         stdout_offset: 0,
         stderr_offset: 0,
     };

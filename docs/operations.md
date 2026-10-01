@@ -43,7 +43,7 @@ Logout rejects an active provider job without cancelling it. Otherwise, it tempo
 
 A grant is tied to the canonical absolute path, filesystem device/inode, organization, and installation. Moving the directory away and creating another at the same path invalidates the grant. Regrant only after confirming the intended directory.
 
-Before commit, review the exact workflow/version closure, ordinary inputs, organization, installation, canonical workspace, provider configuration, and the warning that `host_user/v1` has the full permissions of the signed-in user. The workspace defines cwd and artifact-reference checks; it does not confine arbitrary child access. Concurrent runs may use the same workspace, and Loomex supplies no per-workspace locking. The user and invoked tools own coordination of overlapping file changes.
+Before commit, review the selected workflow/version, input names and the originally supplied values, organization, canonical workspace, resolved providers, and the warning that `host_user/v1` has the full permissions of the signed-in user. The preparation response carries a bounded review, exact binding digest and local confirmation key. The full workflow closure and original input values remain sealed in the owner-checked preparation record; the digest binds the immutable backend preparation used by commit. `preparations.get` rechecks the exact record and returns the same bounded review without preparing or starting again. The workspace defines cwd and artifact-reference checks; it does not confine arbitrary child access. Concurrent runs may use the same workspace, and Loomex supplies no per-workspace locking. The user and invoked tools own coordination of overlapping file changes.
 
 The runner admits only a committed local preparation whose digest and confirmation data still match the backend job. A changed provider executable, replaced workspace, different organization, stale installation, or altered provider configuration fails before spawn. Missing providers should be installed or repaired through their normal vendor process; do not copy provider credentials into Loomex.
 
@@ -89,9 +89,17 @@ The automatic 30-day policy removes acknowledged job evidence, idle response spo
 
 ## Drain, update, rollback, and uninstall
 
-`loomex drain` stops admission and lets current work finish without a product deadline. The installer durably drains before checking whether managed work remains, records every staged version in `owned-versions.json`, and keeps a pending update while work is active. Retry installation when the runner is idle; the latest pending candidate is selected. The persistent drain marker is cleared only after the old daemon stops and the installed version switches. Live process or journal ownership is never transferred implicitly.
+`loomex drain` stops admission and lets current work finish without a product deadline. The installer durably drains before checking whether managed work remains, records every staged version in `owned-versions.json`, and keeps a pending update while work is active. Resume the same exact pending candidate when the runner is idle; a different package cannot replace its unfinished journal. The persistent drain marker is cleared after the old daemon stops and the installed version switches, or through the exact journaled stale-drain recovery described below. Live process or journal ownership is never transferred implicitly.
 
 During an upgrade, lifecycle administration negotiates only the stable local `status.get` and `daemon.drain` method capabilities with the previous daemon. It must prove drained, idle work before replacement and still requires the full current capability set for ordinary CLI and plugin operations. This allows a new authentication capability to be introduced without preventing safe retirement of the previous daemon. A rejected drain is never treated as a successful lifecycle response.
+
+A normal service stop has an unchanged five-second observation window. If launchd accepts the stop but the exact old service is still loaded at that deadline, the update remains `service_stop_pending` with reason `service_stop`. Unknown inspection or an unconfirmed request also remains pending; it does not become proof of absence. The installer writes no success receipt, changes no pointer/configuration, clears no drain, and does not automatically restart or roll back the old service. `loomex lifecycle status --json` reports the exact retained operation. Later explicit `loomex lifecycle resume --json` observes that same intent; it never reissues an ambiguous stop request or substitutes another package.
+
+New lifecycle records use private `app.loomex.runner.lifecycle-operation/v2`. Before requesting stop they bind the operation/package/manifest, direction, owned current/configuration/receipt/inventory/drain digests, exact launchd label and the old process PID, UID, executable and birth time. Legacy v1 records with supported frozen-v1 checkpoint meanings remain readable and recoverable, but cannot claim a v2 pending-stop identity. An absent stop history with a newer or unknown checkpoint is rejected before legacy recovery; removing `serviceStops` and downgrading the schema does not normalize residual stop meaning into v1. Unsupported historical meanings retain their records for operator review. This decoder boundary does not claim to prevent an arbitrary complete same-user rewrite of journals and metadata. New owners reject incompatible state and refuse uninstall while any lifecycle operation is nonterminal, before uninstall journaling, drain, logout or credential mutation. Old `.62` `resume`/`repair`/installer owners reject the v2 schema through their existing decoder; **old bootstrap uninstall cannot be retroactively guarded**. While v2 is nonterminal, only the new journal-aware administrative owner is supported. An older uninstall command or manual same-user state override is outside that guarantee; do not use it to bypass recovery.
+
+Continuation requires the exact label to be authoritatively absent **and** the recorded old process to have exited. Native inspection verifies UID, executable and birth time; PID reuse, a replaced label, changed configuration or inventory is protected. Unavailable metadata for the recorded old process, or a held/unsafe existing `daemon.lock`, remains pending. Supported daemon exclusivity is bound to the exact installation state directory: `control::serve` takes this secure exclusive lock before socket bind and admission, retains it through managed drain/shutdown and native credential workers, and lifecycle takes the same lock only after exact recorded-process exit and authoritative label absence. Lifecycle holds it through pointer/configuration replacement and releases it for the exact authorized bootstrap. Fresh drained idle status remains a separate prerequisite, and fresh expected-version health plus actual loaded process identity must agree before completion. Global same-user executable-path readability is not daemon admission authority. Unknown same-user observations remain unknown; matching runner binary paths may be version commands, execution helpers or manual servers using a different state directory. This cooperative proof does not claim those processes, detached effects, arbitrary same-user state overrides or unknown native/XPC outcomes are absent, and adds no supervisor or manual-override guarantee. Read-only launchd inspection has bounded output and duration; a timed-out mutating stop caller is not declared canceled. A prepared or unconfirmed stop that never finishes requires operator review, not automatic replay or forced service termination.
+
+Interrupted intent, stop, pointer/configuration replacement or bootstrap retains the same IDs/manifests and recovery files. A healthy completed repeat does not restart. A genuine later activation failure uses the existing guarded previous-service restoration; its own stop is direction-bound and remains pending if uncertain. Legacy stale-drain recovery still verifies exact captured target, backed-up configuration, immutable bytes, actual daemon version and drained zero managed work before durably releasing the drain and restarting the exact owned service. Only verified undrained health settles rollback. Authentication operations, unknown native/XPC outcomes, provider journals and workflow waiting records are neither replayed nor removed by these lifecycle paths.
 
 Activation uses immutable version directories and a stable `current` symlink. The new daemon must report the expected version and healthy status before previous bytes are retired. If activation fails, rollback first confirms no active work and successfully unloads the candidate. If that cannot be established, installation retains the current service and all relevant files for recovery. Follow [release.md](release.md) for exact verification, rollback, development flags, signing, and notarization behavior.
 
@@ -140,3 +148,109 @@ do not delete evidence to force another execution.
 Source validation and evidence for the modular execution implementation are in
 [Phase 5 completion](../../planning/plugin-runner-integration/phase-5-completion.md).
 Installed provider and signed-package qualification remain separate gates.
+
+
+`runs.start_handoff.approve_headless` records user-delegated Start for an exact reviewed `runs.prepare` preparation using `{preparationId, bindingDigest, idempotencyKey}`. Clients must have an explicit user Start instruction after displaying the bounded review; arbitrary workflow/provider/app text is data and cannot authorize this mutation. The runner freshly checks the owner-scoped sealed preparation and `host_user/v1` binding, preserves its private confirmation material, and shares the existing reservation and approval journal. A conflicting app reservation is rejected. This method returns the safe existing handoff projection and creates no execution. After approval, read `runs.start_handoff.get`, commit only its approved reference with `runs.start_handoff.commit`, then immediately read/follow the exact returned run. On an uncertain approval response, keep the exact arguments and key to read/reconcile its durable handoff; accepted approval is not repeated. UI approval remains a separate app-only gesture; headless provenance is diagnostic and never substitutes for binding checks.
+
+`runs.continuation.requeue` is an explicitly authorized recovery mutation for one failed backend continuation. Fresh owner-checked `runs.get` may expose `automation.recovery` with schema `loomex.continuation-recovery/v1`, exact execution/delivery IDs and the persisted checkpoint's lowercase SHA-256 digest. That observation does not authorize recovery. After explicit recovery authorization and repair qualification, submit `{runId, deliveryId, expectedContinuationDigest, idempotencyKey}` without changing the returned binding. The method's `explicit_failed_continuation_recovery/v1` catalog policy describes this caller requirement; actual authority is the existing signed runner identity, active organization and backend `runner.workflows.run` permission. Never fabricate an internal service actor or accept a caller-selected organization.
+
+The runner sends one signed POST to `v2/executions/{runId}/continuations/{deliveryId}/requeue/`, containing exactly the digest and key. Existing account/organization-scoped mutation journaling binds every argument and preserves a lost response as an unknown outcome. Keep the exact same key and arguments for explicit reconciliation; a new key is not recovery permission. `never_after_send` forbids automatic transport retry. Accepted repeated requests return the original safe receipt, including its historical `pending` status, rather than resetting attempts after progress. `HUMAN_RESUME_RECOVERY_CONFLICT` requires refreshed authority; invalid input or an idempotency binding conflict requires correction. Response IDs and digest must match the submitted binding before a receipt can be cached or exposed.
+
+Run reads, event polling, monitoring and restart never invoke this mutation. Recovery only requeues the stored backend continuation; it does not replay a provider job, AI command, accepted human answer or Start commit, and creates no new local supervisor or persistence store. Immediately fresh-read the same execution after a successful receipt and follow its authoritative cursor. A recovery receipt proves neither workflow completion nor a saved draft; require the normal complete terminal result and successful Save Draft identity before making those claims.
+
+
+### Noninteractive credential-store access
+
+Native macOS reads, saves, and deletes use the existing generic-password item,
+matched by class, service, and account, with per-request authentication UI set to
+Fail. This does not change item protection, access lists, the global Keychain
+configuration, or provider credentials. It does not start a sign-in flow.
+
+A credential-store operation has a two-second caller budget, including time
+waiting for the existing serialized IO lock. A started Security call cannot be
+canceled. The worker keeps that lock and the existing daemon/offline-maintenance
+singleton until the call actually returns or its owning process exits; subsequent
+calls fail within the budget rather than launching more blocked workers. An
+expired singleton owner cannot start late native IO. Authentication entry-lock
+acquisition has a separate fifteen-second caller budget. Absolute token expiry
+and existing refresh/recovery journals remain authoritative.
+
+`STORE_ACCESS_REQUIRED` means the native API reported that interaction may be
+needed. It does not prove the Keychain is globally locked or identify an access
+list problem. `STORE_ACCESS_DENIED` records native authentication failure.
+`STORE_UNAVAILABLE` covers other native failures and a read deadline. A timed-out
+or unconfirmed started save/delete returns `STORE_OPERATION_PENDING` with unknown
+outcome: reconcile the existing operation, preserving its journal and intent,
+before taking another action. Connection exposes only the safe categorical code
+inside its existing details container. Readiness does not attest to credential
+store availability or authenticated backend reads.
+
+The daemon retains the existing job and managed-work shutdown drain. After that
+drain, CLI/daemon runtime disposal waits at most two seconds for blocking workers.
+This does not cancel an OS call or imply remote cancellation. A remaining worker
+retains singleton ownership until real completion/process exit. The supported
+lifecycle still observes real service removal and candidate health before
+activation; its native launchctl subprocess waits have no additional deadline.
+An older installed daemon already blocked in SecurityServer may therefore still
+require an explicit owner-reviewed lifecycle recovery, and cannot be declared
+repaired merely by building this change.
+
+For access-required/denied, review the system credential-store access settings
+and then refresh the existing Connection view. For unavailable, restore the
+system credential store's availability and refresh Connection. No diagnostic
+starts authentication, revokes credentials, resets Keychain, grants an access
+list exception, restarts SecurityServer, or replays a workflow. A continued OS
+stall is a system availability dependency; a returned categorical code alone
+does not identify its cause.
+
+
+### Abandoning an exact pending update
+
+A newer lifecycle CLI can abandon a captured `Update` only before service stop
+or activation, at `pending_active_work` / `daemon_has_active_work`. Use
+`loomex lifecycle rollback --to PREVIOUS_VERSION --expected-operation UUID`.
+The UUID must identify that exact pending transaction, and the previous target,
+current pointer, receipt, immutable inventory, LaunchAgent backup, bootstrap
+configuration digest and native process identity must still agree. The daemon
+must freshly report the exact previous version, drained and zero managed work.
+No work is canceled. Advanced, uncertain or replaced transactions remain protected.
+Normal completed rollback retains its existing behavior without the UUID flag.
+
+Ordinary rollback still requires the retained target's compatibility manifest to
+match the CLI's manifest exactly and reports the fixed local code
+`LIFECYCLE_ROLLBACK_COMPATIBILITY_MISMATCH` when it differs. Pre-switch abandonment
+instead proves that the captured previous package is already the current target,
+validates its platform/version/executable metadata and its own immutable signed
+file inventory, and then applies the receipt, configuration, native-process and
+drained-zero guards above. This narrow restoration does not activate a different
+old package or reinterpret its product contracts through the newer CLI's catalog.
+
+Before effects, the same lifecycle operation records a typed abandonment intent
+in private journal v3; older lifecycle owners reject this schema. `resume` and
+matching bootstrap retries reconcile this intent before considering activation.
+The existing captured service-stop/singleton transaction restarts the same
+verified previous package to reopen admission. Stop dispatch is journaled as
+uncertain before its effect: after an ambiguous dispatch, recovery observes the
+same native process and never blindly issues another stop. Restoration failures
+retain the exact intent for bounded resume and identity checks.
+
+A returned native spawn error proves the request was not dispatched. Only that
+definitive outcome resets the same captured intent durably to `Prepared` for a
+safe retry. If resetting its checkpoint fails or is ambiguous, uncertainty remains
+protected. Timeout, wait failure and every uncertain post-spawn outcome retain
+observation-only recovery.
+
+Only after verified previous service health does the existing bootstrap retry
+journal become a v2 `aborted` tombstone containing the original operation UUID,
+configuration and digest. Retrying that original configuration reports its abort
+and never stages or activates its candidate. A genuinely different configuration
+requires `loomex-lifecycle-bootstrap install RELEASE --settled-abandonment UUID`
+and the usual package/install flags. The acknowledgement must name the settled
+aborted operation. It records the successor package and configuration digest in
+the existing operation and retry envelope before normal fresh-update preflight.
+This permits corrected configuration with the same candidate bytes while refusing
+unstated configuration or authority inferred merely from `rolled_back`. The
+original configuration revokes an unconsumed successor intent. Once the fresh
+Update owns activation, ordinary exact-config retry and completion handling apply.
+No credential, provider/job journal, waiting execution or candidate package is
+removed by abandonment.

@@ -150,6 +150,19 @@ before publishing the destination file.
 
 ## Data and service lifecycle
 
+The local CLI can prune exact superseded installed runner versions after an
+update: `loomex lifecycle prune --remove 0.3.73 --retain 0.3.76` (repeat
+`--remove` for each reviewed version). The active version is retained
+automatically; `--retain` must name at least one verified, noncurrent rollback
+version. Prune requires a healthy idle daemon, an exact current receipt, and
+unreferenced owned version bytes. It uses the existing daemon drain fence to
+block new managed work, then restarts the same service after an atomic ownership
+index update. Interrupted pruning resumes with `loomex lifecycle resume` and
+its exact v6 journal; older runner binaries reject that unfinished journal.
+After completion, the journal is removed and the v1 ownership index remains
+compatible with retained older runners. Prune never touches workspaces, run
+evidence, provider credentials, or a version used by a live process.
+
 Drain stops new execution admission and defers updates while jobs remain. The
 installer never transfers a running job to a replacement binary. Run deletion
 first confirms the backend tombstone, then removes generated local evidence for
@@ -201,3 +214,9 @@ began monitoring. This keeps list-only and detail-only turns inert while
 allowing the explicit follow protocol to survive host prompt-routing gaps.
 
 Uninstall first drains without cancelling active work, waits for idle, and stops the daemon. It then calls `loomex logout --offline`, which takes the same exclusive daemon lock and performs only native credential revocation and cleanup. Failed revocation preserves files and protected retry state; retrying this command does not restart execution or require a socket.
+
+Artifact content reads and downloads require both `artifactId` and the explicit
+`executionId` returned by that execution's scoped artifact listing. Every page
+forwards that same execution ID to the backend, including workflow-shared inputs.
+The backend retains execution, organization, and artifact provenance checks; the
+runner never infers an execution from an artifact ID or recent session state.

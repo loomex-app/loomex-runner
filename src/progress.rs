@@ -318,6 +318,79 @@ mod tests {
     }
 
     #[test]
+    fn supported_provider_milestones_remain_fixed_and_content_free() {
+        let fixtures: [(&str, &[&str], &[&str]); 4] = [
+            (
+                "codex",
+                &[
+                    r#"{"type":"thread.started","private":"secret"}"#,
+                    r#"{"type":"item.started","item":{"type":"command_execution","command":"secret"}}"#,
+                    r#"{"type":"item.completed","item":{"type":"file_change","changes":"secret"}}"#,
+                    r#"{"type":"turn.completed","message":"secret"}"#,
+                ],
+                &[
+                    "activity.started",
+                    "tool.started",
+                    "activity.updated",
+                    "activity.completed",
+                ],
+            ),
+            (
+                "claude",
+                &[
+                    r#"{"type":"system","subtype":"init","cwd":"secret"}"#,
+                    r#"{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","input":"secret"}}}"#,
+                    r#"{"type":"tool_progress","tool_id":"secret"}"#,
+                    r#"{"type":"result","is_error":false,"result":"secret"}"#,
+                ],
+                &[
+                    "activity.started",
+                    "tool.started",
+                    "tool.updated",
+                    "activity.completed",
+                ],
+            ),
+            (
+                "gemini",
+                &[
+                    r#"{"type":"init","session_id":"secret"}"#,
+                    r#"{"type":"tool_use","parameters":{"secret":"secret"}}"#,
+                    r#"{"type":"tool_result","output":"secret"}"#,
+                    r#"{"type":"result","status":"success","response":"secret"}"#,
+                ],
+                &[
+                    "activity.started",
+                    "tool.started",
+                    "tool.completed",
+                    "activity.completed",
+                ],
+            ),
+            (
+                "antigravity",
+                &[r#"{"conversation_id":"secret","structured_output":{"secret":"secret"}}"#],
+                &["activity.completed"],
+            ),
+        ];
+        for (provider, lines, kinds) in fixtures {
+            let mut decoder = Decoder::default();
+            let text = lines.join("\n") + "\n";
+            let events = decoder.push(text.as_bytes(), 0, &context(provider));
+            let actual = events
+                .iter()
+                .map(|event| event["kind"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(actual, kinds, "{provider}");
+            let mut ids = std::collections::HashSet::new();
+            for event in events {
+                assert!(ids.insert(event["eventId"].as_str().unwrap().to_owned()));
+                let serialized = event.to_string();
+                assert!(!serialized.contains("secret"), "{provider}");
+                assert_eq!(event["provenance"], "provider_reported");
+            }
+        }
+    }
+
+    #[test]
     fn claude_unwraps_documented_partial_event_envelopes() {
         let cases = [
             (

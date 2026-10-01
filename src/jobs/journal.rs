@@ -33,6 +33,25 @@ impl PartialEq<&str> for JournalPhase {
         self.as_str() == *other
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum DeliveryDiagnosticCategory {
+    OutputDelivery,
+    ArtifactFinalization,
+    TerminalSubmission,
+    LeaseReclaim,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct DeliveryDiagnostic {
+    pub(super) schema_version: String,
+    pub(super) category: DeliveryDiagnosticCategory,
+    pub(super) code: String,
+    pub(super) observed_at_epoch_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) correlation_id: Option<String>,
+}
 impl Journal {
     pub(super) fn transition(&mut self, next: JournalPhase) -> Result<()> {
         use JournalPhase::*;
@@ -76,6 +95,14 @@ pub(super) struct Journal {
     pub(super) started_at: u64,
     #[serde(default)]
     pub(super) acknowledged_at: Option<u64>,
+    /// Optional bounded diagnostic for the exact delivery failure that left
+    /// this journal blocked. Older journals deserialize without this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) delivery_diagnostic: Option<DeliveryDiagnostic>,
+    /// The first failed output/finalization step is immutable evidence even if
+    /// a later terminal submission fails for a different reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) first_failure_diagnostic: Option<DeliveryDiagnostic>,
     #[serde(skip)]
     pub(super) event_sender: Arc<tokio::sync::Mutex<()>>,
     #[serde(default)]
@@ -92,6 +119,16 @@ pub(super) struct Journal {
     pub(super) progress_discarding: bool,
     #[serde(default)]
     pub(super) progress_pending: Option<Vec<Value>>,
+    /// Latest accepted public status that has not been assigned a transport
+    /// identity. Replacements coalesce while an older exact event is pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) public_status_latest: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) public_status_pending: Option<Value>,
+    #[serde(default)]
+    pub(super) public_status_next_sequence: u64,
+    #[serde(default)]
+    pub(super) public_status_last_sent_at_ms: u64,
     pub(super) stdout_offset: u64,
     pub(super) stderr_offset: u64,
 }

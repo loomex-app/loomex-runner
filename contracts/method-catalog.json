@@ -1,6 +1,6 @@
 {
   "protocol": "loomex.local-control/v2",
-  "version": "0.3.5",
+  "version": "0.3.8",
   "maxFrameBytes": 1048576,
   "methods": [
     {
@@ -1561,6 +1561,152 @@
         },
         "required": [
           "workflowId",
+          "idempotencyKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "workflow": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "draft": {
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "additionalProperties": true
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "workflow"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "transportRetry": "never_after_send",
+      "appOnly": false
+    },
+    {
+      "name": "workflows.patch",
+      "mutating": true,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "workflowId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "expectedVersion": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "expectedDefinitionChecksum": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64
+          },
+          "operations": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "properties": {
+                "op": {
+                  "type": "string",
+                  "enum": [
+                    "add",
+                    "replace",
+                    "remove"
+                  ]
+                },
+                "nodeKey": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 160
+                },
+                "path": {
+                  "type": "string",
+                  "minLength": 2,
+                  "maxLength": 256
+                },
+                "value": {
+                  "type": [
+                    "object",
+                    "array",
+                    "string",
+                    "number",
+                    "boolean",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "op",
+                "nodeKey",
+                "path"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "notes": {
+            "type": "string",
+            "maxLength": 4096
+          }
+        },
+        "required": [
+          "workflowId",
+          "expectedVersion",
+          "expectedDefinitionChecksum",
+          "operations",
           "idempotencyKey"
         ],
         "additionalProperties": false
@@ -3447,6 +3593,133 @@
       "appOnly": true
     },
     {
+      "name": "runs.start_handoff.approve_headless",
+      "mutating": true,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "preparationId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "bindingDigest": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "preparationId",
+          "bindingDigest",
+          "idempotencyKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "schemaVersion": {
+                "const": "loomex.run-start-handoff/v2"
+              },
+              "handoffRef": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "lifecycle": {
+                "enum": [
+                  "prepared",
+                  "approved",
+                  "committing",
+                  "committed",
+                  "ambiguous",
+                  "expired"
+                ]
+              },
+              "approvalObserved": {
+                "type": "boolean"
+              },
+              "nextAction": {
+                "enum": [
+                  "approve",
+                  "commit",
+                  "reconcile",
+                  "none"
+                ]
+              },
+              "preparationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "runId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "result": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "schemaVersion",
+              "handoffRef",
+              "lifecycle",
+              "approvalObserved",
+              "nextAction",
+              "preparationId"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "transportRetry": "never_after_send",
+      "appOnly": false
+    },
+    {
       "name": "runs.start_handoff.get",
       "mutating": false,
       "idempotent": true,
@@ -4565,6 +4838,117 @@
       "appOnly": false
     },
     {
+      "name": "runs.continuation.requeue",
+      "mutating": true,
+      "idempotent": true,
+      "authorizationPolicy": "explicit_failed_continuation_recovery/v1",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "runId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "deliveryId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "expectedContinuationDigest": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "runId",
+          "deliveryId",
+          "expectedContinuationDigest",
+          "idempotencyKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "executionId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "deliveryId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "expectedContinuationDigest": {
+                "type": "string",
+                "minLength": 64,
+                "maxLength": 64
+              },
+              "requeued": {
+                "type": "boolean"
+              },
+              "status": {
+                "const": "pending"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "executionId",
+              "deliveryId",
+              "expectedContinuationDigest",
+              "requeued",
+              "status"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "transportRetry": "never_after_send",
+      "appOnly": false
+    },
+    {
       "name": "runs.cancel",
       "mutating": true,
       "idempotent": true,
@@ -5295,10 +5679,15 @@
           "limit": {
             "type": "integer",
             "minimum": 0
+          },
+          "executionId": {
+            "type": "string",
+            "format": "uuid"
           }
         },
         "required": [
-          "artifactId"
+          "artifactId",
+          "executionId"
         ],
         "additionalProperties": false
       },
@@ -5404,12 +5793,17 @@
           "idempotencyKey": {
             "type": "string",
             "format": "uuid"
+          },
+          "executionId": {
+            "type": "string",
+            "format": "uuid"
           }
         },
         "required": [
           "artifactId",
           "destinationPath",
-          "idempotencyKey"
+          "idempotencyKey",
+          "executionId"
         ],
         "additionalProperties": false
       },
@@ -8888,6 +9282,7 @@
     "method:workflows.get",
     "method:workflows.create",
     "method:workflows.update",
+    "method:workflows.patch",
     "method:workflow.operations.get",
     "method:workflows.validate",
     "method:workflows.publish",
@@ -8905,6 +9300,7 @@
     "method:runs.start_handoff.issue",
     "method:runs.start_handoff.restore",
     "method:runs.start_handoff.approve",
+    "method:runs.start_handoff.approve_headless",
     "method:runs.start_handoff.get",
     "method:runs.start_handoff.commit",
     "method:runs.commit",
@@ -8913,6 +9309,7 @@
     "method:runs.wait",
     "method:runs.events",
     "method:runs.result",
+    "method:runs.continuation.requeue",
     "method:runs.cancel",
     "method:runs.delete",
     "method:interactions.list",
@@ -8964,6 +9361,7 @@
     "workflows.atomic-draft-create/v1",
     "workflows.canonical-authoring-contract/v1",
     "workflows.runtime-draft-mutations/v1",
-    "auth:browser-pkce/v1"
+    "auth:browser-pkce/v1",
+    "workflows.patch.notes-preserve/v1"
   ]
 }

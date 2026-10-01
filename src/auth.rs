@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::Mutex;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -22,6 +23,90 @@ use tokio::{
 
 const SERVICE: &str = "app.loomex.runner.v1";
 const ACCOUNT: &str = "installation";
+const STORE_IO_BUDGET: Duration = Duration::from_secs(2);
+const AUTH_LOCK_BUDGET: Duration = Duration::from_secs(15);
+
+fn credential_store_code(error: &anyhow::Error) -> &'static str {
+    match error.to_string().as_str() {
+        "STORE_ACCESS_REQUIRED" => "STORE_ACCESS_REQUIRED",
+        "STORE_ACCESS_DENIED" => "STORE_ACCESS_DENIED",
+        "STORE_OPERATION_PENDING" => "STORE_OPERATION_PENDING",
+        "STORE_INVALID" => "STORE_INVALID",
+        _ => "STORE_UNAVAILABLE",
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn noninteractive_password_options(
+    service: &str,
+    account: &str,
+) -> security_framework::passwords::PasswordOptions {
+    use core_foundation::{base::TCFType, string::CFString};
+    use security_framework_sys::item::kSecUseAuthenticationUI;
+    // The existing sys crate omits this documented Security constant. No new
+    // framework, authentication context, global policy or item ACL is created.
+    unsafe extern "C" {
+        static kSecUseAuthenticationUIFail: core_foundation::string::CFStringRef;
+    }
+    let mut options =
+        security_framework::passwords::PasswordOptions::new_generic_password(service, account);
+    #[allow(deprecated)]
+    options.query.push(unsafe {
+        (
+            CFString::wrap_under_get_rule(kSecUseAuthenticationUI),
+            CFString::wrap_under_get_rule(kSecUseAuthenticationUIFail).into_CFType(),
+        )
+    });
+    options
+}
+
+// This path is called only by the explicit foreground daemon-binary probe.
+// Omitting kSecUseAuthenticationUI uses Apple's documented Allow default;
+// ordinary daemon operations continue to pass Fail above.
+#[cfg(target_os = "macos")]
+fn foreground_password_options(
+    service: &str,
+    account: &str,
+) -> security_framework::passwords::PasswordOptions {
+    security_framework::passwords::PasswordOptions::new_generic_password(service, account)
+}
+
+#[cfg(target_os = "macos")]
+fn probe_password(options: security_framework::passwords::PasswordOptions) -> &'static str {
+    match security_framework::passwords::generic_password(options) {
+        Ok(mut bytes) => {
+            bytes.fill(0);
+            "AUTHORIZED"
+        }
+        Err(error) if error.code() == -25300 => "ABSENT",
+        Err(error) if matches!(error.code(), -25308 | -25315) => "ACCESS_REQUIRED",
+        Err(error) if error.code() == -25293 => "ACCESS_DENIED",
+        Err(_) => "UNAVAILABLE",
+    }
+}
+
+/// Fixed-status read of the exact existing item by the daemon executable.
+/// The foreground form may display macOS authorization UI, and is never used
+/// by normal daemon startup or local-control requests.
+#[cfg(target_os = "macos")]
+pub fn credential_store_probe(foreground_authorization: bool) -> &'static str {
+    if foreground_authorization {
+        probe_password(foreground_password_options(SERVICE, ACCOUNT))
+    } else {
+        probe_password(noninteractive_password_options(SERVICE, ACCOUNT))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn native_store_error(status: i32) -> anyhow::Error {
+    // InteractionNotAllowed/InteractionRequired do not identify an ACL or a
+    // globally locked keychain. Preserve that uncertainty in the public code.
+    anyhow!(match status {
+        -25308 | -25315 => "STORE_ACCESS_REQUIRED",
+        -25293 => "STORE_ACCESS_DENIED",
+        _ => "STORE_UNAVAILABLE",
+    })
+}
 const BROWSER_AUTH_CSS: &str = include_str!("../assets/browser_authority.css");
 
 #[cfg(target_os = "macos")]
@@ -126,21 +211,28 @@ impl Store for MemoryStore {
 #[cfg(target_os = "macos")]
 impl Store for NativeStore {
     fn load(&self) -> Result<Option<Vec<u8>>> {
-        match security_framework::passwords::get_generic_password(SERVICE, ACCOUNT) {
+        match security_framework::passwords::generic_password(noninteractive_password_options(
+            SERVICE, ACCOUNT,
+        )) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(error) if error.code() == -25300 => Ok(None),
-            Err(_) => bail!("STORE_UNAVAILABLE"),
+            Err(error) => Err(native_store_error(error.code())),
         }
     }
     fn save(&self, data: &[u8]) -> Result<()> {
-        security_framework::passwords::set_generic_password(SERVICE, ACCOUNT, data)
-            .map_err(|_| anyhow!("STORE_UNAVAILABLE"))
+        security_framework::passwords::set_generic_password_options(
+            data,
+            noninteractive_password_options(SERVICE, ACCOUNT),
+        )
+        .map_err(|error| native_store_error(error.code()))
     }
     fn delete(&self) -> Result<()> {
-        match security_framework::passwords::delete_generic_password(SERVICE, ACCOUNT) {
+        match security_framework::passwords::delete_generic_password_options(
+            noninteractive_password_options(SERVICE, ACCOUNT),
+        ) {
             Ok(()) => Ok(()),
             Err(error) if error.code() == -25300 => Ok(()),
-            Err(_) => bail!("STORE_UNAVAILABLE"),
+            Err(error) => Err(native_store_error(error.code())),
         }
     }
 }
@@ -162,7 +254,10 @@ struct Token {
 }
 impl Token {
     fn usable(&self) -> bool {
-        self.expires_at > now().saturating_add(60)
+        self.usable_at(now())
+    }
+    fn usable_at(&self, timestamp: u64) -> bool {
+        self.expires_at > timestamp.saturating_add(60)
     }
     fn signed(&self, state: &ProtectedState) -> SignedCredential {
         SignedCredential {
@@ -212,6 +307,8 @@ struct Pending {
     target: Target,
     route: String,
     body: Value,
+    // Persisted before dispatch. A retry must retain this original bound so a
+    // recovered response cannot acquire a new lifetime at receipt time.
     started_at: u64,
     // Retained only to decode pre-0.3.35 Keychain records. Exact proof-bound
     // recovery is repeatable on compatible backends until the server deadline.
@@ -261,6 +358,7 @@ pub struct Auth {
     store: Arc<dyn Store>,
     lock: Arc<Mutex<()>>,
     store_lock: Arc<Mutex<()>>,
+    store_owner: Arc<std::sync::Mutex<Option<std::sync::Weak<std::fs::File>>>>,
     listeners: Arc<Mutex<BTreeMap<String, JoinHandle<()>>>>,
 }
 impl Auth {
@@ -271,6 +369,7 @@ impl Auth {
             store: Arc::new(MemoryStore::default()),
             lock: Arc::new(Mutex::new(())),
             store_lock: Arc::new(Mutex::new(())),
+            store_owner: Arc::new(std::sync::Mutex::new(None)),
             listeners: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -301,39 +400,86 @@ impl Auth {
             .expect("in-memory fixture write");
         auth
     }
+    #[cfg(test)]
+    pub(crate) async fn test_hold_credential_gate(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.lock.clone().lock_owned().await
+    }
     pub fn new(api: Api) -> Result<Self> {
         Ok(Self {
             api,
             store: Arc::new(NativeStore),
             lock: Arc::new(Mutex::new(())),
             store_lock: Arc::new(Mutex::new(())),
+            store_owner: Arc::new(std::sync::Mutex::new(None)),
             listeners: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
-    async fn load(&self) -> Result<Option<ProtectedState>> {
+    pub(crate) fn retain_store_owner(&self, owner: &Arc<std::fs::File>) {
+        // Do not extend ownership merely because an Auth clone survives. Only
+        // a started native worker retains the existing singleton through IO.
+        *self.store_owner.lock().unwrap() = Some(Arc::downgrade(owner));
+    }
+    async fn auth_guard(&self) -> Result<tokio::sync::MutexGuard<'_, ()>> {
+        tokio::time::timeout(AUTH_LOCK_BUDGET, self.lock.lock())
+            .await
+            .map_err(|_| anyhow!("STORE_UNAVAILABLE"))
+    }
+    async fn store_operation<T: Send + 'static>(
+        &self,
+        mutating: bool,
+        operation: impl FnOnce(Arc<dyn Store>) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let deadline = tokio::time::Instant::now() + STORE_IO_BUDGET;
+        let io_guard = tokio::time::timeout_at(deadline, self.store_lock.clone().lock_owned())
+            .await
+            .map_err(|_| anyhow!("STORE_UNAVAILABLE"))?;
         let store = self.store.clone();
-        let io_guard = self.store_lock.clone().lock_owned().await;
-        tokio::task::spawn_blocking(move || {
+        let owner = match self.store_owner.lock().unwrap().as_ref() {
+            Some(owner) => Some(
+                owner
+                    .upgrade()
+                    .ok_or_else(|| anyhow!("STORE_UNAVAILABLE"))?,
+            ),
+            None => None,
+        };
+        let task = tokio::task::spawn_blocking(move || {
+            let _owner = owner;
+            // A started OS call cannot be aborted. This guard survives caller
+            // timeout/cancellation, so no later store operation can overtake it
+            // and repeated calls cannot spawn further blocked OS tasks.
             let _io_guard = io_guard;
+            operation(store)
+        });
+        tokio::time::timeout_at(deadline, task)
+            .await
+            .map_err(|_| {
+                anyhow!(if mutating {
+                    "STORE_OPERATION_PENDING"
+                } else {
+                    "STORE_UNAVAILABLE"
+                })
+            })?
+            .map_err(|_| {
+                anyhow!(if mutating {
+                    "STORE_OPERATION_PENDING"
+                } else {
+                    "STORE_UNAVAILABLE"
+                })
+            })?
+    }
+    async fn load(&self) -> Result<Option<ProtectedState>> {
+        self.store_operation(false, |store| {
             store
                 .load()?
                 .map(|data| serde_json::from_slice(&data).map_err(|_| anyhow!("STORE_INVALID")))
                 .transpose()
         })
         .await
-        .map_err(|_| anyhow!("STORE_UNAVAILABLE"))?
     }
     async fn save(&self, state: &ProtectedState) -> Result<()> {
         let bytes = serde_json::to_vec(state).map_err(|_| anyhow!("STORE_INVALID"))?;
-        let store = self.store.clone();
-        // The blocking closure retains the guard even if its caller is cancelled.
-        let io_guard = self.store_lock.clone().lock_owned().await;
-        tokio::task::spawn_blocking(move || {
-            let _io_guard = io_guard;
-            store.save(&bytes)
-        })
-        .await
-        .map_err(|_| anyhow!("STORE_UNAVAILABLE"))?
+        self.store_operation(true, move |store| store.save(&bytes))
+            .await
     }
     async fn required(&self) -> Result<ProtectedState> {
         self.load().await?.ok_or_else(|| anyhow!("AUTH_REQUIRED"))
@@ -343,7 +489,7 @@ impl Auth {
         Ok(())
     }
     pub async fn installation_id(&self) -> Result<String> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.auth_guard().await?;
         let state = match self.load().await? {
             Some(state) => state,
             None => {
@@ -355,7 +501,7 @@ impl Auth {
         Ok(state.installation_id)
     }
     pub async fn enrolled_organizations(&self) -> Result<Vec<String>> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.auth_guard().await?;
         let Some(state) = self.load().await? else {
             return Ok(vec![]);
         };
@@ -363,12 +509,14 @@ impl Auth {
         Ok(state.children.keys().cloned().collect())
     }
     pub async fn status(&self) -> Result<Value> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.auth_guard().await?;
         match self.load().await {
             Err(error) => Ok(
-                json!({"authenticated":false,"code":if error.to_string()=="STORE_UNAVAILABLE" {"STORE_UNAVAILABLE"} else {"STORE_INVALID"}}),
+                json!({"authenticated":false,"code":credential_store_code(&error),"loginPending":false}),
             ),
-            Ok(None) => Ok(json!({"authenticated":false,"code":"AUTH_REQUIRED"})),
+            Ok(None) => {
+                Ok(json!({"authenticated":false,"code":"AUTH_REQUIRED","loginPending":false}))
+            }
             Ok(Some(state)) => Ok(
                 json!({"authenticated":state.device.is_some() && !state.logout_pending,"code":if state.logout_pending {"LOGOUT_PENDING"} else if state.pending.is_some() {"AUTH_RECOVERY_PENDING"} else if state.device.is_some() {"AUTHENTICATED"} else {"AUTH_REQUIRED"},"installationId":state.installation_id,"activeOrganization":state.active_organization,"organizations":state.children.keys().collect::<Vec<_>>(),"loginPending":state.login.is_some()}),
             ),
@@ -377,7 +525,7 @@ impl Auth {
     /// Reconcile the exact durable authentication operation already stored in
     /// the Keychain. This never starts a new login, enrollment, or rotation.
     pub async fn reconcile(&self) -> Result<Value> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.auth_guard().await?;
         let mut state = self.required().await?;
         if state.pending.is_some() {
             self.recover(&mut state).await?;
@@ -415,8 +563,7 @@ impl Auth {
         selected_organization: Option<String>,
         active_work: usize,
     ) -> Value {
-        let _guard = self.lock.lock().await;
-        let unavailable = || {
+        let unavailable = |code: &str| {
             json!({
                 "schemaVersion":"loomex.runner.connection/v2",
                 "state":"credential_store_unavailable",
@@ -425,10 +572,16 @@ impl Auth {
                 "activeWork":active_work,
                 "actions":[],
                 "login":Value::Null,
+                "details":{"credentialStoreCode":code},
             })
         };
-        let Ok(stored) = self.load().await else {
-            return unavailable();
+        let _guard = match self.auth_guard().await {
+            Ok(guard) => guard,
+            Err(error) => return unavailable(credential_store_code(&error)),
+        };
+        let stored = match self.load().await {
+            Ok(stored) => stored,
+            Err(error) => return unavailable(credential_store_code(&error)),
         };
         let Some(state) = stored else {
             return json!({
@@ -544,7 +697,7 @@ impl Auth {
     pub async fn login(&self, runner_name: &str, key: &str) -> Result<Value> {
         ensure!((16..=256).contains(&key.len()), "INVALID_IDEMPOTENCY_KEY");
         ensure!(!runner_name.trim().is_empty(), "RUNNER_NAME_REQUIRED");
-        let _guard = self.lock.lock().await;
+        let _guard = self.auth_guard().await?;
         let mut state = self.load().await?.unwrap_or_else(ProtectedState::fresh);
         Self::allowed(&state)?;
         if state.pending.is_some() {
@@ -669,7 +822,7 @@ impl Auth {
         F: FnOnce(String) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
-        let _guard = self.lock.lock().await;
+        let _guard = self.auth_guard().await?;
         let state = self.required().await?;
         Self::allowed(&state)?;
         ensure!(state.device.is_none(), "AUTH_ALREADY_COMPLETED");
@@ -824,7 +977,7 @@ impl Auth {
         code: Option<&str>,
         error: Option<&str>,
     ) -> Result<()> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.auth_guard().await?;
         let mut state = self.required().await?;
         let login = state
             .login
@@ -860,7 +1013,7 @@ impl Auth {
         .await
     }
     pub async fn cancel_login(&self, flow_id: &str) -> Result<Value> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.auth_guard().await?;
         let mut state = self.required().await?;
         let login = state
             .login
@@ -886,7 +1039,7 @@ impl Auth {
         Ok(json!({"canceled":true}))
     }
     pub async fn organizations(&self) -> Result<Value> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.auth_guard().await?;
         let mut state = self.required().await?;
         self.ensure_device(&mut state).await?;
         let credential = state.device.as_ref().unwrap().signed(&state);
@@ -929,7 +1082,7 @@ impl Auth {
                     .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
             "INVALID_ORGANIZATION_ID"
         );
-        let _guard = self.lock.lock().await;
+        let _guard = self.auth_guard().await?;
         let mut state = self.required().await?;
         self.ensure_device(&mut state).await?;
         if !state.children.contains_key(org) {
@@ -959,17 +1112,20 @@ impl Auth {
         Ok(json!({"organizationId":org,"selected":true,"enrolled":true}))
     }
     pub async fn credential(&self, org: &str) -> Result<SignedCredential> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.auth_guard().await?;
         let mut state = self.required().await?;
         Self::allowed(&state)?;
         if state.pending.is_some() {
             self.recover(&mut state).await?;
         }
-        let child = state
-            .children
-            .get(org)
-            .ok_or_else(|| anyhow!("ORGANIZATION_NOT_ENROLLED"))?;
-        if !child.usable() {
+        for _ in 0..2 {
+            let child = state
+                .children
+                .get(org)
+                .ok_or_else(|| anyhow!("ORGANIZATION_NOT_ENROLLED"))?;
+            if child.usable() {
+                return Ok(child.signed(&state));
+            }
             let refresh = child.refresh.clone();
             let proof = key_proof(&state.private_key, "refresh", &refresh);
             self.begin(
@@ -980,16 +1136,12 @@ impl Auth {
             )
             .await?;
         }
-        Ok(state
-            .children
-            .get(org)
-            .ok_or_else(|| anyhow!("AUTH_REQUIRED"))?
-            .signed(&state))
+        bail!("AUTH_EXPIRED")
     }
     /// Returns the already-enrolled local child identity without refreshing,
     /// recovering, persisting, or contacting the backend.
     pub async fn current_child_identity(&self, org: &str) -> Result<(String, String)> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.auth_guard().await?;
         let state = self.required().await?;
         Self::allowed(&state)?;
         ensure!(state.pending.is_none(), "AUTH_RECONCILIATION_REQUIRED");
@@ -1001,11 +1153,11 @@ impl Auth {
         Ok((child.subject.clone(), state.installation_id))
     }
     pub async fn logout(&self) -> Result<Value> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.auth_guard().await?;
         self.logout_locked().await
     }
     pub async fn offline_logout(&self) -> Result<Value> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.auth_guard().await?;
         if let Some(mut state) = self.load().await? {
             if state.device.is_none() && (state.pending.is_some() || !state.children.is_empty()) {
                 // A lost bootstrap reply can represent an active remote authority.
@@ -1025,15 +1177,7 @@ impl Auth {
             }
         }
         let result = self.logout_locked().await?;
-        let store = self.store.clone();
-        let io_guard = self.store_lock.clone().lock_owned().await;
-        tokio::task::spawn_blocking(move || {
-            // Cancellation cannot let another native store operation overtake deletion.
-            let _io_guard = io_guard;
-            store.delete()
-        })
-        .await
-        .map_err(|_| anyhow!("STORE_UNAVAILABLE"))??;
+        self.store_operation(true, |store| store.delete()).await?;
         Ok(result)
     }
     async fn logout_locked(&self) -> Result<Value> {
@@ -1097,11 +1241,14 @@ impl Auth {
         if state.pending.is_some() {
             self.recover(state).await?;
         }
-        let token = state
-            .device
-            .as_ref()
-            .ok_or_else(|| anyhow!("AUTH_REQUIRED"))?;
-        if !token.usable() {
+        for _ in 0..2 {
+            let token = state
+                .device
+                .as_ref()
+                .ok_or_else(|| anyhow!("AUTH_REQUIRED"))?;
+            if token.usable() {
+                return Ok(());
+            }
             let refresh = token.refresh.clone();
             let proof = key_proof(&state.private_key, "device-refresh", &refresh);
             self.begin(
@@ -1112,7 +1259,7 @@ impl Auth {
             )
             .await?;
         }
-        Ok(())
+        bail!("AUTH_EXPIRED")
     }
     async fn begin(
         &self,
@@ -1157,18 +1304,26 @@ impl Auth {
             .pending
             .clone()
             .ok_or_else(|| anyhow!("AUTH_REQUIRED"))?;
-        let mut body = pending.body;
+        let mut body = pending.body.clone();
         if recovery {
             body["recovery"] = json!(true);
         }
         let credential = if matches!(pending.target, Target::Enroll(_)) {
-            Some(
-                state
-                    .device
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("AUTH_REQUIRED"))?
-                    .signed(state),
-            )
+            let device = state
+                .device
+                .as_ref()
+                .ok_or_else(|| anyhow!("AUTH_REQUIRED"))?;
+            if !device.usable() {
+                if !recovery {
+                    // The initial enrollment has not been transmitted. Drop
+                    // only this local unsent record so the next select can
+                    // refresh the device before starting the same request.
+                    state.pending = None;
+                    self.save(state).await?;
+                }
+                bail!("AUTH_EXPIRED")
+            }
+            Some(device.signed(state))
         } else {
             None
         };
@@ -1219,7 +1374,11 @@ impl Auth {
             }
             Target::Bootstrap => {
                 let device = &data["device"];
-                state.device = Some(parse_token(device, field(device, "deviceId")?)?);
+                state.device = Some(parse_token(
+                    device,
+                    field(device, "deviceId")?,
+                    pending.started_at,
+                )?);
                 state.login = None;
             }
             Target::DeviceRefresh => {
@@ -1229,7 +1388,7 @@ impl Auth {
                     .ok_or_else(|| anyhow!("AUTH_REQUIRED"))?
                     .subject
                     .clone();
-                state.device = Some(parse_token(&data, subject)?);
+                state.device = Some(parse_token(&data, subject, pending.started_at)?);
             }
             Target::ChildRefresh(org) => {
                 let subject = state
@@ -1238,7 +1397,9 @@ impl Auth {
                     .ok_or_else(|| anyhow!("AUTH_REQUIRED"))?
                     .subject
                     .clone();
-                state.children.insert(org, parse_token(&data, subject)?);
+                state
+                    .children
+                    .insert(org, parse_token(&data, subject, pending.started_at)?);
             }
             Target::Enroll(org) => {
                 ensure!(
@@ -1247,7 +1408,11 @@ impl Auth {
                 );
                 state.children.insert(
                     org,
-                    parse_token(&data["child"], field(&data["runner"], "id")?)?,
+                    parse_token(
+                        &data["child"],
+                        field(&data["runner"], "id")?,
+                        pending.started_at,
+                    )?,
                 );
             }
         }
@@ -1263,22 +1428,38 @@ fn field(value: &Value, name: &str) -> Result<String> {
         .map(str::to_owned)
         .ok_or_else(|| anyhow!("INVALID_API_RESPONSE"))
 }
-fn expiry(value: &Value) -> Result<u64> {
-    now()
-        .checked_add(
-            value["expiresInSeconds"]
-                .as_u64()
-                .filter(|n| *n > 0)
-                .ok_or_else(|| anyhow!("INVALID_API_RESPONSE"))?,
-        )
-        .ok_or_else(|| anyhow!("INVALID_API_RESPONSE"))
+fn expiry(value: &Value, started_at: u64) -> Result<u64> {
+    let ttl = value["expiresInSeconds"]
+        .as_u64()
+        .filter(|n| *n > 0)
+        .ok_or_else(|| anyhow!("INVALID_API_RESPONSE"))?;
+    let dispatch_bound = started_at
+        .checked_add(ttl)
+        .ok_or_else(|| anyhow!("INVALID_API_RESPONSE"))?;
+    match value.get("expiresAt") {
+        None => Ok(dispatch_bound),
+        Some(absolute) => {
+            let absolute = absolute
+                .as_str()
+                .filter(|s| !s.is_empty() && s.len() <= 64)
+                .ok_or_else(|| anyhow!("INVALID_API_RESPONSE"))?;
+            let parsed = OffsetDateTime::parse(absolute, &Rfc3339)
+                .map_err(|_| anyhow!("INVALID_API_RESPONSE"))?;
+            let unix = u64::try_from(parsed.unix_timestamp())
+                .map_err(|_| anyhow!("INVALID_API_RESPONSE"))?;
+            ensure!(unix > 0, "INVALID_API_RESPONSE");
+            // Server absolute expiry is authoritative. The dispatch bound is a
+            // conservative cap for clock skew and old/replayed responses.
+            Ok(unix.min(dispatch_bound))
+        }
+    }
 }
-fn parse_token(value: &Value, subject: String) -> Result<Token> {
+fn parse_token(value: &Value, subject: String, started_at: u64) -> Result<Token> {
     Ok(Token {
         access: field(value, "accessToken")?,
         refresh: field(value, "refreshToken")?,
         subject,
-        expires_at: expiry(value)?,
+        expires_at: expiry(value, started_at)?,
     })
 }
 fn login_projection(login: &Login) -> Value {
@@ -1330,7 +1511,9 @@ mod tests {
     async fn public_fixtures_use_only_memory() {
         let api = Api::for_test_origin("http://127.0.0.1:9").unwrap();
         let unauthed = Auth::test_unauthed(api.clone());
-        assert_eq!(unauthed.status().await.unwrap()["code"], "AUTH_REQUIRED");
+        let unauthed_status = unauthed.status().await.unwrap();
+        assert_eq!(unauthed_status["code"], "AUTH_REQUIRED");
+        assert_eq!(unauthed_status["loginPending"], false);
         let auth = Auth::test_enrolled(api, "organization", "runner");
         let credential = auth.credential("organization").await.unwrap();
         assert_eq!(credential.subject, "runner");
@@ -1370,6 +1553,7 @@ mod tests {
         let token = parse_token(
             &json!({"accessToken":"a","refreshToken":"r","expiresInSeconds":120}),
             "s".into(),
+            now(),
         )
         .unwrap();
         let restored: Token =
@@ -1381,6 +1565,53 @@ mod tests {
             ..restored
         };
         assert!(!expired.usable());
+    }
+    #[test]
+    fn delayed_and_replayed_token_responses_never_gain_receipt_lifetime() {
+        let started = 1_000_000;
+        let old_backend = json!({"accessToken":"a","refreshToken":"r","expiresInSeconds":900});
+        let delayed = parse_token(&old_backend, "subject".into(), started).unwrap();
+        assert_eq!(delayed.expires_at, started + 900);
+        assert!(!delayed.usable_at(started + 1_000));
+
+        // A recovered response uses the persisted original request start even
+        // when the server processes it much later than the first attempt.
+        let mut absolute = old_backend.clone();
+        absolute["expiresAt"] = json!("1970-01-12T14:01:30.500000+00:00");
+        assert_eq!(expiry(&absolute, started).unwrap(), started + 890);
+        absolute["expiresAt"] = json!("1970-01-12T14:03:20Z");
+        assert_eq!(expiry(&absolute, started).unwrap(), started + 900);
+        assert!(
+            !parse_token(&absolute, "subject".into(), started)
+                .unwrap()
+                .usable_at(started + 1_000)
+        );
+    }
+    #[test]
+    fn token_expiry_rejects_malformed_absolute_and_overflow() {
+        for absolute in [
+            json!(null),
+            json!(900),
+            json!(""),
+            json!("tomorrow"),
+            json!("1969-12-31T23:59:59Z"),
+        ] {
+            let token = json!({"accessToken":"a","refreshToken":"r","expiresInSeconds":900,"expiresAt":absolute});
+            assert_eq!(
+                expiry(&token, 1_000).unwrap_err().to_string(),
+                "INVALID_API_RESPONSE"
+            );
+        }
+        let token = json!({"expiresInSeconds":900});
+        assert_eq!(
+            expiry(&token, u64::MAX - 899).unwrap_err().to_string(),
+            "INVALID_API_RESPONSE"
+        );
+        let token = json!({"expiresInSeconds":0});
+        assert_eq!(
+            expiry(&token, 1_000).unwrap_err().to_string(),
+            "INVALID_API_RESPONSE"
+        );
     }
     #[test]
     fn login_projection_has_no_secret() {
@@ -1540,6 +1771,7 @@ mod tests {
             store: Arc::new(Unavailable),
             lock: Arc::new(Mutex::new(())),
             store_lock: Arc::new(Mutex::new(())),
+            store_owner: Arc::new(std::sync::Mutex::new(None)),
             listeners: Arc::new(Mutex::new(BTreeMap::new())),
         };
         let projection = auth.connection(None, 0).await;
@@ -1669,6 +1901,7 @@ mod tests {
             store: store.clone(),
             lock: Arc::new(Mutex::new(())),
             store_lock: Arc::new(Mutex::new(())),
+            store_owner: Arc::new(std::sync::Mutex::new(None)),
             listeners: Arc::new(Mutex::new(BTreeMap::new())),
         };
         (auth, store, listener)
@@ -1855,6 +2088,280 @@ mod tests {
         assert!(!status.contains("replacement") && !status.contains("lmxr_"));
     }
     #[tokio::test]
+    async fn recovered_expired_child_commits_refresh_material_then_refreshes_before_signing() {
+        let (auth, store, listener) = test_auth().await;
+        let mut state = ProtectedState::fresh();
+        state.children.insert(
+            "org".into(),
+            Token {
+                access: "old-access".into(),
+                refresh: "old-refresh".into(),
+                subject: "runner".into(),
+                expires_at: 0,
+            },
+        );
+        let old_start = now().saturating_sub(1_200);
+        state.pending = Some(Pending {
+            target: Target::ChildRefresh("org".into()),
+            route: "v1/delegations/refresh/".into(),
+            body: json!({"refreshToken":"old-refresh","proof":"original-proof"}),
+            started_at: old_start,
+            recovery_used: false,
+        });
+        auth.save(&state).await.unwrap();
+        let server = tokio::spawn(async move {
+            let (mut recovered, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut recovered).await;
+            assert_eq!(request["refreshToken"], "old-refresh");
+            assert_eq!(request["proof"], "original-proof");
+            assert_eq!(request["recovery"], true);
+            respond(
+                &mut recovered,
+                200,
+                json!({"data":{
+                    "accessToken":"expired-recovered-access",
+                    "refreshToken":"recovered-refresh",
+                    "expiresInSeconds":900
+                }}),
+            )
+            .await;
+
+            let (mut refreshed, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut refreshed).await;
+            assert_eq!(request["refreshToken"], "recovered-refresh");
+            assert!(request.get("recovery").is_none());
+            assert_ne!(request["proof"], "original-proof");
+            respond(
+                &mut refreshed,
+                200,
+                json!({"data":{
+                    "accessToken":"fresh-access",
+                    "refreshToken":"fresh-refresh",
+                    "expiresInSeconds":900
+                }}),
+            )
+            .await;
+        });
+        let credential = auth.credential("org").await.unwrap();
+        assert_eq!(credential.token, "fresh-access");
+        server.await.unwrap();
+        let durable: ProtectedState =
+            serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+        assert!(durable.pending.is_none());
+        assert_eq!(durable.children["org"].refresh, "fresh-refresh");
+        assert!(durable.children["org"].usable());
+    }
+    #[tokio::test]
+    async fn repeated_expired_child_refresh_fails_closed_with_latest_material_saved() {
+        let (auth, store, listener) = test_auth().await;
+        let mut state = ProtectedState::fresh();
+        state.children.insert(
+            "org".into(),
+            Token {
+                access: "old-access".into(),
+                refresh: "old-refresh".into(),
+                subject: "runner".into(),
+                expires_at: 0,
+            },
+        );
+        auth.save(&state).await.unwrap();
+        let server = tokio::spawn(async move {
+            for (expected, next) in [("old-refresh", "refresh-1"), ("refresh-1", "refresh-2")] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                assert_eq!(request["refreshToken"], expected);
+                respond(
+                    &mut stream,
+                    200,
+                    json!({"data":{
+                        "accessToken":"expired-access", "refreshToken":next,
+                        "expiresInSeconds":1
+                    }}),
+                )
+                .await;
+            }
+        });
+        assert_eq!(
+            auth.credential("org").await.err().unwrap().to_string(),
+            "AUTH_EXPIRED"
+        );
+        server.await.unwrap();
+        let durable: ProtectedState =
+            serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+        assert!(durable.pending.is_none());
+        assert_eq!(durable.children["org"].refresh, "refresh-2");
+        assert!(!durable.children["org"].usable());
+    }
+    #[tokio::test]
+    async fn expired_device_refresh_never_sends_a_bearer_to_organizations() {
+        let (auth, store, listener) = test_auth().await;
+        let mut state = ProtectedState::fresh();
+        state.device = Some(Token {
+            access: "old-device-access".into(),
+            refresh: "old-device-refresh".into(),
+            subject: "device".into(),
+            expires_at: 0,
+        });
+        auth.save(&state).await.unwrap();
+        let server = tokio::spawn(async move {
+            for (expected, next) in [
+                ("old-device-refresh", "device-refresh-1"),
+                ("device-refresh-1", "device-refresh-2"),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut stream).await;
+                assert_eq!(request["refreshToken"], expected);
+                respond(
+                    &mut stream,
+                    200,
+                    json!({"data":{
+                        "accessToken":"expired-device-access", "refreshToken":next,
+                        "expiresInSeconds":1
+                    }}),
+                )
+                .await;
+            }
+            // A GET would carry an expired device Bearer. Bounded refresh
+            // failure must return before one is transmitted.
+            assert_eq!(
+                listener.into_std().unwrap().accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        });
+        assert_eq!(
+            auth.organizations().await.err().unwrap().to_string(),
+            "AUTH_EXPIRED"
+        );
+        server.await.unwrap();
+        let durable: ProtectedState =
+            serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+        assert_eq!(durable.device.unwrap().refresh, "device-refresh-2");
+    }
+    #[tokio::test]
+    async fn recovered_bootstrap_uses_original_request_start_for_device_expiry() {
+        let (auth, store, listener) = test_auth().await;
+        let mut state = ProtectedState::fresh();
+        let old_start = now().saturating_sub(1_200);
+        state.pending = Some(Pending {
+            target: Target::Bootstrap,
+            route: "v2/device-authorities/bootstrap/".into(),
+            body: json!({"bootstrapGrant":"original-grant","proof":"original-proof"}),
+            started_at: old_start,
+            recovery_used: false,
+        });
+        auth.save(&state).await.unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            assert_eq!(request["recovery"], true);
+            respond(
+                &mut stream,
+                200,
+                json!({"data":{"device":{
+                    "deviceId":"device", "accessToken":"expired-access",
+                    "refreshToken":"usable-refresh", "expiresInSeconds":900
+                }}}),
+            )
+            .await;
+        });
+        assert_eq!(auth.reconcile().await.unwrap()["reconciled"], true);
+        server.await.unwrap();
+        let durable: ProtectedState =
+            serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+        assert!(durable.pending.is_none());
+        assert_eq!(durable.device.as_ref().unwrap().expires_at, old_start + 900);
+        assert!(!durable.device.unwrap().usable());
+    }
+    #[tokio::test]
+    async fn recovered_enrollment_uses_original_request_start_for_child_expiry() {
+        let (auth, store, listener) = test_auth().await;
+        let mut state = ProtectedState::fresh();
+        state.device = Some(Token {
+            access: "lmxda_deviceprefix_deviceaccess".into(),
+            refresh: "device-refresh".into(),
+            subject: "device".into(),
+            expires_at: now() + 900,
+        });
+        let old_start = now().saturating_sub(1_200);
+        state.pending = Some(Pending {
+            target: Target::Enroll("org".into()),
+            route: "v2/organizations/org/enroll/".into(),
+            body: json!({"idempotencyKey":"original-key"}),
+            started_at: old_start,
+            recovery_used: false,
+        });
+        auth.save(&state).await.unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            assert_eq!(request["recovery"], true);
+            respond(
+                &mut stream,
+                200,
+                json!({"data":{
+                    "runner":{"id":"runner"},
+                    "child":{"accessToken":"expired-child", "refreshToken":"usable-refresh",
+                        "expiresInSeconds":900}
+                }}),
+            )
+            .await;
+        });
+        assert_eq!(auth.reconcile().await.unwrap()["reconciled"], true);
+        server.await.unwrap();
+        let durable: ProtectedState =
+            serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+        assert!(durable.pending.is_none());
+        assert_eq!(durable.children["org"].expires_at, old_start + 900);
+        assert!(!durable.children["org"].usable());
+    }
+    #[tokio::test]
+    async fn enrollment_with_expired_device_never_sends_bearer_or_discards_ambiguous_recovery() {
+        let (auth, store, listener) = test_auth().await;
+        let mut state = ProtectedState::fresh();
+        state.device = Some(Token {
+            access: "expired-device-access".into(),
+            refresh: "device-refresh".into(),
+            subject: "device".into(),
+            expires_at: 0,
+        });
+        auth.save(&state).await.unwrap();
+        // Model the device crossing its expiry reserve during the protected
+        // store write, after select's initial ensure_device check.
+        let result = auth
+            .begin(
+                &mut state,
+                Target::Enroll("org".into()),
+                "v2/organizations/org/enroll/".into(),
+                json!({"idempotencyKey":"original-key"}),
+            )
+            .await;
+        assert_eq!(result.err().unwrap().to_string(), "AUTH_EXPIRED");
+        assert!(state.pending.is_none());
+        let durable: ProtectedState =
+            serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+        assert!(durable.pending.is_none());
+
+        state.pending = Some(Pending {
+            target: Target::Enroll("org".into()),
+            route: "v2/organizations/org/enroll/".into(),
+            body: json!({"idempotencyKey":"original-key"}),
+            started_at: now().saturating_sub(1_200),
+            recovery_used: false,
+        });
+        auth.save(&state).await.unwrap();
+        assert_eq!(
+            auth.reconcile().await.err().unwrap().to_string(),
+            "AUTH_EXPIRED"
+        );
+        let durable: ProtectedState =
+            serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+        assert!(durable.pending.is_some());
+        assert_eq!(
+            listener.into_std().unwrap().accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+    #[tokio::test]
     async fn offline_bootstrap_cleanup_requires_recovered_revocable_authority() {
         for outcome in ["recovered", "denied", "exhausted"] {
             let (auth, store, listener) = test_auth().await;
@@ -2027,6 +2534,7 @@ mod tests {
             store: store.clone(),
             lock: Arc::new(Mutex::new(())),
             store_lock: Arc::new(Mutex::new(())),
+            store_owner: Arc::new(std::sync::Mutex::new(None)),
             listeners: Arc::new(Mutex::new(BTreeMap::new())),
         };
         let original = auth.installation_id().await.unwrap();
@@ -2243,6 +2751,7 @@ mod tests {
                 store: store.clone(),
                 lock: Arc::new(Mutex::new(())),
                 store_lock: Arc::new(Mutex::new(())),
+                store_owner: Arc::new(std::sync::Mutex::new(None)),
                 listeners: Arc::new(Mutex::new(BTreeMap::new())),
             };
             let operation_auth = auth.clone();
@@ -2335,5 +2844,441 @@ mod tests {
         let durable: ProtectedState =
             serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
         assert!(durable.pending.is_none());
+    }
+    #[tokio::test]
+    async fn blocked_store_read_returns_typed_failure_and_retains_one_io_guard() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct BlockedRead {
+            calls: AtomicUsize,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+            entered: tokio::sync::Notify,
+        }
+        impl Store for BlockedRead {
+            fn load(&self) -> Result<Option<Vec<u8>>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.entered.notify_one();
+                self.release.lock().unwrap().recv().unwrap();
+                Ok(None)
+            }
+            fn save(&self, _: &[u8]) -> Result<()> {
+                panic!("read failure must not write")
+            }
+        }
+        let (release, receiver) = std::sync::mpsc::channel();
+        let store = Arc::new(BlockedRead {
+            calls: AtomicUsize::new(0),
+            release: std::sync::Mutex::new(receiver),
+            entered: tokio::sync::Notify::new(),
+        });
+        let auth = Auth {
+            api: Api::for_test_origin("http://127.0.0.1:9").unwrap(),
+            store: store.clone(),
+            lock: Arc::new(Mutex::new(())),
+            store_lock: Arc::new(Mutex::new(())),
+            store_owner: Arc::new(std::sync::Mutex::new(None)),
+            listeners: Arc::new(Mutex::new(BTreeMap::new())),
+        };
+        let copy = auth.clone();
+        let mut call = tokio::spawn(async move { copy.load().await });
+        store.entered.notified().await;
+        let result = tokio::time::timeout(Duration::from_secs(3), &mut call).await;
+        // Always release the test-only OS substitute before asserting, including red-before.
+        release.send(()).unwrap();
+        if result.is_err() {
+            call.await.unwrap().unwrap();
+        }
+        assert!(
+            result.is_ok(),
+            "credential read failed to return a bounded typed error"
+        );
+        assert_eq!(
+            result.unwrap().unwrap().err().unwrap().to_string(),
+            "STORE_UNAVAILABLE"
+        );
+        assert_eq!(store.calls.load(Ordering::SeqCst), 1);
+    }
+    fn auth_with_store(store: Arc<dyn Store>) -> Auth {
+        Auth {
+            api: Api::for_test_origin("http://127.0.0.1:9").unwrap(),
+            store,
+            lock: Arc::new(Mutex::new(())),
+            store_lock: Arc::new(Mutex::new(())),
+            store_owner: Arc::new(std::sync::Mutex::new(None)),
+            listeners: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+    #[tokio::test]
+    async fn denied_store_reports_connection_category_without_starting_auth() {
+        struct Denied;
+        impl Store for Denied {
+            fn load(&self) -> Result<Option<Vec<u8>>> {
+                bail!("STORE_ACCESS_DENIED")
+            }
+            fn save(&self, _: &[u8]) -> Result<()> {
+                panic!("denied read must not write")
+            }
+        }
+        let auth = auth_with_store(Arc::new(Denied));
+        let temp = tempfile::tempdir().unwrap();
+        let daemon =
+            crate::control::Daemon::new(temp.path().to_path_buf(), auth.api.clone(), auth.clone())
+                .unwrap();
+        let readiness = daemon.dispatch("status.get", json!({})).await.unwrap();
+        assert_eq!(readiness["activeJobs"], 0);
+        assert_eq!(readiness["draining"], false);
+        // Local readiness does not attest to the separately read credential store.
+        assert_eq!(auth.status().await.unwrap()["code"], "STORE_ACCESS_DENIED");
+        let connection = auth.connection(None, 0).await;
+        assert_eq!(connection["state"], "credential_store_unavailable");
+        assert_eq!(
+            connection["details"]["credentialStoreCode"],
+            "STORE_ACCESS_DENIED"
+        );
+        assert!(connection["login"].is_null());
+        assert_eq!(connection["actions"], json!([]));
+        assert_eq!(
+            auth.credential("org").await.err().unwrap().to_string(),
+            "STORE_ACCESS_DENIED"
+        );
+    }
+    #[tokio::test]
+    async fn timed_out_write_retains_serialization_and_late_completion_cannot_overtake_logout() {
+        struct Delayed {
+            bytes: std::sync::Mutex<Option<Vec<u8>>>,
+            writes: std::sync::atomic::AtomicUsize,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+            entered: tokio::sync::Notify,
+        }
+        impl Store for Delayed {
+            fn load(&self) -> Result<Option<Vec<u8>>> {
+                Ok(self.bytes.lock().unwrap().clone())
+            }
+            fn save(&self, bytes: &[u8]) -> Result<()> {
+                if self
+                    .writes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    == 0
+                {
+                    self.entered.notify_one();
+                    self.release.lock().unwrap().recv().unwrap();
+                }
+                *self.bytes.lock().unwrap() = Some(bytes.to_vec());
+                Ok(())
+            }
+            fn delete(&self) -> Result<()> {
+                *self.bytes.lock().unwrap() = None;
+                Ok(())
+            }
+        }
+        let (release, receiver) = std::sync::mpsc::channel();
+        let store = Arc::new(Delayed {
+            bytes: std::sync::Mutex::new(None),
+            writes: std::sync::atomic::AtomicUsize::new(0),
+            release: std::sync::Mutex::new(receiver),
+            entered: tokio::sync::Notify::new(),
+        });
+        let auth = auth_with_store(store.clone());
+        let copy = auth.clone();
+        let operation = tokio::spawn(async move { copy.save(&ProtectedState::fresh()).await });
+        store.entered.notified().await;
+        assert_eq!(
+            operation.await.unwrap().unwrap_err().to_string(),
+            "STORE_OPERATION_PENDING"
+        );
+        assert_eq!(
+            auth.offline_logout().await.unwrap_err().to_string(),
+            "STORE_UNAVAILABLE"
+        );
+        assert_eq!(store.writes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        release.send(()).unwrap();
+        assert_eq!(auth.offline_logout().await.unwrap()["revoked"], true);
+        assert!(store.bytes.lock().unwrap().is_none());
+        assert_eq!(auth.status().await.unwrap()["authenticated"], false);
+    }
+    #[tokio::test]
+    async fn late_expired_read_is_discarded_and_concurrent_auth_does_not_repeat_native_io() {
+        struct DelayedRead {
+            calls: std::sync::atomic::AtomicUsize,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+            entered: tokio::sync::Notify,
+            bytes: Vec<u8>,
+        }
+        impl Store for DelayedRead {
+            fn load(&self) -> Result<Option<Vec<u8>>> {
+                if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    self.entered.notify_one();
+                    self.release.lock().unwrap().recv().unwrap();
+                    Ok(Some(self.bytes.clone()))
+                } else {
+                    Ok(None)
+                }
+            }
+            fn save(&self, _: &[u8]) -> Result<()> {
+                panic!("no late expired credential may initiate refresh")
+            }
+        }
+        let mut state = ProtectedState::fresh();
+        state.children.insert(
+            "org".into(),
+            Token {
+                access: "expired-test-access".into(),
+                refresh: "expired-test-refresh".into(),
+                subject: "runner".into(),
+                expires_at: 0,
+            },
+        );
+        let (release, receiver) = std::sync::mpsc::channel();
+        let store = Arc::new(DelayedRead {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            release: std::sync::Mutex::new(receiver),
+            entered: tokio::sync::Notify::new(),
+            bytes: serde_json::to_vec(&state).unwrap(),
+        });
+        let auth = auth_with_store(store.clone());
+        let copy = auth.clone();
+        let read = tokio::spawn(async move { copy.credential("org").await });
+        store.entered.notified().await;
+        let copy = auth.clone();
+        let concurrent = tokio::spawn(async move { copy.credential("org").await });
+        assert_eq!(
+            read.await.unwrap().err().unwrap().to_string(),
+            "STORE_UNAVAILABLE"
+        );
+        assert_eq!(
+            concurrent.await.unwrap().err().unwrap().to_string(),
+            "STORE_UNAVAILABLE"
+        );
+        assert_eq!(store.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        release.send(()).unwrap();
+        assert_eq!(
+            auth.credential("org").await.err().unwrap().to_string(),
+            "AUTH_REQUIRED"
+        );
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_noninteractive_disposable_item_preserves_exact_matching_and_roundtrip() {
+        use security_framework::os::macos::keychain::CreateOptions;
+        let service = format!("app.loomex.runner.fixture.{}", uuid::Uuid::new_v4());
+        let account = "disposable-native-fixture";
+        let directory = tempfile::tempdir().unwrap();
+        let keychain_path = directory.path().join("fixture.keychain-db");
+        let keychain = CreateOptions::new()
+            .password("disposable-fixture-password")
+            .create(&keychain_path)
+            .unwrap();
+        // The fixture always names its own temporary keychain explicitly.
+        let result = (|| -> Result<()> {
+            keychain.add_generic_password(&service, account, b"disposable-fixture")?;
+            if let Some(helper) = std::env::var_os("LOOMEX_NATIVE_FIXTURE_PROBE") {
+                let mut probe = std::process::Command::new(helper)
+                    .arg(&service)
+                    .arg(account)
+                    .arg(&keychain_path)
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()?;
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                loop {
+                    if probe.try_wait()?.is_some() {
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        probe.kill()?;
+                        probe.wait()?;
+                        bail!("disposable native peer query stalled; isolated child stopped");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let output = probe.wait_with_output()?;
+                ensure!(output.status.success(), "native fixture helper failed");
+                let status: i32 = std::str::from_utf8(&output.stdout)?.trim().parse()?;
+                ensure!(
+                    matches!(status, 0 | -25300 | -25308 | -25315 | -25293),
+                    "unexpected native fixture status"
+                );
+            }
+            ensure!(
+                keychain
+                    .find_generic_password(&service, account)?
+                    .0
+                    .as_ref()
+                    == b"disposable-fixture",
+                "fixture read mismatch"
+            );
+            ensure!(
+                keychain
+                    .find_generic_password(&service, "different-fixture-account")
+                    .unwrap_err()
+                    .code()
+                    == -25300,
+                "account isolation"
+            );
+            ensure!(
+                keychain
+                    .find_generic_password(&format!("{service}.absent"), account)
+                    .unwrap_err()
+                    .code()
+                    == -25300,
+                "service isolation"
+            );
+            keychain.set_generic_password(&service, account, b"updated-disposable-fixture")?;
+            ensure!(
+                keychain
+                    .find_generic_password(&service, account)?
+                    .0
+                    .as_ref()
+                    == b"updated-disposable-fixture",
+                "fixture update mismatch"
+            );
+            Ok(())
+        })();
+        let deleted = keychain
+            .find_generic_password(&service, account)
+            .map(|(_, item)| item.delete());
+        result.unwrap();
+        deleted.unwrap();
+        assert_eq!(
+            keychain
+                .find_generic_password(&service, account)
+                .unwrap_err()
+                .code(),
+            -25300
+        );
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_osstatus_categories_do_not_infer_acl_or_global_lock() {
+        assert_eq!(
+            native_store_error(-25308).to_string(),
+            "STORE_ACCESS_REQUIRED"
+        );
+        assert_eq!(
+            native_store_error(-25315).to_string(),
+            "STORE_ACCESS_REQUIRED"
+        );
+        assert_eq!(
+            native_store_error(-25293).to_string(),
+            "STORE_ACCESS_DENIED"
+        );
+        assert_eq!(native_store_error(-25243).to_string(), "STORE_UNAVAILABLE");
+        assert_eq!(native_store_error(-36).to_string(), "STORE_UNAVAILABLE");
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_explicit_foreground_probe_allows_keychain_ui() {
+        use core_foundation::{base::TCFType, string::CFString};
+        use security_framework_sys::item::kSecUseAuthenticationUI;
+        let key = unsafe { CFString::wrap_under_get_rule(kSecUseAuthenticationUI) };
+        #[allow(deprecated)]
+        let ordinary = noninteractive_password_options("fixture", "account")
+            .query
+            .iter()
+            .filter(|(name, _)| name == &key)
+            .count();
+        #[allow(deprecated)]
+        let foreground = foreground_password_options("fixture", "account")
+            .query
+            .iter()
+            .filter(|(name, _)| name == &key)
+            .count();
+        assert_eq!(ordinary, 1);
+        assert_eq!(foreground, 0);
+    }
+    #[test]
+    fn runtime_disposal_retains_singleton_until_native_worker_actually_finishes() {
+        use fs2::FileExt;
+        struct DelayedDelete {
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl Store for DelayedDelete {
+            fn load(&self) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn save(&self, _: &[u8]) -> Result<()> {
+                panic!("delete fixture cannot save")
+            }
+            fn delete(&self) -> Result<()> {
+                self.release.lock().unwrap().recv().unwrap();
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.lock");
+        let owner = Arc::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap(),
+        );
+        owner.try_lock_exclusive().unwrap();
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let (release, receiver) = std::sync::mpsc::channel();
+        let auth = auth_with_store(Arc::new(DelayedDelete {
+            release: std::sync::Mutex::new(receiver),
+        }));
+        auth.retain_store_owner(&owner);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(auth.store_operation(true, |store| store.delete()))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "STORE_OPERATION_PENDING");
+        drop(owner);
+        drop(auth);
+        let before = std::time::Instant::now();
+        runtime.shutdown_timeout(Duration::from_millis(20));
+        let disposed_in = before.elapsed();
+        let still_owned = contender.try_lock_exclusive().is_err();
+        // Release our fake native worker even if an assertion is going to fail.
+        release.send(()).unwrap();
+        assert!(
+            disposed_in < Duration::from_secs(1),
+            "runtime disposal blocked"
+        );
+        assert!(still_owned, "late native delete lost singleton ownership");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while contender.try_lock_exclusive().is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker did not release singleton after completion"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    #[tokio::test]
+    async fn disposed_daemon_owner_cannot_start_late_native_io() {
+        struct MustNotRun;
+        impl Store for MustNotRun {
+            fn load(&self) -> Result<Option<Vec<u8>>> {
+                panic!("disposed owner cannot read")
+            }
+            fn save(&self, _: &[u8]) -> Result<()> {
+                panic!("disposed owner cannot write")
+            }
+        }
+        let auth = auth_with_store(Arc::new(MustNotRun));
+        let owner = Arc::new(tempfile::tempfile().unwrap());
+        auth.retain_store_owner(&owner);
+        drop(owner);
+        assert_eq!(
+            auth.load().await.err().unwrap().to_string(),
+            "STORE_UNAVAILABLE"
+        );
+        assert_eq!(
+            auth.save(&ProtectedState::fresh())
+                .await
+                .unwrap_err()
+                .to_string(),
+            "STORE_UNAVAILABLE"
+        );
     }
 }

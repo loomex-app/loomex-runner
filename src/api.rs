@@ -25,7 +25,9 @@ pub struct Api {
 pub struct ApiError {
     pub code: String,
     pub retryable: bool,
+    pub status: Option<u16>,
     pub data: Option<Value>,
+    pub correlation_id: Option<String>,
 }
 impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -38,9 +40,18 @@ impl ApiError {
         Self {
             code: code.into(),
             retryable,
+            status: None,
             data: None,
+            correlation_id: None,
         }
     }
+}
+
+struct PreparedRequest {
+    method: reqwest::Method,
+    url: Url,
+    body: Vec<u8>,
+    idempotency_key: Option<String>,
 }
 
 const MAX_VALIDATION_ISSUES: usize = 32;
@@ -364,6 +375,47 @@ impl Api {
         credential: Option<&SignedCredential>,
         idempotency_key: Option<&str>,
     ) -> Result<Value, ApiError> {
+        let prepared = self.prepare_request(method, route, body, idempotency_key)?;
+        self.send_prepared(&prepared, credential).await
+    }
+
+    /// A proof retry is permitted only for an authenticated, pre-handler stale
+    /// proof rejection and an unchanged job authority. The exact domain bytes
+    /// and idempotency key are prepared once; only the transport proof changes.
+    pub(crate) async fn request_job_with_stale_proof_retry<F>(
+        &self,
+        method: &str,
+        route: &str,
+        body: Option<Value>,
+        credential: &SignedCredential,
+        idempotency_key: Option<&str>,
+        authority_unchanged: F,
+    ) -> Result<Value, ApiError>
+    where
+        F: Fn() -> bool,
+    {
+        let prepared = self.prepare_request(method, route, body, idempotency_key)?;
+        if !authority_unchanged() {
+            return Err(ApiError::new("RUNNER_JOB_LEASE_CONFLICT", false));
+        }
+        match self.send_prepared(&prepared, Some(credential)).await {
+            Err(error) if error.status == Some(422) && error.code == "RUNNER_PROOF_STALE" => {
+                if !authority_unchanged() {
+                    return Err(ApiError::new("RUNNER_JOB_LEASE_CONFLICT", false));
+                }
+                self.send_prepared(&prepared, Some(credential)).await
+            }
+            result => result,
+        }
+    }
+
+    fn prepare_request(
+        &self,
+        method: &str,
+        route: &str,
+        body: Option<Value>,
+        idempotency_key: Option<&str>,
+    ) -> Result<PreparedRequest, ApiError> {
         if !(route.starts_with("v1/") || route.starts_with("v2/"))
             || route.contains(['\\', '#'])
             || route
@@ -389,35 +441,51 @@ impl Api {
             .transpose()
             .map_err(|_| ApiError::new("INVALID_REQUEST_BODY", false))?
             .unwrap_or_default();
+        Ok(PreparedRequest {
+            method,
+            url,
+            body: bytes,
+            idempotency_key: idempotency_key.map(str::to_owned),
+        })
+    }
+
+    async fn send_prepared(
+        &self,
+        prepared: &PreparedRequest,
+        credential: Option<&SignedCredential>,
+    ) -> Result<Value, ApiError> {
         let mut request = self
             .client
-            .request(method.clone(), url.clone())
-            .timeout(request_timeout(method.as_str(), route))
+            .request(prepared.method.clone(), prepared.url.clone())
+            .timeout(request_timeout(
+                prepared.method.as_str(),
+                prepared.url.path().strip_prefix(BASE).unwrap_or(""),
+            ))
             .header("Accept", "application/json");
-        if let Some(key) = idempotency_key {
+        if let Some(key) = &prepared.idempotency_key {
             request = request.header("Idempotency-Key", key);
         }
         if let Some(credential) = credential {
-            let path = match url.query() {
-                Some(query) => format!("{}?{query}", url.path()),
-                None => url.path().into(),
+            let path = match prepared.url.query() {
+                Some(query) => format!("{}?{query}", prepared.url.path()),
+                None => prepared.url.path().into(),
             };
             request = request.bearer_auth(&credential.token).header(
                 "X-Loomex-Runner-Proof",
                 request_proof(
                     credential,
-                    method.as_str(),
+                    prepared.method.as_str(),
                     &path,
-                    &bytes,
+                    &prepared.body,
                     now(),
                     &uuid::Uuid::new_v4().to_string(),
                 )?,
             );
         }
-        if !bytes.is_empty() {
+        if !prepared.body.is_empty() {
             request = request
                 .header("Content-Type", "application/json")
-                .body(bytes);
+                .body(prepared.body.clone());
         }
         let response = request
             .send()
@@ -455,6 +523,12 @@ fn parse_envelope(status: u16, payload: Value) -> Result<Value, ApiError> {
         })
         .unwrap_or("API_REQUEST_FAILED");
     let mut error = ApiError::new(code, status >= 500 || status == 429 || status == 408);
+    error.status = Some(status);
+    error.correlation_id = payload
+        .pointer("/meta/correlationId")
+        .and_then(Value::as_str)
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        .map(|value| value.to_string());
     error.data = if code == "RUN_VALIDATION_FAILED" {
         safe_validation_data(&payload)
     } else {
@@ -465,7 +539,55 @@ fn parse_envelope(status: u16, payload: Value) -> Result<Value, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD;
     use ed25519_dalek::{Signature, Verifier};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    async fn capture_request(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
+        let mut bytes = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 4096];
+            let count = stream.read(&mut chunk).await.unwrap();
+            assert!(count > 0);
+            bytes.extend_from_slice(&chunk[..count]);
+            if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                let head = String::from_utf8(bytes[..end].to_vec()).unwrap();
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|s| s.parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if bytes.len() >= end + 4 + length {
+                    return (head, bytes[end + 4..end + 4 + length].to_vec());
+                }
+            }
+        }
+    }
+
+    async fn respond(stream: &mut tokio::net::TcpStream, status: &str, payload: Value) {
+        let body = payload.to_string();
+        stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+    }
+
+    fn header<'a>(head: &'a str, name: &str) -> &'a str {
+        head.lines()
+            .find_map(|line| {
+                line.split_once(':')
+                    .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                    .map(|(_, value)| value.trim())
+            })
+            .unwrap()
+    }
     #[test]
     fn transport_timeout_allows_long_poll_without_extending_auth_recovery() {
         for (method, route) in [
@@ -571,6 +693,206 @@ mod tests {
         );
     }
     #[test]
+    fn proof_matches_shared_raw_body_fixture() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/runner-request-proof-v1.json"
+        ))
+        .unwrap();
+        assert_eq!(fixture["schemaVersion"], "loomex.runner-request-proof/v1");
+        let body = STANDARD
+            .decode(fixture["bodyBase64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(hash(&body), fixture["bodySha256"].as_str().unwrap());
+        let seed = STANDARD
+            .decode(fixture["ed25519SeedBase64"].as_str().unwrap())
+            .unwrap();
+        let private_key: [u8; 32] = seed.try_into().unwrap();
+        let public_key = SigningKey::from_bytes(&private_key).verifying_key();
+        assert_eq!(
+            URL_SAFE_NO_PAD.encode(public_key.as_bytes()),
+            fixture["publicKeyBase64Url"].as_str().unwrap()
+        );
+        let credential = SignedCredential {
+            token: format!("lmxda_{}_SECRET", fixture["tokenPrefix"].as_str().unwrap()),
+            subject: fixture["bindingId"].as_str().unwrap().into(),
+            private_key,
+        };
+        let proof = request_proof(
+            &credential,
+            fixture["method"].as_str().unwrap(),
+            fixture["pathAndQuery"].as_str().unwrap(),
+            &body,
+            fixture["timestamp"].as_u64().unwrap(),
+            fixture["nonce"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            proof.split('.').nth(2).unwrap(),
+            fixture["signatureBase64Url"].as_str().unwrap()
+        );
+        let canonical = STANDARD
+            .decode(fixture["canonicalBytesBase64"].as_str().unwrap())
+            .unwrap();
+        let signature = Signature::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(fixture["signatureBase64Url"].as_str().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        public_key.verify(&canonical, &signature).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_proof_retries_once_with_exact_domain_bytes_and_new_transport_proof() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let first_request = capture_request(&mut first).await;
+            respond(
+                &mut first,
+                "422 Unprocessable Entity",
+                json!({"error":{"code":"RUNNER_PROOF_STALE"},"meta":{}}),
+            )
+            .await;
+            let (mut second, _) = listener.accept().await.unwrap();
+            let second_request = capture_request(&mut second).await;
+            respond(
+                &mut second,
+                "200 OK",
+                json!({"data":{"accepted":true},"meta":{}}),
+            )
+            .await;
+            (first_request, second_request)
+        });
+        let credential = SignedCredential {
+            token: "lmxda_PREFIX_SECRET".into(),
+            subject: "runner".into(),
+            private_key: [7; 32],
+        };
+        let result = api
+            .request_job_with_stale_proof_retry(
+                "POST",
+                "v1/jobs/job-id/fail/?b=2&a=1",
+                Some(json!({"unicode":"café ☃","n":1.25,"nil":null})),
+                &credential,
+                Some("same-domain-key"),
+                || true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["accepted"], true);
+        let (first, second) = server.await.unwrap();
+        assert_eq!(first.1, second.1);
+        assert_eq!(header(&first.0, "Idempotency-Key"), "same-domain-key");
+        assert_eq!(header(&second.0, "Idempotency-Key"), "same-domain-key");
+        assert_eq!(first.0.lines().next(), second.0.lines().next());
+        assert_ne!(
+            header(&first.0, "X-Loomex-Runner-Proof"),
+            header(&second.0, "X-Loomex-Runner-Proof")
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_invalid_proof_and_changed_authority_never_retry() {
+        for (code, revoke_after_first) in [
+            ("RUNNER_PROOF_INVALID", false),
+            ("RUNNER_PROOF_STALE", true),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api = Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+            let authorized = Arc::new(AtomicBool::new(true));
+            let server_authorized = authorized.clone();
+            let server = tokio::spawn(async move {
+                let (mut first, _) = listener.accept().await.unwrap();
+                capture_request(&mut first).await;
+                if revoke_after_first {
+                    server_authorized.store(false, Ordering::SeqCst);
+                }
+                respond(
+                    &mut first,
+                    "422 Unprocessable Entity",
+                    json!({"error":{"code":code},"meta":{}}),
+                )
+                .await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            let credential = SignedCredential {
+                token: "lmxda_PREFIX_SECRET".into(),
+                subject: "runner".into(),
+                private_key: [7; 32],
+            };
+            let error = api
+                .request_job_with_stale_proof_retry(
+                    "POST",
+                    "v1/jobs/job-id/fail/",
+                    Some(json!({"error":{"code":"X"}})),
+                    &credential,
+                    Some("same-domain-key"),
+                    || authorized.load(Ordering::SeqCst),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.code,
+                if revoke_after_first {
+                    "RUNNER_JOB_LEASE_CONFLICT"
+                } else {
+                    code
+                }
+            );
+            server.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn a_second_stale_proof_response_never_causes_a_third_send() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                capture_request(&mut stream).await;
+                respond(
+                    &mut stream,
+                    "422 Unprocessable Entity",
+                    json!({"error":{"code":"RUNNER_PROOF_STALE"},"meta":{}}),
+                )
+                .await;
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let credential = SignedCredential {
+            token: "lmxda_PREFIX_SECRET".into(),
+            subject: "runner".into(),
+            private_key: [7; 32],
+        };
+        let error = api
+            .request_job_with_stale_proof_retry(
+                "POST",
+                "v1/jobs/job-id/fail/",
+                Some(json!({"error":{"code":"X"}})),
+                &credential,
+                Some("same-domain-key"),
+                || true,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "RUNNER_PROOF_STALE");
+        assert_eq!(error.status, Some(422));
+        server.await.unwrap();
+    }
+    #[test]
     fn origin_restrictions() {
         assert!(validate_origin("http://example.com", false).is_err());
         assert!(validate_origin("https://example.com", true).is_err());
@@ -590,6 +912,28 @@ mod tests {
                 .code,
             "API_REQUEST_FAILED"
         );
+        let error = parse_envelope(
+            401,
+            json!({
+                "error":{"code":"AUTH_EXPIRED","message":"private backend detail"},
+                "meta":{"correlationId":"11111111-1111-4111-8111-111111111111"}
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.correlation_id.as_deref(),
+            Some("11111111-1111-4111-8111-111111111111")
+        );
+        assert_eq!(error.to_string(), "AUTH_EXPIRED");
+        let invalid = parse_envelope(
+            401,
+            json!({
+                "error":{"code":"AUTH_EXPIRED"},
+                "meta":{"correlationId":"private correlation text"}
+            }),
+        )
+        .unwrap_err();
+        assert!(invalid.correlation_id.is_none());
     }
 
     #[test]

@@ -64,7 +64,46 @@ if [[ "$mode" == "--production" ]]; then
   codesign --force --timestamp --options runtime --sign "$LOOMEX_CODESIGN_IDENTITY" "$payload/bin/loomex-lifecycle-bootstrap"
 else
   strip -S "$payload/bin/loomex" "$payload/bin/loomex-runner" "$payload/bin/loomex-lifecycle-bootstrap"
-  echo "WARNING: building unsigned development artifact for isolated testing only" >&2
+  if [[ -n "${LOOMEX_DEVELOPMENT_CODESIGN_IDENTITY:-}" ]]; then
+    [[ "$LOOMEX_DEVELOPMENT_CODESIGN_IDENTITY" != - ]] || { echo "ad-hoc development signing is not a stable identity" >&2; exit 1; }
+    if [[ -n "${LOOMEX_DEVELOPMENT_CODESIGN_KEYCHAIN:-}" ]]; then
+      [[ -f "$LOOMEX_DEVELOPMENT_CODESIGN_KEYCHAIN" ]] || { echo "development signing keychain is missing" >&2; exit 1; }
+    fi
+    for name in loomex loomex-runner loomex-lifecycle-bootstrap; do
+      if [[ -n "${LOOMEX_DEVELOPMENT_CODESIGN_KEYCHAIN:-}" ]]; then
+        codesign --force --sign "$LOOMEX_DEVELOPMENT_CODESIGN_IDENTITY" --keychain "$LOOMEX_DEVELOPMENT_CODESIGN_KEYCHAIN" --identifier "app.loomex.runner.$name" "$payload/bin/$name"
+      else
+        codesign --force --sign "$LOOMEX_DEVELOPMENT_CODESIGN_IDENTITY" --identifier "app.loomex.runner.$name" "$payload/bin/$name"
+      fi
+      codesign --verify --strict "$payload/bin/$name"
+    done
+    python3 - "$payload" <<'PY'
+import json,re,subprocess,sys
+from pathlib import Path
+root=Path(sys.argv[1]); requirements={}
+def stable_requirement(requirement,name):
+    prefix=f'identifier "app.loomex.runner.{name}" and '
+    if not requirement.startswith(prefix) or 'cdhash ' in requirement:
+        return False
+    policy=requirement[len(prefix):]
+    return policy.startswith('anchor ') or re.fullmatch(r'certificate leaf = H"[0-9a-fA-F]{40}"',policy) is not None
+for name in ('loomex','loomex-runner','loomex-lifecycle-bootstrap'):
+    path=root/'bin'/name
+    info=subprocess.run(['/usr/bin/codesign','-dv','--verbose=4',str(path)],capture_output=True,text=True,check=True).stderr
+    if 'Signature=adhoc' in info or 'TeamIdentifier=not set' in info and 'Authority=' not in info:
+        raise SystemExit(f'{name} has no stable signing identity')
+    display=subprocess.run(['/usr/bin/codesign','-dr','-',str(path)],capture_output=True,text=True,check=True)
+    lines=[line.split('designated => ',1)[1].strip() for line in (display.stdout+display.stderr).splitlines() if line.startswith(('designated => ','# designated => '))]
+    if len(lines)!=1 or not stable_requirement(lines[0],name):
+        raise SystemExit(f'{name} has no stable designated requirement')
+    requirements[name]=lines[0]
+manifest={'schema':'app.loomex.runner.development-signing/v1','requirements':requirements}
+(root/'metadata'/'development-signing.json').write_text(json.dumps(manifest,sort_keys=True,separators=(',',':'))+'\n')
+PY
+    python3 "$build_root/scripts/validate_package.py" "$payload" --expected-version "$version" --source-root "$build_root"
+  else
+    echo "WARNING: building unsigned development artifact for isolated testing only" >&2
+  fi
 fi
 python3 - "$payload" "${HOME:?}" <<'PY'
 import sys
