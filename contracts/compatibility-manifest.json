@@ -16,6 +16,8 @@
     "method:auth.logout",
     "method:auth.open_browser",
     "method:auth.recover",
+    "method:auth.scope_status",
+    "method:auth.scope_upgrade",
     "method:auth.status",
     "method:builder.catalog",
     "method:builder.commit",
@@ -43,6 +45,17 @@
     "method:interactions.respond",
     "method:organizations.list",
     "method:organizations.select",
+    "method:persona.roles.get",
+    "method:persona.roles.list",
+    "method:personas.chat_context.create",
+    "method:personas.chat_context.get",
+    "method:personas.get",
+    "method:personas.list",
+    "method:personas.memory.read",
+    "method:personas.memory.search",
+    "method:personas.memory.update",
+    "method:personas.memory.write",
+    "method:personas.operations.get",
     "method:preparations.get",
     "method:presentation.delivery.begin",
     "method:presentation.delivery.get",
@@ -102,11 +115,11 @@
   "catalogVersion": "0.3.8",
   "generatedFrom": {
     "backendRoutes": {
-      "digest": "sha256:4d1c71719b810e5d8c215a850e7019ea87c73f805b7a0a2a43d1b8b183bd9777",
+      "digest": "sha256:ed8c73ba7af276f96ea0bfb314ae19c4a538cf14989e3e3e03d61b515cc98a10",
       "path": "contracts/backend-routes.json"
     },
     "methodCatalog": {
-      "digest": "sha256:6029087f6f9263b23663d3f1899b4aa41f2843aa6d1379abb0a010d9409772ee",
+      "digest": "sha256:9471babc7d788b050d4de3b29e04ba2be86b628f927f337017298afb5f084ee8",
       "path": "contracts/method-catalog.json"
     }
   },
@@ -205,6 +218,28 @@
         "auth.browser.exchange",
         "auth.device.bootstrap",
         "auth.device.refresh"
+      ],
+      "transportRetry": "never_after_send"
+    },
+    {
+      "classification": "local-control",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:41cbe80ebd1e6126269b1343e7b0db8abab6187cc0965620ba76a732b554134d",
+      "mutating": false,
+      "name": "auth.scope_status",
+      "outputSchemaDigest": "sha256:3c3aca38d835f416a078513c8438115759293afe9aed23efa5982e4b35174a92",
+      "routeIds": [],
+      "transportRetry": "before_response_once"
+    },
+    {
+      "classification": "backend-auth",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:f1b31f88f4a9841de21129be78b4e2a25ecef7857394048aa9eb0748c88346f3",
+      "mutating": true,
+      "name": "auth.scope_upgrade",
+      "outputSchemaDigest": "sha256:3c3aca38d835f416a078513c8438115759293afe9aed23efa5982e4b35174a92",
+      "routeIds": [
+        "persona.auth.scope_upgrade"
       ],
       "transportRetry": "never_after_send"
     },
@@ -520,6 +555,138 @@
       "transportRetry": "never_after_send"
     },
     {
+      "classification": "backend-proxy",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:2b10f7d73b1de2bb3aa0af967e740388127f3f363c46b00a1bf62e263ca3b66c",
+      "mutating": false,
+      "name": "persona.roles.get",
+      "outputSchemaDigest": "sha256:c8a01c39a5834a4d88351a6668fbbe60756e85209828b435627072d2cef24b57",
+      "routeIds": [
+        "persona.persona.roles.get"
+      ],
+      "transportRetry": "before_response_once"
+    },
+    {
+      "classification": "backend-proxy",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:4072f5b60440e81bc5c357163d2b9b5d08476e1625a18ef37eccce3de8ad2ef7",
+      "mutating": false,
+      "name": "persona.roles.list",
+      "outputSchemaDigest": "sha256:54b9f4c33367525c57dd285b430a6546d6ae89b15e3a2b740248326d8e717ab0",
+      "routeIds": [
+        "persona.persona.roles.list"
+      ],
+      "transportRetry": "before_response_once"
+    },
+    {
+      "classification": "backend-proxy",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:9d32ffe1021318849e3487dff89247421383dae6fbd9e87594aeca19f2ed9894",
+      "mutating": true,
+      "name": "personas.chat_context.create",
+      "outputSchemaDigest": "sha256:28c4cbb98e2b9f406b3d7af27899fb79c2d62692264ee5159a1ca37e1c0ce599",
+      "routeIds": [
+        "persona.personas.chat_context.create"
+      ],
+      "transportRetry": "never_after_send"
+    },
+    {
+      "classification": "backend-proxy",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:ef2a416ec3f77e58c9d65ce1cc8ec64fa31137153df44a7e5ec3935f43ff077c",
+      "mutating": false,
+      "name": "personas.chat_context.get",
+      "outputSchemaDigest": "sha256:28c4cbb98e2b9f406b3d7af27899fb79c2d62692264ee5159a1ca37e1c0ce599",
+      "routeIds": [
+        "persona.personas.chat_context.get"
+      ],
+      "transportRetry": "before_response_once"
+    },
+    {
+      "classification": "backend-proxy",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:2d1eec287cb73ed856b671fa075b6de1a5605b9b7015ea112fe490f98d259746",
+      "mutating": false,
+      "name": "personas.get",
+      "outputSchemaDigest": "sha256:8653cf070c5e84353dea3ea00fd39a6bc75285d8d4d529635010d3137de0b0cf",
+      "routeIds": [
+        "persona.personas.get"
+      ],
+      "transportRetry": "before_response_once"
+    },
+    {
+      "classification": "backend-proxy",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:6b15c3590efd6ff5223e657ac185f5074fc255050e65bc425f433fe67ab05b0c",
+      "mutating": false,
+      "name": "personas.list",
+      "outputSchemaDigest": "sha256:275f2d540c34432156d9b620618c7f215c892d555665ca4c33f3892cdc7d460e",
+      "routeIds": [
+        "persona.personas.list"
+      ],
+      "transportRetry": "before_response_once"
+    },
+    {
+      "classification": "backend-proxy",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:790d736ff5e872eedd5aa2af2d8d8ecc651dc83b5dac14b3cc962d2f0cbe551d",
+      "mutating": false,
+      "name": "personas.memory.read",
+      "outputSchemaDigest": "sha256:3d41bf32659b317b98a39b9998395745ed6ddbeefff62708d4d6310e71eca164",
+      "routeIds": [
+        "persona.memory.tool"
+      ],
+      "transportRetry": "before_response_once"
+    },
+    {
+      "classification": "backend-proxy",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:033e326947b48278543aa14a46f6e7d2d9754c92cbafea3ab5a4ba8221fde022",
+      "mutating": false,
+      "name": "personas.memory.search",
+      "outputSchemaDigest": "sha256:3d41bf32659b317b98a39b9998395745ed6ddbeefff62708d4d6310e71eca164",
+      "routeIds": [
+        "persona.memory.tool"
+      ],
+      "transportRetry": "before_response_once"
+    },
+    {
+      "classification": "backend-proxy",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:23080a7c3ca1fdf93816523c5876ad577f102f4516cd0517c93e6beb87d3ba6e",
+      "mutating": true,
+      "name": "personas.memory.update",
+      "outputSchemaDigest": "sha256:3d41bf32659b317b98a39b9998395745ed6ddbeefff62708d4d6310e71eca164",
+      "routeIds": [
+        "persona.memory.tool"
+      ],
+      "transportRetry": "never_after_send"
+    },
+    {
+      "classification": "backend-proxy",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:25f632ce8967fefa69b700d95c111970dde47712a256aee2d0acac67da9bad9f",
+      "mutating": true,
+      "name": "personas.memory.write",
+      "outputSchemaDigest": "sha256:3d41bf32659b317b98a39b9998395745ed6ddbeefff62708d4d6310e71eca164",
+      "routeIds": [
+        "persona.memory.tool"
+      ],
+      "transportRetry": "never_after_send"
+    },
+    {
+      "classification": "backend-proxy",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:fd6417fc9b66346c4a093d7bd54e240e2b22ef38125b40c3f28d98ad51fafd44",
+      "mutating": false,
+      "name": "personas.operations.get",
+      "outputSchemaDigest": "sha256:2c8e8050ce60320f4d4f760b6adba7be94b61222f7013f5b727a5be95f5d0e5e",
+      "routeIds": [
+        "persona.personas.operations.get"
+      ],
+      "transportRetry": "before_response_once"
+    },
+    {
       "classification": "local-control",
       "idempotent": true,
       "inputSchemaDigest": "sha256:b1aa131648c27494d0c51a1331b4c5bcba355ea67935293ff424ec893670490a",
@@ -542,7 +709,7 @@
     {
       "classification": "local-control",
       "idempotent": true,
-      "inputSchemaDigest": "sha256:23e1164885d960e0d6f46e96996e4e6f5de26ebd38fa699c65dfc20e316aee43",
+      "inputSchemaDigest": "sha256:fcc94b18aee592af0b348c5a548060ec8fd2ec3c58846e7cf794c87acce47cbe",
       "mutating": false,
       "name": "presentation.delivery.get",
       "outputSchemaDigest": "sha256:2ce3a4eedaffe0ef95e0829014ee1865b94a5c41453dc1b7483705e3fb11c818",
@@ -582,7 +749,7 @@
     {
       "classification": "local-control",
       "idempotent": true,
-      "inputSchemaDigest": "sha256:2ef57d515219430e0f7724eec69581d5c91716fcf38f869fcb1d12e9fd30240f",
+      "inputSchemaDigest": "sha256:c67abff5dd5332b482ff39dba2eb22a03c1d34f5f1db0a0651ff964e814a4ca4",
       "mutating": true,
       "name": "presentation.sessions.create",
       "outputSchemaDigest": "sha256:7dd4836a3f538015ab0823325ee469c602ca1af417cb93cf59585fc21af54e21",
@@ -1326,6 +1493,72 @@
       "source": "src/control.rs"
     },
     {
+      "id": "job.persona-memory.operation",
+      "method": "GET",
+      "pathTemplate": "v1/jobs/{jobId}/memory-operations/{operation}/{key}/",
+      "source": "src/jobs/persona_memory.rs"
+    },
+    {
+      "id": "job.persona-memory.tool",
+      "method": "POST",
+      "pathTemplate": "v1/jobs/{jobId}/memory-tools/{operation}/",
+      "source": "src/jobs/persona_memory.rs"
+    },
+    {
+      "id": "persona.auth.scope_upgrade",
+      "method": "POST",
+      "pathTemplate": "v2/device-authorities/organizations/{organizationId}/scope-upgrade/",
+      "source": "src/auth.rs"
+    },
+    {
+      "id": "persona.memory.tool",
+      "method": "POST",
+      "pathTemplate": "v1/personas/{personId}/memory-tools/{operation}/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "persona.persona.roles.get",
+      "method": "GET",
+      "pathTemplate": "v1/persona-roles/{roleId}/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "persona.persona.roles.list",
+      "method": "GET",
+      "pathTemplate": "v1/persona-roles/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "persona.personas.chat_context.create",
+      "method": "POST",
+      "pathTemplate": "v1/personas/{personId}/chat-context/create/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "persona.personas.chat_context.get",
+      "method": "POST",
+      "pathTemplate": "v1/personas/{personId}/chat-context/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "persona.personas.get",
+      "method": "GET",
+      "pathTemplate": "v1/personas/{personId}/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "persona.personas.list",
+      "method": "GET",
+      "pathTemplate": "v1/personas/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "persona.personas.operations.get",
+      "method": "GET",
+      "pathTemplate": "v1/personas/operations/{operation}/{key}/",
+      "source": "src/control.rs"
+    },
+    {
       "id": "workflow.activate",
       "method": "POST",
       "pathTemplate": "v1/workflow-versions/{versionId}/activate/",
@@ -1382,14 +1615,14 @@
   ],
   "schemaVersion": "loomex.runner.compatibility-manifest/v1",
   "summary": {
-    "backendRouteCount": 58,
-    "capabilityCount": 98,
+    "backendRouteCount": 69,
+    "capabilityCount": 111,
     "methodClassifications": {
-      "backend-auth": 6,
-      "backend-proxy": 40,
+      "backend-auth": 7,
+      "backend-proxy": 51,
       "daemon-lifecycle": 1,
-      "local-control": 35
+      "local-control": 36
     },
-    "methodCount": 82
+    "methodCount": 95
   }
 }

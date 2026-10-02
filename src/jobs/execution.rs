@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::ensure;
 
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -69,6 +70,34 @@ pub(super) async fn execute_job(
         None
     } else {
         Some(command_request(&authorized, id, path, journal.clone())?)
+    };
+    let memory_server = if persona_memory::enabled(payload) {
+        let provider = payload["provider"]
+            .as_str()
+            .context("PERSONA_MEMORY_PROVIDER_UNSUPPORTED")?;
+        ensure!(
+            persona_memory::provider_supported(provider),
+            "PERSONA_MEMORY_PROVIDER_UNSUPPORTED"
+        );
+        let server = persona_memory::MemoryServer::start(
+            daemon.clone(),
+            path,
+            journal.clone(),
+            cancel.clone(),
+        )?;
+        server.configure_request(
+            request
+                .as_mut()
+                .context("PERSONA_MEMORY_PROVIDER_UNSUPPORTED")?,
+            provider,
+        )?;
+        Some(server)
+    } else {
+        ensure!(
+            !persona_memory::required_memory(payload),
+            "PERSONA_MEMORY_UNAVAILABLE"
+        );
+        None
     };
     let status_server = if dispatch_enabled(job) {
         let provider = payload["provider"]
@@ -204,6 +233,7 @@ pub(super) async fn execute_job(
     // The provider process has stopped. Its scoped reporter can no longer
     // submit statuses, while already accepted journal entries may still drain.
     drop(status_server);
+    drop(memory_server);
     let terminal: Result<()> = async {
         let outcome = outcome?;
         if outcome.error.is_some() {

@@ -42,7 +42,7 @@ async fn reply_error(mut stream: TcpStream, code: &str) {
     let body = json!({"error":{"code":code},"meta":{}}).to_string();
     stream.write_all(format!("HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
 }
-fn journal() -> Journal {
+pub(super) fn journal() -> Journal {
     Journal {
         job: json!({"id":"11111111-1111-4111-8111-111111111111","idempotencyKey":"original-job-key","leaseVersion":7,"leasedUntilEpochMs":2000000000000u64,"payloadDigest":"digest","createdByExecutionId":"22222222-2222-4222-8222-222222222222","createdByNodeExecutionId":null,"payload":{"command":["/bin/sh","-c","exit 99"]}}),
         organization: "org".into(),
@@ -72,7 +72,7 @@ fn journal() -> Journal {
         stderr_offset: 0,
     }
 }
-fn daemon(path: &Path, origin: String) -> Arc<Daemon> {
+pub(super) fn daemon(path: &Path, origin: String) -> Arc<Daemon> {
     let api = Api::for_test_origin(&origin).unwrap();
     Arc::new(
         Daemon::new(

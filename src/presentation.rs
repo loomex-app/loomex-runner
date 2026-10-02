@@ -990,7 +990,8 @@ fn validate_delivery_identity(identity: &str) -> Result<()> {
             && !identity.chars().any(char::is_whitespace)
             && (identity.starts_with("start:")
                 || identity.starts_with("follow:")
-                || identity.starts_with("question:")),
+                || identity.starts_with("question:")
+                || identity.starts_with("persona:")),
         "INVALID_REQUEST"
     );
     Ok(())
@@ -1072,6 +1073,29 @@ fn validate_continuation(value: &Value) -> Result<()> {
             );
             required_uuid(value, "handoffRef")?;
         }
+        "persona_chat" => {
+            ensure!(
+                object.len() == 6
+                    && object.keys().all(|key| [
+                        "kind",
+                        "personId",
+                        "organizationId",
+                        "conversationId",
+                        "chatId",
+                        "configDigest"
+                    ]
+                    .contains(&key.as_str())),
+                "INVALID_REQUEST"
+            );
+            for key in ["personId", "organizationId", "conversationId", "chatId"] {
+                required_uuid(value, key)?;
+            }
+            let digest = required(value, "configDigest")?;
+            ensure!(
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "INVALID_REQUEST"
+            );
+        }
         "question" => {
             ensure!(
                 object.keys().all(|key| {
@@ -1106,7 +1130,9 @@ fn validate_kind(kind: &str) -> Result<()> {
             "interaction",
             "runs",
             "connection",
-            "organizations"
+            "organizations",
+            "personas",
+            "personaChat"
         ]
         .contains(&kind),
         "INVALID_REQUEST"
@@ -1122,7 +1148,10 @@ fn validate_entity(session_kind: &str, entity_type: &str, id: &str) -> Result<()
             "request",
             "execution",
             "builderSession",
-            "preparation"
+            "preparation",
+            "personaRole",
+            "persona",
+            "personaConversation"
         ]
         .contains(&entity_type),
         "INVALID_REQUEST"
@@ -1269,6 +1298,9 @@ fn forbidden_presentation_key(key: &str) -> bool {
         "signingkey",
         "cookie",
         "idempotencykey",
+        "prompt",
+        "toolinstructions",
+        "effectiveconfig",
     ]
     .iter()
     .any(|sensitive| key.contains(sensitive))

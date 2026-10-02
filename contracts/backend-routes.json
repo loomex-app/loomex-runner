@@ -355,6 +355,72 @@
       "method": "POST",
       "pathTemplate": "v2/workflow-drafts/",
       "source": "src/control.rs"
+    },
+    {
+      "id": "persona.persona.roles.list",
+      "method": "GET",
+      "pathTemplate": "v1/persona-roles/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "persona.persona.roles.get",
+      "method": "GET",
+      "pathTemplate": "v1/persona-roles/{roleId}/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "persona.personas.list",
+      "method": "GET",
+      "pathTemplate": "v1/personas/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "persona.personas.get",
+      "method": "GET",
+      "pathTemplate": "v1/personas/{personId}/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "persona.personas.chat_context.create",
+      "method": "POST",
+      "pathTemplate": "v1/personas/{personId}/chat-context/create/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "persona.personas.chat_context.get",
+      "method": "POST",
+      "pathTemplate": "v1/personas/{personId}/chat-context/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "persona.personas.operations.get",
+      "method": "GET",
+      "pathTemplate": "v1/personas/operations/{operation}/{key}/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "persona.auth.scope_upgrade",
+      "method": "POST",
+      "pathTemplate": "v2/device-authorities/organizations/{organizationId}/scope-upgrade/",
+      "source": "src/auth.rs"
+    },
+    {
+      "id": "job.persona-memory.tool",
+      "method": "POST",
+      "pathTemplate": "v1/jobs/{jobId}/memory-tools/{operation}/",
+      "source": "src/jobs/persona_memory.rs"
+    },
+    {
+      "id": "job.persona-memory.operation",
+      "method": "GET",
+      "pathTemplate": "v1/jobs/{jobId}/memory-operations/{operation}/{key}/",
+      "source": "src/jobs/persona_memory.rs"
+    },
+    {
+      "id": "persona.memory.tool",
+      "method": "POST",
+      "pathTemplate": "v1/personas/{personId}/memory-tools/{operation}/",
+      "source": "src/control.rs"
     }
   ],
   "daemonRouteIds": [
@@ -372,7 +438,9 @@
     "daemon.job.reclaim",
     "daemon.job.events",
     "daemon.job.complete",
-    "daemon.job.fail"
+    "daemon.job.fail",
+    "job.persona-memory.tool",
+    "job.persona-memory.operation"
   ],
   "methodBindings": [
     {
@@ -878,6 +946,95 @@
     },
     {
       "method": "runs.start_handoff.approve_headless",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "persona.roles.list",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "persona.persona.roles.list"
+      ]
+    },
+    {
+      "method": "persona.roles.get",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "persona.persona.roles.get"
+      ]
+    },
+    {
+      "method": "personas.list",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "persona.personas.list"
+      ]
+    },
+    {
+      "method": "personas.get",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "persona.personas.get"
+      ]
+    },
+    {
+      "method": "personas.chat_context.create",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "persona.personas.chat_context.create"
+      ]
+    },
+    {
+      "method": "personas.chat_context.get",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "persona.personas.chat_context.get"
+      ]
+    },
+    {
+      "method": "personas.memory.search",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "persona.memory.tool"
+      ]
+    },
+    {
+      "method": "personas.memory.read",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "persona.memory.tool"
+      ]
+    },
+    {
+      "method": "personas.memory.write",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "persona.memory.tool"
+      ]
+    },
+    {
+      "method": "personas.memory.update",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "persona.memory.tool"
+      ]
+    },
+    {
+      "method": "personas.operations.get",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "persona.personas.operations.get"
+      ]
+    },
+    {
+      "method": "auth.scope_upgrade",
+      "classification": "backend-auth",
+      "routeIds": [
+        "persona.auth.scope_upgrade"
+      ]
+    },
+    {
+      "method": "auth.scope_status",
       "classification": "local-control",
       "routeIds": []
     }

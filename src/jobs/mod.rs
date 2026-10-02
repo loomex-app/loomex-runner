@@ -38,6 +38,7 @@ mod authorization;
 use authorization::*;
 mod provider;
 use provider::*;
+pub mod persona_memory;
 pub mod public_status;
 use public_status::*;
 mod http;
@@ -52,7 +53,7 @@ mod recovery;
 use recovery::*;
 
 fn runner_manifest() -> Value {
-    json!({"version":env!("CARGO_PKG_VERSION"),"executionPolicies":["host_user/v1"],"jobKinds":["shell.exec","command.run","http.request"],"capabilities":{"shell.exec":true,"command.run":true,"http.request":true,"ai.public-status/v1":LIVE_PROVIDER_QUALIFIED,"codex.native-projected-json/v3":true},"httpResultContracts":[HTTP_RESULT_SCHEMA],"concurrency":null,"executionSeconds":null,"outputBytes":null,"artifactBytes":null})
+    json!({"version":env!("CARGO_PKG_VERSION"),"executionPolicies":["host_user/v1"],"jobKinds":["shell.exec","command.run","http.request"],"capabilities":{"shell.exec":true,"command.run":true,"http.request":true,"ai.public-status/v1":LIVE_PROVIDER_QUALIFIED,"ai.persona-memory/v1":persona_memory::provider_supported("codex"),"codex.native-projected-json/v3":true},"httpResultContracts":[HTTP_RESULT_SCHEMA],"concurrency":null,"executionSeconds":null,"outputBytes":null,"artifactBytes":null})
 }
 async fn apply_cancellations(daemon: &Daemon, response: &Value) {
     if let Some(jobs) = response["cancellations"].as_array() {

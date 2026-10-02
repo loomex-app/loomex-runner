@@ -23,6 +23,21 @@
       "method": "workflow.operations.get",
       "identity": "idempotencyKey",
       "operation": "workflows.publish"
+    },
+    "personas.memory.write": {
+      "method": "personas.operations.get",
+      "identity": "idempotencyKey",
+      "operation": "memory.write"
+    },
+    "personas.memory.update": {
+      "method": "personas.operations.get",
+      "identity": "idempotencyKey",
+      "operation": "memory.update"
+    },
+    "personas.chat_context.create": {
+      "method": "personas.operations.get",
+      "identity": "idempotencyKey",
+      "operation": "chat_context.create"
     }
   }
 }

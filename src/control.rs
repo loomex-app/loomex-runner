@@ -297,7 +297,8 @@ impl Daemon {
         let operation = (!method.starts_with("recovery.")
             && !matches!(
                 method,
-                "runs.start_handoff.issue"
+                "auth.scope_upgrade"
+                    | "runs.start_handoff.issue"
                     | "runs.start_handoff.approve"
                     | "runs.start_handoff.approve_headless"
             ))
@@ -360,7 +361,49 @@ impl Daemon {
                 if record["expired"] == true {
                     bail!("RESULT_EXPIRED");
                 }
-                record.get("result").cloned()
+                if matches!(
+                    method,
+                    "personas.chat_context.create"
+                        | "personas.memory.write"
+                        | "personas.memory.update"
+                ) {
+                    // A response loss or permission change never causes another
+                    // write. Read the backend's exact owner-checked receipt even
+                    // when a convenience result was cached locally.
+                    let operation = if method == "personas.chat_context.create" {
+                        "chat_context.create"
+                    } else if method == "personas.memory.write" {
+                        "memory.write"
+                    } else {
+                        "memory.update"
+                    };
+                    let query =
+                        json!({"operation":operation,"idempotencyKey":params["idempotencyKey"]});
+                    let (verb, route, body) = backend_route("personas.operations.get", &query)?;
+                    let receipt = self
+                        .backend(
+                            scope.as_deref().context("ORGANIZATION_REQUIRED")?,
+                            &verb,
+                            &route,
+                            body,
+                            None,
+                        )
+                        .await?;
+                    ensure!(
+                        receipt["operation"] == operation
+                            && receipt["key"] == params["idempotencyKey"]
+                            && receipt["status"] == "completed",
+                        "NETWORK_AMBIGUOUS"
+                    );
+                    Some(
+                        receipt
+                            .get("response")
+                            .cloned()
+                            .context("BACKEND_PROTOCOL_ERROR")?,
+                    )
+                } else {
+                    record.get("result").cloned()
+                }
             } else {
                 state::write_json(
                     path,
@@ -379,6 +422,8 @@ impl Daemon {
             let result = self
                 .restore_cached_follow_continuation(scope.as_deref(), method, &params, cached)
                 .await?;
+            let result =
+                self.spool_response(&params, result, scope.as_deref(), scoped_account.as_deref())?;
             if let Some(path) = operation.as_ref() {
                 let execution = params
                     .get("runId")
@@ -403,7 +448,8 @@ impl Daemon {
                 .cloned();
             // Spooling remains inside writer coverage; socket delivery below is not
             // counted once no more local files or backend state can be changed.
-            let result = self.spool_response(&params, result)?;
+            let result =
+                self.spool_response(&params, result, scope.as_deref(), scoped_account.as_deref())?;
             if let Some(path) = operation.as_ref() {
                 state::write_json(
                     path,
@@ -419,7 +465,13 @@ impl Daemon {
             Ok(result)
         }
     }
-    fn spool_response(&self, params: &Value, result: Value) -> Result<Value> {
+    fn spool_response(
+        &self,
+        params: &Value,
+        result: Value,
+        organization: Option<&str>,
+        account: Option<&str>,
+    ) -> Result<Value> {
         let bytes = serde_json::to_vec(&result)?;
         if bytes.len() <= MAX_FRAME - 1024 {
             return Ok(result);
@@ -442,11 +494,39 @@ impl Daemon {
                 .dir
                 .join("responses")
                 .join(format!("{reference}.meta.json")),
-            &json!({"executionId":params["runId"],"lastAccessAt":state::now()}),
+            &json!({"executionId":params["runId"],"lastAccessAt":state::now(),"ownerScope":account.map(|account|json!({"organizationId":organization,"accountSubject":account}))}),
         )?;
         Ok(
             json!({"responseRef":reference,"sizeBytes":bytes.len(),"encoding":"json","nextOffset":0,"checksumSha256":checksum}),
         )
+    }
+
+    async fn require_spool_owner(&self, params: &Value) -> Result<()> {
+        let reference = required(params, "responseRef")?;
+        Uuid::parse_str(reference).map_err(|_| anyhow::anyhow!("INVALID_REQUEST"))?;
+        let meta: Value = state::read_json(
+            &self
+                .dir
+                .join("responses")
+                .join(format!("{reference}.meta.json")),
+        )
+        .map_err(|_| anyhow::anyhow!("RESPONSE_NOT_FOUND"))?;
+        if let Some(owner) = meta.get("ownerScope").filter(|owner| !owner.is_null()) {
+            let org = self
+                .selected_org()
+                .await
+                .map_err(|_| anyhow::anyhow!("RESPONSE_NOT_FOUND"))?;
+            let (account, _) = self
+                .auth
+                .current_child_identity(&org)
+                .await
+                .map_err(|_| anyhow::anyhow!("RESPONSE_NOT_FOUND"))?;
+            ensure!(
+                owner["organizationId"] == org && owner["accountSubject"] == account,
+                "RESPONSE_NOT_FOUND"
+            );
+        }
+        Ok(())
     }
 
     /// A preparation's backend binding is sealed in the owner-checked local
@@ -464,6 +544,18 @@ impl Daemon {
         };
         let root_workflow = binding.get("workflowId").and_then(Value::as_str);
         let root_version = binding.get("versionId").and_then(Value::as_str);
+        let personas = binding
+            .get("workflowClosureReview")
+            .and_then(|review| review.get("personas"))
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .take(64)
+                    .filter_map(safe_persona_review)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let mut providers = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut providers_truncated = false;
@@ -503,6 +595,7 @@ impl Daemon {
             json!({
                 "rootVersion":version,
                 "providers":providers,
+                "personas":personas,
                 "providerCount":provider_count,
                 "providersTruncated":providers_truncated,
             }),
@@ -539,6 +632,19 @@ impl Daemon {
             "auth.cancel" => return self.auth.cancel_login(required(p, "flowId")?).await,
             "auth.recover" => return self.auth.reconcile().await,
             "auth.status" => return self.auth.status().await,
+            "auth.scope_status" => {
+                return self.auth.scope_status(required(p, "organizationId")?).await;
+            }
+            "auth.scope_upgrade" => {
+                return self
+                    .auth
+                    .scope_upgrade(
+                        required(p, "organizationId")?,
+                        &p["requestedScopes"],
+                        key.unwrap(),
+                    )
+                    .await;
+            }
             "auth.logout" => {
                 let _logout_admission = {
                     let _admission = self.execution.admission_lock()?;
@@ -593,8 +699,12 @@ impl Daemon {
                 );
             }
             "workspaces.list" => return Ok(json!({"workspaces":self.public.lock().await.grants})),
-            "responses.read" => return read_spool(&self.dir, p).await,
+            "responses.read" => {
+                self.require_spool_owner(p).await?;
+                return read_spool(&self.dir, p).await;
+            }
             "responses.delete" => {
+                self.require_spool_owner(p).await?;
                 crate::retention::purge_response(&self.dir, required(p, "responseRef")?)?;
                 return Ok(json!({"deleted":true}));
             }
@@ -772,7 +882,13 @@ impl Daemon {
                     // A lost mutation transport response does not establish
                     // that the owner route never ran. Keep the exact journal
                     // and require explicit same-key reconciliation, not retry.
-                    if method == "runs.continuation.requeue"
+                    if (method == "runs.continuation.requeue"
+                        || matches!(
+                            method,
+                            "personas.chat_context.create"
+                                | "personas.memory.write"
+                                | "personas.memory.update"
+                        ))
                         && error.downcast_ref::<ApiError>().is_some_and(|api| {
                             matches!(
                                 api.code.as_str(),
@@ -1094,6 +1210,48 @@ impl Daemon {
     async fn delivery_get_or_derive(&self, org: &str, p: &Value) -> Result<Value> {
         let identity = required(p, "identity")?;
         let account = self.auth.credential(org).await?.subject;
+        // Reverify every Persona delivery read, including an already sealed
+        // receipt. The receipt is convenience state, never current config authority.
+        if let Some(conversation) = identity.strip_prefix("persona:") {
+            let previous = self
+                .presentation
+                .dispatch(org, &account, "presentation.delivery.get", p)
+                .ok();
+            let context = p
+                .get("personaContext")
+                .or_else(|| {
+                    previous
+                        .as_ref()
+                        .and_then(|value| value.get("continuation"))
+                })
+                .context("DELIVERY_NOT_READY")?;
+            ensure!(
+                context["organizationId"] == org && context["conversationId"] == conversation,
+                "DELIVERY_NOT_READY"
+            );
+            let read = json!({"personId":context["personId"],"conversationId":context["conversationId"],"chatId":context["chatId"]});
+            let (verb, route, body) = backend_route("personas.chat_context.get", &read)?;
+            let verified = self.backend(org, &verb, &route, body, None).await?;
+            ensure!(
+                verified["person"]["id"] == context["personId"]
+                    && verified["conversation"]["conversationId"] == context["conversationId"]
+                    && verified["conversation"]["chatId"] == context["chatId"]
+                    && verified["configDigest"] == context["configDigest"],
+                "PERSONA_CONFIG_CHANGED"
+            );
+            if previous.is_some() {
+                return self
+                    .presentation
+                    .dispatch(org, &account, "presentation.delivery.get", p);
+            }
+            let mut continuation = context.clone();
+            continuation["kind"] = json!("persona_chat");
+            self.presentation
+                .register_delivery(org, &account, identity, &continuation)?;
+            return self
+                .presentation
+                .dispatch(org, &account, "presentation.delivery.get", p);
+        }
         match self
             .presentation
             .dispatch(org, &account, "presentation.delivery.get", p)
@@ -1428,6 +1586,7 @@ impl Daemon {
                 p["idempotencyKey"].as_str(),
             )
             .await?;
+        verify_persona_memory_binding(&result["binding"], &providers, true)?;
         let preparation = required(&result, "preparationId")?.to_owned();
         Uuid::parse_str(&preparation)?;
         let record_path = self
@@ -2506,6 +2665,7 @@ impl Daemon {
         if record["providers"] != provider_snapshot()? {
             bail!("PRECONDITION_FAILED")
         }
+        verify_persona_memory_binding(&record["binding"], &record["providers"], false)?;
         // The separate confirmation authorizes this exact preparation before the
         // backend can enqueue a job. A lost response never removes this grant.
         record["commitAuthorization"] = json!({"preparationId":preparation,"bindingDigest":p["bindingDigest"],"idempotencyKey":p["idempotencyKey"],"authorizedAt":state::now()});
@@ -3040,7 +3200,9 @@ fn required<'a>(p: &'a Value, key: &str) -> Result<&'a str> {
         .context("INVALID_REQUEST")
 }
 fn account_scoped_method(method: &str) -> bool {
-    method.starts_with("presentation.")
+    method.starts_with("personas.")
+        || method.starts_with("persona.roles.")
+        || method.starts_with("presentation.")
         || method.starts_with("recovery.")
         || method.starts_with("follow.session.")
         || method.starts_with("interactions.draft.")
@@ -3067,7 +3229,7 @@ fn account_scoped_method(method: &str) -> bool {
                 | "interactions.decide"
         )
 }
-fn validate_params(p: &Value, schema: &Value) -> Result<()> {
+pub(crate) fn validate_params(p: &Value, schema: &Value) -> Result<()> {
     let map = p.as_object().context("INVALID_REQUEST")?;
     for key in schema["required"].as_array().unwrap() {
         if !map.contains_key(key.as_str().unwrap()) {
@@ -3081,7 +3243,10 @@ fn validate_params(p: &Value, schema: &Value) -> Result<()> {
         };
         let type_matches = |kind: &str| match kind {
             "string" => value.is_string(),
-            "object" => value.is_object(),
+            "object" => {
+                value.is_object()
+                    && (s.get("properties").is_none() || validate_params(value, s).is_ok())
+            }
             "integer" => value.as_u64().is_some(),
             "number" => value.is_number(),
             "boolean" => value.is_boolean(),
@@ -3089,14 +3254,20 @@ fn validate_params(p: &Value, schema: &Value) -> Result<()> {
             "array" => value.as_array().is_some_and(|items| {
                 let item_schema = &s["items"];
                 items.len() >= s["minItems"].as_u64().unwrap_or(0) as usize
+                    && items.len() <= s["maxItems"].as_u64().unwrap_or(u64::MAX) as usize
                     && items.iter().all(|item| {
                         if item_schema["type"] == "object" {
                             validate_params(item, item_schema).is_ok()
                         } else if item_schema.is_null() {
                             true
                         } else {
-                            item.as_str()
-                                .is_some_and(|text| !text.is_empty() && text.len() <= 160)
+                            item.as_str().is_some_and(|text| {
+                                !text.is_empty()
+                                    && text.len() <= 160
+                                    && item_schema["enum"]
+                                        .as_array()
+                                        .is_none_or(|options| options.contains(item))
+                            })
                         }
                     })
                     && (s["uniqueItems"] != true
@@ -3119,6 +3290,28 @@ fn validate_params(p: &Value, schema: &Value) -> Result<()> {
         if !valid {
             bail!("INVALID_REQUEST")
         };
+        if let Some(text) = value.as_str() {
+            ensure!(
+                text.chars().count() >= s["minLength"].as_u64().unwrap_or(0) as usize
+                    && text.chars().count() <= s["maxLength"].as_u64().unwrap_or(u64::MAX) as usize,
+                "INVALID_REQUEST"
+            );
+        }
+        if s["pattern"] == "\\S" {
+            ensure!(
+                value
+                    .as_str()
+                    .is_some_and(|text| text.chars().any(|character| !character.is_whitespace())),
+                "INVALID_REQUEST"
+            );
+        }
+        if let Some(number) = value.as_f64() {
+            ensure!(
+                s["minimum"].as_f64().is_none_or(|min| number >= min)
+                    && s["maximum"].as_f64().is_none_or(|max| number <= max),
+                "INVALID_REQUEST"
+            );
+        }
         if let Some(expected) = s.get("const") {
             if expected != value {
                 bail!("INVALID_REQUEST")
@@ -3145,6 +3338,8 @@ pub fn backend_route(method: &str, p: &Value) -> Result<(String, String, Option<
         "sessionId",
         "requestId",
         "artifactId",
+        "personId",
+        "roleId",
     ] {
         body.as_object_mut().unwrap().remove(key);
     }
@@ -3153,7 +3348,13 @@ pub fn backend_route(method: &str, p: &Value) -> Result<(String, String, Option<
             body["workflowId"] = id.clone();
         }
     }
-    if method == "workflow.operations.get" {
+    if method == "workflow.operations.get"
+        || method == "personas.operations.get"
+        || matches!(
+            method,
+            "personas.chat_context.create" | "personas.memory.write" | "personas.memory.update"
+        )
+    {
         body["idempotencyKey"] = p
             .get("idempotencyKey")
             .cloned()
@@ -3166,6 +3367,51 @@ pub fn backend_route(method: &str, p: &Value) -> Result<(String, String, Option<
         });
     }
     let (verb, route) = match method {
+        "persona.roles.list" => ("GET", "v1/persona-roles/".into()),
+        "persona.roles.get" => (
+            "GET",
+            format!("v1/persona-roles/{}/", required(p, "roleId")?),
+        ),
+        "personas.list" => {
+            if let Some(id) = p.get("roleId") {
+                body["roleId"] = id.clone();
+            }
+            ("GET", "v1/personas/".into())
+        }
+        "personas.get" => ("GET", format!("v1/personas/{}/", required(p, "personId")?)),
+        "personas.chat_context.create" => (
+            "POST",
+            format!(
+                "v1/personas/{}/chat-context/create/",
+                required(p, "personId")?
+            ),
+        ),
+        "personas.chat_context.get" => (
+            "POST",
+            format!("v1/personas/{}/chat-context/", required(p, "personId")?),
+        ),
+        "personas.memory.search"
+        | "personas.memory.read"
+        | "personas.memory.write"
+        | "personas.memory.update" => (
+            "POST",
+            format!(
+                "v1/personas/{}/memory-tools/{}/",
+                required(p, "personId")?,
+                method.rsplit('.').next().unwrap()
+            ),
+        ),
+        "personas.operations.get" => {
+            body.as_object_mut().unwrap().clear();
+            (
+                "GET",
+                format!(
+                    "v1/personas/operations/{}/{}/",
+                    required(p, "operation")?,
+                    required(p, "idempotencyKey")?
+                ),
+            )
+        }
         "workflows.list" => ("GET", "v1/workflows/".into()),
         "workflows.get" => (
             "GET",
@@ -3326,6 +3572,85 @@ pub fn backend_route(method: &str, p: &Value) -> Result<(String, String, Option<
         Ok((verb.into(), route, Some(body)))
     }
 }
+fn safe_persona_review(item: &Value) -> Option<Value> {
+    let object = item.as_object()?;
+    let mut safe = serde_json::Map::new();
+    for key in ["workflowVersionId", "personId", "roleId"] {
+        let id = object.get(key)?.as_str()?;
+        Uuid::parse_str(id).ok()?;
+        safe.insert(key.into(), json!(id));
+    }
+    for key in ["nodeKey", "selectionKey", "personName", "roleName"] {
+        let text = object.get(key)?.as_str()?;
+        if text.is_empty() || text.len() > 512 {
+            return None;
+        }
+        safe.insert(key.into(), json!(text));
+    }
+    let digest = object.get("configDigest")?.as_str()?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    safe.insert("configDigest".into(), json!(digest));
+    Some(Value::Object(safe))
+}
+
+fn verify_persona_memory_binding(
+    binding: &Value,
+    providers: &Value,
+    newly_prepared: bool,
+) -> Result<()> {
+    const CONTRACT: &str = "ai.persona-memory/v1";
+    let declared = match binding.get("personaMemoryContract") {
+        None => false,
+        Some(value) if value == CONTRACT => true,
+        Some(_) => bail!("PERSONA_MEMORY_CONTRACT_INVALID"),
+    };
+    if let Some(closure) = binding["workflowClosure"].as_array() {
+        for workflow in closure {
+            if let Some(nodes) = workflow["nodeDependencies"].as_object() {
+                for snapshot in nodes.values() {
+                    if snapshot["node"]["type"] != "person" {
+                        continue;
+                    }
+                    ensure!(
+                        workflow["workflowVersionId"] == binding["versionId"],
+                        "PERSONA_SUBWORKFLOW_UNSUPPORTED"
+                    );
+                    let memory = &snapshot["node"]["config"]["_memoryContext"];
+                    let bridge = memory.get("bridge");
+                    ensure!(
+                        declared || (!newly_prepared && bridge.is_none()),
+                        "PERSONA_MEMORY_CONTRACT_INVALID"
+                    );
+                    // Historical closures without negotiation keep their original
+                    // execution behavior; they never acquire a new memory bridge.
+                    if !declared {
+                        continue;
+                    }
+                    if memory["enabled"] != true {
+                        ensure!(bridge.is_none(), "PERSONA_MEMORY_CONTRACT_INVALID");
+                        continue;
+                    }
+                    ensure!(
+                        bridge == Some(&json!({"schemaVersion":CONTRACT,"required":true})),
+                        "PERSONA_MEMORY_CONTRACT_INVALID"
+                    );
+                    let provider = snapshot["modelResolution"]["provider"]
+                        .as_str()
+                        .context("PERSONA_MEMORY_PROVIDER_UNSUPPORTED")?;
+                    ensure!(
+                        providers[provider]["capabilities"][CONTRACT] == true
+                            && crate::jobs::persona_memory::provider_supported(provider),
+                        "PERSONA_MEMORY_PROVIDER_UNSUPPORTED"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn provider_snapshot() -> Result<Value> {
     provider_snapshot_with(find_executable_result)
 }
@@ -3398,7 +3723,7 @@ fn provider_snapshot_with(
                 hasher.update(&buffer[..size]);
             }
             let checksum = hex::encode(hasher.finalize());
-            providers.insert(name.into(),json!({"path":path,"adapter":adapter,"checksumSha256":checksum,"sizeBytes":m.len(),"modifiedNanos":m.modified()?.duration_since(std::time::UNIX_EPOCH)?.as_nanos().to_string(),"executionPolicy":"host_user/v1"}));
+            providers.insert(name.into(),json!({"path":path,"adapter":adapter,"checksumSha256":checksum,"sizeBytes":m.len(),"modifiedNanos":m.modified()?.duration_since(std::time::UNIX_EPOCH)?.as_nanos().to_string(),"executionPolicy":"host_user/v1","capabilities":{"ai.persona-memory/v1":name == "codex" && crate::jobs::persona_memory::qualified_executable(&path)}}));
         }
     }
     Ok(Value::Object(providers))
@@ -7798,5 +8123,401 @@ mod lifecycle_tests {
         let response = client(t.path(), "status.get", json!({})).await.unwrap();
         assert_eq!(response["result"]["protocol"], PROTOCOL);
         running.abort();
+    }
+}
+
+#[cfg(test)]
+mod persona_contract_tests {
+    use super::*;
+    fn input(name: &str) -> Value {
+        let catalog: Value =
+            serde_json::from_str(include_str!("../contracts/method-catalog.json")).unwrap();
+        catalog["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == name)
+            .unwrap()["inputSchema"]
+            .clone()
+    }
+    #[test]
+    fn persona_memory_is_strict_and_routes_preserve_original_mutation_key() {
+        let ids = json!({"personId":Uuid::new_v4(),"conversationId":Uuid::new_v4(),"chatId":Uuid::new_v4(),"arguments":{"content":"stable fact","type":"fact"},"idempotencyKey":Uuid::new_v4()});
+        assert!(validate_params(&ids, &input("personas.memory.write")).is_ok());
+        let (_, route, body) = backend_route("personas.memory.write", &ids).unwrap();
+        assert!(route.ends_with("/memory-tools/write/"));
+        let body = body.unwrap();
+        assert_eq!(body["idempotencyKey"], ids["idempotencyKey"]);
+        assert!(body.get("personId").is_none());
+        for arguments in [
+            json!({"content":"x","policy":{}}),
+            json!({"content":"x","type":"unknown"}),
+            json!({"content":"x","confidence":1.1}),
+            json!({"content":"   "}),
+        ] {
+            let mut invalid = ids.clone();
+            invalid["arguments"] = arguments;
+            assert!(validate_params(&invalid, &input("personas.memory.write")).is_err());
+        }
+        let mut read = ids.clone();
+        read.as_object_mut().unwrap().remove("idempotencyKey");
+        read["arguments"] = json!({"query":"query","types":["not-a-type"]});
+        assert!(validate_params(&read, &input("personas.memory.search")).is_err());
+    }
+    #[test]
+    fn persona_inspection_is_read_only_and_account_scoped() {
+        assert!(account_scoped_method("personas.chat_context.create"));
+        assert!(account_scoped_method("personas.memory.write"));
+        let catalog: Value =
+            serde_json::from_str(include_str!("../contracts/method-catalog.json")).unwrap();
+        for name in [
+            "personas.chat_context.get",
+            "personas.memory.search",
+            "personas.memory.read",
+            "personas.operations.get",
+        ] {
+            let entry = catalog["methods"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["name"] == name)
+                .unwrap();
+            assert_eq!(entry["mutating"], false);
+        }
+    }
+    #[test]
+    fn required_memory_and_nested_personas_fail_before_commit() {
+        let mut binding = json!({"versionId":"root","personaMemoryContract":"ai.persona-memory/v1","workflowClosure":[{"workflowVersionId":"root","nodeDependencies":{"node":{"node":{"type":"person","config":{"_memoryContext":{"enabled":true,"bridge":{"schemaVersion":"ai.persona-memory/v1","required":true}}}},"modelResolution":{"provider":"codex"}}}}]});
+        assert_eq!(
+            verify_persona_memory_binding(
+                &binding,
+                &json!({"codex":{"capabilities":{"ai.persona-memory/v1":false}}}),
+                true
+            )
+            .unwrap_err()
+            .to_string(),
+            "PERSONA_MEMORY_PROVIDER_UNSUPPORTED"
+        );
+        binding["workflowClosure"][0]["nodeDependencies"]["node"]["node"]["config"]["_memoryContext"] =
+            json!({"enabled":false});
+        binding["workflowClosure"][0]["nodeDependencies"]["node"]["modelResolution"]["provider"] =
+            json!("claude");
+        assert!(verify_persona_memory_binding(&binding, &json!({}), true).is_ok());
+        binding["workflowClosure"][0]["workflowVersionId"] = json!("child");
+        assert_eq!(
+            verify_persona_memory_binding(&binding, &json!({}), false)
+                .unwrap_err()
+                .to_string(),
+            "PERSONA_SUBWORKFLOW_UNSUPPORTED"
+        );
+    }
+    #[test]
+    fn persona_memory_negotiation_is_explicit_and_preserves_historical_behavior() {
+        let mut binding = json!({"versionId":"root","workflowClosure":[{"workflowVersionId":"root","nodeDependencies":{"node":{"node":{"type":"person","config":{"_memoryContext":{"enabled":true}}},"modelResolution":{"provider":"claude"}}}}]});
+        assert!(verify_persona_memory_binding(&binding, &json!({}), false).is_ok());
+        assert_eq!(
+            verify_persona_memory_binding(&binding, &json!({}), true)
+                .unwrap_err()
+                .to_string(),
+            "PERSONA_MEMORY_CONTRACT_INVALID"
+        );
+        let bridge = json!({"schemaVersion":"ai.persona-memory/v1","required":true});
+        binding["workflowClosure"][0]["nodeDependencies"]["node"]["node"]["config"]["_memoryContext"]
+            ["bridge"] = bridge;
+        assert_eq!(
+            verify_persona_memory_binding(&binding, &json!({}), false)
+                .unwrap_err()
+                .to_string(),
+            "PERSONA_MEMORY_CONTRACT_INVALID"
+        );
+        binding["personaMemoryContract"] = json!("ai.persona-memory/v2");
+        assert_eq!(
+            verify_persona_memory_binding(&binding, &json!({}), false)
+                .unwrap_err()
+                .to_string(),
+            "PERSONA_MEMORY_CONTRACT_INVALID"
+        );
+        binding["personaMemoryContract"] = json!("ai.persona-memory/v1");
+        assert_eq!(
+            verify_persona_memory_binding(
+                &binding,
+                &json!({"claude":{"capabilities":{"ai.persona-memory/v1":true}}}),
+                true
+            )
+            .unwrap_err()
+            .to_string(),
+            "PERSONA_MEMORY_PROVIDER_UNSUPPORTED"
+        );
+        let memory = &mut binding["workflowClosure"][0]["nodeDependencies"]["node"]["node"]["config"]
+            ["_memoryContext"];
+        memory["enabled"] = json!(false);
+        assert_eq!(
+            verify_persona_memory_binding(&binding, &json!({}), true)
+                .unwrap_err()
+                .to_string(),
+            "PERSONA_MEMORY_CONTRACT_INVALID"
+        );
+        binding["workflowClosure"][0]["nodeDependencies"]["node"]["node"]["config"]["_memoryContext"] =
+            json!({"enabled":true});
+        assert_eq!(
+            verify_persona_memory_binding(&binding, &json!({}), true)
+                .unwrap_err()
+                .to_string(),
+            "PERSONA_MEMORY_CONTRACT_INVALID"
+        );
+        binding["workflowClosure"][0]["nodeDependencies"]["node"]["node"]["config"]["_memoryContext"]
+            ["bridge"] = json!({"schemaVersion":"ai.persona-memory/v2","required":true});
+        assert_eq!(
+            verify_persona_memory_binding(&binding, &json!({}), true)
+                .unwrap_err()
+                .to_string(),
+            "PERSONA_MEMORY_CONTRACT_INVALID"
+        );
+    }
+    #[tokio::test]
+    async fn persona_spool_is_bound_to_current_org_child_and_signed_in_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let api = Api::for_test_origin("http://127.0.0.1:1").unwrap();
+        let daemon = Daemon::new(
+            tmp.path().into(),
+            api.clone(),
+            Auth::test_enrolled(api.clone(), "org", "runner-one"),
+        )
+        .unwrap();
+        daemon.public.lock().await.active_organization = Some("org".into());
+        let reference = daemon
+            .spool_response(
+                &json!({}),
+                json!({"largeMemory":"x".repeat(MAX_FRAME)}),
+                Some("org"),
+                Some("runner-one"),
+            )
+            .unwrap();
+        let p = json!({"responseRef":reference["responseRef"]});
+        assert!(daemon.require_spool_owner(&p).await.is_ok());
+        assert!(daemon.dispatch("responses.read", p.clone()).await.is_ok());
+        daemon.public.lock().await.active_organization = Some("other".into());
+        assert_eq!(
+            daemon
+                .require_spool_owner(&p)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "RESPONSE_NOT_FOUND"
+        );
+        assert_eq!(
+            daemon
+                .dispatch("responses.read", p.clone())
+                .await
+                .unwrap_err()
+                .to_string(),
+            "RESPONSE_NOT_FOUND"
+        );
+        let changed = Daemon::new(
+            tmp.path().into(),
+            api.clone(),
+            Auth::test_enrolled(api.clone(), "org", "runner-two"),
+        )
+        .unwrap();
+        changed.public.lock().await.active_organization = Some("org".into());
+        assert_eq!(
+            changed
+                .require_spool_owner(&p)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "RESPONSE_NOT_FOUND"
+        );
+        let logged_out =
+            Daemon::new(tmp.path().into(), api.clone(), Auth::test_unauthed(api)).unwrap();
+        logged_out.public.lock().await.active_organization = Some("org".into());
+        assert_eq!(
+            logged_out
+                .require_spool_owner(&p)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "RESPONSE_NOT_FOUND"
+        );
+        assert_eq!(
+            logged_out
+                .dispatch("responses.read", p)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "RESPONSE_NOT_FOUND"
+        );
+    }
+    async fn request(listener: &tokio::net::TcpListener) -> (tokio::net::TcpStream, String, Value) {
+        use tokio::io::AsyncReadExt;
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        loop {
+            let mut buf = [0; 8192];
+            let size = stream.read(&mut buf).await.unwrap();
+            assert!(size > 0);
+            bytes.extend_from_slice(&buf[..size]);
+            if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&bytes[..end]).into_owned();
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|length| length.parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if bytes.len() >= end + 4 + length {
+                    return (
+                        stream,
+                        head,
+                        if length > 0 {
+                            serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap()
+                        } else {
+                            json!({})
+                        },
+                    );
+                }
+            }
+        }
+    }
+    async fn response(mut stream: tokio::net::TcpStream, body: Value) {
+        let bytes = body.to_string();
+        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",bytes.len(),bytes).as_bytes()).await.unwrap();
+    }
+    #[tokio::test]
+    async fn persona_dispatch_pending_and_completed_replays_only_owner_checked_receipt_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = Daemon::new(
+            tmp.path().into(),
+            api.clone(),
+            Auth::test_enrolled(api, "org", "runner"),
+        )
+        .unwrap();
+        daemon.public.lock().await.active_organization = Some("org".into());
+        let key = Uuid::new_v4().to_string();
+        let args = json!({"personId":Uuid::new_v4(),"conversationId":Uuid::new_v4(),"chatId":Uuid::new_v4(),"arguments":{"content":"stable fact"},"idempotencyKey":key});
+        let server_key = key.clone();
+        let server = tokio::spawn(async move {
+            let (stream, head, body) = request(&listener).await;
+            assert!(head.starts_with("POST "));
+            assert_eq!(body["idempotencyKey"], server_key);
+            drop(stream);
+            for _ in 0..2 {
+                let (stream, head, body) = request(&listener).await;
+                assert!(head.starts_with("GET "));
+                assert!(head.contains(&format!("/personas/operations/memory.write/{server_key}/")));
+                assert_eq!(body, json!({}));
+                response(stream,json!({"data":{"operation":"memory.write","key":server_key,"status":"completed","requestDigest":"a".repeat(64),"response":{"result":{"candidateId":"same-candidate"}}}})).await;
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        assert_eq!(
+            daemon
+                .dispatch("personas.memory.write", args.clone())
+                .await
+                .unwrap_err()
+                .to_string(),
+            "NETWORK_AMBIGUOUS"
+        );
+        let recovered = daemon
+            .dispatch("personas.memory.write", args.clone())
+            .await
+            .unwrap();
+        assert_eq!(recovered["result"]["candidateId"], "same-candidate");
+        assert_eq!(
+            daemon
+                .dispatch("personas.memory.write", args)
+                .await
+                .unwrap(),
+            recovered
+        );
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn persona_dispatch_cached_receipt_rechecks_revoked_permission() {
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = Daemon::new(
+            tmp.path().into(),
+            api.clone(),
+            Auth::test_enrolled(api, "org", "runner"),
+        )
+        .unwrap();
+        daemon.public.lock().await.active_organization = Some("org".into());
+        let args = json!({"personId":Uuid::new_v4(),"conversationId":Uuid::new_v4(),"chatId":Uuid::new_v4(),"arguments":{"content":"stable fact"},"idempotencyKey":Uuid::new_v4()});
+        let copy = args.clone();
+        let backend = tokio::spawn(async move {
+            let (stream, head, _) = request(&listener).await;
+            assert!(head.starts_with("POST "));
+            response(
+                stream,
+                json!({"data":{"result":{"candidateId":"protected-candidate"}}}),
+            )
+            .await;
+            let (mut stream, head, _) = request(&listener).await;
+            assert!(head.starts_with("GET "));
+            let body = json!({"error":{"code":"AUTHORIZATION_FAILED"}}).to_string();
+            stream.write_all(format!("HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        assert_eq!(
+            daemon
+                .dispatch("personas.memory.write", args)
+                .await
+                .unwrap()["result"]["candidateId"],
+            "protected-candidate"
+        );
+        let denied = daemon
+            .dispatch("personas.memory.write", copy)
+            .await
+            .unwrap_err();
+        assert_eq!(public_error(&denied).0, "AUTHORIZATION_FAILED");
+        backend.await.unwrap();
+    }
+    #[tokio::test]
+    async fn persona_scope_upgrade_dispatch_never_uses_generic_previous_child_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let org = "10000000-0000-4000-8000-000000000001";
+        let runner = "10000000-0000-4000-8000-000000000002";
+        let delegation = "10000000-0000-4000-8000-000000000003";
+        let device = "00000000-0000-4000-8000-000000000002";
+        let key = Uuid::new_v4().to_string();
+        let daemon = Daemon::new(
+            tmp.path().into(),
+            api.clone(),
+            Auth::test_enrolled(api, org, runner),
+        )
+        .unwrap();
+        let args = json!({"organizationId":org,"requestedScopes":["runner.personas.read"],"idempotencyKey":key});
+        state::write_json(&tmp.path().join("operations").join(format!("{key}.json")),&json!({"digest":state::json_digest(&json!({"method":"auth.scope_upgrade","params":args,"organizationId":null,"accountSubject":null})),"method":"auth.scope_upgrade","result":{"status":"verified","runnerId":"former-child"}})).unwrap();
+        let backend = tokio::spawn(async move {
+            let (stream, head, _) = request(&listener).await;
+            assert!(head.contains("/enroll/"));
+            response(stream,json!({"data":{"deviceId":device,"runner":{"id":runner},"child":{"delegationId":delegation,"scopes":[]}}})).await;
+            let (stream, head, _) = request(&listener).await;
+            assert!(head.contains("/scope-upgrade/"));
+            response(stream,json!({"data":{"status":"denied","deviceId":device,"organizationId":org,"runnerId":runner,"delegationId":delegation,"requestedScopes":["runner.personas.read"],"grantedScopes":[],"refreshRequired":false}})).await;
+        });
+        let result = daemon.dispatch("auth.scope_upgrade", args).await.unwrap();
+        assert_eq!(result["status"], "denied");
+        assert_eq!(result["runnerId"], runner);
+        backend.await.unwrap();
     }
 }

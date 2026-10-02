@@ -6556,7 +6556,9 @@
               "prepare",
               "monitor",
               "interaction",
-              "runs"
+              "runs",
+              "personas",
+              "personaChat"
             ]
           },
           "entityType": {
@@ -6567,7 +6569,10 @@
               "request",
               "execution",
               "builderSession",
-              "preparation"
+              "preparation",
+              "personaRole",
+              "persona",
+              "personaConversation"
             ]
           },
           "entityId": {
@@ -7175,6 +7180,40 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 384
+          },
+          "personaContext": {
+            "type": "object",
+            "properties": {
+              "personId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "organizationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "conversationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "chatId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "configDigest": {
+                "type": "string",
+                "minLength": 64,
+                "maxLength": 64
+              }
+            },
+            "required": [
+              "personId",
+              "organizationId",
+              "conversationId",
+              "chatId",
+              "configDigest"
+            ],
+            "additionalProperties": false
           }
         },
         "required": [
@@ -9262,6 +9301,1418 @@
       },
       "transportRetry": "never_after_send",
       "appOnly": false
+    },
+    {
+      "name": "persona.roles.list",
+      "mutating": false,
+      "idempotent": true,
+      "appOnly": false,
+      "transportRetry": "before_response_once",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "cursor": {
+            "type": "string"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "roles": {
+                "type": "array",
+                "items": {
+                  "type": "object"
+                }
+              },
+              "nextCursor": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "roles",
+              "nextCursor"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "persona.roles.get",
+      "mutating": false,
+      "idempotent": true,
+      "appOnly": false,
+      "transportRetry": "before_response_once",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "roleId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "roleId"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "role": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "role"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "personas.list",
+      "mutating": false,
+      "idempotent": true,
+      "appOnly": false,
+      "transportRetry": "before_response_once",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "roleId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "cursor": {
+            "type": "string"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "personas": {
+                "type": "array",
+                "items": {
+                  "type": "object"
+                }
+              },
+              "nextCursor": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "personas",
+              "nextCursor"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "personas.get",
+      "mutating": false,
+      "idempotent": true,
+      "appOnly": false,
+      "transportRetry": "before_response_once",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "personId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "personId"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "contractVersion": {
+                "type": "string"
+              },
+              "person": {
+                "type": "object"
+              },
+              "role": {
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "effectiveConfig": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "contractVersion",
+              "person",
+              "role",
+              "effectiveConfig"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "personas.chat_context.create",
+      "mutating": true,
+      "idempotent": true,
+      "appOnly": false,
+      "transportRetry": "never_after_send",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "personId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "chatId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "personId",
+          "idempotencyKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "contractVersion": {
+                "type": "string"
+              },
+              "person": {
+                "type": "object"
+              },
+              "role": {
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "conversation": {
+                "type": "object"
+              },
+              "memory": {
+                "type": "object"
+              },
+              "configDigest": {
+                "type": "string"
+              },
+              "effectiveConfig": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "contractVersion",
+              "person",
+              "role",
+              "conversation",
+              "memory",
+              "configDigest",
+              "effectiveConfig"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "personas.chat_context.get",
+      "mutating": false,
+      "idempotent": true,
+      "appOnly": false,
+      "transportRetry": "before_response_once",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "personId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "conversationId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "chatId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "personId",
+          "conversationId",
+          "chatId"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "contractVersion": {
+                "type": "string"
+              },
+              "person": {
+                "type": "object"
+              },
+              "role": {
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "conversation": {
+                "type": "object"
+              },
+              "memory": {
+                "type": "object"
+              },
+              "configDigest": {
+                "type": "string"
+              },
+              "effectiveConfig": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "contractVersion",
+              "person",
+              "role",
+              "conversation",
+              "memory",
+              "configDigest",
+              "effectiveConfig"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "personas.memory.search",
+      "mutating": false,
+      "idempotent": true,
+      "appOnly": false,
+      "transportRetry": "before_response_once",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "personId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "conversationId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "chatId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "arguments": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096,
+                "pattern": "\\S"
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200
+              },
+              "types": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "artifact_reference",
+                    "constraint",
+                    "decision",
+                    "fact",
+                    "interaction_summary",
+                    "preference",
+                    "relationship_context"
+                  ]
+                },
+                "maxItems": 7,
+                "uniqueItems": true
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "additionalProperties": false
+          },
+          "callId": {
+            "type": "string"
+          },
+          "expectedConfigDigest": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "personId",
+          "conversationId",
+          "chatId",
+          "arguments"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "result": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "result"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "personas.memory.read",
+      "mutating": false,
+      "idempotent": true,
+      "appOnly": false,
+      "transportRetry": "before_response_once",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "personId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "conversationId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "chatId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "arguments": {
+            "type": "object",
+            "properties": {
+              "memoryId": {
+                "type": "string",
+                "format": "uuid",
+                "maxLength": 36
+              }
+            },
+            "required": [
+              "memoryId"
+            ],
+            "additionalProperties": false
+          },
+          "callId": {
+            "type": "string"
+          },
+          "expectedConfigDigest": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "personId",
+          "conversationId",
+          "chatId",
+          "arguments"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "result": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "result"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "personas.memory.write",
+      "mutating": true,
+      "idempotent": true,
+      "appOnly": false,
+      "transportRetry": "never_after_send",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "personId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "conversationId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "chatId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "arguments": {
+            "type": "object",
+            "properties": {
+              "content": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32768,
+                "pattern": "\\S"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "artifact_reference",
+                  "constraint",
+                  "decision",
+                  "fact",
+                  "interaction_summary",
+                  "preference",
+                  "relationship_context"
+                ]
+              },
+              "summary": {
+                "type": "string",
+                "maxLength": 4096
+              },
+              "importance": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "confidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              }
+            },
+            "required": [
+              "content"
+            ],
+            "additionalProperties": false
+          },
+          "callId": {
+            "type": "string"
+          },
+          "expectedConfigDigest": {
+            "type": "string"
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "personId",
+          "conversationId",
+          "chatId",
+          "arguments",
+          "idempotencyKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "result": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "result"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "personas.memory.update",
+      "mutating": true,
+      "idempotent": true,
+      "appOnly": false,
+      "transportRetry": "never_after_send",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "personId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "conversationId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "chatId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "arguments": {
+            "type": "object",
+            "properties": {
+              "memoryId": {
+                "type": "string",
+                "format": "uuid",
+                "maxLength": 36
+              },
+              "content": {
+                "type": "string",
+                "maxLength": 32768,
+                "pattern": "\\S"
+              },
+              "summary": {
+                "type": "string",
+                "maxLength": 4096
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "artifact_reference",
+                  "constraint",
+                  "decision",
+                  "fact",
+                  "interaction_summary",
+                  "preference",
+                  "relationship_context"
+                ]
+              },
+              "importance": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "confidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "reason": {
+                "type": "string",
+                "maxLength": 4096
+              }
+            },
+            "required": [
+              "memoryId"
+            ],
+            "additionalProperties": false
+          },
+          "callId": {
+            "type": "string"
+          },
+          "expectedConfigDigest": {
+            "type": "string"
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "personId",
+          "conversationId",
+          "chatId",
+          "arguments",
+          "idempotencyKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "result": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "result"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "personas.operations.get",
+      "mutating": false,
+      "idempotent": true,
+      "appOnly": false,
+      "transportRetry": "before_response_once",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "operation": {
+            "type": "string",
+            "enum": [
+              "chat_context.create",
+              "memory.write",
+              "memory.update"
+            ]
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "operation",
+          "idempotencyKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "operation": {
+                "type": "string",
+                "enum": [
+                  "chat_context.create",
+                  "memory.write",
+                  "memory.update"
+                ]
+              },
+              "key": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "status": {
+                "const": "not_found"
+              }
+            },
+            "required": [
+              "operation",
+              "key",
+              "status"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "operation": {
+                "type": "string",
+                "enum": [
+                  "chat_context.create",
+                  "memory.write",
+                  "memory.update"
+                ]
+              },
+              "key": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "status": {
+                "const": "processing"
+              },
+              "requestDigest": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              }
+            },
+            "required": [
+              "operation",
+              "key",
+              "status",
+              "requestDigest"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "operation": {
+                "type": "string",
+                "enum": [
+                  "chat_context.create",
+                  "memory.write",
+                  "memory.update"
+                ]
+              },
+              "key": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "status": {
+                "const": "completed"
+              },
+              "requestDigest": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              },
+              "response": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "operation",
+              "key",
+              "status",
+              "requestDigest",
+              "response"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "auth.scope_upgrade",
+      "mutating": true,
+      "idempotent": true,
+      "appOnly": false,
+      "transportRetry": "never_after_send",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "organizationId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "requestedScopes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "runner.personas.read",
+                "runner.personas.chat",
+                "runner.personas.memory.read",
+                "runner.personas.memory.write"
+              ]
+            },
+            "uniqueItems": true,
+            "minItems": 1
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "organizationId",
+          "requestedScopes",
+          "idempotencyKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "organizationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "runnerId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "delegationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "deviceId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "scopes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "status": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "organizationId",
+              "runnerId",
+              "delegationId",
+              "deviceId",
+              "scopes",
+              "status"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "auth.scope_status",
+      "mutating": false,
+      "idempotent": true,
+      "appOnly": false,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "organizationId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "organizationId"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "organizationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "runnerId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "delegationId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "deviceId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "scopes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "status": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "organizationId",
+              "runnerId",
+              "delegationId",
+              "deviceId",
+              "scopes",
+              "status"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
     }
   ],
   "capabilities": [
@@ -9362,6 +10813,19 @@
     "workflows.canonical-authoring-contract/v1",
     "workflows.runtime-draft-mutations/v1",
     "auth:browser-pkce/v1",
-    "workflows.patch.notes-preserve/v1"
+    "workflows.patch.notes-preserve/v1",
+    "method:persona.roles.list",
+    "method:persona.roles.get",
+    "method:personas.list",
+    "method:personas.get",
+    "method:personas.chat_context.create",
+    "method:personas.chat_context.get",
+    "method:personas.memory.search",
+    "method:personas.memory.read",
+    "method:personas.memory.write",
+    "method:personas.memory.update",
+    "method:personas.operations.get",
+    "method:auth.scope_upgrade",
+    "method:auth.scope_status"
   ]
 }

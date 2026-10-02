@@ -80,7 +80,7 @@ def validate_schema(value: Any, where: str) -> None:
     allowed = {
         "type", "properties", "required", "additionalProperties", "items", "oneOf",
         "const", "enum", "format", "minLength", "maxLength", "minimum", "minItems",
-        "uniqueItems",
+        "uniqueItems", "maximum", "maxItems", "pattern",
     }
     unknown = set(schema) - allowed
     if unknown:
@@ -118,7 +118,7 @@ def validate_schema(value: Any, where: str) -> None:
             fail(f"{where}.enum: contains duplicate values")
     if "additionalProperties" in schema and not isinstance(schema["additionalProperties"], bool):
         fail(f"{where}.additionalProperties: expected boolean")
-    for key in ("minLength", "maxLength", "minimum", "minItems"):
+    for key in ("minLength", "maxLength", "minimum", "maximum", "minItems", "maxItems"):
         if key in schema and (not isinstance(schema[key], int) or isinstance(schema[key], bool) or schema[key] < 0):
             fail(f"{where}.{key}: expected non-negative integer")
     if "uniqueItems" in schema and not isinstance(schema["uniqueItems"], bool):

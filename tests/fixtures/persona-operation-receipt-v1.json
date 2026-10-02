@@ -1,0 +1,101 @@
+{
+  "valid": [
+    {
+      "operation": "memory.write",
+      "key": "10000000-0000-4000-8000-000000000001",
+      "status": "not_found"
+    },
+    {
+      "operation": "memory.write",
+      "key": "10000000-0000-4000-8000-000000000001",
+      "status": "processing",
+      "requestDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "operation": "memory.write",
+      "key": "10000000-0000-4000-8000-000000000001",
+      "status": "completed",
+      "requestDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "response": {
+        "result": {
+          "candidateId": "10000000-0000-4000-8000-000000000001"
+        }
+      }
+    },
+    {
+      "responseRef": "10000000-0000-4000-8000-000000000002",
+      "sizeBytes": 123,
+      "encoding": "json",
+      "nextOffset": 0,
+      "checksumSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ],
+  "invalid": [
+    {
+      "operation": "memory.write",
+      "key": "10000000-0000-4000-8000-000000000001",
+      "status": "not_found",
+      "requestDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "operation": "memory.write",
+      "key": "10000000-0000-4000-8000-000000000001",
+      "status": "not_found",
+      "response": {}
+    },
+    {
+      "operation": "memory.write",
+      "key": "10000000-0000-4000-8000-000000000001",
+      "status": "processing"
+    },
+    {
+      "operation": "memory.write",
+      "key": "10000000-0000-4000-8000-000000000001",
+      "status": "processing",
+      "requestDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "response": {}
+    },
+    {
+      "operation": "memory.write",
+      "key": "10000000-0000-4000-8000-000000000001",
+      "status": "completed",
+      "requestDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "operation": "memory.write",
+      "key": "10000000-0000-4000-8000-000000000001",
+      "status": "completed",
+      "response": {}
+    },
+    {
+      "operation": "memory.write",
+      "key": "10000000-0000-4000-8000-000000000001",
+      "status": "completed",
+      "requestDigest": "bad",
+      "response": {}
+    },
+    {
+      "operation": "memory.write",
+      "key": "10000000-0000-4000-8000-000000000001",
+      "status": "unknown"
+    },
+    {
+      "operation": "memory.write",
+      "key": "10000000-0000-4000-8000-000000000001",
+      "status": "completed",
+      "requestDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "response": []
+    },
+    {
+      "operation": "memory.write",
+      "key": "10000000-0000-4000-8000-000000000001",
+      "status": "not_found",
+      "authority": {}
+    },
+    {
+      "operation": "other",
+      "key": "10000000-0000-4000-8000-000000000001",
+      "status": "not_found"
+    }
+  ]
+}

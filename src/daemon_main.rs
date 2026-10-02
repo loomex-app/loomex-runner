@@ -42,6 +42,23 @@ fn entry() -> Result<()> {
     }
     if std::env::args()
         .nth(1)
+        .is_some_and(|a| a == "--internal-persona-memory-mcp")
+    {
+        let path = std::env::args()
+            .nth(2)
+            .ok_or_else(|| anyhow::anyhow!("PERSONA_MEMORY_UNAVAILABLE"))?;
+        if std::env::args().nth(3).is_some() {
+            anyhow::bail!("PERSONA_MEMORY_UNAVAILABLE")
+        }
+        return tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(loomex_runner::jobs::persona_memory::serve_mcp(
+                std::path::Path::new(&path),
+            ));
+    }
+    if std::env::args()
+        .nth(1)
         .is_some_and(|a| a == "--internal-public-status-mcp")
     {
         let socket = std::env::args()

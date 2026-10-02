@@ -1,0 +1,25 @@
+{
+  "schemaVersion": "ai.persona-memory/v1",
+  "negotiation": {
+    "bindingField": "personaMemoryContract",
+    "bindingValue": "ai.persona-memory/v1",
+    "nodeField": "node.config._memoryContext.bridge",
+    "nodeValue": {
+      "schemaVersion": "ai.persona-memory/v1",
+      "required": true
+    },
+    "enabledProvider": "codex",
+    "requiredCapabilities": [
+      "registration.capabilities.capabilities[ai.persona-memory/v1]",
+      "providerConfiguration.installed[selectedProvider].capabilities[ai.persona-memory/v1]"
+    ],
+    "disabled": "bridge field absent; no provider memory capability required",
+    "historical": "binding contract absent and bridge absent; no new job memory marker or gateway authority",
+    "unknownVersion": "reject"
+  },
+  "jobPayloadMarker": {
+    "schemaVersion": "ai.persona-memory/v1",
+    "required": true
+  },
+  "publicStatusEnabled": false
+}

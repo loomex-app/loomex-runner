@@ -336,6 +336,8 @@ struct ProtectedState {
     login: Option<Login>,
     pending: Option<Pending>,
     logout_pending: bool,
+    #[serde(default)]
+    persona_state: BTreeMap<String, Value>,
 }
 impl ProtectedState {
     fn fresh() -> Self {
@@ -349,6 +351,7 @@ impl ProtectedState {
             login: None,
             pending: None,
             logout_pending: false,
+            persona_state: BTreeMap::new(),
         }
     }
 }
@@ -1152,6 +1155,182 @@ impl Auth {
         ensure!(child.usable(), "AUTH_REQUIRED");
         Ok((child.subject.clone(), state.installation_id))
     }
+    /// Explicit additive grant upgrade. The old child remains enrolled and usable
+    /// throughout grant ambiguity. Rotation is separately proof-journaled.
+    pub async fn scope_upgrade(&self, org: &str, scopes: &Value, key: &str) -> Result<Value> {
+        uuid::Uuid::parse_str(org).map_err(|_| anyhow!("INVALID_REQUEST"))?;
+        uuid::Uuid::parse_str(key).map_err(|_| anyhow!("INVALID_REQUEST"))?;
+        let requested = scopes
+            .as_array()
+            .ok_or_else(|| anyhow!("INVALID_REQUEST"))?;
+        ensure!(
+            !requested.is_empty()
+                && requested.iter().all(|scope| scope
+                    .as_str()
+                    .is_some_and(|scope| PERSONA_SCOPES.contains(&scope))),
+            "INVALID_REQUEST"
+        );
+        let _guard = self.auth_guard().await?;
+        let mut state = self.required().await?;
+        Self::allowed(&state)?;
+        let journal_key = format!("upgrade:{org}:{key}");
+        let digest = runner_state::json_digest(
+            &json!({"organizationId":org,"requestedScopes":scopes,"idempotencyKey":key}),
+        );
+        if let Some(record) = state.persona_state.get(&journal_key) {
+            ensure!(record["digest"] == digest, "IDEMPOTENCY_CONFLICT");
+            if record["phase"] == "verified" || record["phase"] == "denied" {
+                ensure!(
+                    state
+                        .device
+                        .as_ref()
+                        .is_some_and(|device| record["deviceId"] == device.subject)
+                        && state
+                            .children
+                            .get(org)
+                            .is_some_and(|child| record["runnerId"] == child.subject),
+                    "AUTH_IDENTITY_CHANGED"
+                );
+                return Ok(record["result"].clone());
+            }
+        } else {
+            self.ensure_device(&mut state).await?;
+            let child = state
+                .children
+                .get(org)
+                .ok_or_else(|| anyhow!("ORGANIZATION_NOT_ENROLLED"))?;
+            let runner_id = child.subject.clone();
+            let credential = state.device.as_ref().unwrap().signed(&state);
+            // Existing attachment discovery does not issue a replacement child.
+            let enrolled = self
+                .api
+                .request(
+                    "POST",
+                    &format!("v2/organizations/{org}/enroll/"),
+                    Some(json!({"idempotencyKey":key})),
+                    Some(&credential),
+                    Some(key),
+                )
+                .await?;
+            ensure!(
+                enrolled["runner"]["id"] == runner_id,
+                "AUTH_IDENTITY_CHANGED"
+            );
+            let delegation = field(&enrolled["child"], "delegationId")?;
+            let device = state.device.as_ref().unwrap().subject.clone();
+            if let Some(id) = enrolled.get("deviceId") {
+                ensure!(id == &json!(device), "AUTH_IDENTITY_CHANGED");
+            }
+            state.persona_state.insert(journal_key.clone(),json!({"digest":digest,"phase":"grant_pending","organizationId":org,"runnerId":runner_id,"deviceId":device,"delegationId":delegation,"requestedScopes":scopes,"idempotencyKey":key}));
+            self.save(&state).await?;
+        }
+        let mut record = state.persona_state[&journal_key].clone();
+        if record["phase"] == "grant_pending" {
+            self.ensure_device(&mut state).await?;
+            let credential = state.device.as_ref().unwrap().signed(&state);
+            ensure!(
+                record["deviceId"] == credential.subject,
+                "AUTH_IDENTITY_CHANGED"
+            );
+            let receipt = self.api.request("POST",&format!("v2/device-authorities/organizations/{org}/scope-upgrade/"),Some(json!({"delegationId":record["delegationId"],"requestedScopes":scopes,"idempotencyKey":key})),Some(&credential),Some(key)).await.map_err(|error| if error.retryable { anyhow!("NETWORK_AMBIGUOUS") } else { error.into() })?;
+            for identity in ["deviceId", "runnerId", "delegationId", "organizationId"] {
+                ensure!(
+                    receipt[identity] == record[identity],
+                    "AUTH_IDENTITY_CHANGED"
+                );
+            }
+            ensure!(
+                receipt["requestedScopes"] == *scopes,
+                "INVALID_API_RESPONSE"
+            );
+            if receipt["status"] == "denied" {
+                record["phase"] = json!("denied");
+                record["result"] = json!({"organizationId":org,"runnerId":record["runnerId"],"delegationId":record["delegationId"],"deviceId":record["deviceId"],"scopes":receipt["grantedScopes"],"status":"denied"});
+                state.persona_state.insert(journal_key, record.clone());
+                self.save(&state).await?;
+                return Ok(record["result"].clone());
+            }
+            ensure!(
+                receipt["status"] == "granted" && receipt["refreshRequired"] == true,
+                "INVALID_API_RESPONSE"
+            );
+            record["phase"] = json!("refresh_pending");
+            state
+                .persona_state
+                .insert(journal_key.clone(), record.clone());
+            self.save(&state).await?;
+        }
+        // An interrupted refresh is recovered using its original refresh/proof.
+        // One additional rotation may be necessary when recovery returns a
+        // pre-upgrade access token; both rotations retain the same child.
+        if state.pending.is_some() {
+            self.recover(&mut state).await?;
+        }
+        for _ in 0..2 {
+            let child = state
+                .children
+                .get(org)
+                .ok_or_else(|| anyhow!("AUTH_REQUIRED"))?;
+            ensure!(record["runnerId"] == child.subject, "AUTH_IDENTITY_CHANGED");
+            let refresh = child.refresh.clone();
+            let proof = key_proof(&state.private_key, "refresh", &refresh);
+            self.begin(
+                &mut state,
+                Target::ChildRefresh(org.into()),
+                "v1/delegations/refresh/".into(),
+                json!({"refreshToken":refresh,"proof":proof}),
+            )
+            .await?;
+            let metadata = state
+                .persona_state
+                .get(&format!("credential:{org}"))
+                .ok_or_else(|| anyhow!("AUTH_SCOPE_VERIFICATION_REQUIRED"))?;
+            for identity in ["deviceId", "runnerId", "delegationId", "organizationId"] {
+                ensure!(
+                    metadata[identity] == record[identity],
+                    "AUTH_IDENTITY_CHANGED"
+                );
+            }
+            if requested.iter().all(|scope| {
+                metadata["scopes"]
+                    .as_array()
+                    .is_some_and(|granted| granted.contains(scope))
+            }) {
+                record["phase"] = json!("verified");
+                let mut result = metadata.clone();
+                result["status"] = json!("verified");
+                record["result"] = result.clone();
+                state.persona_state.insert(journal_key, record);
+                self.save(&state).await?;
+                return Ok(result);
+            }
+        }
+        bail!("AUTH_SCOPE_VERIFICATION_REQUIRED")
+    }
+    pub async fn scope_status(&self, org: &str) -> Result<Value> {
+        let _guard = self.auth_guard().await?;
+        let state = self.required().await?;
+        Self::allowed(&state)?;
+        let child = state
+            .children
+            .get(org)
+            .ok_or_else(|| anyhow!("ORGANIZATION_NOT_ENROLLED"))?;
+        let mut metadata = state
+            .persona_state
+            .get(&format!("credential:{org}"))
+            .cloned()
+            .ok_or_else(|| anyhow!("AUTH_SCOPE_VERIFICATION_REQUIRED"))?;
+        ensure!(
+            metadata["runnerId"] == child.subject,
+            "AUTH_IDENTITY_CHANGED"
+        );
+        metadata["status"] = json!(if child.usable() {
+            "verified"
+        } else {
+            "expired"
+        });
+        Ok(metadata)
+    }
     pub async fn logout(&self) -> Result<Value> {
         let _guard = self.auth_guard().await?;
         self.logout_locked().await
@@ -1229,6 +1408,7 @@ impl Auth {
         state.device = None;
         state.children.clear();
         state.organization_profiles.clear();
+        state.persona_state.clear();
         state.pending = None;
         state.login = None;
         state.logout_pending = false;
@@ -1397,11 +1577,29 @@ impl Auth {
                     .ok_or_else(|| anyhow!("AUTH_REQUIRED"))?
                     .subject
                     .clone();
-                state
-                    .children
-                    .insert(org, parse_token(&data, subject, pending.started_at)?);
+                let token = parse_token(&data, subject.clone(), pending.started_at)?;
+                // Preserve successful rotation material before optional Persona
+                // metadata verification. Legacy children have no device attachment.
+                state.children.insert(org.clone(), token);
+                state.persona_state.remove(&format!("credential:{org}"));
+                if data["deviceId"].is_string() {
+                    if let Ok(metadata) = persona_credential_metadata(&data, &org) {
+                        if metadata["runnerId"] == subject {
+                            state
+                                .persona_state
+                                .insert(format!("credential:{org}"), metadata);
+                        }
+                    }
+                }
             }
             Target::Enroll(org) => {
+                if data["child"].get("delegationId").is_some() {
+                    let metadata = json!({"deviceId":data["deviceId"],"delegationId":data["child"]["delegationId"],"organizationId":org,"runnerId":data["runner"]["id"],"scopes":data["child"]["scopes"]});
+                    state.persona_state.insert(
+                        format!("credential:{org}"),
+                        persona_credential_metadata(&metadata, &org)?,
+                    );
+                }
                 ensure!(
                     data.get("child").is_some(),
                     "ENROLLMENT_CREDENTIALS_UNAVAILABLE"
@@ -1419,6 +1617,27 @@ impl Auth {
         state.pending = None;
         self.save(state).await
     }
+}
+const PERSONA_SCOPES: [&str; 4] = [
+    "runner.personas.read",
+    "runner.personas.chat",
+    "runner.personas.memory.read",
+    "runner.personas.memory.write",
+];
+fn persona_credential_metadata(data: &Value, org: &str) -> Result<Value> {
+    ensure!(
+        data["organizationId"] == org
+            && data["scopes"]
+                .as_array()
+                .is_some_and(|scopes| scopes.iter().all(Value::is_string)),
+        "INVALID_API_RESPONSE"
+    );
+    for key in ["deviceId", "delegationId", "runnerId"] {
+        uuid::Uuid::parse_str(&field(data, key)?).map_err(|_| anyhow!("INVALID_API_RESPONSE"))?;
+    }
+    Ok(
+        json!({"deviceId":data["deviceId"],"delegationId":data["delegationId"],"runnerId":data["runnerId"],"organizationId":org,"scopes":data["scopes"]}),
+    )
 }
 fn field(value: &Value, name: &str) -> Result<String> {
     value
@@ -3280,5 +3499,177 @@ mod tests {
                 .to_string(),
             "STORE_UNAVAILABLE"
         );
+    }
+    #[tokio::test]
+    async fn persona_scope_upgrade_recovers_same_grant_and_same_child_without_logout() {
+        let (auth, store, listener) = test_auth().await;
+        let org = "10000000-0000-4000-8000-000000000001";
+        let runner = "10000000-0000-4000-8000-000000000002";
+        let device = "10000000-0000-4000-8000-000000000003";
+        let delegation = "10000000-0000-4000-8000-000000000004";
+        let key = "10000000-0000-4000-8000-000000000005";
+        let mut state = ProtectedState::fresh();
+        state.device = Some(Token {
+            access: "lmxda_device_secret".into(),
+            refresh: "device-refresh".into(),
+            subject: device.into(),
+            expires_at: now() + 3600,
+        });
+        state.children.insert(
+            org.into(),
+            Token {
+                access: "lmxr_child_secret".into(),
+                refresh: "old-child-refresh".into(),
+                subject: runner.into(),
+                expires_at: now() + 3600,
+            },
+        );
+        let installation = state.installation_id.clone();
+        let private_key = state.private_key;
+        auth.save(&state).await.unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let enrollment = read_request(&mut stream).await;
+            assert_eq!(enrollment["idempotencyKey"], key);
+            respond(&mut stream,200,json!({"data":{"deviceId":device,"runner":{"id":runner},"child":{"delegationId":delegation,"attachmentId":"attachment","scopes":[]}}})).await;
+            let (mut first, _) = listener.accept().await.unwrap();
+            let grant = read_request(&mut first).await;
+            assert_eq!(
+                grant,
+                json!({"delegationId":delegation,"requestedScopes":["runner.personas.read"],"idempotencyKey":key})
+            );
+            drop(first);
+            let (mut retry, _) = listener.accept().await.unwrap();
+            assert_eq!(read_request(&mut retry).await, grant);
+            respond(&mut retry,200,json!({"data":{"operationId":"operation","operation":"device_authority.persona_scope_upgrade","status":"granted","deviceId":device,"organizationId":org,"delegationId":delegation,"runnerId":runner,"requestedScopes":["runner.personas.read"],"grantedScopes":["runner.personas.read"],"refreshRequired":true}})).await;
+            let (mut original, _) = listener.accept().await.unwrap();
+            let refresh = read_request(&mut original).await;
+            assert_eq!(refresh["refreshToken"], "old-child-refresh");
+            drop(original);
+            let (mut recovered, _) = listener.accept().await.unwrap();
+            let recovery = read_request(&mut recovered).await;
+            assert_eq!(recovery["refreshToken"], refresh["refreshToken"]);
+            assert_eq!(recovery["proof"], refresh["proof"]);
+            assert_eq!(recovery["recovery"], true);
+            respond(&mut recovered,200,json!({"data":{"accessToken":"new-child-access","refreshToken":"new-child-refresh","expiresInSeconds":3600,"deviceId":device,"organizationId":org,"delegationId":delegation,"runnerId":runner,"scopes":["runner.personas.read"]}})).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        assert_eq!(
+            auth.scope_upgrade(org, &json!(["runner.personas.read"]), key)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "NETWORK_AMBIGUOUS"
+        );
+        assert_eq!(
+            auth.credential(org).await.unwrap().token,
+            "lmxr_child_secret"
+        );
+        let result = auth
+            .scope_upgrade(org, &json!(["runner.personas.read"]), key)
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "verified");
+        assert_eq!(
+            auth.scope_upgrade(org, &json!(["runner.personas.read"]), key)
+                .await
+                .unwrap(),
+            result
+        );
+        assert_eq!(
+            auth.scope_upgrade(org, &json!(["runner.personas.chat"]), key)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "IDEMPOTENCY_CONFLICT"
+        );
+        server.await.unwrap();
+        let durable: ProtectedState =
+            serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+        assert_eq!(durable.installation_id, installation);
+        assert_eq!(durable.private_key, private_key);
+        assert_eq!(durable.children[org].subject, runner);
+        assert_eq!(durable.children[org].refresh, "new-child-refresh");
+        assert!(durable.pending.is_none());
+        let status = auth.scope_status(org).await.unwrap();
+        assert_eq!(status["scopes"], json!(["runner.personas.read"]));
+        assert!(!status.to_string().contains("access") && !status.to_string().contains("refresh"));
+    }
+    #[tokio::test]
+    async fn legacy_persona_metadata_null_device_keeps_rotated_child_usable() {
+        let (auth, store, listener) = test_auth().await;
+        let mut state = ProtectedState::fresh();
+        state.children.insert(
+            "org".into(),
+            Token {
+                access: "lmxr_old_secret".into(),
+                refresh: "old-refresh".into(),
+                subject: "runner".into(),
+                expires_at: 0,
+            },
+        );
+        auth.save(&state).await.unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            respond(&mut stream,200,json!({"data":{"accessToken":"lmxr_new_secret","refreshToken":"new-refresh","expiresInSeconds":3600,"runnerId":"runner","organizationId":"org","delegationId":"10000000-0000-4000-8000-000000000004","deviceId":null,"scopes":["runner.jobs"]}})).await;
+        });
+        assert_eq!(
+            auth.credential("org").await.unwrap().token,
+            "lmxr_new_secret"
+        );
+        server.await.unwrap();
+        let saved: ProtectedState =
+            serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+        assert_eq!(saved.children["org"].refresh, "new-refresh");
+        assert!(saved.pending.is_none());
+        assert!(!saved.persona_state.contains_key("credential:org"));
+    }
+    #[tokio::test]
+    async fn cached_persona_upgrade_rejects_replaced_identity_and_logout_clears_journal() {
+        let (auth, store, listener) = test_auth().await;
+        let org = "10000000-0000-4000-8000-000000000001";
+        let key = "10000000-0000-4000-8000-000000000005";
+        let scopes = json!(["runner.personas.read"]);
+        let mut state = ProtectedState::fresh();
+        state.device = Some(Token {
+            access: "lmxda_device_secret".into(),
+            refresh: "device-refresh".into(),
+            subject: "new-device".into(),
+            expires_at: now() + 3600,
+        });
+        state.children.insert(
+            org.into(),
+            Token {
+                access: "lmxr_child_secret".into(),
+                refresh: "child-refresh".into(),
+                subject: "new-runner".into(),
+                expires_at: now() + 3600,
+            },
+        );
+        state.persona_state.insert(format!("upgrade:{org}:{key}"),json!({"digest":runner_state::json_digest(&json!({"organizationId":org,"requestedScopes":scopes,"idempotencyKey":key})),"phase":"verified","deviceId":"old-device","runnerId":"old-runner","result":{"status":"verified"}}));
+        auth.save(&state).await.unwrap();
+        assert_eq!(
+            auth.scope_upgrade(org, &scopes, key)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "AUTH_IDENTITY_CHANGED"
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert_eq!(read_request(&mut stream).await, json!({}));
+            respond(&mut stream, 200, json!({"data":{"revoked":true}})).await;
+        });
+        auth.logout().await.unwrap();
+        server.await.unwrap();
+        let saved: ProtectedState =
+            serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+        assert!(saved.persona_state.is_empty() && saved.children.is_empty());
+        assert!(auth.scope_upgrade(org, &scopes, key).await.is_err());
     }
 }

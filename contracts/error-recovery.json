@@ -189,6 +189,30 @@
     "RUNNER_RESPONSE_UNAVAILABLE": {
       "recovery": "reconcile_outcome",
       "outcome": "unknown"
+    },
+    "PERSONA_CONFIG_CHANGED": {
+      "recovery": "refresh_context",
+      "outcome": "rejected"
+    },
+    "AUTH_SCOPE_VERIFICATION_REQUIRED": {
+      "recovery": "explicit_scope_upgrade",
+      "outcome": "unknown"
+    },
+    "AUTH_IDENTITY_CHANGED": {
+      "recovery": "reconcile_outcome",
+      "outcome": "unknown"
+    },
+    "PERSONA_MEMORY_PROVIDER_UNSUPPORTED": {
+      "recovery": "select_supported_provider",
+      "outcome": "rejected"
+    },
+    "PERSONA_MEMORY_NOT_ACTIVE": {
+      "recovery": "read_run_status",
+      "outcome": "rejected"
+    },
+    "PERSONA_MEMORY_CONTRACT_INVALID": {
+      "recovery": "prepare_again",
+      "outcome": "rejected"
     }
   }
 }
