@@ -147,34 +147,30 @@ async fn run() -> Result<()> {
 /// instead of terminating the command.
 async fn diagnostics(dir: &Path) -> Value {
     let daemon;
-    let mut installation = json!({"available":false,"reason":"RUNNER_UNAVAILABLE"});
-    match control::client(dir, "status.get", json!({})).await {
+    let mut fingerprint = fingerprint_diagnostics(&Value::Null);
+    let installation = json!({"available":false,"reason":"INSTALLATION_ID_UNAVAILABLE"});
+    let status = control::client(
+        dir,
+        "status.get",
+        json!({"includeFingerprintDiagnostics":true}),
+    )
+    .await;
+    let status = match status {
+        Err(error) if control::public_error(&error).0 == "COMPATIBILITY_ERROR" => {
+            control::client(dir, "status.get", json!({})).await
+        }
+        result => result,
+    };
+    match status {
         Ok(response) if response.get("error").is_none() => {
             let status = &response["result"];
+            fingerprint = fingerprint_diagnostics(&status["fingerprint"]);
             daemon = json!({
                 "connected":true,
                 "reason":"available",
                 "version":status["version"],
                 "protocol":status["protocol"],
             });
-            match control::client(dir, "auth.status", json!({})).await {
-                Ok(response) if response.get("error").is_none() => {
-                    let result = &response["result"];
-                    if let Some(id) = result["installationId"].as_str() {
-                        installation = json!({"available":true,"reason":"available","id":id});
-                    } else {
-                        installation =
-                            json!({"available":false,"reason":"INSTALLATION_ID_UNAVAILABLE"});
-                    }
-                }
-                Ok(response) => {
-                    installation = json!({"available":false,"reason":response["error"]["code"].as_str().unwrap_or("RUNNER_UNAVAILABLE")});
-                }
-                Err(error) => {
-                    let (code, _, _) = control::public_error(&error);
-                    installation = json!({"available":false,"reason":code});
-                }
-            }
         }
         Ok(response) => {
             daemon = json!({"connected":false,"reason":response["error"]["code"].as_str().unwrap_or("RUNNER_UNAVAILABLE")});
@@ -189,7 +185,99 @@ async fn diagnostics(dir: &Path) -> Value {
         "daemon":daemon,
         "installation":installation,
         "providers":control::provider_diagnostics(),
+        "build":build_diagnostics(),
+        "fingerprint":fingerprint,
     })
+}
+
+fn build_diagnostics() -> Value {
+    json!({
+        "profile":env!("LOOMEX_BUILD_PROFILE"),
+        "optimizationLevel":env!("LOOMEX_BUILD_OPT_LEVEL"),
+        "debugAssertions":cfg!(debug_assertions),
+        "classification":if cfg!(debug_assertions) { "development" } else { "production" },
+    })
+}
+
+fn fingerprint_diagnostics(value: &Value) -> Value {
+    const COUNTERS: &[&str] = &[
+        "workerLimit",
+        "activeWorkers",
+        "peakWorkers",
+        "started",
+        "shared",
+        "bytesHashed",
+        "queueMicros",
+        "hashMicros",
+        "unavailable",
+        "changed",
+        "canceled",
+        "inFlight",
+        "queued",
+    ];
+    if COUNTERS.iter().any(|key| value[key].as_u64().is_none()) || value["completedCache"] != false
+    {
+        return json!({"available":false,"reason":"FINGERPRINT_DIAGNOSTICS_UNAVAILABLE"});
+    }
+    let Some(observations) = value["stageObservations"]
+        .as_array()
+        .filter(|records| records.len() <= 128)
+    else {
+        return json!({"available":false,"reason":"FINGERPRINT_DIAGNOSTICS_UNAVAILABLE"});
+    };
+    let catalog: Value = serde_json::from_str(include_str!("../contracts/method-catalog.json"))
+        .expect("embedded catalog");
+    if observations
+        .iter()
+        .any(|record| !safe_stage_observation(record, &catalog))
+    {
+        return json!({"available":false,"reason":"FINGERPRINT_DIAGNOSTICS_UNAVAILABLE"});
+    }
+    let mut statistics = serde_json::Map::new();
+    for key in COUNTERS {
+        statistics.insert((*key).into(), value[key].clone());
+    }
+    statistics.insert("completedCache".into(), json!(false));
+    statistics.insert("stageObservations".into(), json!(observations));
+    json!({"available":true,"statistics":statistics})
+}
+
+fn safe_stage_observation(value: &Value, catalog: &Value) -> bool {
+    let Some(object) = value.as_object().filter(|object| object.len() == 7) else {
+        return false;
+    };
+    let Some(operation) = object.get("operation").and_then(Value::as_str) else {
+        return false;
+    };
+    (operation == "provider.fingerprint"
+        || catalog["methods"]
+            .as_array()
+            .is_some_and(|methods| methods.iter().any(|method| method["name"] == operation)))
+        && matches!(
+            value["stage"].as_str(),
+            Some(
+                "credential"
+                    | "queue"
+                    | "hash"
+                    | "backend"
+                    | "review_enrichment"
+                    | "presentation"
+                    | "total"
+            )
+        )
+        && matches!(
+            value["provider"].as_str(),
+            Some("codex" | "claude" | "gemini" | "antigravity" | "none")
+        )
+        && matches!(
+            value["outcome"].as_str(),
+            Some("completed" | "changed" | "unavailable" | "canceled" | "unknown")
+        )
+        && value["durationMicros"].as_u64().is_some()
+        && value["byteCount"].as_u64().is_some()
+        && value["correlationReference"]
+            .as_str()
+            .is_some_and(|reference| uuid::Uuid::parse_str(reference).is_ok())
 }
 
 /// Keep the ordinary status command suitable for scripts and quick checks.
@@ -365,12 +453,122 @@ mod tests {
         assert_eq!(value["daemon"]["connected"], false);
         assert_eq!(value["daemon"]["reason"], "RUNNER_UNAVAILABLE");
         assert_eq!(value["installation"]["available"], false);
+        assert_eq!(value["build"], build_diagnostics());
+        assert_eq!(value["build"]["debugAssertions"], cfg!(debug_assertions));
+        assert_eq!(value["build"]["profile"], env!("LOOMEX_BUILD_PROFILE"));
+        assert_eq!(value["fingerprint"]["available"], false);
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
         for provider in value["providers"].as_object().unwrap().values() {
             assert!(provider["available"].is_boolean());
             assert!(provider["reason"].is_string());
             assert_eq!(provider["modelAccess"], "unknown");
             assert!(provider.get("path").is_none());
             assert!(provider.get("checksumSha256").is_none());
+        }
+    }
+
+    #[test]
+    fn fingerprint_projection_is_allowlisted_and_legacy_compatible() {
+        assert_eq!(fingerprint_diagnostics(&Value::Null)["available"], false);
+        let mut metrics = json!({"workerLimit":2,"activeWorkers":0,"peakWorkers":1,
+            "started":1,"shared":0,"bytesHashed":1024,"queueMicros":12,
+            "hashMicros":34,"unavailable":0,"changed":0,"canceled":0,
+            "completedCache":false,"inFlight":0,"queued":0,"stageObservations":[],"private":"excluded"});
+        let projection = fingerprint_diagnostics(&metrics);
+        assert_eq!(projection["available"], true);
+        assert!(projection["statistics"].get("private").is_none());
+        metrics["bytesHashed"] = json!("invalid");
+        assert_eq!(fingerprint_diagnostics(&metrics)["available"], false);
+    }
+
+    #[test]
+    fn fingerprint_stage_projection_rejects_private_and_oversized_records() {
+        let catalog: Value =
+            serde_json::from_str(include_str!("../contracts/method-catalog.json")).unwrap();
+        let mut observation = json!({"operation":"provider.fingerprint","stage":"hash",
+            "durationMicros":123,"byteCount":500,"provider":"codex",
+            "correlationReference":uuid::Uuid::new_v4().to_string(),"outcome":"completed"});
+        assert!(safe_stage_observation(&observation, &catalog));
+        observation["operation"] = json!("private argument");
+        assert!(!safe_stage_observation(&observation, &catalog));
+        observation["operation"] = json!("provider.fingerprint");
+        observation["credential"] = json!("excluded");
+        assert!(!safe_stage_observation(&observation, &catalog));
+        let metrics = json!({"workerLimit":2,"activeWorkers":0,"peakWorkers":0,
+            "started":0,"shared":0,"bytesHashed":0,"queueMicros":0,"hashMicros":0,
+            "unavailable":0,"changed":0,"canceled":0,"inFlight":0,"queued":0,
+            "completedCache":false,"stageObservations":vec![observation;129]});
+        assert_eq!(fingerprint_diagnostics(&metrics)["available"], false);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_negotiates_opt_in_and_legacy_fallback_without_auth() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        for legacy in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let socket = temp.path().join("control.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let server = tokio::spawn(async move {
+                for attempt in 0..=usize::from(legacy) {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let (reader, mut writer) = stream.into_split();
+                    let mut reader = BufReader::new(reader);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    assert_eq!(request["method"], "protocol.negotiate");
+                    let capabilities = &request["params"]["requiredCapabilities"];
+                    assert_eq!(
+                        capabilities
+                            .as_array()
+                            .unwrap()
+                            .contains(&json!("diagnostics.fingerprint/v1")),
+                        attempt == 0
+                    );
+                    let response = if legacy && attempt == 0 {
+                        json!({"protocol":control::PROTOCOL,"id":request["id"],"error":{"code":"COMPATIBILITY_ERROR","retryable":false}})
+                    } else {
+                        json!({"protocol":control::PROTOCOL,"id":request["id"],"result":{"selectedProtocol":control::PROTOCOL,"maxFrameBytes":1048576,"serverVersion":"0.4.0","capabilities":capabilities}})
+                    };
+                    writer
+                        .write_all(format!("{response}\n").as_bytes())
+                        .await
+                        .unwrap();
+                    if legacy && attempt == 0 {
+                        continue;
+                    }
+                    line.clear();
+                    reader.read_line(&mut line).await.unwrap();
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    assert_eq!(request["method"], "status.get");
+                    assert_eq!(
+                        request["params"],
+                        if legacy {
+                            json!({})
+                        } else {
+                            json!({"includeFingerprintDiagnostics":true})
+                        }
+                    );
+                    let response = json!({"protocol":control::PROTOCOL,"id":request["id"],"result":{"version":"0.4.0","protocol":control::PROTOCOL}});
+                    writer
+                        .write_all(format!("{response}\n").as_bytes())
+                        .await
+                        .unwrap();
+                    line.clear();
+                    assert_eq!(reader.read_line(&mut line).await.unwrap(), 0);
+                }
+            });
+            let result = diagnostics(temp.path()).await;
+            assert_eq!(result["daemon"]["connected"], true);
+            assert_eq!(
+                result["installation"]["reason"],
+                "INSTALLATION_ID_UNAVAILABLE"
+            );
+            assert_eq!(result["fingerprint"]["available"], false);
+            server.await.unwrap();
+            assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
         }
     }
 }

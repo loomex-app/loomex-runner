@@ -1,6 +1,8 @@
 //! Fenced durable workers. Interrupted execution is reported indeterminate, never replayed.
+#[cfg(test)]
+use crate::control::provider_snapshot;
 use crate::{
-    control::{Daemon, find_executable, provider_snapshot},
+    control::{Daemon, find_executable},
     executor::{self, ExecutionObserver, ExecutionRequest, ProcessIdentity},
     state,
 };
@@ -52,8 +54,13 @@ use delivery::*;
 mod recovery;
 use recovery::*;
 
-fn runner_manifest() -> Value {
-    json!({"version":env!("CARGO_PKG_VERSION"),"executionPolicies":["host_user/v1"],"jobKinds":["shell.exec","command.run","http.request"],"capabilities":{"shell.exec":true,"command.run":true,"http.request":true,"ai.public-status/v1":LIVE_PROVIDER_QUALIFIED,"ai.persona-memory/v1":persona_memory::provider_supported("codex"),"codex.native-projected-json/v3":true},"httpResultContracts":[HTTP_RESULT_SCHEMA],"concurrency":null,"executionSeconds":null,"outputBytes":null,"artifactBytes":null})
+fn runner_manifest_with_memory(memory: bool) -> Value {
+    json!({"version":env!("CARGO_PKG_VERSION"),"executionPolicies":["host_user/v1"],"jobKinds":["shell.exec","command.run","http.request"],"capabilities":{"shell.exec":true,"command.run":true,"http.request":true,"ai.public-status/v1":LIVE_PROVIDER_QUALIFIED,"ai.persona-memory/v1":memory,"codex.native-projected-json/v3":true},"httpResultContracts":[HTTP_RESULT_SCHEMA],"concurrency":null,"executionSeconds":null,"outputBytes":null,"artifactBytes":null})
+}
+async fn runner_manifest(daemon: &Daemon) -> Result<Value> {
+    Ok(runner_manifest_with_memory(
+        persona_memory::provider_supported(daemon, "codex").await?,
+    ))
 }
 async fn apply_cancellations(daemon: &Daemon, response: &Value) {
     if let Some(jobs) = response["cancellations"].as_array() {

@@ -3,6 +3,7 @@
     "auth:browser-pkce/v1",
     "authorization.prepare-commit/v1",
     "connection.projection/v2",
+    "diagnostics.fingerprint/v1",
     "error.recovery/v1",
     "error.validation-issues/v1",
     "execution.host_user/v1",
@@ -119,7 +120,7 @@
       "path": "contracts/backend-routes.json"
     },
     "methodCatalog": {
-      "digest": "sha256:9471babc7d788b050d4de3b29e04ba2be86b628f927f337017298afb5f084ee8",
+      "digest": "sha256:a3e6b79cb39f193691dc93d7fab46d6fa9402228d05599e73735d00b50298542",
       "path": "contracts/method-catalog.json"
     }
   },
@@ -1051,10 +1052,10 @@
     {
       "classification": "local-control",
       "idempotent": true,
-      "inputSchemaDigest": "sha256:d0157ce84790721854763c7480015e84f7cb0c7fde53afb21c3a42908805bf35",
+      "inputSchemaDigest": "sha256:826604fe71383c9efdc7d03f43ffcb51937eac8853efa957f85e910725238806",
       "mutating": false,
       "name": "status.get",
-      "outputSchemaDigest": "sha256:1b007a7a88eeb9c5896825ad10cac46636b9a6f670f6c41f710f5ec798a42874",
+      "outputSchemaDigest": "sha256:d6f3e03db2aa71d2bbeb3811989d39751ddfc72c7e6b4d9810710078a1d6f351",
       "routeIds": [],
       "transportRetry": "before_response_once"
     },
@@ -1616,7 +1617,7 @@
   "schemaVersion": "loomex.runner.compatibility-manifest/v1",
   "summary": {
     "backendRouteCount": 69,
-    "capabilityCount": 111,
+    "capabilityCount": 112,
     "methodClassifications": {
       "backend-auth": 7,
       "backend-proxy": 51,

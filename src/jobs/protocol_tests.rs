@@ -119,12 +119,15 @@ fn unqualified_public_status_is_not_advertised_or_injected_for_a_sealed_job() {
     assert!(!codex_opted_in(&record.job));
     assert!(!dispatch_enabled(&record.job));
     assert_eq!(
-        runner_manifest()["capabilities"]["ai.public-status/v1"],
+        runner_manifest_with_memory(false)["capabilities"]["ai.public-status/v1"],
         false
     );
-    assert_eq!(runner_manifest()["capabilities"]["shell.exec"], true);
     assert_eq!(
-        runner_manifest()["capabilities"]["codex.native-projected-json/v3"],
+        runner_manifest_with_memory(false)["capabilities"]["shell.exec"],
+        true
+    );
+    assert_eq!(
+        runner_manifest_with_memory(false)["capabilities"]["codex.native-projected-json/v3"],
         true
     );
 }

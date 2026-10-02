@@ -2,6 +2,7 @@ pub mod api;
 pub mod auth;
 pub mod control;
 pub mod executor;
+pub mod fingerprint;
 pub mod follow;
 pub mod jobs;
 pub mod lifecycle;

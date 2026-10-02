@@ -40,8 +40,7 @@ pub const REQUIRED_SEMANTICS: [&str; 5] = [
     "transfer.chunked/v1",
     VALIDATION_ERRORS_CAPABILITY,
 ];
-#[cfg(test)]
-static TEST_START_HANDOFF_FOLLOW_FAILURE: AtomicBool = AtomicBool::new(false);
+
 fn negotiate(params: &Value) -> Result<Value> {
     let catalog: Value = serde_json::from_str(include_str!("../contracts/method-catalog.json"))?;
     let offered = params["supportedProtocols"]
@@ -73,6 +72,7 @@ struct PatchSubmission<'a> {
     // body omitted notes, so there is no historical expected note to assert.
     expected_notes: Option<&'a str>,
 }
+type ProviderPaths = Vec<(&'static str, &'static str, Option<PathBuf>)>;
 pub struct Daemon {
     pub dir: PathBuf,
     pub api: Api,
@@ -82,10 +82,15 @@ pub struct Daemon {
     pub follow: FollowStore,
     pub public: Mutex<PublicState>,
     pub execution: Arc<crate::jobs::supervisor::ExecutionSupervisor>,
+    pub fingerprints: crate::fingerprint::FingerprintService,
     mutation_keys: std::sync::Mutex<HashMap<String, MutationKey>>,
     start_handoff_locks: std::sync::Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
     preparation_handoff_locks: std::sync::Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
     lifecycle_draining: AtomicBool,
+    #[cfg(test)]
+    test_start_handoff_follow_failure: AtomicBool,
+    #[cfg(test)]
+    test_provider_paths: std::sync::Mutex<Option<ProviderPaths>>,
 }
 struct ControlWriter<'a>(&'a Daemon);
 impl Drop for ControlWriter<'_> {
@@ -116,11 +121,70 @@ impl Daemon {
             follow,
             public: Mutex::new(public),
             execution: Arc::new(crate::jobs::supervisor::ExecutionSupervisor::new(draining)),
+            fingerprints: crate::fingerprint::FingerprintService::default(),
             mutation_keys: std::sync::Mutex::new(HashMap::new()),
             start_handoff_locks: std::sync::Mutex::new(HashMap::new()),
             preparation_handoff_locks: std::sync::Mutex::new(HashMap::new()),
             lifecycle_draining: AtomicBool::new(draining),
+            #[cfg(test)]
+            test_start_handoff_follow_failure: AtomicBool::new(false),
+            #[cfg(test)]
+            test_provider_paths: std::sync::Mutex::new(None),
         })
+    }
+    pub fn fingerprint_diagnostics(&self) -> Value {
+        self.fingerprints.diagnostics()
+    }
+    pub async fn provider_snapshot(&self) -> Result<Value> {
+        let paths = self
+            .fingerprints
+            .filesystem(|cancel| {
+                [
+                    ("codex", "codex"),
+                    ("claude", "claude"),
+                    ("gemini", "gemini"),
+                    ("antigravity", "agy"),
+                ]
+                .into_iter()
+                .map(|(name, adapter)| {
+                    ensure!(!cancel.is_canceled(), "PROVIDER_UNAVAILABLE");
+                    Ok((name, adapter, find_executable_result(adapter)?))
+                })
+                .collect::<Result<ProviderPaths>>()
+            })
+            .await?;
+        #[cfg(test)]
+        let paths = self
+            .test_provider_paths
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(paths);
+        let mut providers = serde_json::Map::new();
+        let mut files = Vec::new();
+        for (name, adapter, path) in paths {
+            if let Some(path) = path {
+                let fingerprint = self
+                    .fingerprints
+                    .fingerprint_provider(path.clone(), name)
+                    .await?;
+                let memory = if name == "codex" {
+                    let (qualified, native) = crate::jobs::persona_memory::qualify_fingerprint(
+                        &self.fingerprints,
+                        &fingerprint,
+                    )
+                    .await?;
+                    files.extend(native);
+                    qualified
+                } else {
+                    false
+                };
+                providers.insert(name.into(), json!({"path":path,"adapter":adapter,"checksumSha256":fingerprint.checksum,"sizeBytes":fingerprint.size,"modifiedNanos":fingerprint.modified_nanos,"executionPolicy":"host_user/v1","capabilities":{"ai.persona-memory/v1":memory}}));
+                files.push(fingerprint);
+            }
+        }
+        self.fingerprints.validate(&files).await?;
+        Ok(Value::Object(providers))
     }
     pub fn managed_work(&self) -> usize {
         self.execution.managed_work()
@@ -154,11 +218,18 @@ impl Daemon {
         body: Option<Value>,
         key: Option<&str>,
     ) -> Result<Value> {
-        let credential = self.auth.credential(org).await?;
-        Ok(self
-            .api
-            .request(method, path, body, Some(&credential), key)
-            .await?)
+        let credential = self
+            .fingerprints
+            .measure(method, "credential", self.auth.credential(org))
+            .await?;
+        self.fingerprints
+            .measure(method, "backend", async {
+                Ok(self
+                    .api
+                    .request(method, path, body, Some(&credential), key)
+                    .await?)
+            })
+            .await
     }
     pub async fn granted(&self, path: &Path, org: &str) -> Result<PathBuf> {
         let install = self.auth.installation_id().await?;
@@ -210,6 +281,21 @@ impl Daemon {
         Ok(Some(ControlWriter(self)))
     }
     pub async fn dispatch(&self, method: &str, params: Value) -> Result<Value> {
+        if crate::fingerprint::REQUEST_REFERENCE
+            .try_with(|_| ())
+            .is_ok()
+        {
+            self.dispatch_body(method, params).await
+        } else {
+            crate::fingerprint::REQUEST_REFERENCE
+                .scope(
+                    Uuid::new_v4().to_string(),
+                    self.dispatch_body(method, params),
+                )
+                .await
+        }
+    }
+    async fn dispatch_body(&self, method: &str, params: Value) -> Result<Value> {
         let catalog: Value =
             serde_json::from_str(include_str!("../contracts/method-catalog.json"))?;
         let entry = catalog["methods"]
@@ -438,7 +524,13 @@ impl Daemon {
             result
         } else {
             let result = normalize_catalog_output(
-                self.handle(method, &params, scope.as_deref()).await?,
+                self.fingerprints
+                    .measure(
+                        method,
+                        "total",
+                        self.handle(method, &params, scope.as_deref()),
+                    )
+                    .await?,
                 &entry["outputSchema"],
             )?;
             let execution = params
@@ -607,9 +699,11 @@ impl Daemon {
         match method {
             "protocol.negotiate" => return negotiate(p),
             "status.get" => {
-                return Ok(
-                    json!({"version":env!("CARGO_PKG_VERSION"),"protocol":PROTOCOL,"activeJobs":self.reported_work(),"draining":self.execution.is_draining(),"updateDeferred":self.dir.join("pending-update.json").exists(),"details":{"monitoring":{"schemaVersion":"loomex.monitoring-readiness/v1","runObservationAvailable":true,"hostHookDeliveryAuthority":"host_managed","hostRecoveryAuthority":"host_managed","guarantee":"none"}}}),
-                );
+                let mut status = json!({"version":env!("CARGO_PKG_VERSION"),"protocol":PROTOCOL,"activeJobs":self.reported_work(),"draining":self.execution.is_draining(),"updateDeferred":self.dir.join("pending-update.json").exists(),"details":{"monitoring":{"schemaVersion":"loomex.monitoring-readiness/v1","runObservationAvailable":true,"hostHookDeliveryAuthority":"host_managed","hostRecoveryAuthority":"host_managed","guarantee":"none"}}});
+                if p["includeFingerprintDiagnostics"] == true {
+                    status["fingerprint"] = self.fingerprint_diagnostics();
+                }
+                return Ok(status);
             }
             "connection.get" => {
                 let selected = self.public.lock().await.active_organization.clone();
@@ -1558,9 +1652,22 @@ impl Daemon {
         let workspace = self
             .granted(Path::new(required(p, "workspacePath")?), org)
             .await?;
-        let install = self.auth.installation_id().await?;
-        let account = self.auth.credential(org).await?.subject;
-        let providers = provider_snapshot()?;
+        let (install, account) = self
+            .fingerprints
+            .measure(method, "credential", async {
+                Ok((
+                    self.auth.installation_id().await?,
+                    self.auth.credential(org).await?.subject,
+                ))
+            })
+            .await?;
+        let providers = self.provider_snapshot().await?;
+        ensure!(
+            self.auth.current_child_identity(org).await? == (account.clone(), install.clone()),
+            "AUTH_IDENTITY_CHANGED"
+        );
+        self.granted(Path::new(required(p, "workspacePath")?), org)
+            .await?;
         let mut body = p.clone();
         let map = body.as_object_mut().unwrap();
         map.remove("idempotencyKey");
@@ -1586,6 +1693,12 @@ impl Daemon {
                 p["idempotencyKey"].as_str(),
             )
             .await?;
+        ensure!(
+            self.auth.current_child_identity(org).await? == (account.clone(), install.clone()),
+            "AUTH_IDENTITY_CHANGED"
+        );
+        self.granted(Path::new(required(p, "workspacePath")?), org)
+            .await?;
         verify_persona_memory_binding(&result["binding"], &providers, true)?;
         let preparation = required(&result, "preparationId")?.to_owned();
         Uuid::parse_str(&preparation)?;
@@ -1608,11 +1721,30 @@ impl Daemon {
             .find(|entry| entry["name"] == method)
             .context("INTERNAL")?["outputSchema"];
         let sealed = normalize_catalog_output(result, output_schema)?;
+        let persisted = Instant::now();
         state::write_json(
             &record_path,
             &json!({"operation":method,"organizationId":org,"accountSubject":account,"installationId":install,"workspacePath":workspace,"bindingDigest":sealed["bindingDigest"],"binding":sealed["binding"],"confirmationKey":confirmation,"providers":providers,"review":sealed}),
         )?;
-        Ok(Self::preparation_review_projection(&sealed))
+        self.fingerprints.record_stage(
+            method,
+            "presentation",
+            persisted.elapsed(),
+            0,
+            "none",
+            "completed",
+        );
+        let enriching = Instant::now();
+        let projection = Self::preparation_review_projection(&sealed);
+        self.fingerprints.record_stage(
+            method,
+            "review_enrichment",
+            enriching.elapsed(),
+            0,
+            "none",
+            "completed",
+        );
+        Ok(projection)
     }
     async fn preparation_get(&self, org: &str, p: &Value) -> Result<Value> {
         let preparation = required(p, "preparationId")?;
@@ -1715,9 +1847,25 @@ impl Daemon {
         {
             return Ok(stale("workspace_changed", "prepare_again"));
         }
-        if !provider_snapshot().is_ok_and(|providers| providers == record["providers"]) {
+        if self.provider_snapshot().await? != record["providers"] {
             return Ok(stale("provider_changed", "prepare_again"));
         }
+        ensure!(
+            self.auth.current_child_identity(org).await? == (account, install),
+            "AUTH_IDENTITY_CHANGED"
+        );
+        let current: Value =
+            state::read_json(&path).map_err(|_| anyhow::anyhow!("PREPARATION_NOT_FOUND"))?;
+        if current != record {
+            return Ok(stale("record_invalid", "prepare_again"));
+        }
+        if review["expiresAt"]
+            .as_u64()
+            .is_some_and(|expires| expires <= state::now())
+        {
+            return Ok(stale("expired", "prepare_again"));
+        }
+        self.granted(Path::new(workspace), org).await?;
         Ok(
             json!({"status":"valid","operation":operation,"preparation":Self::preparation_review_projection(&review)}),
         )
@@ -1825,6 +1973,10 @@ impl Daemon {
             }
             return self.start_handoff_projection(&existing);
         }
+        ensure!(
+            self.auth.current_child_identity(org).await? == (account.clone(), installation.clone()),
+            "AUTH_IDENTITY_CHANGED"
+        );
         let handoff_ref = Uuid::new_v4().to_string();
         let mut record = json!({
             "schemaVersion":"loomex.run-start-handoff/v2",
@@ -2608,7 +2760,10 @@ impl Daemon {
             .restore_cached_follow_continuation(Some(org), "runs.commit", &params, result)
             .await?;
         #[cfg(test)]
-        if TEST_START_HANDOFF_FOLLOW_FAILURE.load(Ordering::SeqCst) {
+        if self
+            .test_start_handoff_follow_failure
+            .load(Ordering::SeqCst)
+        {
             bail!("START_HANDOFF_FOLLOW_INJECTED");
         }
         let handoff_ref = record["handoffRef"]
@@ -2662,9 +2817,28 @@ impl Daemon {
         }
         self.granted(Path::new(required(&record, "workspacePath")?), org)
             .await?;
-        if record["providers"] != provider_snapshot()? {
+        if record["providers"] != self.provider_snapshot().await? {
             bail!("PRECONDITION_FAILED")
         }
+        let (account, installation) = self.auth.current_child_identity(org).await?;
+        ensure!(
+            record["accountSubject"] == account && record["installationId"] == installation,
+            "AUTH_IDENTITY_CHANGED"
+        );
+        let current: Value =
+            state::read_json(&record_path).map_err(|_| anyhow::anyhow!("PRECONDITION_FAILED"))?;
+        ensure!(
+            current == record && !self.execution.is_draining(),
+            "PRECONDITION_FAILED"
+        );
+        ensure!(
+            record["review"]["expiresAt"]
+                .as_u64()
+                .is_none_or(|expiry| expiry > state::now()),
+            "PRECONDITION_FAILED"
+        );
+        self.granted(Path::new(required(&record, "workspacePath")?), org)
+            .await?;
         verify_persona_memory_binding(&record["binding"], &record["providers"], false)?;
         // The separate confirmation authorizes this exact preparation before the
         // backend can enqueue a job. A lost response never removes this grant.
@@ -3640,8 +3814,8 @@ fn verify_persona_memory_binding(
                         .as_str()
                         .context("PERSONA_MEMORY_PROVIDER_UNSUPPORTED")?;
                     ensure!(
-                        providers[provider]["capabilities"][CONTRACT] == true
-                            && crate::jobs::persona_memory::provider_supported(provider),
+                        provider == "codex"
+                            && providers[provider]["capabilities"][CONTRACT] == true,
                         "PERSONA_MEMORY_PROVIDER_UNSUPPORTED"
                     );
                 }
@@ -3651,6 +3825,7 @@ fn verify_persona_memory_binding(
     Ok(())
 }
 
+#[cfg(test)]
 pub fn provider_snapshot() -> Result<Value> {
     provider_snapshot_with(find_executable_result)
 }
@@ -3697,6 +3872,7 @@ fn provider_diagnostics_with(
     }
     Value::Object(providers)
 }
+#[cfg(test)]
 fn provider_snapshot_with(
     mut resolve: impl FnMut(&str) -> Result<Option<PathBuf>>,
 ) -> Result<Value> {
@@ -3709,21 +3885,9 @@ fn provider_snapshot_with(
         ("antigravity", "agy"),
     ] {
         if let Some(path) = resolve(adapter)? {
-            let m = std::fs::metadata(&path)?;
-            use sha2::{Digest, Sha256};
-            use std::io::Read;
-            let mut input = std::fs::File::open(&path)?;
-            let mut hasher = Sha256::new();
-            let mut buffer = [0; 65536];
-            loop {
-                let size = input.read(&mut buffer)?;
-                if size == 0 {
-                    break;
-                }
-                hasher.update(&buffer[..size]);
-            }
-            let checksum = hex::encode(hasher.finalize());
-            providers.insert(name.into(),json!({"path":path,"adapter":adapter,"checksumSha256":checksum,"sizeBytes":m.len(),"modifiedNanos":m.modified()?.duration_since(std::time::UNIX_EPOCH)?.as_nanos().to_string(),"executionPolicy":"host_user/v1","capabilities":{"ai.persona-memory/v1":name == "codex" && crate::jobs::persona_memory::qualified_executable(&path)}}));
+            let fingerprint = crate::fingerprint::synchronous(&path)?;
+            let checksum = fingerprint.checksum;
+            providers.insert(name.into(),json!({"path":path,"adapter":adapter,"checksumSha256":checksum,"sizeBytes":fingerprint.size,"modifiedNanos":fingerprint.modified_nanos,"executionPolicy":"host_user/v1","capabilities":{"ai.persona-memory/v1":name == "codex" && crate::jobs::persona_memory::qualified_executable(&path)}}));
         }
     }
     Ok(Value::Object(providers))
@@ -3898,6 +4062,35 @@ pub async fn serve(daemon: Arc<Daemon>) -> Result<()> {
     serving
 }
 
+async fn disconnected(reader: &BufReader<tokio::net::unix::OwnedReadHalf>) {
+    loop {
+        use std::os::fd::AsRawFd;
+        let socket = reader.get_ref().as_ref();
+        if socket.readable().await.is_err() {
+            return;
+        }
+        let mut byte = [0u8; 1];
+        // MSG_PEEK observes EOF without consuming a pipelined frame. The
+        // descriptor remains owned by Tokio throughout this bounded probe.
+        let count = unsafe {
+            libc::recv(
+                socket.as_raw_fd(),
+                byte.as_mut_ptr().cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if count == 0 {
+            return;
+        }
+        if count < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock {
+            return;
+        }
+        // A pipelined next frame is not cancellation and must not be consumed.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -3942,13 +4135,25 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
                         validation_errors_negotiated = false;
                         recovery_errors_negotiated = false;
                     }
-                    match daemon
-                        .dispatch(
-                            request["method"].as_str().unwrap_or(""),
-                            request["params"].clone(),
-                        )
-                        .await
-                    {
+                    // Disconnect cancels only fingerprint waiters. Dispatch and its
+                    // durable mutation receipt continue to completion/reconciliation.
+                    let cancellation = crate::fingerprint::Cancellation::default();
+                    let dispatch = crate::fingerprint::REQUEST_REFERENCE.scope(
+                        id.clone(),
+                        crate::fingerprint::REQUEST_CANCELLATION.scope(
+                            cancellation.clone(),
+                            daemon.dispatch(
+                                request["method"].as_str().unwrap_or(""),
+                                request["params"].clone(),
+                            ),
+                        ),
+                    );
+                    tokio::pin!(dispatch);
+                    let result = tokio::select! {
+                        result = &mut dispatch => result,
+                        _ = disconnected(&reader) => { cancellation.cancel(); dispatch.await }
+                    };
+                    match result {
                         Ok(result) => {
                             if request["method"] == "protocol.negotiate" {
                                 negotiated = true;
@@ -4104,6 +4309,9 @@ async fn client_with_semantics(
     let mut required: Vec<String> = semantics.iter().map(|cap| cap.to_string()).collect();
     if method != "protocol.negotiate" {
         required.push(format!("method:{method}"));
+    }
+    if method == "status.get" && params["includeFingerprintDiagnostics"] == true {
+        required.push("diagnostics.fingerprint/v1".into());
     }
     let agreement = exchange(
         &mut read,
@@ -4670,7 +4878,7 @@ mod conformance {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     fn fixture(dir: &Path, api: Api) -> Daemon {
-        Daemon::new(
+        let daemon = Daemon::new(
             dir.into(),
             api.clone(),
             Auth::test_enrolled(
@@ -4679,7 +4887,9 @@ mod conformance {
                 "22222222-2222-4222-8222-222222222222",
             ),
         )
-        .unwrap()
+        .unwrap();
+        *daemon.test_provider_paths.lock().unwrap() = Some(Vec::new());
+        daemon
     }
     fn continuation_requeue_input() -> Value {
         json!({"runId":Uuid::new_v4(),"deliveryId":Uuid::new_v4(),
@@ -5998,12 +6208,16 @@ mod conformance {
         assert_eq!(legacy_projection["runId"], run);
         assert_eq!(legacy_projection["result"], backend_result);
 
-        TEST_START_HANDOFF_FOLLOW_FAILURE.store(true, Ordering::SeqCst);
+        daemon
+            .test_start_handoff_follow_failure
+            .store(true, Ordering::SeqCst);
         let error = daemon
             .commit_run_start_handoff(org, &json!({"handoffRef":ticket}))
             .await
             .unwrap_err();
-        TEST_START_HANDOFF_FOLLOW_FAILURE.store(false, Ordering::SeqCst);
+        daemon
+            .test_start_handoff_follow_failure
+            .store(false, Ordering::SeqCst);
         assert_eq!(error.to_string(), "START_HANDOFF_FOLLOW_INJECTED");
         let durable: Value = state::read_json(&path).unwrap();
         assert_eq!(durable["status"], "committed");
@@ -6146,7 +6360,7 @@ mod conformance {
         });
         state::write_json(&root.join("preparations").join(format!("{preparation}.json")), &json!({
             "operation":"runs.prepare","organizationId":org,"accountSubject":"22222222-2222-4222-8222-222222222222","installationId":"00000000-0000-4000-8000-000000000001",
-            "workspacePath":workspace,"bindingDigest":digest,"binding":review["binding"],"confirmationKey":confirmation,"providers":provider_snapshot().unwrap(),"review":review,
+            "workspacePath":workspace,"bindingDigest":digest,"binding":review["binding"],"confirmationKey":confirmation,"providers":daemon.provider_snapshot().await.unwrap(),"review":review,
         })).unwrap();
         json!({"preparationId":preparation,"bindingDigest":digest,"idempotencyKey":Uuid::new_v4()})
     }
@@ -6566,7 +6780,7 @@ mod conformance {
             "operation":"runs.prepare", "organizationId":org,
             "accountSubject":"22222222-2222-4222-8222-222222222222", "installationId":"00000000-0000-4000-8000-000000000001",
             "workspacePath":workspace, "bindingDigest":"digest", "binding":review["binding"], "confirmationKey":confirmation,
-            "providers":provider_snapshot().unwrap(), "review":review,
+            "providers":daemon.provider_snapshot().await.unwrap(), "review":review,
         })).unwrap();
         let issue_params = json!({"preparationId":preparation,"bindingDigest":"digest","confirmationKey":confirmation,"idempotencyKey":Uuid::new_v4()});
         let issued = daemon
@@ -8030,6 +8244,269 @@ mod conformance {
             offset = page["nextOffset"].as_u64().unwrap();
         }
         assert_eq!(gathered, payload);
+    }
+    async fn wait_for_hash(gate: &crate::fingerprint::TestGate) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while gate.entered.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    fn fingerprint_fixture_paths(daemon: &Daemon, root: &Path, bytes: u64) {
+        let paths = [("codex", "codex"), ("claude", "claude")]
+            .into_iter()
+            .map(|(name, adapter)| {
+                let path = root.join(name);
+                let mut file = std::fs::File::create(&path).unwrap();
+                use std::io::Write;
+                let chunk = vec![42u8; 1024 * 1024];
+                for _ in 0..bytes / (1024 * 1024) {
+                    file.write_all(&chunk).unwrap();
+                }
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                (name, adapter, Some(std::fs::canonicalize(path).unwrap()))
+            })
+            .collect();
+        *daemon.test_provider_paths.lock().unwrap() = Some(paths);
+    }
+    #[tokio::test]
+    async fn fingerprint_verification_rechecks_authority_and_preserves_maintenance() {
+        for mutation in [
+            "preparation",
+            "expiry",
+            "workspace",
+            "organization",
+            "installation",
+            "child",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let daemon = Arc::new(fixture(
+                temp.path(),
+                Api::for_test_origin("http://127.0.0.1:9").unwrap(),
+            ));
+            fingerprint_fixture_paths(&daemon, temp.path(), 1024 * 1024);
+            let params = headless_preparation_fixture(&daemon, temp.path()).await;
+            let path = temp.path().join("preparations").join(format!(
+                "{}.json",
+                params["preparationId"].as_str().unwrap()
+            ));
+            let gate = daemon.fingerprints.test_hold();
+            let verifying = tokio::spawn({
+                let daemon = daemon.clone();
+                let params = params.clone();
+                async move {
+                    daemon
+                        .dispatch(
+                            "preparations.get",
+                            json!({"preparationId":params["preparationId"]}),
+                        )
+                        .await
+                }
+            });
+            wait_for_hash(&gate).await;
+            let status = tokio::time::timeout(
+                Duration::from_millis(200),
+                daemon.dispatch("status.get", json!({"includeFingerprintDiagnostics":true})),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(status["fingerprint"]["activeWorkers"], 1);
+            if mutation == "installation" || mutation == "child" {
+                let changed = Uuid::new_v4().to_string();
+                daemon
+                    .auth
+                    .test_fingerprint_identity_drift(
+                        "11111111-1111-4111-8111-111111111111",
+                        (mutation == "installation").then_some(changed.as_str()),
+                        (mutation == "child").then_some(changed.as_str()),
+                    )
+                    .await
+                    .unwrap();
+            } else if mutation == "workspace" {
+                daemon.public.lock().await.grants.clear();
+            } else {
+                let mut record: Value = state::read_json(&path).unwrap();
+                if mutation == "expiry" {
+                    record["review"]["expiresAt"] = json!(state::now() - 1);
+                } else if mutation == "organization" {
+                    record["organizationId"] = json!(Uuid::new_v4());
+                } else {
+                    record["commitAuthorization"] = json!({"consumed":true});
+                }
+                state::write_json(&path, &record).unwrap();
+            }
+            gate.release();
+            let result = verifying.await.unwrap();
+            assert!(result.is_err() || result.unwrap()["status"] == "stale");
+        }
+    }
+
+    #[tokio::test]
+    async fn fingerprint_start_second_check_rejects_consumed_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(fixture(
+            temp.path(),
+            Api::for_test_origin("http://127.0.0.1:9").unwrap(),
+        ));
+        let params = headless_preparation_fixture(&daemon, temp.path()).await;
+        let path = temp.path().join("preparations").join(format!(
+            "{}.json",
+            params["preparationId"].as_str().unwrap()
+        ));
+        let mut record: Value = state::read_json(&path).unwrap();
+        let reservation = json!({"organizationId":record["organizationId"],"accountSubject":record["accountSubject"],"installationId":record["installationId"],"preparationId":params["preparationId"],"bindingDigest":params["bindingDigest"]});
+        let lock = daemon.preparation_handoff_lock(&reservation).unwrap();
+        let guard = lock.lock().await;
+        let issuing = tokio::spawn({
+            let daemon = daemon.clone();
+            let mut params = params.clone();
+            params["confirmationKey"] = record["confirmationKey"].clone();
+            async move {
+                daemon
+                    .issue_run_start_handoff("11111111-1111-4111-8111-111111111111", &params)
+                    .await
+            }
+        });
+        // Obtaining the reservation's second strong owner proves issuance reached
+        // the lock after its first full preparation check; no timing assumption.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while Arc::strong_count(&lock) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        record["commitAuthorization"] = json!({"consumed":true});
+        state::write_json(&path, &record).unwrap();
+        drop(guard);
+        assert_eq!(
+            issuing.await.unwrap().unwrap_err().to_string(),
+            "PRECONDITION_FAILED"
+        );
+        assert!(!temp.path().join("start-handoffs").exists());
+    }
+    #[tokio::test]
+    async fn fingerprint_status_is_optional_strict_and_discovery_free() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = fixture(
+            temp.path(),
+            Api::for_test_origin("http://127.0.0.1:9").unwrap(),
+        );
+        let catalog: Value =
+            serde_json::from_str(include_str!("../contracts/method-catalog.json")).unwrap();
+        let schema = &catalog["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == "status.get")
+            .unwrap()["outputSchema"]["oneOf"][0];
+        let legacy = daemon.dispatch("status.get", json!({})).await.unwrap();
+        assert!(legacy.get("fingerprint").is_none());
+        let mut status = daemon
+            .dispatch("status.get", json!({"includeFingerprintDiagnostics":true}))
+            .await
+            .unwrap();
+        assert_eq!(status["fingerprint"]["started"], 0);
+        assert!(validate_params(&status, schema).is_ok());
+        status["fingerprint"]["authority"] = json!(true);
+        assert!(validate_params(&status, schema).is_err());
+        status.as_object_mut().unwrap().remove("fingerprint");
+        assert!(validate_params(&status, schema).is_ok());
+    }
+    #[tokio::test]
+    async fn fingerprint_disconnect_does_not_abandon_dispatched_mutation_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let daemon = Arc::new(fixture(
+            temp.path(),
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap(),
+        ));
+        daemon.public.lock().await.active_organization =
+            Some("11111111-1111-4111-8111-111111111111".into());
+        let (client, server) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(connection(server, daemon.clone()));
+        let (read, mut write) = client.into_split();
+        let mut read = BufReader::new(read);
+        exchange(
+            &mut read,
+            &mut write,
+            "protocol.negotiate",
+            json!({"supportedProtocols":[PROTOCOL],"requiredCapabilities":[]}),
+        )
+        .await
+        .unwrap();
+        let key = Uuid::new_v4().to_string();
+        let request = json!({"protocol":PROTOCOL,"id":Uuid::new_v4(),"method":"workflows.create","params":{"name":"fixture","idempotencyKey":key}});
+        write
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        let (stream, _) = receive_http(&listener).await;
+        drop(read);
+        drop(write);
+        reply_http(
+            stream,
+            200,
+            json!({"workflowId":Uuid::new_v4(),"name":"fixture","slug":"fixture"}),
+        )
+        .await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap();
+        let receipt: Value =
+            state::read_json(&temp.path().join("operations").join(format!("{key}.json"))).unwrap();
+        assert_eq!(receipt["method"], "workflows.create");
+        assert_eq!(receipt["result"]["name"], "fixture");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    #[ignore = "explicit controlled 500 MiB performance qualification"]
+    async fn fingerprint_qualification_same_preparation_twenty_samples() {
+        let output = std::env::var_os("LOOMEX_QUALIFICATION_OUTPUT")
+            .expect("explicit qualification output path required");
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(fixture(
+            temp.path(),
+            Api::for_test_origin("http://127.0.0.1:9").unwrap(),
+        ));
+        fingerprint_fixture_paths(&daemon, temp.path(), 250 * 1024 * 1024);
+        let params = headless_preparation_fixture(&daemon, temp.path()).await;
+        let preparation = params["preparationId"].clone();
+        let path = temp
+            .path()
+            .join("preparations")
+            .join(format!("{}.json", preparation.as_str().unwrap()));
+        let original = std::fs::read(&path).unwrap();
+        let mut samples = Vec::new();
+        for _ in 0..20 {
+            let start = Instant::now();
+            let result = daemon
+                .dispatch("preparations.get", json!({"preparationId":preparation}))
+                .await
+                .unwrap();
+            assert_eq!(result["status"], "valid");
+            samples.push(start.elapsed().as_micros() as u64);
+        }
+        let concurrent_started = Instant::now();
+        let a = daemon.dispatch("preparations.get", json!({"preparationId":preparation}));
+        let b = daemon.dispatch("preparations.get", json!({"preparationId":preparation}));
+        let (a, b) = tokio::join!(a, b);
+        assert_eq!(a.unwrap()["status"], "valid");
+        assert_eq!(b.unwrap()["status"], "valid");
+        assert_eq!(std::fs::read(path).unwrap(), original);
+        let report = json!({"schemaVersion":"loomex.fingerprint-qualification/v1","qualification":"source-cfg-test","fixtureBytes":500*1024*1024u64,"samePreparation":true,"sampleMicros":samples,"concurrentMicros":concurrent_started.elapsed().as_micros() as u64,"statistics":daemon.fingerprint_diagnostics(),"backend":"synthetic-no-network","credentials":"MemoryStore-synthetic","startCommitted":false});
+        std::fs::write(
+            PathBuf::from(output),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
     }
 }
 

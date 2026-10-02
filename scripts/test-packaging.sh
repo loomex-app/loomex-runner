@@ -10,17 +10,23 @@ trap 'rm -rf "$fixture"' EXIT
 version="$(/usr/bin/sed -nE 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"/\1/p' "$repo/Cargo.toml" | head -1)"
 [[ -n "$version" ]] || { echo "package version is invalid" >&2; exit 1; }
 
-(cd "$repo" && cargo build --locked --bin loomex --bin loomex-runner --bin loomex-lifecycle-bootstrap >/dev/null)
+(cd "$repo" && cargo build --locked --profile distribution-dev --bin loomex --bin loomex-runner --bin loomex-lifecycle-bootstrap >/dev/null)
+LOOMEX_STATE_DIR="$fixture/diagnostics-state" "$repo/target/distribution-dev/loomex" diagnostics > "$fixture/build-diagnostics.json"
+test ! -e "$fixture/diagnostics-state"
+python3 - "$fixture/build-diagnostics.json" <<'PY'
+import json,sys
+assert json.load(open(sys.argv[1]))['build']=={'profile':'distribution-dev','optimizationLevel':'2','debugAssertions':True,'classification':'development'}
+PY
 payload="$fixture/payload"
 mkdir -p "$payload/bin" "$payload/metadata" "$payload/launchd"
-cp "$repo/target/debug/loomex" "$payload/bin/loomex"
-cp "$repo/target/debug/loomex-runner" "$payload/bin/loomex-runner"
-cp "$repo/target/debug/loomex-lifecycle-bootstrap" "$payload/bin/loomex-lifecycle-bootstrap"
+cp "$repo/target/distribution-dev/loomex" "$payload/bin/loomex"
+cp "$repo/target/distribution-dev/loomex-runner" "$payload/bin/loomex-runner"
+cp "$repo/target/distribution-dev/loomex-lifecycle-bootstrap" "$payload/bin/loomex-lifecycle-bootstrap"
 chmod 0755 "$payload/bin/loomex" "$payload/bin/loomex-runner" "$payload/bin/loomex-lifecycle-bootstrap"
 python3 - "$version" "$payload/metadata/project.json" "$payload/metadata/source-content-manifest.json" <<'PY'
 import json,sys
 version,project,source=sys.argv[1:]
-open(project,'w').write(json.dumps({'platform':'darwin-arm64','project':'loomex-runner','stateSchema':'app.loomex.runner.state/v1','version':version},sort_keys=True,indent=2)+'\n')
+open(project,'w').write(json.dumps({'platform':'darwin-arm64','project':'loomex-runner','stateSchema':'app.loomex.runner.state/v1','version':version,'build':{'profile':'distribution-dev','optimizationLevel':'2','debugAssertions':True,'classification':'development'}},sort_keys=True,indent=2)+'\n')
 open(source,'w').write(json.dumps({'files':[],'schema':'app.loomex.source-content/v1','sourceRevision':'packaging-fixture'},sort_keys=True,separators=(',',':'))+'\n')
 PY
 cp "$repo/contracts/compatibility-manifest.json" "$payload/metadata/compatibility-manifest.json"
@@ -45,7 +51,7 @@ test -f "$state/lifecycle-operation.json"
 # rejection must happen before an update intent, drain, or pointer change.
 different_payload="$fixture/different-payload"
 cp -R "$payload" "$different_payload"
-cp "$repo/target/debug/loomex" "$different_payload/bin/loomex-runner"
+cp "$repo/target/distribution-dev/loomex" "$different_payload/bin/loomex-runner"
 different_release="$fixture/different-release"
 SOURCE_DATE_EPOCH=1 python3 "$repo/scripts/artifact.py" create --payload "$different_payload" --output "$different_release" --project loomex-runner --version "$version" --platform darwin-arm64 --source-revision packaging-fixture --unsigned-development --bootstrap "$different_payload/bin/loomex-lifecycle-bootstrap"
 before_receipt="$(/usr/bin/shasum -a 256 "$state/install-receipt.json" | /usr/bin/awk '{print $1}')"

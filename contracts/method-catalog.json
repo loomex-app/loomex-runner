@@ -114,7 +114,11 @@
       "idempotent": true,
       "inputSchema": {
         "type": "object",
-        "properties": {},
+        "properties": {
+          "includeFingerprintDiagnostics": {
+            "type": "boolean"
+          }
+        },
         "required": [],
         "additionalProperties": false
       },
@@ -142,6 +146,148 @@
               "details": {
                 "type": "object",
                 "additionalProperties": true
+              },
+              "fingerprint": {
+                "type": "object",
+                "properties": {
+                  "workerLimit": {
+                    "const": 2
+                  },
+                  "activeWorkers": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "peakWorkers": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "started": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "shared": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "bytesHashed": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "queueMicros": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "hashMicros": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "unavailable": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "changed": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "canceled": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "inFlight": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "queued": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "completedCache": {
+                    "const": false
+                  },
+                  "stageObservations": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "operation": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128
+                        },
+                        "stage": {
+                          "enum": [
+                            "credential",
+                            "queue",
+                            "hash",
+                            "backend",
+                            "review_enrichment",
+                            "presentation",
+                            "total"
+                          ]
+                        },
+                        "durationMicros": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "byteCount": {
+                          "type": "integer",
+                          "minimum": 0
+                        },
+                        "provider": {
+                          "enum": [
+                            "codex",
+                            "claude",
+                            "gemini",
+                            "antigravity",
+                            "none"
+                          ]
+                        },
+                        "correlationReference": {
+                          "type": "string",
+                          "format": "uuid"
+                        },
+                        "outcome": {
+                          "enum": [
+                            "completed",
+                            "changed",
+                            "unavailable",
+                            "canceled",
+                            "unknown"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "operation",
+                        "stage",
+                        "durationMicros",
+                        "byteCount",
+                        "provider",
+                        "correlationReference",
+                        "outcome"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "maxItems": 128
+                  }
+                },
+                "required": [
+                  "workerLimit",
+                  "activeWorkers",
+                  "peakWorkers",
+                  "started",
+                  "shared",
+                  "bytesHashed",
+                  "queueMicros",
+                  "hashMicros",
+                  "unavailable",
+                  "changed",
+                  "canceled",
+                  "inFlight",
+                  "queued",
+                  "completedCache",
+                  "stageObservations"
+                ],
+                "additionalProperties": false
               }
             },
             "required": [
@@ -10826,6 +10972,7 @@
     "method:personas.memory.update",
     "method:personas.operations.get",
     "method:auth.scope_upgrade",
-    "method:auth.scope_status"
+    "method:auth.scope_status",
+    "diagnostics.fingerprint/v1"
   ]
 }

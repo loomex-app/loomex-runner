@@ -183,6 +183,10 @@ fn browser_callback_response(outcome: BrowserCallbackOutcome) -> String {
     )
 }
 trait Store: Send + Sync {
+    #[cfg(test)]
+    fn synthetic_fixture(&self) -> bool {
+        false
+    }
     fn load(&self) -> Result<Option<Vec<u8>>>;
     fn save(&self, data: &[u8]) -> Result<()>;
     fn delete(&self) -> Result<()> {
@@ -196,6 +200,9 @@ struct NativeStore;
 struct MemoryStore(std::sync::Mutex<Option<Vec<u8>>>);
 #[cfg(test)]
 impl Store for MemoryStore {
+    fn synthetic_fixture(&self) -> bool {
+        true
+    }
     fn load(&self) -> Result<Option<Vec<u8>>> {
         Ok(self.0.lock().unwrap().clone())
     }
@@ -375,6 +382,47 @@ impl Auth {
             store_owner: Arc::new(std::sync::Mutex::new(None)),
             listeners: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+    /// Identity-only race seam. NativeStore and custom stores always refuse it.
+    #[cfg(test)]
+    pub(crate) async fn test_fingerprint_identity_drift(
+        &self,
+        org: &str,
+        installation: Option<&str>,
+        subject: Option<&str>,
+    ) -> Result<()> {
+        ensure!(
+            self.store.synthetic_fixture(),
+            "TEST_SYNTHETIC_STORE_REQUIRED"
+        );
+        let _guard = self.auth_guard().await?;
+        let mut state = self.required().await?;
+        if let Some(installation) = installation {
+            state.installation_id = installation.into();
+        }
+        if let Some(subject) = subject {
+            state
+                .children
+                .get_mut(org)
+                .ok_or_else(|| anyhow!("ORGANIZATION_NOT_ENROLLED"))?
+                .subject = subject.into();
+        }
+        self.save(&state).await
+    }
+    #[cfg(test)]
+    pub(crate) async fn test_fingerprint_access_near_expiry(&self, org: &str) -> Result<()> {
+        ensure!(
+            self.store.synthetic_fixture(),
+            "SYNTHETIC_AUTH_FIXTURE_REQUIRED"
+        );
+        let _guard = self.auth_guard().await?;
+        let mut state = self.required().await?;
+        state
+            .children
+            .get_mut(org)
+            .ok_or_else(|| anyhow!("SYNTHETIC_AUTH_FIXTURE_REQUIRED"))?
+            .expires_at = now().saturating_add(59);
+        self.save(&state).await
     }
     #[cfg(test)]
     pub(crate) fn test_enrolled(api: Api, org: &str, runner: &str) -> Self {

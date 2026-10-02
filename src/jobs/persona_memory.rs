@@ -4,7 +4,7 @@ use super::*;
 use anyhow::ensure;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::{UnixListener, UnixStream},
@@ -30,9 +30,57 @@ pub(super) fn required_memory(payload: &Value) -> bool {
 pub(super) fn enabled(payload: &Value) -> bool {
     payload["memoryBridge"] == json!({"schemaVersion":SCHEMA,"required":true})
 }
-pub(crate) fn provider_supported(provider: &str) -> bool {
-    provider == "codex" && find_executable("codex").is_some_and(|path| qualified_executable(&path))
+pub(crate) async fn provider_supported(daemon: &Daemon, provider: &str) -> Result<bool> {
+    if provider != "codex" {
+        return Ok(false);
+    }
+    let path = daemon
+        .fingerprints
+        .filesystem(|_| Ok(find_executable("codex")))
+        .await?;
+    let Some(path) = path else {
+        return Ok(false);
+    };
+    let launcher = daemon
+        .fingerprints
+        .fingerprint_provider(path, "codex")
+        .await?;
+    let (qualified, native) = qualify_fingerprint(&daemon.fingerprints, &launcher).await?;
+    let mut files = vec![launcher];
+    files.extend(native);
+    daemon.fingerprints.validate(&files).await?;
+    Ok(qualified)
 }
+pub(crate) async fn qualify_fingerprint(
+    service: &crate::fingerprint::FingerprintService,
+    launcher: &crate::fingerprint::Fingerprint,
+) -> Result<(bool, Option<crate::fingerprint::Fingerprint>)> {
+    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        return Ok((false, None));
+    }
+    let Some(root) = launcher.path().parent().and_then(Path::parent) else {
+        return Ok((false, None));
+    };
+    let native =
+        root.join("node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex");
+    if launcher.checksum != QUALIFIED_LAUNCHER {
+        return Ok((false, None));
+    }
+    let native = match service.fingerprint_provider(native, "codex").await {
+        Ok(native) => native,
+        Err(error)
+            if error.to_string() == "PROVIDER_UNAVAILABLE"
+                && !crate::fingerprint::REQUEST_CANCELLATION
+                    .try_with(|cancel| cancel.is_canceled())
+                    .unwrap_or(false) =>
+        {
+            return Ok((false, None));
+        }
+        Err(error) => return Err(error),
+    };
+    Ok((native.checksum == QUALIFIED_NATIVE, Some(native)))
+}
+#[cfg(test)]
 pub(crate) fn qualified_executable(path: &Path) -> bool {
     if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         return false;
@@ -42,46 +90,10 @@ pub(crate) fn qualified_executable(path: &Path) -> bool {
     };
     let native =
         root.join("node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex");
-    static CACHE: std::sync::OnceLock<Mutex<HashMap<String, bool>>> = std::sync::OnceLock::new();
-    let signature = [path, &native]
-        .iter()
-        .map(|file| {
-            let metadata = std::fs::metadata(file).ok()?;
-            if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
-                return None;
-            }
-            Some(format!(
-                "{}:{}:{}:{}:{}:{}:{}",
-                file.display(),
-                metadata.dev(),
-                metadata.ino(),
-                metadata.len(),
-                metadata.mtime_nsec(),
-                metadata.ctime(),
-                metadata.ctime_nsec()
-            ))
-        })
-        .collect::<Option<Vec<_>>>();
-    let Some(signature) = signature else {
-        return false;
-    };
-    let key = signature.join("|");
-    let mut cache = CACHE
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    if let Some(qualified) = cache.get(&key) {
-        return *qualified;
-    }
-    let qualified = std::fs::read(path)
-        .ok()
-        .is_some_and(|bytes| state::digest(&bytes) == QUALIFIED_LAUNCHER)
-        && std::fs::read(&native)
-            .ok()
-            .is_some_and(|bytes| state::digest(&bytes) == QUALIFIED_NATIVE);
-    cache.clear();
-    cache.insert(key, qualified);
-    qualified
+    crate::fingerprint::synchronous(path)
+        .is_ok_and(|fingerprint| fingerprint.checksum == QUALIFIED_LAUNCHER)
+        && crate::fingerprint::synchronous(&native)
+            .is_ok_and(|fingerprint| fingerprint.checksum == QUALIFIED_NATIVE)
 }
 fn tool_schema(operation: &str) -> Result<Value> {
     ensure!(
@@ -543,7 +555,7 @@ mod tests {
             "existing-global-config"
         );
         assert_eq!(
-            runner_manifest()["capabilities"]["ai.public-status/v1"],
+            runner_manifest_with_memory(false)["capabilities"]["ai.public-status/v1"],
             false
         );
     }
@@ -680,7 +692,56 @@ mod tests {
         assert!(!qualified_executable(&fake));
         assert!(!qualified_executable(&temp.path().join("missing")));
         for provider in ["claude", "gemini", "antigravity"] {
-            assert!(!provider_supported(provider));
+            assert_ne!(provider, "codex");
         }
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_optional_qualification_tests {
+    use super::*;
+    #[tokio::test]
+    async fn fingerprint_missing_optional_native_downgrades_only_memory_capability() {
+        if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let path = bin.join("codex");
+        std::fs::write(&path, b"synthetic launcher").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let service = crate::fingerprint::FingerprintService::default();
+        let mut launcher = service
+            .fingerprint(std::fs::canonicalize(&path).unwrap())
+            .await
+            .unwrap();
+        // Select the already-qualified branch without invoking a provider or
+        // claiming that these synthetic bytes are a qualified executable.
+        launcher.checksum = QUALIFIED_LAUNCHER.into();
+        assert!(matches!(
+            qualify_fingerprint(&service, &launcher).await.unwrap(),
+            (false, None)
+        ));
+        let native = temp
+            .path()
+            .join("node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex");
+        std::fs::create_dir_all(native.parent().unwrap()).unwrap();
+        std::fs::write(&native, b"not executable").unwrap();
+        std::fs::set_permissions(&native, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            qualify_fingerprint(&service, &launcher).await.unwrap(),
+            (false, None)
+        ));
+        let canceled = crate::fingerprint::Cancellation::default();
+        canceled.cancel();
+        let result = crate::fingerprint::REQUEST_CANCELLATION
+            .scope(canceled, qualify_fingerprint(&service, &launcher))
+            .await;
+        assert_eq!(result.unwrap_err().to_string(), "PROVIDER_UNAVAILABLE");
+        assert!(required_memory(
+            &json!({"memoryBridge":{"schemaVersion":SCHEMA,"required":true}})
+        ));
+        assert_eq!(service.diagnostics()["inFlight"], 0);
     }
 }

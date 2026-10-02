@@ -46,6 +46,20 @@ fn cancellation_cause(canceled: bool, local_lease_expired: bool) -> Option<Cance
     (canceled && local_lease_expired).then_some(CancellationCause::LocalLeaseExpired)
 }
 
+fn require_job_admission(
+    daemon: &Daemon,
+    expected: &Journal,
+    journal: &Arc<Mutex<Journal>>,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    ensure!(
+        job_authority_unchanged(expected, journal, true)
+            && !cancel.load(Ordering::SeqCst)
+            && !daemon.execution.is_draining(),
+        "LOCAL_EXECUTION_AUTHORIZATION_REQUIRED"
+    );
+    Ok(())
+}
 pub(super) async fn execute_job(
     daemon: Arc<Daemon>,
     path: &Path,
@@ -60,6 +74,7 @@ pub(super) async fn execute_job(
     let job = &current.job;
     let id = job["id"].as_str().context("BACKEND_PROTOCOL_ERROR")?;
     let authorized = authorize(&daemon, &current).await?;
+    require_job_admission(&daemon, &current, &journal, &cancel)?;
     let payload = authorized.payload();
     if payload["executionPolicy"] != "host_user/v1" {
         bail!("UNSUPPORTED_EXECUTION_POLICY")
@@ -76,7 +91,7 @@ pub(super) async fn execute_job(
             .as_str()
             .context("PERSONA_MEMORY_PROVIDER_UNSUPPORTED")?;
         ensure!(
-            persona_memory::provider_supported(provider),
+            persona_memory::provider_supported(&daemon, provider).await?,
             "PERSONA_MEMORY_PROVIDER_UNSUPPORTED"
         );
         let server = persona_memory::MemoryServer::start(
@@ -112,6 +127,11 @@ pub(super) async fn execute_job(
     } else {
         None
     };
+    // Qualification is another asynchronous filesystem stage. Re-read the exact
+    // committed local authority using the original verified snapshot, without
+    // applying a preparation TTL to an already committed job or hashing again.
+    authorized.revalidate(&daemon, &current).await?;
+    require_job_admission(&daemon, &current, &journal, &cancel)?;
     let mut j = snapshot(&journal)?;
     j.transition(JournalPhase::StartPending)?;
     {
@@ -306,5 +326,42 @@ mod cancellation_cause_tests {
         drop(gate);
         worker.join().unwrap();
         assert!(expiry.cause(true).is_none());
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_admission_tests {
+    use super::*;
+    #[test]
+    fn fingerprint_await_cannot_extend_lease_or_ignore_cancellation() {
+        let temp = tempfile::tempdir().unwrap();
+        let api = crate::api::Api::for_test_origin("http://127.0.0.1:9").unwrap();
+        let daemon = Daemon::new(
+            temp.path().into(),
+            api.clone(),
+            crate::auth::Auth::test_enrolled(api, "org", "runner"),
+        )
+        .unwrap();
+        let original = crate::jobs::protocol_tests::journal();
+        let journal = Arc::new(Mutex::new(original.clone()));
+        let cancel = AtomicBool::new(false);
+        assert!(require_job_admission(&daemon, &original, &journal, &cancel).is_ok());
+        cancel.store(true, Ordering::SeqCst);
+        assert!(require_job_admission(&daemon, &original, &journal, &cancel).is_err());
+        cancel.store(false, Ordering::SeqCst);
+        for drift in [
+            "leaseVersion",
+            "leasedUntilEpochMs",
+            "runnerId",
+            "payloadDigest",
+        ] {
+            let mut changed = original.clone();
+            changed.job[drift] = json!(0);
+            *journal.lock().unwrap() = changed;
+            assert!(require_job_admission(&daemon, &original, &journal, &cancel).is_err());
+        }
+        *journal.lock().unwrap() = original.clone();
+        daemon.execution.set_draining(true);
+        assert!(require_job_admission(&daemon, &original, &journal, &cancel).is_err());
     }
 }

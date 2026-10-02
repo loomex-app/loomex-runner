@@ -11,7 +11,11 @@ for name in ("loomex","loomex-runner","loomex-lifecycle-bootstrap"):
     binary=root/"bin"/name
     if not binary.is_file() or not (binary.stat().st_mode & 0o111): raise SystemExit(f"runner executable missing: {name}")
 metadata=json.loads((root/"metadata/project.json").read_text())
+has_build='build' in metadata
+build=metadata.pop('build',None)
 if metadata!={"project":"loomex-runner","version":args.expected_version,"platform":"darwin-arm64","stateSchema":"app.loomex.runner.state/v1"}: raise SystemExit("runner metadata mismatch")
+if has_build and (build != {'profile':'distribution-dev','optimizationLevel':'2','debugAssertions':True,'classification':'development'} or type(build.get('debugAssertions')) is not bool):
+    raise SystemExit("runner build metadata mismatch")
 compatibility=root/"metadata/compatibility-manifest.json"
 if not compatibility.is_file(): raise SystemExit("runner compatibility manifest missing")
 source_root=Path(__file__).resolve().parent.parent

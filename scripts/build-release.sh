@@ -40,8 +40,8 @@ if [[ "$mode" == "--production" ]]; then
   binary_root="$temporary/target/aarch64-apple-darwin/release"
 else
   [[ "$(uname -s)-$(uname -m)" == "Darwin-arm64" ]] || { echo "unsigned development artifact requires a macOS arm64 host" >&2; exit 1; }
-  (cd "$build_root" && CARGO_TARGET_DIR="$temporary/target" RUSTFLAGS="$remap_flags" CFLAGS="$remap_cflags" cargo build --locked --bin loomex --bin loomex-runner --bin loomex-lifecycle-bootstrap)
-  binary_root="$temporary/target/debug"
+  (cd "$build_root" && CARGO_TARGET_DIR="$temporary/target" RUSTFLAGS="$remap_flags" CFLAGS="$remap_cflags" cargo build --locked --profile distribution-dev --bin loomex --bin loomex-runner --bin loomex-lifecycle-bootstrap)
+  binary_root="$temporary/target/distribution-dev"
 fi
 payload="$temporary/payload"
 mkdir -p "$payload/bin" "$payload/metadata" "$payload/launchd"
@@ -49,10 +49,14 @@ cp "$binary_root/loomex" "$payload/bin/loomex"
 cp "$binary_root/loomex-runner" "$payload/bin/loomex-runner"
 cp "$binary_root/loomex-lifecycle-bootstrap" "$payload/bin/loomex-lifecycle-bootstrap"
 chmod 0755 "$payload/bin/loomex" "$payload/bin/loomex-runner" "$payload/bin/loomex-lifecycle-bootstrap"
-python3 - "$version" "$payload/metadata/project.json" <<'PY'
+python3 - "$version" "$payload/metadata/project.json" "$mode" <<'PY'
 import json,sys
 from pathlib import Path
-version,out=sys.argv[1:]; Path(out).write_text(json.dumps({"project":"loomex-runner","version":version,"platform":"darwin-arm64","stateSchema":"app.loomex.runner.state/v1"},sort_keys=True,indent=2)+"\n")
+version,out,mode=sys.argv[1:]
+metadata={"project":"loomex-runner","version":version,"platform":"darwin-arm64","stateSchema":"app.loomex.runner.state/v1"}
+if mode == '--unsigned-development':
+    metadata['build']={'profile':'distribution-dev','optimizationLevel':'2','debugAssertions':True,'classification':'development'}
+Path(out).write_text(json.dumps(metadata,sort_keys=True,indent=2)+"\n")
 PY
 cp "$build_root/contracts/compatibility-manifest.json" "$payload/metadata/compatibility-manifest.json"
 cp "$source_manifest" "$payload/metadata/source-content-manifest.json"

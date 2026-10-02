@@ -297,7 +297,7 @@ pub(super) async fn session(daemon: Arc<Daemon>, org: String) -> Result<()> {
     let Some(_session_admission) = admit(&daemon)? else {
         return Ok(());
     };
-    let manifest = runner_manifest();
+    let manifest = runner_manifest(&daemon).await?;
     let response = daemon
         .backend(
             &org,

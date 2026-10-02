@@ -1,6 +1,6 @@
 [package]
 name = "loomex-runner"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.88"
 license = "Proprietary"
@@ -40,6 +40,14 @@ tempfile = "3"
 [profile.release]
 lto = "thin"
 strip = "symbols"
+
+[profile.distribution-dev]
+inherits = "dev"
+opt-level = 2
+debug-assertions = true
+overflow-checks = true
+debug = 1
+incremental = false
 
 [[bin]]
 name = "loomex-runner"
