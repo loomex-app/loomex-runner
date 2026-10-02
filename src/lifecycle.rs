@@ -6974,6 +6974,258 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persona_records_survive_feature_floor_lifecycle_and_pending_recovery_refuses() {
+        use crate::{api::Api, auth::Auth, control::Daemon};
+        use base64::Engine;
+        let _serial = TEST_SERIAL.lock().await;
+        struct TestScope;
+        impl Drop for TestScope {
+            fn drop(&mut self) {
+                TEST_MODE.store(false, Ordering::SeqCst);
+                *TEST_AUTH_STATUS.lock().unwrap() = None;
+                *TEST_RECOVERY_STATUS.lock().unwrap() = None;
+            }
+        }
+        let _scope = TestScope;
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        make_compatible_version(&paths, "0.3.78");
+        make_compatible_version(&paths, "0.4.0");
+        symlink(paths.versions().join("0.3.78"), paths.current()).unwrap();
+        fs::write(launch_agent(&paths), b"persona-floor-plist").unwrap();
+        let org = "10000000-0000-4000-8000-000000000001";
+        let runner = "10000000-0000-4000-8000-000000000002";
+        let api = Api::for_test_origin("http://127.0.0.1:9").unwrap();
+        let auth = Auth::test_persona_lifecycle_fixture(api.clone(), org, runner, false);
+        let protected = auth.test_persona_lifecycle_fingerprint(org);
+        assert_eq!(
+            protected["grantPhases"],
+            json!(["grant_pending", "refresh_pending"])
+        );
+        let daemon = Daemon::new(paths.state_dir.clone(), api.clone(), auth.clone()).unwrap();
+        daemon.public.lock().await.active_organization = Some(org.into());
+        let person = Uuid::new_v4();
+        let conversation = Uuid::new_v4();
+        let chat = Uuid::new_v4();
+        let context = json!({"personId":person,"organizationId":org,"conversationId":conversation,"chatId":chat,"configDigest":"a".repeat(64)});
+        let session = daemon.presentation.dispatch(org, runner, "presentation.sessions.create", &json!({"kind":"personas","entityType":"catalog","entityId":Uuid::nil(),"state":{"personas":{"personId":person,"organizationId":org,"context":context}},"idempotencyKey":Uuid::new_v4()})).unwrap();
+        let session_params = json!({"viewSessionId":session["viewSessionId"]});
+        let session_before = daemon
+            .presentation
+            .dispatch(org, runner, "presentation.sessions.get", &session_params)
+            .unwrap();
+        let identity = format!("persona:{conversation}");
+        let mut continuation = context.clone();
+        continuation["kind"] = json!("persona_chat");
+        let delivery_before = daemon
+            .presentation
+            .register_delivery(org, runner, &identity, &continuation)
+            .unwrap();
+        let response_id = Uuid::new_v4();
+        let response_path = paths
+            .state_dir
+            .join("responses")
+            .join(format!("{response_id}.json"));
+        let response_bytes = serde_json::to_vec(
+            &json!({"result":{"content":"synthetic English memory ".repeat(50_000)}}),
+        )
+        .unwrap();
+        state::atomic_write(&response_path, &response_bytes).unwrap();
+        let response_digest = state::digest(&response_bytes);
+        state::atomic_write(
+            &response_path.with_extension("sha256"),
+            response_digest.as_bytes(),
+        )
+        .unwrap();
+        let owner = json!({"organizationId":org,"accountSubject":runner});
+        state::write_json(
+            &response_path.with_extension("meta.json"),
+            &json!({"executionId":null,"lastAccessAt":state::now(),"ownerScope":owner}),
+        )
+        .unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        daemon
+            .dispatch(
+                "workspaces.grant",
+                json!({"workspacePath":workspace,"idempotencyKey":Uuid::new_v4()}),
+            )
+            .await
+            .unwrap();
+        let preparation = Uuid::new_v4();
+        let version = Uuid::new_v4();
+        let confirmation = Uuid::new_v4();
+        let providers = crate::control::provider_snapshot().unwrap();
+        let binding = json!({"workflowId":Uuid::new_v4(),"versionId":version,"organizationId":org,"runnerId":runner,"installationId":protected["installationId"],"workspacePath":workspace,"personaMemoryContract":"ai.persona-memory/v1","workflowClosure":[{"workflowVersionId":version,"nodeDependencies":{"person":{"node":{"type":"person","config":{"_memoryContext":{"enabled":true,"bridge":{"schemaVersion":"ai.persona-memory/v1","required":true}}}},"modelResolution":{"provider":"codex"},"personId":person,"configDigest":"a".repeat(64)}}}]});
+        let binding_digest = state::json_digest(&binding);
+        let review = json!({"preparationId":preparation,"bindingDigest":binding_digest,"binding":binding,"limits":{},"expiresAt":null,"confirmationKey":confirmation});
+        let prep_path = paths
+            .state_dir
+            .join("preparations")
+            .join(format!("{preparation}.json"));
+        state::write_json(&prep_path, &json!({"operation":"runs.prepare","organizationId":org,"accountSubject":runner,"installationId":protected["installationId"],"workspacePath":workspace,"bindingDigest":binding_digest,"binding":binding,"confirmationKey":confirmation,"providers":providers,"review":review})).unwrap();
+        let key = Uuid::new_v4();
+        let params = json!({"personId":person,"idempotencyKey":key});
+        let account_subject = auth.credential(org).await.unwrap().subject;
+        assert_eq!(account_subject, runner);
+        // Match the account-scoped dispatch journal identity and pending shape.
+        let journal_key = state::json_digest(
+            &json!({"organizationId":org,"accountSubject":account_subject,"idempotencyKey":key}),
+        );
+        let pending_digest = state::json_digest(
+            &json!({"method":"personas.chat_context.create","params":params,"organizationId":org,"accountSubject":account_subject}),
+        );
+        let pending_receipt = json!({"digest":pending_digest,"method":"personas.chat_context.create","status":"pending"});
+        let pending_path = paths
+            .state_dir
+            .join("operations")
+            .join(format!("{journal_key}.json"));
+        assert_ne!(journal_key, key.to_string());
+        for (scoped_org, scoped_subject) in [("another-org", runner), (org, "another-account")] {
+            assert_ne!(
+                journal_key,
+                state::json_digest(
+                    &json!({"organizationId":scoped_org,"accountSubject":scoped_subject,"idempotencyKey":key})
+                )
+            );
+        }
+        state::write_json(&pending_path, &pending_receipt).unwrap();
+        assert_eq!(
+            state::read_json::<Value>(&pending_path).unwrap(),
+            pending_receipt
+        );
+        let memory_job = Uuid::new_v4();
+        let memory_call = Uuid::new_v4();
+        let memory_digest = state::json_digest(
+            &json!({"jobId":memory_job,"operation":"write","arguments":{"content":"synthetic English fact"},"callId":memory_call}),
+        );
+        let memory_path = paths
+            .state_dir
+            .join("jobs")
+            .join(memory_job.to_string())
+            .join(format!("memory-call-{memory_call}.json"));
+        state::write_json(
+            &memory_path,
+            &json!({"digest":memory_digest,"status":"pending"}),
+        )
+        .unwrap();
+        let preserved = [&response_path, &prep_path, &pending_path, &memory_path]
+            .map(|path| (path.clone(), state::digest(&fs::read(path).unwrap())));
+        TEST_MODE.store(true, Ordering::SeqCst);
+        *TEST_AUTH_STATUS.lock().unwrap() = Some(auth.status().await.unwrap());
+        for (step, target) in [
+            ("activate", "0.4.0"),
+            ("rollback", "0.3.78"),
+            ("forward", "0.4.0"),
+        ] {
+            if step == "rollback" {
+                assert_eq!(rollback(&paths, target).await.unwrap()["rolledBack"], true);
+            } else {
+                let staged = temp.path().join(format!("{step}.plist"));
+                fs::write(&staged, b"persona-floor-plist").unwrap();
+                activate(
+                    &paths,
+                    paths.versions().join(target),
+                    target.into(),
+                    installed_tree_digest(&paths.versions().join(target)).unwrap(),
+                    staged,
+                )
+                .await
+                .unwrap();
+            }
+            assert_eq!(
+                fs::read_link(paths.current()).unwrap(),
+                paths.versions().join(target)
+            );
+            assert_eq!(
+                resume(&paths).await.unwrap()["operation"]["phase"],
+                "completed"
+            );
+            assert_eq!(auth.test_persona_lifecycle_fingerprint(org), protected);
+            for (path, digest) in &preserved {
+                assert_eq!(&state::digest(&fs::read(path).unwrap()), digest);
+            }
+            assert_eq!(
+                daemon
+                    .presentation
+                    .dispatch(org, runner, "presentation.sessions.get", &session_params)
+                    .unwrap(),
+                session_before
+            );
+            assert_eq!(
+                daemon
+                    .presentation
+                    .dispatch(
+                        org,
+                        runner,
+                        "presentation.delivery.get",
+                        &json!({"identity":identity})
+                    )
+                    .unwrap(),
+                delivery_before
+            );
+            let page = daemon
+                .dispatch(
+                    "responses.read",
+                    json!({"responseRef":response_id,"offset":0,"limit":123}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(page["checksumSha256"], response_digest);
+            assert_eq!(page["sizeBytes"], response_bytes.len());
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(page["dataBase64"].as_str().unwrap())
+                    .unwrap(),
+                response_bytes[..123]
+            );
+            assert_eq!(
+                state::read_json::<Value>(&response_path.with_extension("meta.json")).unwrap()["ownerScope"],
+                owner
+            );
+            let prepared = daemon
+                .dispatch("preparations.get", json!({"preparationId":preparation}))
+                .await
+                .unwrap();
+            assert_eq!(prepared["status"], "valid");
+            assert_eq!(
+                state::read_json::<Value>(&prep_path).unwrap()["binding"],
+                binding
+            );
+            assert_eq!(
+                state::read_json::<Value>(&pending_path).unwrap(),
+                pending_receipt
+            );
+            assert_eq!(
+                state::read_json::<Value>(&memory_path).unwrap()["status"],
+                "pending"
+            );
+        }
+        // Underlying proof-bound refresh recovery fences another transition;
+        // Persona journal state itself remains intact and is never serialized
+        // into evidence or sent through the native credential store.
+        let recovery = Auth::test_persona_lifecycle_fixture(api, org, runner, true);
+        let recovery_before = recovery.test_persona_lifecycle_fingerprint(org);
+        *TEST_AUTH_STATUS.lock().unwrap() = Some(recovery.status().await.unwrap());
+        let pointer_before = fs::read_link(paths.current()).unwrap();
+        assert!(
+            rollback(&paths, "0.3.78")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("prior authentication recovery is pending")
+        );
+        assert_eq!(fs::read_link(paths.current()).unwrap(), pointer_before);
+        assert_eq!(
+            recovery.test_persona_lifecycle_fingerprint(org),
+            recovery_before
+        );
+        for (path, digest) in &preserved {
+            assert_eq!(&state::digest(&fs::read(path).unwrap()), digest);
+        }
+    }
+
+    #[tokio::test]
     async fn consecutive_activation_and_rollback_release_all_resources_on_uninstall() {
         let _serial = TEST_SERIAL.lock().await;
         let temp = tempfile::tempdir().unwrap();

@@ -403,6 +403,52 @@ impl Auth {
             .expect("in-memory fixture write");
         auth
     }
+    /// Synthetic MemoryStore only. No native credential store or serialized
+    /// credential bytes escape this fixture; lifecycle tests receive identities
+    /// and a whole-record fingerprint through the companion helper.
+    #[cfg(test)]
+    pub(crate) fn test_persona_lifecycle_fixture(
+        api: Api,
+        org: &str,
+        runner: &str,
+        recovery_pending: bool,
+    ) -> Self {
+        let auth = Self::test_enrolled(api, org, runner);
+        let mut state: ProtectedState =
+            serde_json::from_slice(&auth.store.load().unwrap().unwrap()).unwrap();
+        let delegation = "00000000-0000-4000-8000-000000000003";
+        let device = state.device.as_ref().unwrap().subject.clone();
+        for (phase, key) in [
+            ("grant_pending", "00000000-0000-4000-8000-000000000004"),
+            ("refresh_pending", "00000000-0000-4000-8000-000000000005"),
+        ] {
+            let scopes = json!(["runner.personas.read", "runner.personas.memory.write"]);
+            let digest = runner_state::json_digest(
+                &json!({"organizationId":org,"requestedScopes":scopes,"idempotencyKey":key}),
+            );
+            state.persona_state.insert(format!("upgrade:{org}:{key}"), json!({"digest":digest,"phase":phase,"organizationId":org,"runnerId":runner,"deviceId":device,"delegationId":delegation,"requestedScopes":scopes,"idempotencyKey":key}));
+        }
+        state.persona_state.insert(format!("credential:{org}"), json!({"organizationId":org,"runnerId":runner,"deviceId":device,"delegationId":delegation,"scopes":["runner.personas.read"]}));
+        if recovery_pending {
+            state.pending = Some(Pending {
+                target: Target::ChildRefresh(org.into()),
+                route: "v2/delegations/refresh/".into(),
+                body: json!({"refreshToken":state.children[org].refresh,"proof":"synthetic-memory-store-proof"}),
+                started_at: now(),
+                recovery_used: false,
+            });
+        }
+        auth.store
+            .save(&serde_json::to_vec(&state).unwrap())
+            .unwrap();
+        auth
+    }
+    #[cfg(test)]
+    pub(crate) fn test_persona_lifecycle_fingerprint(&self, org: &str) -> Value {
+        let bytes = self.store.load().unwrap().unwrap();
+        let state: ProtectedState = serde_json::from_slice(&bytes).unwrap();
+        json!({"protectedDigest":runner_state::digest(&bytes),"installationId":state.installation_id,"deviceId":state.device.as_ref().unwrap().subject,"runnerId":state.children[org].subject,"organizationId":state.active_organization,"delegationId":state.persona_state[&format!("credential:{org}")]["delegationId"],"grantPhases":state.persona_state.values().filter_map(|record| record["phase"].as_str()).collect::<Vec<_>>()})
+    }
     #[cfg(test)]
     pub(crate) async fn test_hold_credential_gate(&self) -> tokio::sync::OwnedMutexGuard<()> {
         self.lock.clone().lock_owned().await
