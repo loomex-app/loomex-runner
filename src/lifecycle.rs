@@ -570,6 +570,7 @@ pub struct ServiceStopIntent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LabelObservation {
     Loaded { pid: i32, program: PathBuf },
+    LoadedIdle { program: PathBuf },
     Absent,
     Unknown,
 }
@@ -1037,7 +1038,11 @@ fn classify_label_output(
     {
         return LabelObservation::Absent;
     }
-    if code != Some(0) || !stdout.starts_with(&format!("gui/{uid}/app.loomex.runner = {{\n")) {
+    if code != Some(0)
+        || !stderr.is_empty()
+        || !stdout.starts_with(&format!("gui/{uid}/app.loomex.runner = {{\n"))
+        || !stdout.ends_with("}\n")
+    {
         return LabelObservation::Unknown;
     }
     let mut pid = None;
@@ -1065,6 +1070,7 @@ fn classify_label_output(
     }
     match (pid, program) {
         (Some(pid), Some(program)) => LabelObservation::Loaded { pid, program },
+        (None, Some(program)) => LabelObservation::LoadedIdle { program },
         _ => LabelObservation::Unknown,
     }
 }
@@ -1306,6 +1312,35 @@ fn service_stop_pending(operation: &Operation) -> Value {
     json!({"activated":false,"resumed":false,"pending":true,"reason":"service_stop","operation":operation})
 }
 
+fn require_recorded_process_exit(operation: &Operation) -> Result<()> {
+    ensure!(
+        operation.service_stops.iter().all(|stop| stop
+            .process
+            .as_ref()
+            .is_none_or(|process| observe_recorded_process(process) == ProcessObservation::Exited)),
+        "idle label recorded process exit is unconfirmed"
+    );
+    Ok(())
+}
+
+fn idle_service_singleton(paths: &Paths, operation: &Operation, program: &Path) -> Result<File> {
+    let target = current_target(paths)?.context("idle label has no owned target")?;
+    let plist = regular_digest(&launch_agent(paths))?.context("idle label has no configuration")?;
+    verify_recovery_service(paths, operation, &target, &plist)?;
+    ensure!(
+        program == paths.current().join("bin/loomex-runner")
+            || program == target.join("bin/loomex-runner"),
+        "idle label program differs from owned target"
+    );
+    require_recorded_process_exit(operation)?;
+    let singleton = stopped_singleton(paths, false)?;
+    ensure!(
+        matches!(fs::symlink_metadata(paths.state_dir.join("control.sock")), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+        "idle label control socket is not absent"
+    );
+    Ok(singleton)
+}
+
 async fn prepare_service_stop(
     paths: &Paths,
     operation: &mut Operation,
@@ -1367,6 +1402,16 @@ async fn prepare_service_stop(
             let _singleton = stopped_singleton(paths, target.is_none())?;
             None
         }
+        LabelObservation::LoadedIdle { program } => {
+            ensure!(
+                direction == StopDirection::RestorePrevious
+                    && !operation.service_stops.is_empty()
+                    && operation.service_stops.len() < 2,
+                "idle label requires captured restoration stop"
+            );
+            let _singleton = idle_service_singleton(paths, operation, &program)?;
+            None
+        }
         LabelObservation::Unknown => bail!("service label identity unavailable"),
     };
     if operation.abandonment.is_none() {
@@ -1407,7 +1452,12 @@ async fn prepare_service_stop(
 // outcome may reset a v3 dispatch intent. A failed/ambiguous reset leaves the
 // caller uncertain and never authorizes another stop in this invocation.
 fn record_stop_not_dispatched(paths: &Paths, operation: &mut Operation) -> Result<()> {
-    if operation.abandonment.is_some() {
+    if operation.abandonment.is_some()
+        || operation
+            .service_stops
+            .last()
+            .is_some_and(|stop| stop.process.is_none())
+    {
         let uncertain = operation.clone();
         #[cfg(test)]
         recovery_fault("before_stop_not_dispatched_checkpoint")?;
@@ -1436,34 +1486,52 @@ async fn request_service_stop(paths: &Paths, operation: &mut Operation) -> Resul
         .context("service-stop intent missing")?
         .clone();
     verify_stop_binding(paths, operation, &stop, false)?;
-    let Some(process) = &stop.process else {
-        return Ok(());
+    let _idle_singleton = if let Some(process) = &stop.process {
+        let label = observe_label(paths).await;
+        ensure!(
+            matches!(label, LabelObservation::Loaded { pid, program } if pid == process.pid && (program == process.executable || program == paths.current().join("bin/loomex-runner"))),
+            "service label changed before stop"
+        );
+        ensure!(
+            observe_recorded_process(process) == ProcessObservation::Present(process.clone()),
+            "service process changed before stop"
+        );
+        let version = stop
+            .target
+            .as_ref()
+            .and_then(|target| target.file_name())
+            .and_then(|name| name.to_str())
+            .context("stop target version missing")?;
+        ensure!(
+            candidate_drain_can_be_released(&daemon_status(paths).await?, version),
+            "service stop requires fresh drained zero managed work"
+        );
+        None
+    } else {
+        let program = match observe_label(paths).await {
+            LabelObservation::Absent => return Ok(()),
+            LabelObservation::LoadedIdle { program } => program,
+            _ => bail!("idle label identity changed before stop"),
+        };
+        ensure!(
+            stop.direction == StopDirection::RestorePrevious && operation.service_stops.len() == 2,
+            "idle label unload has no captured restoration intent"
+        );
+        let singleton = idle_service_singleton(paths, operation, &program)?;
+        ensure!(
+            observe_label(paths).await == LabelObservation::LoadedIdle { program },
+            "idle label changed under singleton ownership"
+        );
+        verify_stop_binding(paths, operation, &stop, false)?;
+        require_recorded_process_exit(operation)?;
+        Some(singleton)
     };
-    let label = observe_label(paths).await;
-    ensure!(
-        matches!(label, LabelObservation::Loaded { pid, program } if pid == process.pid && (program == process.executable || program == paths.current().join("bin/loomex-runner"))),
-        "service label changed before stop"
-    );
-    ensure!(
-        observe_recorded_process(process) == ProcessObservation::Present(process.clone()),
-        "service process changed before stop"
-    );
-    let version = stop
-        .target
-        .as_ref()
-        .and_then(|target| target.file_name())
-        .and_then(|name| name.to_str())
-        .context("stop target version missing")?;
-    ensure!(
-        candidate_drain_can_be_released(&daemon_status(paths).await?, version),
-        "service stop requires fresh drained zero managed work"
-    );
     #[cfg(test)]
     recovery_fault("after_stop_intent")?;
-    if operation.abandonment.is_some() {
-        // v3 records uncertain dispatch BEFORE its effect. A Prepared v3 intent
-        // is therefore safe to dispatch after interruption; Unconfirmed is
-        // observation-only, including a crash before spawn actually occurred.
+    if operation.abandonment.is_some() || stop.process.is_none() {
+        // Abandonment and no-process idle-label unloads record uncertainty
+        // BEFORE their effect. Prepared is a definitive unsent intent;
+        // Unconfirmed is observation-only, even if spawn never occurred.
         operation.service_stops.last_mut().unwrap().request = StopRequest::Unconfirmed;
         set_checkpoint(
             paths,
@@ -1493,6 +1561,9 @@ async fn request_service_stop(paths: &Paths, operation: &mut Operation) -> Resul
             }
             if !TEST_DELAYED_SERVICE_STOP.load(Ordering::SeqCst) {
                 TEST_LABEL_PRESENT.store(false, Ordering::SeqCst);
+                if stop.process.is_none() {
+                    *TEST_LABEL_OBSERVATION.lock().unwrap() = None;
+                }
             }
         }
         StopRequest::Accepted
@@ -1568,6 +1639,12 @@ async fn observe_service_stop(
                 }
             }
             LabelObservation::Absent => {
+                if stop.process.is_none()
+                    && stop.direction == StopDirection::RestorePrevious
+                    && operation.service_stops.len() == 2
+                {
+                    require_recorded_process_exit(operation)?;
+                }
                 let exited = match &stop.process {
                     None => true,
                     Some(old) => match observe_recorded_process(old) {
@@ -1595,7 +1672,7 @@ async fn observe_service_stop(
                     }
                 }
             }
-            LabelObservation::Unknown => {}
+            LabelObservation::LoadedIdle { .. } | LabelObservation::Unknown => {}
         }
         if bounded && !lifecycle_test_mode() {
             tokio::time::sleep_until(interval.min(deadline)).await;
@@ -1733,7 +1810,7 @@ async fn launchctl_label_absent() -> Result<bool> {
         match observe_label(&paths).await {
             LabelObservation::Absent => return Ok(true),
             LabelObservation::Unknown => bail!("service label observation unavailable"),
-            LabelObservation::Loaded { .. } => {}
+            LabelObservation::Loaded { .. } | LabelObservation::LoadedIdle { .. } => {}
         }
         tokio::time::sleep_until(interval.min(deadline)).await;
         if tokio::time::Instant::now() >= deadline {
@@ -2310,6 +2387,31 @@ async fn reconcile_service_stop(paths: &Paths, operation: &mut Operation) -> Res
         &stop,
         stop.request == StopRequest::ObservedStopped,
     )?;
+    if stop.request == StopRequest::ObservedStopped
+        && matches!(
+            observe_label(paths).await,
+            LabelObservation::LoadedIdle { .. }
+        )
+    {
+        // The previous stop completed before the candidate was started. Its
+        // now-idle loaded label is a different effect: capture the existing
+        // restoration intent, never replay the completed activation stop.
+        let Some(singleton) =
+            stop_for_direction(paths, operation, StopDirection::RestorePrevious).await?
+        else {
+            return Ok(service_stop_pending(operation));
+        };
+        return complete_stopped_transition(paths, operation, singleton).await;
+    }
+    if stop.request == StopRequest::Prepared
+        && stop.process.is_none()
+        && stop.direction == StopDirection::RestorePrevious
+        && operation.service_stops.len() == 2
+    {
+        // No-process unload journals uncertainty before dispatch. Prepared is
+        // therefore a definitive unsent intent; Unconfirmed remains read-only.
+        request_service_stop(paths, operation).await?;
+    }
     if stop.request == StopRequest::ObservedStopped
         && stop.direction == StopDirection::ActivateCandidate
         && matches!(
@@ -4770,6 +4872,9 @@ mod tests {
             *TEST_RECOVERY_FAULT.lock().unwrap() = None;
             *TEST_RECOVERY_STATUS.lock().unwrap() = None;
             *TEST_AUTH_STATUS.lock().unwrap() = None;
+            TEST_STATUS_UNAVAILABLE.store(false, Ordering::SeqCst);
+            TEST_STOP_WAIT_UNCONFIRMED.store(false, Ordering::SeqCst);
+            TEST_BOOTOUT_FAIL.store(false, Ordering::SeqCst);
         }
     }
 
@@ -5909,6 +6014,234 @@ mod tests {
         );
         assert_eq!(
             classify_label_output(uid, Some(0), b"malformed", b""),
+            LabelObservation::Unknown
+        );
+    }
+
+    async fn owned_idle_label_fixture(paths: &Paths) -> Operation {
+        let mut operation = pending_stop_fixture(paths).await;
+        operation.service_stops[0].request = StopRequest::ObservedStopped;
+        operation.phase = "service_stop_pending".into();
+        operation.checkpoint = Some("old_service_stop_unconfirmed".into());
+        fs::remove_file(paths.current()).unwrap();
+        symlink(&operation.package.as_ref().unwrap().target, paths.current()).unwrap();
+        fs::write(launch_agent(paths), b"candidate-plist").unwrap();
+        *TEST_PROCESS_OBSERVATION.lock().unwrap() = Some(ProcessObservation::Exited);
+        TEST_STATUS_UNAVAILABLE.store(true, Ordering::SeqCst);
+        TEST_DELAYED_SERVICE_STOP.store(false, Ordering::SeqCst);
+        let uid = unsafe { libc::geteuid() };
+        let label = format!(
+            "gui/{uid}/app.loomex.runner = {{\n\tprogram = {}\n\tstate = not running\n}}\n",
+            paths.current().join("bin/loomex-runner").display()
+        );
+        *TEST_LABEL_OBSERVATION.lock().unwrap() =
+            Some(classify_label_output(uid, Some(0), label.as_bytes(), b""));
+        save_operation(paths, &operation).unwrap();
+        operation
+    }
+
+    #[tokio::test]
+    async fn owned_idle_label_restores_same_operation_without_replacing_stop_history() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = StopTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let original = owned_idle_label_fixture(&paths).await;
+        let result = resume(&paths).await.unwrap();
+        TEST_STATUS_UNAVAILABLE.store(false, Ordering::SeqCst);
+        assert_eq!(result["operation"]["phase"], "rolled_back", "{result}");
+        let saved: Operation = state::read_json(&paths.operation()).unwrap();
+        assert_eq!(saved.id, original.id);
+        assert_eq!(saved.package, original.package);
+        assert_eq!(saved.service_stops.len(), 2);
+        assert_eq!(saved.service_stops[0], original.service_stops[0]);
+        assert_eq!(
+            saved.service_stops[1].direction,
+            StopDirection::RestorePrevious
+        );
+        assert!(saved.service_stops[1].process.is_none());
+        assert_eq!(saved.service_stops[1].request, StopRequest::ObservedStopped);
+        assert_eq!(
+            fs::read_link(paths.current()).unwrap(),
+            original.previous_target.unwrap()
+        );
+        assert_eq!(fs::read(launch_agent(&paths)).unwrap(), b"previous-plist");
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            resume(&paths).await.unwrap()["reason"],
+            "operation is terminal"
+        );
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn owned_idle_label_unknown_or_changed_ownership_never_unloads() {
+        let _serial = TEST_SERIAL.lock().await;
+        for case in [
+            "unknown_label",
+            "foreign_program",
+            "pid_reused",
+            "unknown_process",
+            "singleton",
+            "singleton_symlink",
+            "socket",
+            "plist",
+            "inventory",
+        ] {
+            let _scope = StopTestScope::start();
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let original = owned_idle_label_fixture(&paths).await;
+            let mut singleton = None;
+            match case {
+                "unknown_label" => {
+                    *TEST_LABEL_OBSERVATION.lock().unwrap() = Some(LabelObservation::Unknown)
+                }
+                "foreign_program" => {
+                    *TEST_LABEL_OBSERVATION.lock().unwrap() = Some(LabelObservation::LoadedIdle {
+                        program: PathBuf::from("/foreign/bin/loomex-runner"),
+                    })
+                }
+                "pid_reused" => {
+                    let mut process = original.service_stops[0].process.clone().unwrap();
+                    process.started_seconds += 1;
+                    *TEST_PROCESS_OBSERVATION.lock().unwrap() =
+                        Some(ProcessObservation::Present(process));
+                }
+                "unknown_process" => {
+                    *TEST_PROCESS_OBSERVATION.lock().unwrap() = Some(ProcessObservation::Unknown)
+                }
+                "singleton" => singleton = Some(stopped_singleton(&paths, false).unwrap()),
+                "singleton_symlink" => symlink(
+                    temp.path().join("unrelated"),
+                    paths.state_dir.join("daemon.lock"),
+                )
+                .unwrap(),
+                "socket" => {
+                    fs::write(paths.state_dir.join("control.sock"), b"unconfirmed").unwrap()
+                }
+                "plist" => fs::write(launch_agent(&paths), b"changed").unwrap(),
+                "inventory" => {
+                    fs::write(paths.state_dir.join("owned-versions.json"), b"{}").unwrap()
+                }
+                _ => unreachable!(),
+            }
+            let result = resume(&paths).await.unwrap();
+            assert_ne!(result["operation"]["phase"], "rolled_back", "{case}");
+            let saved: Operation = state::read_json(&paths.operation()).unwrap();
+            assert_eq!(saved.id, original.id, "{case}");
+            assert_eq!(saved.service_stops, original.service_stops, "{case}");
+            assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1, "{case}");
+            drop(singleton);
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_idle_label_dispatch_uncertainty_never_replays_or_adds_intents() {
+        let _serial = TEST_SERIAL.lock().await;
+        for case in [
+            "prepared_interruption",
+            "dispatch_interruption",
+            "wait_uncertain",
+            "spawn_failure",
+            "spawn_reset_failure",
+        ] {
+            let _scope = StopTestScope::start();
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let original = owned_idle_label_fixture(&paths).await;
+            match case {
+                "prepared_interruption" => {
+                    *TEST_RECOVERY_FAULT.lock().unwrap() = Some("after_stop_intent")
+                }
+                "dispatch_interruption" => {
+                    *TEST_RECOVERY_FAULT.lock().unwrap() =
+                        Some("after_abandonment_stop_dispatch_intent")
+                }
+                "wait_uncertain" => TEST_STOP_WAIT_UNCONFIRMED.store(true, Ordering::SeqCst),
+                "spawn_failure" => TEST_BOOTOUT_FAIL.store(true, Ordering::SeqCst),
+                "spawn_reset_failure" => {
+                    TEST_BOOTOUT_FAIL.store(true, Ordering::SeqCst);
+                    *TEST_RECOVERY_FAULT.lock().unwrap() =
+                        Some("before_stop_not_dispatched_checkpoint");
+                }
+                _ => unreachable!(),
+            }
+            let _ = resume(&paths).await.unwrap();
+            let saved: Operation = state::read_json(&paths.operation()).unwrap();
+            assert_eq!(saved.service_stops.len(), 2, "{case}");
+            assert_eq!(saved.service_stops[0], original.service_stops[0], "{case}");
+            let prepared = matches!(case, "prepared_interruption" | "spawn_failure");
+            assert_eq!(
+                saved.service_stops[1].request,
+                if prepared {
+                    StopRequest::Prepared
+                } else {
+                    StopRequest::Unconfirmed
+                },
+                "{case}"
+            );
+            *TEST_RECOVERY_FAULT.lock().unwrap() = None;
+            TEST_BOOTOUT_FAIL.store(false, Ordering::SeqCst);
+            TEST_STOP_WAIT_UNCONFIRMED.store(false, Ordering::SeqCst);
+            let count = TEST_STOP_COUNT.load(Ordering::SeqCst);
+            let result = resume(&paths).await.unwrap();
+            if prepared {
+                assert_eq!(
+                    result["operation"]["phase"], "rolled_back",
+                    "{case}: {result}"
+                );
+                assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), count + 1, "{case}");
+            } else {
+                assert_eq!(result["pending"], true, "{case}: {result}");
+                assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), count, "{case}");
+                *TEST_LABEL_OBSERVATION.lock().unwrap() = Some(LabelObservation::Absent);
+                TEST_LABEL_PRESENT.store(false, Ordering::SeqCst);
+                assert_eq!(
+                    resume(&paths).await.unwrap()["operation"]["phase"],
+                    "rolled_back",
+                    "{case}"
+                );
+                assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), count, "{case}");
+            }
+            let final_operation: Operation = state::read_json(&paths.operation()).unwrap();
+            assert_eq!(final_operation.id, original.id, "{case}");
+            assert_eq!(final_operation.service_stops.len(), 2, "{case}");
+            assert_eq!(
+                final_operation.service_stops[0], original.service_stops[0],
+                "{case}"
+            );
+            assert_eq!(
+                resume(&paths).await.unwrap()["reason"],
+                "operation is terminal",
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_idle_label_classification_never_implies_absence() {
+        let uid = unsafe { libc::geteuid() };
+        let idle =
+            format!("gui/{uid}/app.loomex.runner = {{\n\tprogram = /owned/bin/loomex-runner\n}}\n");
+        assert_eq!(
+            classify_label_output(uid, Some(0), idle.as_bytes(), b""),
+            LabelObservation::LoadedIdle {
+                program: PathBuf::from("/owned/bin/loomex-runner")
+            }
+        );
+        for output in [
+            idle.trim_end_matches("}\n").to_string(),
+            idle.replace("\tprogram = /owned/bin/loomex-runner\n", ""),
+            idle.replace("}\n", "\tpid = 0\n}\n"),
+        ] {
+            assert_eq!(
+                classify_label_output(uid, Some(0), output.as_bytes(), b""),
+                LabelObservation::Unknown
+            );
+        }
+        assert_eq!(
+            classify_label_output(uid, Some(0), idle.as_bytes(), b"unconfirmed"),
             LabelObservation::Unknown
         );
     }
