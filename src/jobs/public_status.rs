@@ -64,28 +64,23 @@ pub(super) fn accept_status(
     message: &str,
 ) -> Result<()> {
     let text = validated_text(message)?;
-    let mut record = journal
-        .lock()
-        .map_err(|_| anyhow::anyhow!("JOURNAL_LOCKED"))?;
-    let expiry = record.job["leasedUntilEpochMs"].as_u64().unwrap_or(0);
-    if record.phase != JournalPhase::Running
-        || record.recovery_session.is_some()
-        || record.job["status"] == "canceling"
-        || expiry <= now_millis()
-        || record.job["createdByNodeExecutionId"].as_str().is_none()
-        || !enabled(&record.job)
-    {
-        bail!("PUBLIC_STATUS_NOT_ACTIVE")
-    }
-    let previous = record.public_status_latest.replace(json!({
-        "text":text,
-        "timestamp":now_millis(),
-    }));
-    if let Err(error) = persist(path, &record) {
-        record.public_status_latest = previous;
-        return Err(error);
-    }
-    Ok(())
+    update_sync(path, journal, |record| {
+        let expiry = record.job["leasedUntilEpochMs"].as_u64().unwrap_or(0);
+        if record.phase != JournalPhase::Running
+            || record.recovery_session.is_some()
+            || record.job["status"] == "canceling"
+            || expiry <= now_millis()
+            || record.job["createdByNodeExecutionId"].as_str().is_none()
+            || !enabled(&record.job)
+        {
+            bail!("PUBLIC_STATUS_NOT_ACTIVE")
+        }
+        record.public_status_latest = Some(json!({
+            "text":text,
+            "timestamp":now_millis(),
+        }));
+        Ok(())
+    })
 }
 
 pub(super) struct StatusServer {
@@ -234,7 +229,7 @@ async fn handle_status_connection(
     path: &Path,
     journal: &Arc<Mutex<Journal>>,
     expected_token: &str,
-    gate: &Mutex<bool>,
+    gate: &Arc<Mutex<bool>>,
 ) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let reader = BufReader::new(read);
@@ -245,7 +240,18 @@ async fn handle_status_connection(
     } else {
         match serde_json::from_slice::<Value>(&bytes) {
             Ok(value) if value["token"] == expected_token => match value["message"].as_str() {
-                Some(message) => accept_if_open(gate, path, journal, message),
+                Some(message) => {
+                    let path = path.to_owned();
+                    let journal = journal.clone();
+                    let gate = gate.clone();
+                    let message = message.to_owned();
+                    let owner = snapshot(&journal)?.durable_writer.own();
+                    blocking_io(move || {
+                        let _owner = owner;
+                        accept_if_open(&gate, &path, &journal, &message)
+                    })
+                    .await
+                }
                 None => Err(anyhow::anyhow!("PUBLIC_STATUS_TEXT_INVALID")),
             },
             _ => Err(anyhow::anyhow!("PUBLIC_STATUS_NOT_ACTIVE")),
@@ -272,49 +278,67 @@ pub(super) fn accept_if_open(
 }
 
 pub(super) fn promote_latest(path: &Path, journal: &Arc<Mutex<Journal>>) -> Result<Option<Value>> {
-    let mut record = journal
-        .lock()
-        .map_err(|_| anyhow::anyhow!("JOURNAL_LOCKED"))?;
-    if let Some(pending) = &record.public_status_pending {
-        return Ok(Some(pending.clone()));
+    let current = snapshot(journal)?;
+    if let Some(pending) = current.public_status_pending {
+        return Ok(Some(pending));
     }
-    if record.public_status_latest.is_none()
-        || record
+    if current.public_status_latest.is_none()
+        || current
             .public_status_last_sent_at_ms
             .saturating_add(MIN_INTERVAL_MS)
             > now_millis()
     {
         return Ok(None);
     }
-    let latest = record.public_status_latest.take().unwrap();
-    let previous_seq = record.public_status_next_sequence;
-    record.public_status_next_sequence = previous_seq.saturating_add(1);
-    let pending = json!({
-        "version":1,
-        "eventId":format!("{}:public-status:{}",record.job["id"].as_str().unwrap_or(""),record.public_status_next_sequence),
-        "jobId":record.job["id"],
-        "nodeExecutionId":record.job["createdByNodeExecutionId"],
-        "attempt":record.job["producerAttempt"].as_u64().or_else(||record.job["attemptCount"].as_u64()).unwrap_or(1),
-        "timestamp":latest["timestamp"],
-        "text":latest["text"],
-        "provenance":"ai_reported",
-    });
-    record.public_status_pending = Some(pending.clone());
-    if let Err(error) = persist(path, &record) {
-        record.public_status_pending = None;
-        record.public_status_next_sequence = previous_seq;
-        record.public_status_latest = Some(latest);
-        return Err(error);
-    }
-    Ok(Some(pending))
+    update_sync(path, journal, |record| {
+        if let Some(pending) = &record.public_status_pending {
+            return Ok(Some(pending.clone()));
+        }
+        if record.public_status_latest.is_none()
+            || record
+                .public_status_last_sent_at_ms
+                .saturating_add(MIN_INTERVAL_MS)
+                > now_millis()
+        {
+            return Ok(None);
+        }
+        let latest = record.public_status_latest.take().unwrap();
+        let previous_seq = record.public_status_next_sequence;
+        record.public_status_next_sequence = previous_seq.saturating_add(1);
+        let pending = json!({
+            "version":1,
+            "eventId":format!("{}:public-status:{}",record.job["id"].as_str().unwrap_or(""),record.public_status_next_sequence),
+            "jobId":record.job["id"],
+            "nodeExecutionId":record.job["createdByNodeExecutionId"],
+            "attempt":record.job["producerAttempt"].as_u64().or_else(||record.job["attemptCount"].as_u64()).unwrap_or(1),
+            "timestamp":latest["timestamp"],
+            "text":latest["text"],
+            "provenance":"ai_reported",
+        });
+        record.public_status_pending = Some(pending.clone());
+        Ok(Some(pending))
+    })
 }
 
 pub(super) async fn send_pending_status(
     daemon: &Daemon,
     path: &Path,
     journal: &Arc<Mutex<Journal>>,
+    sender: Arc<tokio::sync::OwnedMutexGuard<()>>,
 ) -> Result<bool> {
-    let Some(pending) = promote_latest(path, journal)? else {
+    let quiet = snapshot(journal)?;
+    if quiet.public_status_pending.is_none() && quiet.public_status_latest.is_none() {
+        return Ok(false);
+    }
+    let status_path = path.to_owned();
+    let status_journal = journal.clone();
+    let promotion_sender = sender.clone();
+    let Some(pending) = job_io(daemon, journal, move || {
+        let _sender = promotion_sender;
+        promote_latest(&status_path, &status_journal)
+    })
+    .await?
+    else {
         return Ok(false);
     };
     let current = snapshot(journal)?;
@@ -333,14 +357,14 @@ pub(super) async fn send_pending_status(
         None,
     )
     .await?;
-    let mut record = journal
-        .lock()
-        .map_err(|_| anyhow::anyhow!("JOURNAL_LOCKED"))?;
-    if record.public_status_pending.as_ref() == Some(&pending) {
-        record.public_status_pending = None;
-        record.public_status_last_sent_at_ms = now_millis();
-        persist(path, &record)?;
-    }
+    update_while_sending(daemon, path, journal, sender, move |record| {
+        if record.public_status_pending.as_ref() == Some(&pending) {
+            record.public_status_pending = None;
+            record.public_status_last_sent_at_ms = now_millis();
+        }
+        Ok(())
+    })
+    .await?;
     Ok(true)
 }
 

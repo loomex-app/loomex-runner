@@ -35,6 +35,7 @@ use supervisor::{ActiveJob, ExecutionScope};
 #[cfg(test)]
 use supervisor::{admit, session};
 mod journal;
+pub(crate) use journal::blocking_io;
 use journal::*;
 mod authorization;
 use authorization::*;
@@ -134,15 +135,14 @@ async fn initial_finalization(
         Err(error) => Err((DeliveryDiagnosticCategory::OutputDelivery, error)),
     };
     if let Err((category, error)) = outcome {
-        {
-            let mut record = journal
-                .lock()
-                .map_err(|_| anyhow::anyhow!("journal lock"))?;
+        let diagnostic = delivery_diagnostic(category, &error);
+        update(daemon, path, journal, move |record| {
             if record.first_failure_diagnostic.is_none() {
-                record.first_failure_diagnostic = Some(delivery_diagnostic(category, &error));
+                record.first_failure_diagnostic = Some(diagnostic);
             }
-        }
-        save(journal, path)?;
+            Ok(())
+        })
+        .await?;
         return Err(error);
     }
     Ok(())
@@ -176,7 +176,7 @@ async fn work(
         let typed_http_failure = error
             .downcast_ref::<HttpFailure>()
             .map(|failure| (failure.code, failure.stage, failure.dispatched));
-        let mut j = shared.lock().map_err(|_| anyhow::anyhow!("journal lock"))?;
+        update(&daemon, &path, &shared, move |j| {
         if j.error.is_none() && j.result.is_none() {
             j.result = None;
             let code = if error
@@ -210,8 +210,9 @@ async fn work(
                 },
             );
             j.transition(JournalPhase::TerminalPending)?;
-            persist(&path, &j)?;
         }
+        Ok(())
+        }).await?;
     }
     deliver(daemon, &path, shared).await
 }

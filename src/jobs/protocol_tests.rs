@@ -30,11 +30,11 @@ async fn receive_with_headers(listener: &TcpListener) -> (TcpStream, String, Val
         }
     }
 }
-async fn receive(listener: &TcpListener) -> (TcpStream, Value) {
+pub(super) async fn receive(listener: &TcpListener) -> (TcpStream, Value) {
     let (stream, _, body) = receive_with_headers(listener).await;
     (stream, body)
 }
-async fn reply(mut stream: TcpStream, data: Value) {
+pub(super) async fn reply(mut stream: TcpStream, data: Value) {
     let body = json!({"data":data,"meta":{}}).to_string();
     stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
 }
@@ -58,6 +58,7 @@ pub(super) fn journal() -> Journal {
         delivery_diagnostic: None,
         first_failure_diagnostic: None,
         event_sender: Default::default(),
+        durable_writer: Default::default(),
         stdout_pending: None,
         stderr_pending: None,
         progress_buffer: Vec::new(),
@@ -1262,16 +1263,13 @@ async fn restart_reclaims_terminal_authority_before_delivery() {
         reply(stream, json!({"job":{"status":"failed"}})).await;
     });
     recover(d.clone(), "org", "new-session").await.unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(8), server)
-        .await
-        .unwrap()
-        .unwrap();
-    for _ in 0..100 {
-        if d.execution.active_work() == 0 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        server.await.unwrap();
+        d.execution.join_recovery().await;
+    })
+    .await
+    .unwrap();
+    assert_eq!(d.execution.active_work(), 0);
     let record: Journal = state::read_json(&path).unwrap();
     assert_eq!(record.phase, "acknowledged");
     assert_eq!(record.session, "new-session");
@@ -1665,4 +1663,493 @@ async fn repeated_local_lease_changes_have_a_distinct_safe_diagnostic() {
         "RUNNER_JOB_LOCAL_LEASE_CHANGED"
     );
     assert!(fence_error(&error.to_string()));
+}
+
+#[tokio::test]
+async fn responsive_output_batch_drains_one_mib_with_fair_streams() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let daemon = daemon(
+        temp.path(),
+        format!("http://{}", listener.local_addr().unwrap()),
+    );
+    let shared = Arc::new(Mutex::new(journal()));
+    let path = temp.path().join("jobs/throughput/journal.json");
+    state::write_json(&path, &snapshot(&shared).unwrap()).unwrap();
+    for stream in ["stdout", "stderr"] {
+        std::fs::write(path.parent().unwrap().join(stream), vec![b'x'; 1_048_576]).unwrap();
+    }
+    let server = tokio::spawn(async move {
+        for index in 0..64 {
+            let (stream, body) = receive(&listener).await;
+            let expected_stream = if index % 2 == 0 { "stdout" } else { "stderr" };
+            let event = &body["events"][0];
+            assert_eq!(event["stream"], expected_stream);
+            assert_eq!(event["payload"]["offset"], (index / 2) * 32768);
+            assert_eq!(
+                STANDARD
+                    .decode(event["payload"]["data"].as_str().unwrap())
+                    .unwrap()
+                    .len(),
+                32768
+            );
+            reply(stream, json!({})).await;
+        }
+    });
+    let start = Instant::now();
+    let mut wakes = 0;
+    while snapshot(&shared).unwrap().stdout_offset < 1_048_576 {
+        assert!(stream_event_batch(&daemon, &path, &shared).await.unwrap());
+        wakes += 1;
+    }
+    server.await.unwrap();
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "controlled output took {elapsed:?}"
+    );
+    let record = snapshot(&shared).unwrap();
+    assert_eq!(record.stderr_offset, 1_048_576);
+    assert!((8..=32).contains(&wakes));
+    assert_eq!(record.durable_writer.commits.load(Ordering::SeqCst), 128);
+    println!(
+        "responsive output: bytes=2097152 events=64 durable_commits=128 wakes={wakes} elapsed_ms={}",
+        elapsed.as_millis()
+    );
+}
+
+// Each deliberate worker stall owns an isolated copy of the production 2/1
+// admissions. Jobs within a fixture still contend for those exact shared slots.
+fn fault_journal(record: Journal) -> Arc<Mutex<Journal>> {
+    let shared = Arc::new(Mutex::new(record));
+    *snapshot(&shared)
+        .unwrap()
+        .durable_writer
+        .test_slots
+        .lock()
+        .unwrap() = Some(Arc::new(TestIoSlots::default()));
+    shared
+}
+
+#[tokio::test]
+async fn responsive_canceled_ack_waiter_retains_sender_and_durable_scope_ownership() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let daemon = daemon(
+        temp.path(),
+        format!("http://{}", listener.local_addr().unwrap()),
+    );
+    let shared = fault_journal(journal());
+    let path = temp.path().join("jobs/canceled-ack/journal.json");
+    state::write_json(&path, &snapshot(&shared).unwrap()).unwrap();
+    std::fs::write(path.parent().unwrap().join("stdout"), b"first").unwrap();
+    let scope = Arc::new(ExecutionScope::default());
+    let evidence = snapshot(&shared).unwrap().durable_writer;
+    *scope.evidence.lock().unwrap() = Some(evidence.clone());
+    let d = daemon.clone();
+    let j = shared.clone();
+    let p = path.clone();
+    let sender = tokio::spawn(async move { stream_events(&d, &p, &j).await });
+    let (stream, body) = receive(&listener).await;
+    assert_eq!(body["events"][0]["payload"]["offset"], 0);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    *evidence.delay_write.lock().unwrap() = Some((ready_tx, release_rx));
+    reply(stream, json!({})).await;
+    ready_rx.await.unwrap();
+    sender.abort();
+    let _ = sender.await;
+    // The canceled waiter has not published its uncommitted offset or released
+    // sender/evidence ownership. Snapshots and local-control remain responsive.
+    assert_eq!(snapshot(&shared).unwrap().stdout_offset, 0);
+    assert!(daemon.managed_work() > 0);
+    let status = tokio::time::timeout(Duration::from_millis(100), async {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        daemon.dispatch("status.get", json!({})).await
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(status["version"].as_str().is_some());
+    let d = daemon.clone();
+    let j = shared.clone();
+    let p = path.clone();
+    let second = tokio::spawn(async move { stream_events(&d, &p, &j).await });
+    let stop_scope = scope.clone();
+    let stop = tokio::spawn(async move { stop_scope.stop().await });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(!stop.is_finished());
+    assert!(!second.is_finished());
+    assert_eq!(snapshot(&shared).unwrap().stdout_pending, Some(5));
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), stop)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!second.await.unwrap().unwrap());
+    assert_eq!(snapshot(&shared).unwrap().stdout_offset, 5);
+    assert_eq!(state::read_json::<Journal>(&path).unwrap().stdout_offset, 5);
+    assert_eq!(daemon.managed_work(), 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn responsive_blocking_workers_stay_bounded_after_waiter_cancellation() {
+    let temp = tempfile::tempdir().unwrap();
+    let daemon = daemon(temp.path(), "http://127.0.0.1:9".into());
+    let shared = fault_journal(journal());
+    let release = Arc::new(std::sync::Barrier::new(3));
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut tasks = Vec::new();
+    for index in 0..3 {
+        let daemon = daemon.clone();
+        let journal = shared.clone();
+        let release = release.clone();
+        let started = started_tx.clone();
+        tasks.push(tokio::spawn(async move {
+            job_io(&daemon, &journal, move || {
+                started.send(index).unwrap();
+                if index < 2 {
+                    release.wait();
+                }
+                Ok(())
+            })
+            .await
+        }));
+        if index < 2 {
+            assert_eq!(started_rx.recv().await, Some(index));
+        }
+    }
+    let first = tasks.remove(0);
+    first.abort();
+    let _ = first.await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), started_rx.recv())
+            .await
+            .is_err()
+    );
+    assert!(daemon.managed_work() >= 2);
+    release.wait();
+    assert_eq!(started_rx.recv().await, Some(2));
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+    snapshot(&shared).unwrap().durable_writer.wait_idle().await;
+    assert_eq!(daemon.managed_work(), 0);
+}
+
+#[tokio::test]
+async fn responsive_two_slow_hashes_reserve_capacity_for_durable_renewal() {
+    let temp = tempfile::tempdir().unwrap();
+    let daemon = daemon(temp.path(), "http://127.0.0.1:9".into());
+    let shared = fault_journal(journal());
+    let path = temp.path().join("journal.json");
+    state::write_json(&path, &snapshot(&shared).unwrap()).unwrap();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let d = daemon.clone();
+    let j = shared.clone();
+    let first = tokio::spawn(async move {
+        job_hash_io(&d, &j, move || {
+            ready_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5))?;
+            Ok(())
+        })
+        .await
+    });
+    ready_rx.await.unwrap();
+    let (second_tx, mut second_rx) = tokio::sync::oneshot::channel();
+    let d = daemon.clone();
+    let j = shared.clone();
+    let second = tokio::spawn(async move {
+        job_hash_io(&d, &j, move || {
+            second_tx.send(()).unwrap();
+            Ok(())
+        })
+        .await
+    });
+    // The first actual hash remains delayed, the second hash waits outside
+    // the shared two-worker pool, and a renewal can commit its newer fence.
+    let start = Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        update(&daemon, &path, &shared, |record| {
+            record.job["leaseVersion"] = json!(8);
+            Ok(())
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let committed_in = start.elapsed();
+    assert_eq!(snapshot(&shared).unwrap().job["leaseVersion"], 8);
+    assert_eq!(
+        state::read_json::<Journal>(&path).unwrap().job["leaseVersion"],
+        8
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), &mut second_rx)
+            .await
+            .is_err()
+    );
+    println!(
+        "reserved journal capacity: delayed_hash_requests=2 active_hash_workers=1 renewal_commit_ms={}",
+        committed_in.as_millis()
+    );
+    first.abort();
+    let _ = first.await;
+    // Cancellation retains hash admission until its actual worker finishes.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), &mut second_rx)
+            .await
+            .is_err()
+    );
+    release_tx.send(()).unwrap();
+    second_rx.await.unwrap();
+    second.await.unwrap().unwrap();
+    snapshot(&shared).unwrap().durable_writer.wait_idle().await;
+    assert_eq!(daemon.managed_work(), 0);
+}
+
+#[tokio::test]
+async fn responsive_artifact_hash_await_rechecks_current_lease_before_transfer() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let daemon = daemon(
+        temp.path(),
+        format!("http://{}", listener.local_addr().unwrap()),
+    );
+    let original = journal();
+    let shared = fault_journal(original.clone());
+    let journal_path = temp.path().join("journal.json");
+    state::write_json(&journal_path, &original).unwrap();
+    let artifact_path = temp.path().join("artifact");
+    std::fs::write(&artifact_path, b"immutable transfer bytes").unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    *original.durable_writer.delay_hash.lock().unwrap() = Some((ready_tx, release_rx));
+    let d = daemon.clone();
+    let j = shared.clone();
+    let upload = tokio::spawn(async move {
+        upload(
+            &d,
+            &j,
+            &original,
+            &artifact_path,
+            "artifact",
+            "application/octet-stream",
+            "stable-tag",
+        )
+        .await
+    });
+    ready_rx.await.unwrap();
+    update(&daemon, &journal_path, &shared, |record| {
+        record.job["leasedUntilEpochMs"] = json!(0);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        upload.await.unwrap().unwrap_err().to_string(),
+        "RUNNER_JOB_LEASE_EXPIRED"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn responsive_failed_durable_commit_preserves_committed_offsets() {
+    let temp = tempfile::tempdir().unwrap();
+    let daemon = daemon(temp.path(), "http://127.0.0.1:9".into());
+    let shared = Arc::new(Mutex::new(journal()));
+    let path = temp.path().join("journal.json");
+    state::write_json(&path, &snapshot(&shared).unwrap()).unwrap();
+    let invalid_path = path.join("journal.json");
+    assert!(
+        update(&daemon, &invalid_path, &shared, |record| {
+            record.stdout_offset = 99;
+            record.stdout_pending = None;
+            Ok(())
+        })
+        .await
+        .is_err()
+    );
+    assert_eq!(snapshot(&shared).unwrap().stdout_offset, 0);
+    assert_eq!(state::read_json::<Journal>(&path).unwrap().stdout_offset, 0);
+    assert_eq!(daemon.managed_work(), 0);
+}
+
+#[tokio::test]
+async fn responsive_advisory_ack_timeout_retains_sender_until_durable_commit() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let daemon = daemon(
+        temp.path(),
+        format!("http://{}", listener.local_addr().unwrap()),
+    );
+    let mut record = journal();
+    record.job["payload"]["publicStatus"] =
+        json!({"schemaVersion":"ai.public-status/v1","enabled":true});
+    record.job["createdByNodeExecutionId"] = json!("33333333-3333-4333-8333-333333333333");
+    let shared = fault_journal(record);
+    let path = temp.path().join("journal.json");
+    state::write_json(&path, &snapshot(&shared).unwrap()).unwrap();
+    accept_status(&path, &shared, "Reviewing the draft").unwrap();
+    let d = daemon.clone();
+    let j = shared.clone();
+    let p = path.clone();
+    let first = tokio::spawn(async move { stream_events(&d, &p, &j).await });
+    let (stream, event) = receive(&listener).await;
+    assert_eq!(event["events"][0]["eventType"], "ai.public-status.v1");
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    *snapshot(&shared)
+        .unwrap()
+        .durable_writer
+        .delay_write
+        .lock()
+        .unwrap() = Some((ready_tx, release_rx));
+    reply(stream, json!({})).await;
+    ready_rx.await.unwrap();
+    // Exercise the real advisory timeout, which drops only the async waiter.
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(4), first)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    );
+    assert!(snapshot(&shared).unwrap().public_status_pending.is_some());
+    assert!(daemon.managed_work() > 0);
+    let d = daemon.clone();
+    let j = shared.clone();
+    let p = path.clone();
+    let second = tokio::spawn(async move { stream_events(&d, &p, &j).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), listener.accept())
+            .await
+            .is_err()
+    );
+    assert!(!second.is_finished());
+    release_tx.send(()).unwrap();
+    assert!(!second.await.unwrap().unwrap());
+    assert!(snapshot(&shared).unwrap().public_status_pending.is_none());
+    assert!(
+        state::read_json::<Journal>(&path)
+            .unwrap()
+            .public_status_pending
+            .is_none()
+    );
+    assert_eq!(daemon.managed_work(), 0);
+}
+
+#[tokio::test]
+async fn responsive_fault_fixture_slots_do_not_capture_unrelated_recovery_capacity() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let d = daemon(
+        temp.path(),
+        format!("http://{}", listener.local_addr().unwrap()),
+    );
+    let fault = fault_journal(journal());
+    let (hash_ready_tx, hash_ready_rx) = tokio::sync::oneshot::channel();
+    let (hash_release_tx, hash_release_rx) = std::sync::mpsc::channel();
+    let hash_d = d.clone();
+    let hash_j = fault.clone();
+    let hash = tokio::spawn(async move {
+        job_hash_io(&hash_d, &hash_j, move || {
+            hash_ready_tx.send(()).unwrap();
+            hash_release_rx.recv_timeout(Duration::from_secs(5))?;
+            Ok(())
+        })
+        .await
+    });
+    hash_ready_rx.await.unwrap();
+    let (write_ready_tx, write_ready_rx) = tokio::sync::oneshot::channel();
+    let (write_release_tx, write_release_rx) = std::sync::mpsc::channel();
+    let write_d = d.clone();
+    let write_j = fault.clone();
+    let write = tokio::spawn(async move {
+        job_io(&write_d, &write_j, move || {
+            write_ready_tx.send(()).unwrap();
+            write_release_rx.recv_timeout(Duration::from_secs(5))?;
+            Ok(())
+        })
+        .await
+    });
+    write_ready_rx.await.unwrap();
+    // A normal fixture continues to use the real process-global admissions.
+    // Fault owners stay held throughout renewal and terminal acknowledgment.
+    let healthy = Arc::new(Mutex::new(journal()));
+    let renewal_path = temp.path().join("healthy/journal.json");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        update(&d, &renewal_path, &healthy, |record| {
+            record.job["leaseVersion"] = json!(9);
+            Ok(())
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        state::read_json::<Journal>(&renewal_path).unwrap().job["leaseVersion"],
+        9
+    );
+    let record = journal();
+    let recovery_path = d
+        .dir
+        .join("jobs")
+        .join(record.job["id"].as_str().unwrap())
+        .join("journal.json");
+    state::write_json(&recovery_path, &record).unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, reclaim) = receive(&listener).await;
+        assert_eq!(reclaim["sessionId"], "new-session");
+        assert_eq!(reclaim["expectedLeaseVersion"], 7);
+        assert_eq!(reclaim["terminalSubmission"], true);
+        let mut renewed = journal().job;
+        renewed["leaseVersion"] = json!(8);
+        reply(stream, json!({"job":renewed})).await;
+        let (stream, terminal) = receive(&listener).await;
+        assert_eq!(terminal["sessionId"], "new-session");
+        assert_eq!(terminal["leaseVersion"], 8);
+        assert_eq!(terminal["idempotencyKey"], "persistent-terminal-key");
+        assert_eq!(terminal["error"]["code"], "EXECUTION_INDETERMINATE");
+        reply(stream, json!({"job":{"status":"failed"}})).await;
+    });
+    recover(d.clone(), "org", "new-session").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        server.await.unwrap();
+        d.execution.join_recovery().await;
+    })
+    .await
+    .unwrap();
+    let final_record: Journal = state::read_json(&recovery_path).unwrap();
+    assert_eq!(final_record.phase, JournalPhase::Acknowledged);
+    assert_eq!(final_record.session, "new-session");
+    assert_eq!(final_record.job["leaseVersion"], 8);
+    assert_eq!(final_record.terminal_key, "persistent-terminal-key");
+    assert!(final_record.delivery_diagnostic.is_none());
+    assert!(final_record.identity.is_none());
+    assert_eq!(d.execution.active_work(), 0);
+    assert!(!hash.is_finished() && !write.is_finished());
+    assert!(d.managed_work() >= 2);
+    println!(
+        "isolated fault overlap: held_hash=1 held_journal=1 normal_renewal=durable recovery=acknowledged fence=new-session/8 terminal_key=unchanged command_replayed=false"
+    );
+    hash_release_tx.send(()).unwrap();
+    write_release_tx.send(()).unwrap();
+    hash.await.unwrap().unwrap();
+    write.await.unwrap().unwrap();
+    snapshot(&fault).unwrap().durable_writer.wait_idle().await;
+    assert_eq!(d.managed_work(), 0);
 }

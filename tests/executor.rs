@@ -579,3 +579,89 @@ async fn detached_child_is_reported_as_indeterminate_effects() {
         libc::kill(pid, libc::SIGKILL);
     }
 }
+
+struct DelayedJournalObserver {
+    after_spawn: bool,
+    ready: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    identity: Mutex<Option<ProcessIdentity>>,
+}
+impl DelayedJournalObserver {
+    fn delay(&self) -> Result<()> {
+        if let Some(ready) = self.ready.lock().unwrap().take() {
+            let _ = ready.send(());
+        }
+        self.release
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))?;
+        Ok(())
+    }
+}
+impl ExecutionObserver for DelayedJournalObserver {
+    fn before_spawn(&self, _: &ExecutionRequest) -> Result<()> {
+        if !self.after_spawn {
+            self.delay()?;
+        }
+        Ok(())
+    }
+    fn spawned(&self, identity: &ProcessIdentity) -> Result<()> {
+        *self.identity.lock().unwrap() = Some(identity.clone());
+        if self.after_spawn {
+            self.delay()?;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn cancellation_during_blocking_launch_journal_never_spawns_target() {
+    let root = tempfile::tempdir().unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let observer = Arc::new(DelayedJournalObserver {
+        after_spawn: false,
+        ready: Mutex::new(Some(ready_tx)),
+        release: Mutex::new(release_rx),
+        identity: Mutex::new(None),
+    });
+    let mut request = request(root.path(), "touch should-not-exist");
+    request.observer = observer.clone();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let task = tokio::spawn(run(request, cancel.clone()));
+    ready_rx.await.unwrap();
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        tokio::time::sleep(Duration::from_millis(10)),
+    )
+    .await
+    .unwrap();
+    cancel.store(true, Ordering::SeqCst);
+    release_tx.send(()).unwrap();
+    assert!(task.await.unwrap().unwrap().canceled);
+    assert!(observer.identity.lock().unwrap().is_some());
+    assert!(!root.path().join("should-not-exist").exists());
+}
+
+#[tokio::test]
+async fn abort_during_blocking_identity_journal_preserves_owned_guardian_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let observer = Arc::new(DelayedJournalObserver {
+        after_spawn: true,
+        ready: Mutex::new(Some(ready_tx)),
+        release: Mutex::new(release_rx),
+        identity: Mutex::new(None),
+    });
+    let mut request = request(root.path(), "touch should-not-exist");
+    request.observer = observer.clone();
+    let task = tokio::spawn(run(request, Arc::new(AtomicBool::new(false))));
+    ready_rx.await.unwrap();
+    let pgid = observer.identity.lock().unwrap().as_ref().unwrap().pgid;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    wait_for_group_stop(pgid).await;
+    assert!(!root.path().join("should-not-exist").exists());
+    release_tx.send(()).unwrap();
+}

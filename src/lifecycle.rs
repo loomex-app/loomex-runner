@@ -7,6 +7,8 @@ use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::{
     fs::{self, File, OpenOptions},
     os::unix::{
@@ -761,9 +763,79 @@ pub fn verify_owned_version_from_inventory(target: &Path, owned: &Value) -> Resu
     verify_directory_against_files(target, expected)
 }
 
+// Bound payload allocation independently of retained package size. Identity is
+// checked against both the opened descriptor and the path after EOF; no digest
+// is cached across lifecycle authorization/mutation boundaries.
+const INTEGRITY_BUFFER_BYTES: usize = 64 * 1024;
+
+fn same_file_identity(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    a.dev() == b.dev()
+        && a.ino() == b.ino()
+        && a.len() == b.len()
+        && a.mode() == b.mode()
+        && a.mtime() == b.mtime()
+        && a.mtime_nsec() == b.mtime_nsec()
+        && a.ctime() == b.ctime()
+        && a.ctime_nsec() == b.ctime_nsec()
+}
+
+fn streaming_file_digest(path: &Path) -> Result<(String, fs::Metadata)> {
+    streaming_file_digest_checked(path, || {})
+}
+
+fn streaming_file_digest_checked(
+    path: &Path,
+    after_read: impl FnOnce(),
+) -> Result<(String, fs::Metadata)> {
+    let before = fs::symlink_metadata(path)?;
+    ensure!(
+        before.is_file() && !before.file_type().is_symlink(),
+        "unsafe lifecycle resource"
+    );
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    ensure!(
+        same_file_identity(&before, &file.metadata()?),
+        "lifecycle resource changed during verification"
+    );
+    let mut buffer = [0u8; INTEGRITY_BUFFER_BYTES];
+    let mut digest = Sha256::new();
+    let mut bytes = 0u64;
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        bytes += count as u64;
+        digest.update(&buffer[..count]);
+    }
+    after_read();
+    let after = fs::symlink_metadata(path)?;
+    ensure!(
+        bytes == before.len()
+            && !after.file_type().is_symlink()
+            && same_file_identity(&before, &file.metadata()?)
+            && same_file_identity(&before, &after),
+        "lifecycle resource changed during verification"
+    );
+    Ok((hex::encode(digest.finalize()), before))
+}
+
 fn verify_directory_against_files(target: &Path, expected: &[Value]) -> Result<()> {
+    let root_metadata = fs::symlink_metadata(target)?;
+    ensure!(
+        root_metadata.is_dir() && !root_metadata.file_type().is_symlink(),
+        "unsafe owned version path"
+    );
     let mut actual = Vec::new();
     fn visit(root: &Path, directory: &Path, output: &mut Vec<Value>) -> Result<()> {
+        let directory_before = fs::symlink_metadata(directory)?;
+        ensure!(
+            directory_before.is_dir() && !directory_before.file_type().is_symlink(),
+            "unsafe owned version path"
+        );
         for entry in fs::read_dir(directory)? {
             let entry = entry?;
             let path = entry.path();
@@ -774,11 +846,20 @@ fn verify_directory_against_files(target: &Path, expected: &[Value]) -> Result<(
             if metadata.is_dir() {
                 visit(root, &path, output)?;
             } else if metadata.is_file() {
-                output.push(json!({"path":path.strip_prefix(root)?.to_string_lossy(),"sha256":state::digest(&fs::read(&path)?),"size":metadata.len(),"mode":metadata.permissions().mode() & 0o777}));
+                let (digest, verified) = streaming_file_digest(&path)?;
+                ensure!(
+                    same_file_identity(&metadata, &verified),
+                    "lifecycle resource changed during verification"
+                );
+                output.push(json!({"path":path.strip_prefix(root)?.to_string_lossy(),"sha256":digest,"size":verified.len(),"mode":verified.permissions().mode() & 0o777}));
             } else {
                 bail!("installed package contains an unsupported entry")
             }
         }
+        ensure!(
+            same_file_identity(&directory_before, &fs::symlink_metadata(directory)?),
+            "lifecycle directory changed during verification"
+        );
         Ok(())
     }
     visit(target, target, &mut actual)?;
@@ -790,8 +871,11 @@ fn verify_directory_against_files(target: &Path, expected: &[Value]) -> Result<(
 }
 
 fn verify_all_owned_versions(paths: &Paths) -> Result<()> {
+    // Read the immutable inventory once per pass, while hashing every version
+    // freshly. Later authorization boundaries still perform their own pass.
+    let owned: Value = state::read_json(&paths.state_dir.join("owned-versions.json"))?;
     for version in owned_versions(paths)? {
-        verify_owned_version(paths, &version)?;
+        verify_owned_version_from_inventory(&version, &owned)?;
     }
     Ok(())
 }
@@ -825,11 +909,11 @@ fn validate_retained_target_cli(target: &Path) -> Result<()> {
 fn validate_rollback_target(target: &Path, version: &str) -> Result<()> {
     validate_retained_target_metadata(target, version)?;
     ensure!(
-        fs::read(target.join("metadata/compatibility-manifest.json"))?
-            == include_bytes!(concat!(
+        streaming_file_digest(&target.join("metadata/compatibility-manifest.json"))?.0
+            == state::digest(include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/contracts/compatibility-manifest.json"
-            )),
+            ))),
         "LIFECYCLE_ROLLBACK_COMPATIBILITY_MISMATCH"
     );
     validate_retained_target_cli(target)
@@ -971,6 +1055,11 @@ fn installed_tree_digest(root: &Path) -> Result<String> {
         directory: &Path,
         entries: &mut Vec<(String, String, u32)>,
     ) -> Result<()> {
+        let before = fs::symlink_metadata(directory)?;
+        ensure!(
+            before.is_dir() && !before.file_type().is_symlink(),
+            "unsafe owned version path"
+        );
         for entry in fs::read_dir(directory)? {
             let entry = entry?;
             let path = entry.path();
@@ -981,15 +1070,24 @@ fn installed_tree_digest(root: &Path) -> Result<String> {
             if metadata.is_dir() {
                 visit(root, &path, entries)?;
             } else if metadata.is_file() {
+                let (digest, verified) = streaming_file_digest(&path)?;
+                ensure!(
+                    same_file_identity(&metadata, &verified),
+                    "lifecycle resource changed during verification"
+                );
                 entries.push((
                     path.strip_prefix(root)?.to_string_lossy().into_owned(),
-                    state::digest(&fs::read(&path)?),
+                    digest,
                     metadata.permissions().mode() & 0o777,
                 ));
             } else {
                 bail!("installed package contains an unsupported entry")
             }
         }
+        ensure!(
+            same_file_identity(&before, &fs::symlink_metadata(directory)?),
+            "lifecycle directory changed during verification"
+        );
         Ok(())
     }
     let mut entries = Vec::new();
@@ -1840,12 +1938,23 @@ async fn daemon_status(paths: &Paths) -> Result<Value> {
 }
 
 async fn local_auth_status(paths: &Paths) -> Result<Value> {
+    local_auth_observation(paths, json!({})).await
+}
+
+async fn local_auth_startup_status(paths: &Paths) -> Result<Value> {
+    // The local client sends this read-only option only when the negotiated
+    // server advertises auth:startup-observation/v1. A retained controller
+    // without it receives the original {} status request on the same socket.
+    local_auth_observation(paths, json!({"observation":"startup"})).await
+}
+
+async fn local_auth_observation(paths: &Paths, params: Value) -> Result<Value> {
     #[cfg(test)]
     if let Some(status) = TEST_AUTH_STATUS.lock().unwrap().clone() {
         return Ok(status);
     }
     let response =
-        crate::control::lifecycle_client(&paths.state_dir, "auth.status", json!({})).await?;
+        crate::control::lifecycle_client(&paths.state_dir, "auth.status", params).await?;
     ensure!(
         response.get("error").is_none(),
         "candidate auth status is unavailable"
@@ -1988,11 +2097,12 @@ async fn healthy_restored_previous(
     healthy_service(paths, version, baseline, true).await
 }
 
+// Qualified startup observation is independent of ordinary auth operation
+// admission. A daemon performing a legitimate refresh may hold its shared auth
+// state for longer than the short admission budget used by client mutations.
+const STARTUP_AUTH_HEALTH_BUDGET: Duration = Duration::from_secs(22);
 fn startup_health_budget() -> Duration {
-    // Readiness can precede startup credential work taking the shared Auth
-    // mutex. Include its existing wait and read limits, once, without changing
-    // Auth, ordinary RPC budgets or the maximum number of observations.
-    Duration::from_secs(5) + crate::auth::AUTH_LOCK_BUDGET + crate::auth::STORE_IO_BUDGET
+    STARTUP_AUTH_HEALTH_BUDGET
 }
 
 async fn healthy_service(
@@ -2019,11 +2129,14 @@ async fn healthy_service(
                 if lifecycle_test_mode() && TEST_AUTH_STATUS.lock().unwrap().is_none() {
                     return Ok(());
                 }
-                let auth_status = tokio::time::timeout_at(deadline, local_auth_status(paths))
-                    .await
-                    .context(
-                        "candidate authentication is unconfirmed: observation deadline exceeded",
-                    )??;
+                let auth_status = tokio::time::timeout_at(
+                    deadline,
+                    local_auth_startup_status(paths),
+                )
+                .await
+                .context(
+                    "candidate authentication is unconfirmed: observation deadline exceeded",
+                )??;
                 if transient_auth_store_observation(&auth_status) {
                     auth_store_unavailable = true;
                 } else {
@@ -2068,7 +2181,7 @@ fn regular_digest(path: &Path) -> Result<Option<String>> {
             if !metadata.is_file() || metadata.file_type().is_symlink() {
                 bail!("unsafe lifecycle resource")
             }
-            Ok(Some(state::digest(&fs::read(path)?)))
+            Ok(Some(streaming_file_digest(path)?.0))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
@@ -3078,6 +3191,39 @@ pub fn status(paths: &Paths) -> Result<Value> {
     }))
 }
 
+/// Eligibility under this controller's compiled product contract. This is a
+/// read-only preflight, not activation authorization or a live downgrade proof.
+pub fn rollback_preflight(paths: &Paths) -> Result<Value> {
+    let mut targets = Vec::new();
+    if paths.state_dir.join("owned-versions.json").exists() {
+        let owned: Value = state::read_json(&paths.state_dir.join("owned-versions.json"))?;
+        for target in owned_versions(paths)? {
+            let version = target
+                .file_name()
+                .and_then(|v| v.to_str())
+                .context("unsafe owned version path")?;
+            let reason = if verify_owned_version_from_inventory(&target, &owned).is_err() {
+                Some("inventory_verification_failed")
+            } else {
+                match validate_rollback_target(&target, version) {
+                    Ok(()) => None,
+                    Err(error)
+                        if error.to_string() == "LIFECYCLE_ROLLBACK_COMPATIBILITY_MISMATCH" =>
+                    {
+                        Some("compatibility_manifest_mismatch")
+                    }
+                    Err(_) => Some("target_validation_failed"),
+                }
+            };
+            targets.push(json!({"version":version,"eligible":reason.is_none(),"reason":reason}));
+        }
+    }
+    Ok(json!({"schema":"app.loomex.runner.rollback-preflight/v1",
+        "controllerVersion":env!("CARGO_PKG_VERSION"),
+        "controllerCompatibilitySha256":state::digest(include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/contracts/compatibility-manifest.json"))),
+        "targets":targets}))
+}
+
 fn save_operation(paths: &Paths, operation: &Operation) -> Result<()> {
     operation.validate()?;
     state::write_json(&paths.operation(), operation)
@@ -3356,11 +3502,16 @@ fn prune_quarantine_inventory(
                 let expected = expected_files
                     .get(&relative)
                     .context("PRUNE_QUARANTINE_UNOWNED_ENTRY")?;
+                let (digest, verified) = streaming_file_digest(&path)?;
+                ensure!(
+                    same_file_identity(&meta, &verified),
+                    "PRUNE_QUARANTINE_CONTENT_MISMATCH"
+                );
                 ensure!(
                     expected["size"].as_u64() == Some(meta.len())
                         && expected["mode"].as_u64()
                             == Some(u64::from(meta.permissions().mode() & 0o777))
-                        && expected["sha256"] == state::digest(&fs::read(&path)?),
+                        && expected["sha256"] == digest,
                     "PRUNE_QUARANTINE_CONTENT_MISMATCH"
                 );
                 present_files.push(relative);
@@ -3418,26 +3569,94 @@ async fn prune_in_use(targets: &[PathBuf]) -> Result<()> {
         );
         return Ok(());
     }
-    let output = tokio::time::timeout(
+    let mut command = tokio::process::Command::new("/usr/sbin/lsof");
+    command.args(["-n", "-F", "n"]);
+    inspect_prune_processes(
+        &mut command,
+        targets,
         Duration::from_secs(20),
-        tokio::process::Command::new("/usr/sbin/lsof")
-            .args(["-n", "-F", "n"])
-            .kill_on_drop(true)
-            .output(),
+        16 * 1024 * 1024,
     )
     .await
-    .context("PRUNE_PROCESS_OBSERVATION_UNAVAILABLE")??;
-    ensure!(
-        output.stdout.len() <= 16 * 1024 * 1024
-            && output.stderr.is_empty()
-            && (output.status.success()
-                || (output.status.code() == Some(1) && output.stdout.is_empty())),
-        "PRUNE_PROCESS_OBSERVATION_UNAVAILABLE"
-    );
-    for line in output.stdout.split(|byte| *byte == b'\n') {
-        let Some(name) = line.strip_prefix(b"n") else {
-            continue;
-        };
+}
+
+// Both pipes are consumed concurrently, with one absolute deadline covering
+// reads, EOF and child exit. A byte/line limit or stderr never proves absence.
+async fn inspect_prune_processes(
+    command: &mut tokio::process::Command,
+    targets: &[PathBuf],
+    deadline: Duration,
+    byte_limit: usize,
+) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .context("PRUNE_PROCESS_OBSERVATION_UNAVAILABLE")?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("PRUNE_PROCESS_OBSERVATION_UNAVAILABLE")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("PRUNE_PROCESS_OBSERVATION_UNAVAILABLE")?;
+    let inspection = async {
+        let mut out_buffer = [0u8; 8192];
+        let mut err_buffer = [0u8; 8192];
+        let mut pending = Vec::new();
+        let mut stdout_bytes = 0usize;
+        let mut stdout_done = false;
+        let mut stderr_done = false;
+        while !stdout_done || !stderr_done {
+            tokio::select! {
+                count = stdout.read(&mut out_buffer), if !stdout_done => {
+                    let count = count.context("PRUNE_PROCESS_OBSERVATION_UNAVAILABLE")?;
+                    if count == 0 { stdout_done = true; continue; }
+                    stdout_bytes = stdout_bytes.checked_add(count).context("PRUNE_PROCESS_OBSERVATION_UNAVAILABLE")?;
+                    ensure!(stdout_bytes <= byte_limit, "PRUNE_PROCESS_OBSERVATION_UNAVAILABLE");
+                    for byte in &out_buffer[..count] {
+                        if *byte == b'\n' {
+                            check_prune_process_line(&pending, targets)?;
+                            pending.clear();
+                        } else {
+                            ensure!(pending.len() < 64 * 1024, "PRUNE_PROCESS_OBSERVATION_UNAVAILABLE");
+                            pending.push(*byte);
+                        }
+                    }
+                },
+                count = stderr.read(&mut err_buffer), if !stderr_done => {
+                    let count = count.context("PRUNE_PROCESS_OBSERVATION_UNAVAILABLE")?;
+                    ensure!(count == 0, "PRUNE_PROCESS_OBSERVATION_UNAVAILABLE");
+                    stderr_done = true;
+                },
+            }
+        }
+        check_prune_process_line(&pending, targets)?;
+        let status = child
+            .wait()
+            .await
+            .context("PRUNE_PROCESS_OBSERVATION_UNAVAILABLE")?;
+        ensure!(
+            status.success() || (status.code() == Some(1) && stdout_bytes == 0),
+            "PRUNE_PROCESS_OBSERVATION_UNAVAILABLE"
+        );
+        Ok(())
+    };
+    let result = tokio::time::timeout(deadline, inspection).await;
+    if !matches!(result, Ok(Ok(()))) {
+        // Do not await an unbounded process teardown after the observation
+        // deadline; kill_on_drop remains a second safety net.
+        let _ = child.start_kill();
+    }
+    result.context("PRUNE_PROCESS_OBSERVATION_UNAVAILABLE")?
+}
+
+fn check_prune_process_line(line: &[u8], targets: &[PathBuf]) -> Result<()> {
+    if let Some(name) = line.strip_prefix(b"n") {
         let path = Path::new(std::ffi::OsStr::from_bytes(name));
         ensure!(
             !targets
@@ -3597,10 +3816,7 @@ pub async fn prune(paths: &Paths, remove: &[String], retain: &[String]) -> Resul
     let owned_paths = owned_versions(paths)?;
     let named = |name: &str| -> Result<PathBuf> {
         let target = paths.versions().join(name);
-        ensure!(
-            owned_paths.contains(&target),
-            "requested prune version is not owned"
-        );
+        ensure!(owned_paths.contains(&target), "VERSION_NOT_OWNED");
         validate_version_path(&paths.versions(), &target.to_string_lossy())
     };
     let targets = remove
@@ -4292,7 +4508,7 @@ pub async fn rollback(paths: &Paths, version: &str) -> Result<Value> {
     let target = owned_versions(paths)?
         .into_iter()
         .find(|path| path.file_name().is_some_and(|v| v == version))
-        .context("requested version is not owned")?;
+        .context("VERSION_NOT_OWNED")?;
     validate_rollback_target(&target, version)?;
     current_target(paths)?.context("rollback requires an installed current target")?;
     let agent = launch_agent(paths);
@@ -4516,6 +4732,174 @@ pub fn readable(value: &Value) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn integrity_streams_large_files_and_rejects_fresh_mutation() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("payload");
+        let chunk = [7u8; INTEGRITY_BUFFER_BYTES];
+        let mut expected = Sha256::new();
+        let mut file = File::create(&path).unwrap();
+        for _ in 0..1024 {
+            file.write_all(&chunk).unwrap();
+            expected.update(chunk);
+        }
+        drop(file);
+        let started = std::time::Instant::now();
+        let (digest, metadata) = streaming_file_digest(&path).unwrap();
+        assert_eq!(digest, hex::encode(expected.finalize()));
+        assert_eq!(metadata.len(), 64 * 1024 * 1024);
+        eprintln!(
+            "integrity fixture: bytes={} passes=1 buffer={} elapsed_ms={}",
+            metadata.len(),
+            INTEGRITY_BUFFER_BYTES,
+            started.elapsed().as_millis()
+        );
+        fs::write(&path, b"changed").unwrap();
+        assert_ne!(streaming_file_digest(&path).unwrap().0, digest);
+        for change in 0..3 {
+            fs::write(&path, b"unchanged").unwrap();
+            let result = streaming_file_digest_checked(&path, || match change {
+                0 => fs::write(&path, b"different-size").unwrap(),
+                1 => fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap(),
+                _ => {
+                    fs::remove_file(&path).unwrap();
+                    fs::write(&path, b"unchanged").unwrap();
+                }
+            });
+            assert!(result.is_err(), "mutation {change} must fail closed");
+        }
+        fs::remove_file(&path).unwrap();
+        symlink(temp.path().join("absent"), &path).unwrap();
+        assert!(streaming_file_digest(&path).is_err());
+        assert!(streaming_file_digest(temp.path()).is_err());
+    }
+
+    #[test]
+    fn rollback_preflight_reports_verified_contract_eligibility_without_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        make_compatible_target(&paths);
+        make_compatible_version(&paths, "1.2.4");
+        let incompatible = paths
+            .versions()
+            .join("1.2.4/metadata/compatibility-manifest.json");
+        fs::write(&incompatible, b"old contract").unwrap();
+        let inventory_path = paths.state_dir.join("owned-versions.json");
+        let mut inventory: Value = state::read_json(&inventory_path).unwrap();
+        let files = inventory["inventories"][1]["files"].as_array_mut().unwrap();
+        let entry = files
+            .iter_mut()
+            .find(|entry| entry["path"] == "metadata/compatibility-manifest.json")
+            .unwrap();
+        entry["sha256"] = json!(state::digest(b"old contract"));
+        entry["size"] = json!(12);
+        state::write_json(&inventory_path, &inventory).unwrap();
+        let before = fs::read(&inventory_path).unwrap();
+        let result = rollback_preflight(&paths).unwrap();
+        assert_eq!(result["targets"][0]["eligible"], true);
+        assert_eq!(result["targets"][1]["eligible"], false);
+        assert_eq!(
+            result["targets"][1]["reason"],
+            "compatibility_manifest_mismatch"
+        );
+        assert_eq!(fs::read(&inventory_path).unwrap(), before);
+        assert!(!paths.operation().exists());
+        assert!(!paths.current().exists());
+        assert!(validate_rollback_target(&paths.versions().join("1.2.4"), "1.2.4").is_err());
+        fs::write(paths.versions().join("1.2.3/bin/loomex"), b"tamper").unwrap();
+        assert_eq!(
+            rollback_preflight(&paths).unwrap()["targets"][0]["reason"],
+            "inventory_verification_failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn unowned_rollback_is_typed_before_service_calls() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        make_compatible_target(&paths);
+        assert_eq!(
+            rollback(&paths, "9.9.9").await.unwrap_err().to_string(),
+            "VERSION_NOT_OWNED"
+        );
+        assert!(!paths.operation().exists());
+        assert!(!paths.current().exists());
+    }
+
+    #[tokio::test]
+    async fn process_inspection_bounds_actual_pipes_and_rejects_late_observations() {
+        let targets = vec![PathBuf::from("/fixture/retained")];
+        for (script, limit, timeout, expected) in [
+            ("printf 'n/unrelated\\n'; exit 0", 1024, 1000, None),
+            ("exit 1", 1024, 1000, None),
+            (
+                "yes 'n/unrelated'",
+                4096,
+                1000,
+                Some("PRUNE_PROCESS_OBSERVATION_UNAVAILABLE"),
+            ),
+            (
+                "yes 'diagnostic' >&2",
+                4096,
+                1000,
+                Some("PRUNE_PROCESS_OBSERVATION_UNAVAILABLE"),
+            ),
+            (
+                "sleep 1",
+                4096,
+                30,
+                Some("PRUNE_PROCESS_OBSERVATION_UNAVAILABLE"),
+            ),
+            (
+                "printf 'n/unrelated\\n'; sleep 0.02; printf diagnostic >&2",
+                4096,
+                1000,
+                Some("PRUNE_PROCESS_OBSERVATION_UNAVAILABLE"),
+            ),
+            (
+                "printf 'n/unrelated\\n'; sleep 0.02; printf 'n/fixture/retained/bin/loomex\\n'",
+                4096,
+                1000,
+                Some("PRUNE_VERSION_IN_USE"),
+            ),
+            (
+                "printf 'n/fixture/retained/bin/loomex'",
+                4096,
+                1000,
+                Some("PRUNE_VERSION_IN_USE"),
+            ),
+            (
+                "printf 'n/fixture/retained-other/bin/loomex\\n'",
+                4096,
+                1000,
+                None,
+            ),
+            (
+                "exit 2",
+                4096,
+                1000,
+                Some("PRUNE_PROCESS_OBSERVATION_UNAVAILABLE"),
+            ),
+        ] {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.args(["-c", script]);
+            let started = std::time::Instant::now();
+            let result = inspect_prune_processes(
+                &mut command,
+                &targets,
+                Duration::from_millis(timeout),
+                limit,
+            )
+            .await;
+            match expected {
+                Some(code) => assert_eq!(result.unwrap_err().to_string(), code, "{script}"),
+                None => result.unwrap(),
+            }
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+    }
 
     fn paths(root: &Path) -> Paths {
         let root = fs::canonicalize(root).unwrap();
@@ -4911,7 +5295,7 @@ mod tests {
                 );
                 let reply = json!({"protocol":crate::control::PROTOCOL,"id":request["id"],"result":{
                     "selectedProtocol":crate::control::PROTOCOL,"serverVersion":"0.4.0",
-                    "maxFrameBytes":crate::control::MAX_FRAME,"capabilities":["method:auth.status"]}});
+                    "maxFrameBytes":crate::control::MAX_FRAME,"capabilities":["method:auth.status", "auth:startup-observation/v1"]}});
                 write
                     .write_all(format!("{reply}\n").as_bytes())
                     .await
@@ -4920,13 +5304,13 @@ mod tests {
                 read.read_line(&mut line).await.unwrap();
                 let request: Value = serde_json::from_str(&line).unwrap();
                 assert_eq!(request["method"], "auth.status");
-                assert_eq!(request["params"], json!({}));
+                assert_eq!(request["params"], json!({"observation":"startup"}));
                 let index = observed
                     .fetch_add(1, Ordering::SeqCst)
                     .min(observations.len() - 1);
                 tokio::time::sleep(reply_delay).await;
                 let status = match &shared_auth {
-                    Some(auth) => auth.status().await.unwrap(),
+                    Some(auth) => auth.startup_status().await.unwrap(),
                     None => observations[index].clone(),
                 };
                 let reply =

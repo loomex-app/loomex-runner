@@ -456,7 +456,14 @@
       "idempotent": true,
       "inputSchema": {
         "type": "object",
-        "properties": {},
+        "properties": {
+          "observation": {
+            "type": "string",
+            "enum": [
+              "startup"
+            ]
+          }
+        },
         "required": [],
         "additionalProperties": false
       },
@@ -10959,6 +10966,7 @@
     "workflows.canonical-authoring-contract/v1",
     "workflows.runtime-draft-mutations/v1",
     "auth:browser-pkce/v1",
+    "auth:startup-observation/v1",
     "workflows.patch.notes-preserve/v1",
     "method:persona.roles.list",
     "method:persona.roles.get",

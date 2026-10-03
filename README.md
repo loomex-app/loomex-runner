@@ -1,5 +1,7 @@
 # Loomex runner
 
+Current workspace installation and delivery status: [authoritative reliability status](../planning/plugin-runner-integration/reliability-persona-performance-2026-10-03/current-status.md). Source package versions and historical examples below do not establish an installed candidate.
+
 A fresh macOS per-user execution service. `loomex-runner` is the private daemon;
 `loomex` is the public CLI. This project has no old runner imports, state migration,
 or legacy command aliases.
@@ -7,7 +9,7 @@ or legacy command aliases.
 The product version is sourced from the package metadata in `Cargo.toml` at
 build time. It is separate from
 the local-control protocol (`loomex.local-control/v2`) and the method-catalog
-contract version (`0.3.0`); those compatibility identifiers change
+contract version (`0.3.8`); those compatibility identifiers change
 independently of the product release version.
 
 `contracts/compatibility-manifest.json` is the deterministic compatibility
@@ -55,7 +57,7 @@ or installed-host acceptance claim.
 
 ## Build and test
 
-Rust 1.85+ is required. Dependency resolution is pinned by `Cargo.lock`.
+Rust 1.88+ is required; development distribution qualification pins Rust 1.88.0. Dependency resolution is pinned by `Cargo.lock`.
 
 ```sh
 cargo test --locked
@@ -150,8 +152,29 @@ before publishing the destination file.
 
 ## Data and service lifecycle
 
+Before upgrading, run the candidate CLI's read-only
+`lifecycle status --rollback-preflight --json` against the installation. Its
+`rollbackPreflight` detail reports each owned version's integrity and eligibility
+under that CLI's compiled compatibility manifest, including the current version
+that would become the fallback. Run the candidate binary directly so the report
+uses the new controller's contract. `compatibility_manifest_mismatch` means
+ordinary rollback and prune retention are unsupported through that controller;
+retaining bytes alone does not qualify a downgrade. The report does not contact
+the daemon or authorize activation. Every mutation still verifies fresh state,
+identity, inventory and daemon admission independently.
+
+The lifecycle command option matrix is explicit: `status` accepts
+`--rollback-preflight`; `rollback` requires `--to` and optionally accepts
+`--expected-operation`; `prune` requires repeatable `--remove` and `--retain`;
+`resume` and `repair` have no action-specific flags. All five accept `--json`
+and the three directory overrides. Help accepts no options and requires no
+installation discovery. Missing values, duplicate single-value flags, duplicate
+prune versions and flags for another action fail with `INVALID_ARGUMENT` before
+filesystem discovery. A valid version absent from ownership fails with
+`VERSION_NOT_OWNED`.
+
 The local CLI can prune exact superseded installed runner versions after an
-update: `loomex lifecycle prune --remove 0.3.73 --retain 0.3.76` (repeat
+update. Historical example only: `loomex lifecycle prune --remove 0.3.73 --retain 0.3.76` (repeat
 `--remove` for each reviewed version). The active version is retained
 automatically; `--retain` must name at least one verified, noncurrent rollback
 version. Prune requires a healthy idle daemon, an exact current receipt, and
@@ -220,3 +243,22 @@ Artifact content reads and downloads require both `artifactId` and the explicit
 forwards that same execution ID to the backend, including workflow-shared inputs.
 The backend retains execution, organization, and artifact provenance checks; the
 runner never infers an execution from an artifact ID or recent session state.
+
+## Local build iteration and failure evidence
+
+`scripts/build-dev-fast.sh` builds incremental Rust 1.88 dev binaries for local
+iteration. Its outputs are development binaries and do not establish package,
+distribution-dev, signing or immutable release qualification. Use
+`scripts/build-release.sh --unsigned-development` for qualified development
+artifacts; the immutable source snapshot, locked tests, compatibility check,
+distribution-dev guards, package validation and home-path checks remain required.
+
+The immutable builder accepts `--retain-failure-workspace DIR`. On failure it
+reserves a new owner-only directory and retains the private source snapshot,
+compiler/dependency outputs, sanitized Cargo log, invocation metadata and SHA-256
+identities of dependency build outputs. It refuses an existing destination.
+Logs redact configured secrets and build/home paths; source and compiler outputs
+remain private source material. Default cleanup and successful-build cleanup
+still remove the temporary workspace. Retention provides diagnostic evidence and
+does not reuse a cache or bypass tests. Repeated unchanged immutable builds have
+not been benchmarked here.

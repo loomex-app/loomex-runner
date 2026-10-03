@@ -105,6 +105,8 @@ pub(super) struct Journal {
     pub(super) first_failure_diagnostic: Option<DeliveryDiagnostic>,
     #[serde(skip)]
     pub(super) event_sender: Arc<tokio::sync::Mutex<()>>,
+    #[serde(skip)]
+    pub(super) durable_writer: Arc<EvidenceIo>,
     #[serde(default)]
     pub(super) stdout_pending: Option<usize>,
     #[serde(default)]
@@ -137,37 +139,298 @@ pub(super) struct Observer {
     pub(super) journal: Arc<Mutex<Journal>>,
 }
 impl ExecutionObserver for Observer {
+    fn after_blocking(&self) -> Result<()> {
+        let j = snapshot(&self.journal)?;
+        let supervisor = j.durable_writer.supervisor.lock().unwrap().clone();
+        let binding = j.durable_writer.launch_binding.lock().unwrap();
+        anyhow::ensure!(
+            binding
+                .as_ref()
+                .is_none_or(|expected| expected == &local_execution_binding(&j)),
+            "LOCAL_EXECUTION_AUTHORIZATION_REQUIRED"
+        );
+        anyhow::ensure!(
+            matches!(j.phase, JournalPhase::SpawnIntent | JournalPhase::Running)
+                && j.job["leasedUntilEpochMs"].as_u64().unwrap_or(0) > now_millis()
+                && j.recovery_session.is_none()
+                && j.job["status"] != "canceling"
+                && supervisor.is_none_or(|owner| !owner.is_draining() && !owner.logout_requested()),
+            "LOCAL_EXECUTION_AUTHORIZATION_REQUIRED"
+        );
+        Ok(())
+    }
+    fn blocking_guard(&self) -> Option<Box<dyn Send>> {
+        let j = snapshot(&self.journal).ok()?;
+        let mut binding = j.durable_writer.launch_binding.lock().ok()?;
+        binding.get_or_insert_with(|| local_execution_binding(&j));
+        Some(Box::new(j.durable_writer.own()))
+    }
     fn before_spawn(&self, _: &ExecutionRequest) -> Result<()> {
-        let mut j = self
-            .journal
-            .lock()
-            .map_err(|_| anyhow::anyhow!("journal lock"))?;
-        j.transition(JournalPhase::SpawnIntent)?;
-        persist(&self.path, &j)
+        update_sync(&self.path, &self.journal, |j| {
+            j.transition(JournalPhase::SpawnIntent)
+        })
     }
     fn spawned(&self, identity: &ProcessIdentity) -> Result<()> {
-        let mut j = self
-            .journal
-            .lock()
-            .map_err(|_| anyhow::anyhow!("journal lock"))?;
-        j.identity = Some(identity.clone());
-        j.transition(JournalPhase::Running)?;
-        persist(&self.path, &j)
+        update_sync(&self.path, &self.journal, |j| {
+            j.identity = Some(identity.clone());
+            j.transition(JournalPhase::Running)
+        })
     }
 }
+
+fn local_execution_binding(j: &Journal) -> Value {
+    json!({"organization":j.organization,"session":j.session,"recoverySession":j.recovery_session,
+        "terminalKey":j.terminal_key,"jobId":j.job["id"],"runnerId":j.job["runnerId"],
+        "connectionGeneration":j.job["connectionGeneration"],"payloadDigest":j.job["payloadDigest"]})
+}
+
 pub(super) fn snapshot(j: &Arc<Mutex<Journal>>) -> Result<Journal> {
     Ok(j.lock()
         .map_err(|_| anyhow::anyhow!("journal lock"))?
         .clone())
 }
-pub(super) fn save(j: &Arc<Mutex<Journal>>, path: &Path) -> Result<()> {
-    let record = j.lock().map_err(|_| anyhow::anyhow!("journal lock"))?;
-    persist(path, &record)
-}
-
 /// All production writes of job evidence pass through this durability boundary.
 pub(super) fn persist(path: &Path, record: &Journal) -> Result<()> {
     state::write_json(path, record)
+}
+
+/// Serialize the entire read/change/fsync/publish transaction without holding
+/// the journal snapshot mutex during disk I/O. Readers observe only committed
+/// records. A synchronous spawn observer uses this same per-job writer gate.
+pub(super) fn update_sync<T>(
+    path: &Path,
+    journal: &Arc<Mutex<Journal>>,
+    change: impl FnOnce(&mut Journal) -> Result<T>,
+) -> Result<T> {
+    let writer = snapshot(journal)?.durable_writer;
+    let _writing = writer
+        .writer
+        .lock()
+        .map_err(|_| anyhow::anyhow!("journal writer lock"))?;
+    let mut next = snapshot(journal)?;
+    let result = change(&mut next)?;
+    #[cfg(test)]
+    if let Some((ready, release)) = writer.delay_write.lock().unwrap().take() {
+        let _ = ready.send(());
+        release
+            .recv_timeout(Duration::from_secs(5))
+            .context("delayed write release")?;
+    }
+    persist(path, &next)?;
+    #[cfg(test)]
+    writer.commits.fetch_add(1, Ordering::SeqCst);
+    *journal
+        .lock()
+        .map_err(|_| anyhow::anyhow!("journal lock"))? = next;
+    Ok(result)
+}
+
+// Shared by artifact hashing and asynchronous journal commits. Admission is
+// bounded before spawn_blocking; cancellation drops only the waiter, never the
+// worker's permit or daemon quiescence ownership.
+const BLOCKING_IO_WORKERS: usize = 2;
+#[derive(Default)]
+pub(super) struct EvidenceIo {
+    writer: Mutex<()>,
+    pending: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+    pub(super) supervisor: Mutex<Option<Arc<supervisor::ExecutionSupervisor>>>,
+    launch_binding: Mutex<Option<Value>>,
+    #[cfg(test)]
+    pub(super) delay_write: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
+    pub(super) delay_hash: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
+    pub(super) test_slots: Mutex<Option<Arc<TestIoSlots>>>,
+    #[cfg(test)]
+    pub(super) commits: std::sync::atomic::AtomicUsize,
+}
+impl EvidenceIo {
+    pub(super) fn own(self: &Arc<Self>) -> EvidenceOwnership {
+        self.pending.fetch_add(1, Ordering::SeqCst);
+        let supervisor = self.supervisor.lock().unwrap().clone();
+        if let Some(owner) = &supervisor {
+            owner.begin_quiescence();
+        }
+        EvidenceOwnership {
+            evidence: self.clone(),
+            supervisor,
+        }
+    }
+    pub(super) async fn wait_idle(&self) {
+        loop {
+            let wake = self.idle.notified();
+            if self.pending.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            wake.await;
+        }
+    }
+}
+pub(super) struct EvidenceOwnership {
+    evidence: Arc<EvidenceIo>,
+    supervisor: Option<Arc<supervisor::ExecutionSupervisor>>,
+}
+impl Drop for EvidenceOwnership {
+    fn drop(&mut self) {
+        if let Some(owner) = &self.supervisor {
+            owner.end_quiescence();
+        }
+        self.evidence.pending.fetch_sub(1, Ordering::SeqCst);
+        self.evidence.idle.notify_waiters();
+    }
+}
+pub(crate) async fn blocking_io<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let permit = SLOTS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(BLOCKING_IO_WORKERS)))
+        .clone()
+        .acquire_owned()
+        .await?;
+    run_blocking(permit, work).await
+}
+
+async fn run_blocking<T: Send + 'static>(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => Err(error).context("job I/O worker"),
+    }
+}
+pub(super) async fn job_io<T: Send + 'static>(
+    daemon: &Daemon,
+    journal: &Arc<Mutex<Journal>>,
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let evidence = snapshot(journal)?.durable_writer;
+    *evidence.supervisor.lock().unwrap() = Some(daemon.execution.clone());
+    let owner = evidence.own();
+    let owned_work = move || {
+        let _owner = owner;
+        work()
+    };
+    #[cfg(test)]
+    {
+        let slots = evidence.test_slots.lock().unwrap().clone();
+        if let Some(slots) = slots {
+            let permit = slots.blocking.clone().acquire_owned().await?;
+            return run_blocking(permit, owned_work).await;
+        }
+    }
+    blocking_io(owned_work).await
+}
+/// Hash admission precedes shared blocking admission, reserving one of the two
+/// actual workers for journal/observer durability even with many large files.
+pub(super) async fn job_hash_io<T: Send + 'static>(
+    daemon: &Daemon,
+    journal: &Arc<Mutex<Journal>>,
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let permit = hash_slot(journal)?.acquire_owned().await?;
+    #[cfg(test)]
+    let evidence = snapshot(journal)?.durable_writer;
+    job_io(daemon, journal, move || {
+        let _hash_permit = permit;
+        #[cfg(test)]
+        if let Some((ready, release)) = evidence.delay_hash.lock().unwrap().take() {
+            let _ = ready.send(());
+            release
+                .recv_timeout(Duration::from_secs(5))
+                .context("delayed hash release")?;
+        }
+        work()
+    })
+    .await
+}
+fn hash_slot(journal: &Arc<Mutex<Journal>>) -> Result<Arc<tokio::sync::Semaphore>> {
+    #[cfg(test)]
+    if let Some(slots) = snapshot(journal)?
+        .durable_writer
+        .test_slots
+        .lock()
+        .unwrap()
+        .clone()
+    {
+        return Ok(slots.hashing.clone());
+    }
+    #[cfg(not(test))]
+    let _ = journal;
+    static HASH_SLOT: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    Ok(HASH_SLOT
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone())
+}
+
+/// Fault fixtures hold workers for seconds. Their private admissions use the
+/// same executor and bounds, without saturating unrelated fixture runtimes.
+/// Ordinary fixtures and every production caller keep the process-global slots.
+#[cfg(test)]
+pub(super) struct TestIoSlots {
+    blocking: Arc<tokio::sync::Semaphore>,
+    hashing: Arc<tokio::sync::Semaphore>,
+}
+#[cfg(test)]
+impl Default for TestIoSlots {
+    fn default() -> Self {
+        Self {
+            blocking: Arc::new(tokio::sync::Semaphore::new(BLOCKING_IO_WORKERS)),
+            hashing: Arc::new(tokio::sync::Semaphore::new(1)),
+        }
+    }
+}
+
+pub(super) async fn update<T: Send + 'static>(
+    daemon: &Daemon,
+    path: &Path,
+    journal: &Arc<Mutex<Journal>>,
+    change: impl FnOnce(&mut Journal) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let path = path.to_owned();
+    let journal = journal.clone();
+    let ownership_journal = journal.clone();
+    job_io(daemon, &ownership_journal, move || {
+        update_sync(&path, &journal, change)
+    })
+    .await
+}
+
+/// The worker keeps the event sender lock through fsync, even when its waiter
+/// is aborted. A terminal drain or replacement sender cannot overtake it.
+pub(super) async fn update_while_sending<T: Send + 'static>(
+    daemon: &Daemon,
+    path: &Path,
+    journal: &Arc<Mutex<Journal>>,
+    sender: Arc<tokio::sync::OwnedMutexGuard<()>>,
+    change: impl FnOnce(&mut Journal) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let path = path.to_owned();
+    let journal = journal.clone();
+    let ownership_journal = journal.clone();
+    job_io(daemon, &ownership_journal, move || {
+        let _sender = sender;
+        update_sync(&path, &journal, change)
+    })
+    .await
 }
 
 #[cfg(test)]

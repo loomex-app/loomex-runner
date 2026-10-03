@@ -54,18 +54,20 @@ pub(super) fn delivery_diagnostic(
     }
 }
 
-fn block_delivery(
+async fn block_delivery(
+    daemon: &Daemon,
     path: &Path,
     journal: &Arc<Mutex<Journal>>,
     category: DeliveryDiagnosticCategory,
     error: &anyhow::Error,
 ) -> Result<()> {
-    let mut record = journal
-        .lock()
-        .map_err(|_| anyhow::anyhow!("journal lock"))?;
-    record.transition(JournalPhase::DeliveryBlocked)?;
-    record.delivery_diagnostic = Some(delivery_diagnostic(category, error));
-    persist(path, &record)
+    let diagnostic = delivery_diagnostic(category, error);
+    update(daemon, path, journal, move |record| {
+        record.transition(JournalPhase::DeliveryBlocked)?;
+        record.delivery_diagnostic = Some(diagnostic);
+        Ok(())
+    })
+    .await
 }
 
 pub(super) async fn handle_finalization_error(
@@ -75,15 +77,14 @@ pub(super) async fn handle_finalization_error(
     category: DeliveryDiagnosticCategory,
     error: anyhow::Error,
 ) -> Result<()> {
-    {
-        let mut record = journal
-            .lock()
-            .map_err(|_| anyhow::anyhow!("journal lock"))?;
+    let diagnostic = delivery_diagnostic(category, &error);
+    update(daemon, path, journal, move |record| {
         if record.first_failure_diagnostic.is_none() {
-            record.first_failure_diagnostic = Some(delivery_diagnostic(category, &error));
+            record.first_failure_diagnostic = Some(diagnostic);
         }
-    }
-    save(journal, path)?;
+        Ok(())
+    })
+    .await?;
     let code = error.to_string();
     if fence_error(&code)
         || delivery_blocked(&code)
@@ -93,8 +94,7 @@ pub(super) async fn handle_finalization_error(
     {
         retry_delivery(daemon, path, journal, category, error).await?;
     } else {
-        {
-            let mut record = journal.lock().unwrap();
+        update(daemon, path, journal, |record| {
             record.transition(JournalPhase::TerminalPending)?;
             // The original process result and spool paths remain private,
             // durable evidence. `deliver` sends only `error` when both exist.
@@ -102,8 +102,9 @@ pub(super) async fn handle_finalization_error(
                 "code":"ARTIFACT_FINALIZATION_FAILED",
                 "message":"Declared output could not be registered"
             }));
-        }
-        save(journal, path)?;
+            Ok(())
+        })
+        .await?;
     }
     Ok(())
 }
@@ -139,13 +140,14 @@ pub(super) async fn reclaim_terminal(
         (!reclaim_key.is_empty()).then_some(reclaim_key),
         || job_authority_unchanged(&j, journal, false),
     ).await?;
-    {
-        let mut record = journal.lock().unwrap();
+    let session = session.clone();
+    update(daemon, path, journal, move |record| {
         record.job = response["job"].clone();
-        record.session = session.clone();
+        record.session = session;
         record.recovery_session = None;
-    }
-    save(journal, path)
+        Ok(())
+    })
+    .await
 }
 pub(super) async fn retry_delivery(
     daemon: &Daemon,
@@ -163,7 +165,7 @@ pub(super) async fn retry_delivery(
                 .downcast_ref::<crate::api::ApiError>()
                 .is_some_and(|error| error.retryable)
         {
-            block_delivery(path, journal, category, &error)?;
+            block_delivery(daemon, path, journal, category, &error).await?;
             return Err(error);
         }
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -187,11 +189,13 @@ pub(super) async fn retry_delivery(
                     .is_some_and(|error| error.retryable)
             {
                 block_delivery(
+                    daemon,
                     path,
                     journal,
                     DeliveryDiagnosticCategory::LeaseReclaim,
                     &reclaim_error,
-                )?;
+                )
+                .await?;
                 return Err(reclaim_error);
             }
         }
@@ -200,7 +204,7 @@ pub(super) async fn retry_delivery(
             .downcast_ref::<crate::api::ApiError>()
             .is_some_and(|e| e.retryable)
     {
-        block_delivery(path, journal, category, &error)?;
+        block_delivery(daemon, path, journal, category, &error).await?;
         return Err(error);
     }
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -278,12 +282,12 @@ pub(super) async fn deliver(
         .await
         {
             Ok(_) => {
-                {
-                    let mut locked = journal.lock().unwrap();
+                update(&daemon, path, &journal, |locked| {
                     locked.transition(JournalPhase::Acknowledged)?;
                     locked.acknowledged_at = Some(state::now());
-                }
-                save(&journal, path)?;
+                    Ok(())
+                })
+                .await?;
                 return Ok(());
             }
             Err(error) => {

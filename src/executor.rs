@@ -110,6 +110,13 @@ impl Drop for OwnedGroupGuard {
 }
 
 pub trait ExecutionObserver: Send + Sync {
+    fn after_blocking(&self) -> Result<()> {
+        Ok(())
+    }
+    /// Optional job evidence ownership retained by the actual blocking worker.
+    fn blocking_guard(&self) -> Option<Box<dyn Send>> {
+        None
+    }
     /// Persist and sync execution intent before any process is created.
     fn before_spawn(&self, request: &ExecutionRequest) -> Result<()>;
     /// Persist and sync guardian identity before authorizing the target to start.
@@ -246,7 +253,14 @@ pub async fn execute_with_supervisor(
     let stderr_file = private_file(&stderr_path)?;
     private_file(&status_path)?.sync_all()?;
     File::open(&request.output_dir)?.sync_all()?;
-    request.observer.before_spawn(&request)?;
+    let observer_owner = request.observer.blocking_guard();
+    let request = crate::jobs::blocking_io(move || {
+        let _owner = observer_owner;
+        request.observer.before_spawn(&request)?;
+        Ok(request)
+    })
+    .await?;
+    request.observer.after_blocking()?;
     let mut command = tokio::process::Command::new(program);
     command
         .arg(SUPERVISOR)
@@ -275,7 +289,16 @@ pub async fn execute_with_supervisor(
     };
     let mut control = child.stdin.take().context("guardian control pipe")?;
     // Until this durable write succeeds, the guardian cannot spawn the target.
-    if let Err(error) = request.observer.spawned(&identity) {
+    let observer = request.observer.clone();
+    let observer_identity = identity.clone();
+    let observer_owner = observer.blocking_guard();
+    if let Err(error) = crate::jobs::blocking_io(move || {
+        let _owner = observer_owner;
+        observer.spawned(&observer_identity)
+    })
+    .await
+    .and_then(|_| request.observer.after_blocking())
+    {
         signal_owned_group(&identity, libc::SIGKILL)?;
         let _ = child.wait().await;
         return Err(error.context("persist guardian identity; target not authorized"));

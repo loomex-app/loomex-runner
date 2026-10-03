@@ -51,6 +51,30 @@ class CompatibilityExportTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("contains duplicate values", result.stderr)
 
+    def test_startup_auth_observation_changes_only_optional_read_contract(self) -> None:
+        catalog = json.loads(CATALOG.read_text())
+        method = next(value for value in catalog["methods"] if value["name"] == "auth.status")
+        self.assertEqual(method["inputSchema"]["properties"], {
+            "observation": {"type": "string", "enum": ["startup"]},
+        })
+        self.assertEqual(method["inputSchema"]["required"], [])
+        self.assertIn("auth:startup-observation/v1", catalog["capabilities"])
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "manifest.json"
+            result = self.run_export("--output", str(output))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            manifest = json.loads(output.read_text())
+            exported = next(value for value in manifest["methods"] if value["name"] == "auth.status")
+            self.assertFalse(exported["mutating"])
+            self.assertEqual(exported["classification"], "local-control")
+            self.assertEqual(exported["routeIds"], [])
+            self.assertEqual(exported["outputSchemaDigest"],
+                             "sha256:5f9260d8a5d4fb206556d4b2a8a6fca6fb75a3a19b0b39f764ac5e8b4aa0de5d")
+            # Former {} status remains accepted, but the manifest must record
+            # the reviewed optional startup input instead of its old digest.
+            self.assertNotEqual(exported["inputSchemaDigest"],
+                                "sha256:d0157ce84790721854763c7480015e84f7cb0c7fde53afb21c3a42908805bf35")
+
     def test_unclassified_catalog_method_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             routes = Path(temp) / "routes.json"

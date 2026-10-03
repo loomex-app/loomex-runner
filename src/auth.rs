@@ -24,7 +24,12 @@ use tokio::{
 const SERVICE: &str = "app.loomex.runner.v1";
 const ACCOUNT: &str = "installation";
 pub(crate) const STORE_IO_BUDGET: Duration = Duration::from_secs(2);
-pub(crate) const AUTH_LOCK_BUDGET: Duration = Duration::from_secs(15);
+// Admission to the single auth operation owner is independent of network work.
+// Store access retains its separate two-second IO budget.
+pub(crate) const AUTH_LOCK_BUDGET: Duration = Duration::from_secs(2);
+// Retains the qualified startup observation allowance independently of ordinary
+// operation admission. Health may wait for an existing owner, never recover it.
+const AUTH_STARTUP_OBSERVATION_BUDGET: Duration = Duration::from_secs(15);
 
 fn credential_store_code(error: &anyhow::Error) -> &'static str {
     match error.to_string().as_str() {
@@ -366,7 +371,8 @@ impl ProtectedState {
 pub struct Auth {
     api: Api,
     store: Arc<dyn Store>,
-    lock: Arc<Mutex<()>>,
+    // Serializes complete auth operations, including exact-proof recovery.
+    operation_lock: Arc<Mutex<()>>,
     store_lock: Arc<Mutex<()>>,
     store_owner: Arc<std::sync::Mutex<Option<std::sync::Weak<std::fs::File>>>>,
     listeners: Arc<Mutex<BTreeMap<String, JoinHandle<()>>>>,
@@ -377,7 +383,7 @@ impl Auth {
         Self {
             api,
             store: Arc::new(MemoryStore::default()),
-            lock: Arc::new(Mutex::new(())),
+            operation_lock: Arc::new(Mutex::new(())),
             store_lock: Arc::new(Mutex::new(())),
             store_owner: Arc::new(std::sync::Mutex::new(None)),
             listeners: Arc::new(Mutex::new(BTreeMap::new())),
@@ -499,13 +505,13 @@ impl Auth {
     }
     #[cfg(test)]
     pub(crate) async fn test_hold_credential_gate(&self) -> tokio::sync::OwnedMutexGuard<()> {
-        self.lock.clone().lock_owned().await
+        self.operation_lock.clone().lock_owned().await
     }
     pub fn new(api: Api) -> Result<Self> {
         Ok(Self {
             api,
             store: Arc::new(NativeStore),
-            lock: Arc::new(Mutex::new(())),
+            operation_lock: Arc::new(Mutex::new(())),
             store_lock: Arc::new(Mutex::new(())),
             store_owner: Arc::new(std::sync::Mutex::new(None)),
             listeners: Arc::new(Mutex::new(BTreeMap::new())),
@@ -517,9 +523,9 @@ impl Auth {
         *self.store_owner.lock().unwrap() = Some(Arc::downgrade(owner));
     }
     async fn auth_guard(&self) -> Result<tokio::sync::MutexGuard<'_, ()>> {
-        tokio::time::timeout(AUTH_LOCK_BUDGET, self.lock.lock())
+        tokio::time::timeout(AUTH_LOCK_BUDGET, self.operation_lock.lock())
             .await
-            .map_err(|_| anyhow!("STORE_UNAVAILABLE"))
+            .map_err(|_| anyhow!("AUTH_RECOVERY_PENDING"))
     }
     async fn store_operation<T: Send + 'static>(
         &self,
@@ -581,11 +587,22 @@ impl Auth {
     async fn required(&self) -> Result<ProtectedState> {
         self.load().await?.ok_or_else(|| anyhow!("AUTH_REQUIRED"))
     }
+    async fn revalidate(&self, expected: &ProtectedState) -> Result<()> {
+        let current = self.required().await?;
+        ensure!(
+            serde_json::to_vec(&current)? == serde_json::to_vec(expected)?,
+            "AUTH_IDENTITY_CHANGED"
+        );
+        Ok(())
+    }
     fn allowed(state: &ProtectedState) -> Result<()> {
         ensure!(!state.logout_pending, "LOGOUT_PENDING");
         Ok(())
     }
     pub async fn installation_id(&self) -> Result<String> {
+        if let Some(state) = self.load().await? {
+            return Ok(state.installation_id);
+        }
         let _guard = self.auth_guard().await?;
         let state = match self.load().await? {
             Some(state) => state,
@@ -598,7 +615,6 @@ impl Auth {
         Ok(state.installation_id)
     }
     pub async fn enrolled_organizations(&self) -> Result<Vec<String>> {
-        let _guard = self.auth_guard().await?;
         let Some(state) = self.load().await? else {
             return Ok(vec![]);
         };
@@ -606,7 +622,6 @@ impl Auth {
         Ok(state.children.keys().cloned().collect())
     }
     pub async fn status(&self) -> Result<Value> {
-        let _guard = self.auth_guard().await?;
         match self.load().await {
             Err(error) => Ok(
                 json!({"authenticated":false,"code":credential_store_code(&error),"loginPending":false}),
@@ -618,6 +633,15 @@ impl Auth {
                 json!({"authenticated":state.device.is_some() && !state.logout_pending,"code":if state.logout_pending {"LOGOUT_PENDING"} else if state.pending.is_some() {"AUTH_RECOVERY_PENDING"} else if state.device.is_some() {"AUTHENTICATED"} else {"AUTH_REQUIRED"},"installationId":state.installation_id,"activeOrganization":state.active_organization,"organizations":state.children.keys().collect::<Vec<_>>(),"loginPending":state.login.is_some()}),
             ),
         }
+    }
+    /// Internal lifecycle observation of an existing operation owner. Ordinary
+    /// public snapshots remain store-bounded; this never refreshes or recovers.
+    pub(crate) async fn startup_status(&self) -> Result<Value> {
+        let _guard =
+            tokio::time::timeout(AUTH_STARTUP_OBSERVATION_BUDGET, self.operation_lock.lock())
+                .await
+                .map_err(|_| anyhow!("AUTH_RECOVERY_PENDING"))?;
+        self.status().await
     }
     /// Reconcile the exact durable authentication operation already stored in
     /// the Keychain. This never starts a new login, enrollment, or rotation.
@@ -671,10 +695,6 @@ impl Auth {
                 "login":Value::Null,
                 "details":{"credentialStoreCode":code},
             })
-        };
-        let _guard = match self.auth_guard().await {
-            Ok(guard) => guard,
-            Err(error) => return unavailable(credential_store_code(&error)),
         };
         let stored = match self.load().await {
             Ok(stored) => stored,
@@ -888,6 +908,7 @@ impl Auth {
             "clientId":"loomex-native/v1", "redirectUri":login.redirect_uri,
             "state":login.browser_state, "codeChallenge":challenge,
         })), None, Some(key)).await?;
+        self.revalidate(&state).await?;
         let uri = self.api.browser_authorization_uri(
             &field(&data, "authorizationPath")?,
             &field(&data, "transactionId")?,
@@ -1144,6 +1165,7 @@ impl Auth {
             .api
             .request("GET", "v2/organizations/", None, Some(&credential), None)
             .await?;
+        self.revalidate(&state).await?;
         let mut profiles = BTreeMap::new();
         let orgs = data["organizations"]
             .as_array()
@@ -1238,6 +1260,8 @@ impl Auth {
     /// Returns the already-enrolled local child identity without refreshing,
     /// recovering, persisting, or contacting the backend.
     pub async fn current_child_identity(&self, org: &str) -> Result<(String, String)> {
+        // Preserve FIFO ordering with owner mutations queued during refresh.
+        // A raw store snapshot can overtake the already admitted subject change.
         let _guard = self.auth_guard().await?;
         let state = self.required().await?;
         Self::allowed(&state)?;
@@ -1306,6 +1330,7 @@ impl Auth {
                     Some(key),
                 )
                 .await?;
+            self.revalidate(&state).await?;
             ensure!(
                 enrolled["runner"]["id"] == runner_id,
                 "AUTH_IDENTITY_CHANGED"
@@ -1327,6 +1352,7 @@ impl Auth {
                 "AUTH_IDENTITY_CHANGED"
             );
             let receipt = self.api.request("POST",&format!("v2/device-authorities/organizations/{org}/scope-upgrade/"),Some(json!({"delegationId":record["delegationId"],"requestedScopes":scopes,"idempotencyKey":key})),Some(&credential),Some(key)).await.map_err(|error| if error.retryable { anyhow!("NETWORK_AMBIGUOUS") } else { error.into() })?;
+            self.revalidate(&state).await?;
             for identity in ["deviceId", "runnerId", "delegationId", "organizationId"] {
                 ensure!(
                     receipt[identity] == record[identity],
@@ -1402,28 +1428,121 @@ impl Auth {
         bail!("AUTH_SCOPE_VERIFICATION_REQUIRED")
     }
     pub async fn scope_status(&self, org: &str) -> Result<Value> {
+        uuid::Uuid::parse_str(org).map_err(|_| anyhow!("INVALID_REQUEST"))?;
         let _guard = self.auth_guard().await?;
-        let state = self.required().await?;
+        let mut state = self.required().await?;
         Self::allowed(&state)?;
+        if state.pending.is_some() {
+            self.recover(&mut state).await?;
+        }
+        // A local metadata cache is not current grant authority. Self is a
+        // signed, read-only discovery of the existing child attachment.
+        for attempt in 0..2 {
+            let child = state
+                .children
+                .get(org)
+                .ok_or_else(|| anyhow!("ORGANIZATION_NOT_ENROLLED"))?;
+            if !child.usable() {
+                self.refresh_child(&mut state, org).await?;
+            }
+            let child = &state.children[org];
+            let credential = child.signed(&state);
+            let response = self
+                .api
+                .request("GET", "v1/self/", None, Some(&credential), None)
+                .await;
+            self.revalidate(&state).await?;
+            let data = response?;
+            let context = data
+                .get("scopeContext")
+                .filter(|context| context.is_object())
+                .ok_or_else(|| anyhow!("AUTH_SCOPE_VERIFICATION_REQUIRED"))?;
+            ensure!(context["organizationId"] == org, "AUTH_IDENTITY_CHANGED");
+            let granted = context["grantedScopes"]
+                .as_array()
+                .filter(|scopes| scopes.iter().all(Value::is_string))
+                .ok_or_else(|| anyhow!("INVALID_API_RESPONSE"))?;
+            let metadata = persona_credential_metadata(
+                &json!({"organizationId":context["organizationId"],"runnerId":context["runnerId"],"deviceId":context["deviceId"],"delegationId":context["delegationId"],"scopes":context["effectiveTokenScopes"]}),
+                org,
+            )?;
+            ensure!(
+                data["runner"]["id"] == child.subject
+                    && data["runner"]["organizationId"] == org
+                    && metadata["runnerId"] == child.subject
+                    && state
+                        .device
+                        .as_ref()
+                        .is_some_and(|device| metadata["deviceId"] == device.subject),
+                "AUTH_IDENTITY_CHANGED"
+            );
+            if let Some(cached) = state.persona_state.get(&format!("credential:{org}")) {
+                for identity in ["organizationId", "runnerId", "deviceId", "delegationId"] {
+                    ensure!(
+                        cached[identity] == metadata[identity],
+                        "AUTH_IDENTITY_CHANGED"
+                    );
+                }
+            }
+            ensure!(
+                data["tokenScopes"] == metadata["scopes"],
+                "INVALID_API_RESPONSE"
+            );
+            // A grant can have been explicitly upgraded while this access token
+            // predates it. Only ordinary rotation is permitted by a status read.
+            let effective = metadata["scopes"].as_array().unwrap();
+            let mut normalized_grant = granted.clone();
+            for (source, implied) in [
+                ("runner.personas.chat", "runner.personas.read"),
+                (
+                    "runner.personas.memory.write",
+                    "runner.personas.memory.read",
+                ),
+            ] {
+                if granted.contains(&json!(source)) && !normalized_grant.contains(&json!(implied)) {
+                    normalized_grant.push(json!(implied));
+                }
+            }
+            ensure!(
+                effective.iter().all(|scope| !scope
+                    .as_str()
+                    .is_some_and(|scope| PERSONA_SCOPES.contains(&scope))
+                    || normalized_grant.contains(scope)),
+                "INVALID_API_RESPONSE"
+            );
+            let token_stale = normalized_grant.iter().any(|scope| {
+                scope
+                    .as_str()
+                    .is_some_and(|scope| PERSONA_SCOPES.contains(&scope))
+                    && !effective.contains(scope)
+            });
+            if token_stale {
+                if attempt == 0 {
+                    self.refresh_child(&mut state, org).await?;
+                    continue;
+                }
+                bail!("AUTH_SCOPE_VERIFICATION_REQUIRED");
+            }
+            let mut result = metadata;
+            result["status"] = json!("verified");
+            return Ok(result);
+        }
+        bail!("AUTH_SCOPE_VERIFICATION_REQUIRED")
+    }
+    async fn refresh_child(&self, state: &mut ProtectedState, org: &str) -> Result<()> {
         let child = state
             .children
             .get(org)
             .ok_or_else(|| anyhow!("ORGANIZATION_NOT_ENROLLED"))?;
-        let mut metadata = state
-            .persona_state
-            .get(&format!("credential:{org}"))
-            .cloned()
-            .ok_or_else(|| anyhow!("AUTH_SCOPE_VERIFICATION_REQUIRED"))?;
-        ensure!(
-            metadata["runnerId"] == child.subject,
-            "AUTH_IDENTITY_CHANGED"
-        );
-        metadata["status"] = json!(if child.usable() {
-            "verified"
-        } else {
-            "expired"
-        });
-        Ok(metadata)
+        let refresh = child.refresh.clone();
+        let proof = key_proof(&state.private_key, "refresh", &refresh);
+        self.begin(
+            state,
+            Target::ChildRefresh(org.into()),
+            "v1/delegations/refresh/".into(),
+            json!({"refreshToken":refresh,"proof":proof}),
+        )
+        .await
     }
     pub async fn logout(&self) -> Result<Value> {
         let _guard = self.auth_guard().await?;
@@ -1499,6 +1618,7 @@ impl Auth {
                 )
                 .await?;
         }
+        self.revalidate(&state).await?;
         state.device = None;
         state.children.clear();
         state.organization_profiles.clear();
@@ -1601,7 +1721,7 @@ impl Auth {
         } else {
             None
         };
-        let data = match self
+        let response = self
             .api
             .request(
                 "POST",
@@ -1610,8 +1730,11 @@ impl Auth {
                 credential.as_ref(),
                 None,
             )
-            .await
-        {
+            .await;
+        // The operation owner never releases its gate across transport. Re-read
+        // the durable generation before adopting either success or rejection.
+        self.revalidate(state).await?;
+        let data = match response {
             Ok(data) => data,
             Err(error) => {
                 // A definite enrollment rejection issued no recoverable child
@@ -1819,6 +1942,164 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+    #[tokio::test]
+    async fn delayed_refresh_keeps_status_bounded_and_duplicate_rotation_serialized() {
+        let (auth, store, listener) = test_auth().await;
+        let mut state = ProtectedState::fresh();
+        state.device = Some(Token {
+            access: "lmxda_device_secret".into(),
+            refresh: "device-refresh".into(),
+            subject: "device".into(),
+            expires_at: now() + 3600,
+        });
+        for org in ["slow", "unaffected"] {
+            state.children.insert(
+                org.into(),
+                Token {
+                    access: "lmxr_child_secret".into(),
+                    refresh: "child-refresh".into(),
+                    subject: "runner".into(),
+                    expires_at: if org == "slow" { 0 } else { now() + 3600 },
+                },
+            );
+        }
+        auth.save(&state).await.unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let server_entered = entered.clone();
+        let server_release = release.clone();
+        let server = tokio::spawn(async move {
+            let (mut original, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut original).await;
+            server_entered.notify_one();
+            server_release.notified().await;
+            drop(original);
+            let (mut recovery, _) = listener.accept().await.unwrap();
+            let replay = read_request(&mut recovery).await;
+            assert_eq!(replay["refreshToken"], request["refreshToken"]);
+            assert_eq!(replay["proof"], request["proof"]);
+            assert_eq!(replay["recovery"], true);
+            respond(&mut recovery,200,json!({"data":{"accessToken":"lmxr_recovered_secret","refreshToken":"recovered-refresh","expiresInSeconds":3600}})).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let copy = auth.clone();
+        let operation = tokio::spawn(async move { copy.credential("slow").await });
+        entered.notified().await;
+        // This bounded equivalent reproduces the original >15s lock problem:
+        // readers must finish while the original transport remains withheld.
+        let status = tokio::time::timeout(Duration::from_millis(300), auth.status()).await;
+        let connection =
+            tokio::time::timeout(Duration::from_millis(300), auth.connection(None, 0)).await;
+        let duplicate = tokio::time::timeout(
+            AUTH_LOCK_BUDGET + Duration::from_millis(300),
+            auth.credential("unaffected"),
+        )
+        .await;
+        let durable: ProtectedState =
+            serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+        release.notify_one();
+        let recovered = operation.await.unwrap().unwrap();
+        server.await.unwrap();
+        assert_eq!(status.unwrap().unwrap()["code"], "AUTH_RECOVERY_PENDING");
+        assert_eq!(connection.unwrap()["state"], "recovery_pending");
+        assert_eq!(
+            duplicate.unwrap().err().unwrap().to_string(),
+            "AUTH_RECOVERY_PENDING"
+        );
+        assert!(durable.pending.is_some());
+        assert_eq!(recovered.token, "lmxr_recovered_secret");
+        assert_eq!(auth.status().await.unwrap()["code"], "AUTHENTICATED");
+    }
+    #[tokio::test]
+    async fn refresh_response_cannot_overwrite_durable_generation_or_identity_drift() {
+        for drift in ["installation", "subject", "generation", "logout"] {
+            let (auth, store, listener) = test_auth().await;
+            let mut state = ProtectedState::fresh();
+            state.children.insert(
+                "org".into(),
+                Token {
+                    access: "lmxr_old_secret".into(),
+                    refresh: "old-refresh".into(),
+                    subject: "runner".into(),
+                    expires_at: 0,
+                },
+            );
+            auth.save(&state).await.unwrap();
+            let copy = auth.clone();
+            let operation = tokio::spawn(async move { copy.credential("org").await });
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            let mut changed: ProtectedState =
+                serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+            match drift {
+                "installation" => changed.installation_id = "replacement".into(),
+                "subject" => {
+                    changed.children.get_mut("org").unwrap().subject = "replacement".into()
+                }
+                "generation" => {
+                    changed.children.get_mut("org").unwrap().refresh = "replacement-refresh".into()
+                }
+                "logout" => changed.logout_pending = true,
+                _ => unreachable!(),
+            }
+            let bytes = serde_json::to_vec(&changed).unwrap();
+            store.save(&bytes).unwrap();
+            respond(&mut stream,200,json!({"data":{"accessToken":"lmxr_new_secret","refreshToken":"new-refresh","expiresInSeconds":3600}})).await;
+            assert_eq!(
+                operation.await.unwrap().err().unwrap().to_string(),
+                "AUTH_IDENTITY_CHANGED",
+                "{drift}"
+            );
+            assert_eq!(store.load().unwrap().unwrap(), bytes, "{drift}");
+        }
+    }
+    #[tokio::test]
+    async fn startup_observation_waits_existing_owner_and_preserves_pending_refusal() {
+        let api = Api::for_test_origin("http://127.0.0.1:9").unwrap();
+        let auth = Auth::test_enrolled(api, "org", "runner");
+        let owner = auth.test_hold_credential_gate().await;
+        let mut state = auth.required().await.unwrap();
+        state.pending = Some(Pending {
+            target: Target::ChildRefresh("org".into()),
+            route: "v1/delegations/refresh/".into(),
+            body: json!({"refreshToken":"original","proof":"identical"}),
+            started_at: now(),
+            recovery_used: false,
+        });
+        auth.save(&state).await.unwrap();
+        let copy = auth.clone();
+        let observation = tokio::spawn(async move { copy.startup_status().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!observation.is_finished());
+        assert_eq!(
+            auth.status().await.unwrap()["code"],
+            "AUTH_RECOVERY_PENDING"
+        );
+        state.pending = None;
+        auth.save(&state).await.unwrap();
+        drop(owner);
+        assert_eq!(observation.await.unwrap().unwrap()["code"], "AUTHENTICATED");
+        state.pending = Some(Pending {
+            target: Target::ChildRefresh("org".into()),
+            route: "v1/delegations/refresh/".into(),
+            body: json!({"refreshToken":"original","proof":"identical"}),
+            started_at: now(),
+            recovery_used: false,
+        });
+        auth.save(&state).await.unwrap();
+        let before = auth.store.load().unwrap();
+        assert_eq!(
+            auth.startup_status().await.unwrap()["code"],
+            "AUTH_RECOVERY_PENDING"
+        );
+        assert_eq!(auth.store.load().unwrap(), before);
+        assert_eq!(AUTH_STARTUP_OBSERVATION_BUDGET, Duration::from_secs(15));
+        assert_eq!(AUTH_LOCK_BUDGET, Duration::from_secs(2));
     }
     #[tokio::test]
     async fn public_fixtures_use_only_memory() {
@@ -2082,7 +2363,7 @@ mod tests {
         let auth = Auth {
             api: Api::for_test_origin("http://127.0.0.1:9").unwrap(),
             store: Arc::new(Unavailable),
-            lock: Arc::new(Mutex::new(())),
+            operation_lock: Arc::new(Mutex::new(())),
             store_lock: Arc::new(Mutex::new(())),
             store_owner: Arc::new(std::sync::Mutex::new(None)),
             listeners: Arc::new(Mutex::new(BTreeMap::new())),
@@ -2188,6 +2469,9 @@ mod tests {
                     })
                     .unwrap_or(0);
                 if bytes.len() >= end + 4 + length {
+                    if length == 0 {
+                        return Value::Null;
+                    }
                     return serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap();
                 }
             }
@@ -2212,7 +2496,7 @@ mod tests {
         let auth = Auth {
             api,
             store: store.clone(),
-            lock: Arc::new(Mutex::new(())),
+            operation_lock: Arc::new(Mutex::new(())),
             store_lock: Arc::new(Mutex::new(())),
             store_owner: Arc::new(std::sync::Mutex::new(None)),
             listeners: Arc::new(Mutex::new(BTreeMap::new())),
@@ -2845,7 +3129,7 @@ mod tests {
         let auth = Auth {
             api: Api::for_test_origin("http://127.0.0.1:9").unwrap(),
             store: store.clone(),
-            lock: Arc::new(Mutex::new(())),
+            operation_lock: Arc::new(Mutex::new(())),
             store_lock: Arc::new(Mutex::new(())),
             store_owner: Arc::new(std::sync::Mutex::new(None)),
             listeners: Arc::new(Mutex::new(BTreeMap::new())),
@@ -3062,7 +3346,7 @@ mod tests {
             let auth = Auth {
                 api: Api::for_test_origin("http://127.0.0.1:9").unwrap(),
                 store: store.clone(),
-                lock: Arc::new(Mutex::new(())),
+                operation_lock: Arc::new(Mutex::new(())),
                 store_lock: Arc::new(Mutex::new(())),
                 store_owner: Arc::new(std::sync::Mutex::new(None)),
                 listeners: Arc::new(Mutex::new(BTreeMap::new())),
@@ -3186,7 +3470,7 @@ mod tests {
         let auth = Auth {
             api: Api::for_test_origin("http://127.0.0.1:9").unwrap(),
             store: store.clone(),
-            lock: Arc::new(Mutex::new(())),
+            operation_lock: Arc::new(Mutex::new(())),
             store_lock: Arc::new(Mutex::new(())),
             store_owner: Arc::new(std::sync::Mutex::new(None)),
             listeners: Arc::new(Mutex::new(BTreeMap::new())),
@@ -3214,7 +3498,7 @@ mod tests {
         Auth {
             api: Api::for_test_origin("http://127.0.0.1:9").unwrap(),
             store,
-            lock: Arc::new(Mutex::new(())),
+            operation_lock: Arc::new(Mutex::new(())),
             store_lock: Arc::new(Mutex::new(())),
             store_owner: Arc::new(std::sync::Mutex::new(None)),
             listeners: Arc::new(Mutex::new(BTreeMap::new())),
@@ -3357,10 +3641,16 @@ mod tests {
             read.await.unwrap().err().unwrap().to_string(),
             "STORE_UNAVAILABLE"
         );
-        assert_eq!(
-            concurrent.await.unwrap().err().unwrap().to_string(),
-            "STORE_UNAVAILABLE"
-        );
+        assert!(matches!(
+            concurrent
+                .await
+                .unwrap()
+                .err()
+                .unwrap()
+                .to_string()
+                .as_str(),
+            "STORE_UNAVAILABLE" | "AUTH_RECOVERY_PENDING"
+        ));
         assert_eq!(store.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         release.send(()).unwrap();
         assert_eq!(
@@ -3594,6 +3884,198 @@ mod tests {
             "STORE_UNAVAILABLE"
         );
     }
+    const SCOPE_ORG: &str = "10000000-0000-4000-8000-000000000001";
+    const SCOPE_RUNNER: &str = "10000000-0000-4000-8000-000000000002";
+    const SCOPE_DEVICE: &str = "00000000-0000-4000-8000-000000000002";
+    const SCOPE_DELEGATION: &str = "10000000-0000-4000-8000-000000000004";
+    fn scope_self(granted: Value, effective: Value) -> Value {
+        json!({"runner":{"id":SCOPE_RUNNER,"organizationId":SCOPE_ORG},"tokenScopes":effective,"scopeContext":{"organizationId":SCOPE_ORG,"runnerId":SCOPE_RUNNER,"deviceId":SCOPE_DEVICE,"delegationId":SCOPE_DELEGATION,"grantedScopes":granted,"effectiveTokenScopes":effective}})
+    }
+    #[tokio::test]
+    async fn persona_scope_self_recovers_lost_metadata_and_rejects_unverified_authority() {
+        for case in [
+            "lost",
+            "implications",
+            "insufficient",
+            "legacy",
+            "revoked",
+            "organization",
+            "runner",
+            "device",
+            "delegation",
+            "local-generation",
+            "malformed",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api = Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+            let auth = Auth::test_enrolled(api, SCOPE_ORG, SCOPE_RUNNER);
+            if case == "delegation" || case == "insufficient" || case == "revoked" {
+                let mut state = auth.required().await.unwrap();
+                let mut metadata = persona_credential_metadata(&json!({"organizationId":SCOPE_ORG,"runnerId":SCOPE_RUNNER,"deviceId":SCOPE_DEVICE,"delegationId":SCOPE_DELEGATION,"scopes":["runner.personas.read"]}),SCOPE_ORG).unwrap();
+                if case == "delegation" {
+                    metadata["delegationId"] = json!("10000000-0000-4000-8000-000000000009");
+                }
+                state
+                    .persona_state
+                    .insert(format!("credential:{SCOPE_ORG}"), metadata);
+                auth.save(&state).await.unwrap();
+            }
+            let before = auth.store.load().unwrap();
+            let copy = auth.clone();
+            let operation = tokio::spawn(async move { copy.scope_status(SCOPE_ORG).await });
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert!(read_request(&mut stream).await.is_null());
+            let mut data = scope_self(
+                json!(["runner.personas.read"]),
+                json!(["runner.personas.read"]),
+            );
+            match case {
+                "implications" => {
+                    data = scope_self(
+                        json!(["runner.personas.chat", "runner.personas.memory.write"]),
+                        json!([
+                            "runner.personas.chat",
+                            "runner.personas.read",
+                            "runner.personas.memory.write",
+                            "runner.personas.memory.read"
+                        ]),
+                    )
+                }
+                "insufficient" => data = scope_self(json!([]), json!([])),
+                "legacy" => {
+                    data.as_object_mut().unwrap().remove("scopeContext");
+                }
+                "organization" => {
+                    data["runner"]["organizationId"] = json!("10000000-0000-4000-8000-000000000009")
+                }
+                "runner" => {
+                    data["scopeContext"]["runnerId"] = json!("10000000-0000-4000-8000-000000000009")
+                }
+                "device" => {
+                    data["scopeContext"]["deviceId"] = json!("10000000-0000-4000-8000-000000000009")
+                }
+                "malformed" => data["scopeContext"]["grantedScopes"] = json!([7]),
+                "local-generation" => {
+                    let mut state = auth.required().await.unwrap();
+                    state.children.get_mut(SCOPE_ORG).unwrap().refresh =
+                        "external-generation".into();
+                    auth.store
+                        .save(&serde_json::to_vec(&state).unwrap())
+                        .unwrap();
+                }
+                _ => {}
+            }
+            if case == "revoked" {
+                respond(
+                    &mut stream,
+                    401,
+                    json!({"error":{"code":"RUNNER_TOKEN_INVALID"}}),
+                )
+                .await;
+            } else {
+                respond(&mut stream, 200, json!({"data":data})).await;
+            }
+            let result = operation.await.unwrap();
+            match case {
+                "lost" | "insufficient" | "implications" => {
+                    let result = result.unwrap();
+                    assert_eq!(result["status"], "verified");
+                    assert_eq!(
+                        result["scopes"],
+                        match case {
+                            "lost" => json!(["runner.personas.read"]),
+                            "implications" => json!([
+                                "runner.personas.chat",
+                                "runner.personas.read",
+                                "runner.personas.memory.write",
+                                "runner.personas.memory.read"
+                            ]),
+                            _ => json!([]),
+                        }
+                    );
+                    assert_eq!(result.as_object().unwrap().len(), 6);
+                }
+                "legacy" => assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "AUTH_SCOPE_VERIFICATION_REQUIRED"
+                ),
+                "revoked" => {
+                    assert_eq!(result.unwrap_err().to_string(), "RUNNER_TOKEN_INVALID")
+                }
+                "malformed" => assert_eq!(result.unwrap_err().to_string(), "INVALID_API_RESPONSE"),
+                _ => assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "AUTH_IDENTITY_CHANGED",
+                    "{case}"
+                ),
+            }
+            if case != "local-generation" {
+                assert_eq!(auth.store.load().unwrap(), before, "{case}");
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                    .await
+                    .is_err(),
+                "{case}"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn persona_scope_stale_access_rotates_once_without_grant_upgrade() {
+        for still_stale in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api = Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+            let auth = Auth::test_enrolled(api, SCOPE_ORG, SCOPE_RUNNER);
+            let installation = auth.installation_id().await.unwrap();
+            let server = tokio::spawn(async move {
+                let (mut first, _) = listener.accept().await.unwrap();
+                assert!(read_request(&mut first).await.is_null());
+                respond(
+                    &mut first,
+                    200,
+                    json!({"data":scope_self(json!(["runner.personas.read"]),json!([]))}),
+                )
+                .await;
+                let (mut refresh, _) = listener.accept().await.unwrap();
+                let request = read_request(&mut refresh).await;
+                assert_eq!(request["refreshToken"], "lmxrr_testprefix_testrefresh");
+                assert!(request["proof"].is_string());
+                assert!(request.get("requestedScopes").is_none());
+                respond(&mut refresh,200,json!({"data":{"accessToken":"lmxr_new_secret","refreshToken":"new-refresh","expiresInSeconds":3600,"organizationId":SCOPE_ORG,"runnerId":SCOPE_RUNNER,"deviceId":SCOPE_DEVICE,"delegationId":SCOPE_DELEGATION,"scopes":[]}})).await;
+                let (mut second, _) = listener.accept().await.unwrap();
+                assert!(read_request(&mut second).await.is_null());
+                respond(&mut second,200,json!({"data":scope_self(json!(["runner.personas.read"]),if still_stale {json!([])} else {json!(["runner.personas.read"])})})).await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            let result = auth.scope_status(SCOPE_ORG).await;
+            if still_stale {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "AUTH_SCOPE_VERIFICATION_REQUIRED"
+                );
+            } else {
+                assert_eq!(result.unwrap()["scopes"], json!(["runner.personas.read"]));
+            }
+            server.await.unwrap();
+            assert_eq!(auth.installation_id().await.unwrap(), installation);
+            let state = auth.required().await.unwrap();
+            assert_eq!(state.children[SCOPE_ORG].subject, SCOPE_RUNNER);
+            assert_eq!(state.children[SCOPE_ORG].refresh, "new-refresh");
+            assert!(state.pending.is_none());
+            assert!(
+                state
+                    .persona_state
+                    .keys()
+                    .all(|key| !key.starts_with("upgrade:"))
+            );
+        }
+    }
     #[tokio::test]
     async fn persona_scope_upgrade_recovers_same_grant_and_same_child_without_logout() {
         let (auth, store, listener) = test_auth().await;
@@ -3645,12 +4127,10 @@ mod tests {
             assert_eq!(recovery["refreshToken"], refresh["refreshToken"]);
             assert_eq!(recovery["proof"], refresh["proof"]);
             assert_eq!(recovery["recovery"], true);
-            respond(&mut recovered,200,json!({"data":{"accessToken":"new-child-access","refreshToken":"new-child-refresh","expiresInSeconds":3600,"deviceId":device,"organizationId":org,"delegationId":delegation,"runnerId":runner,"scopes":["runner.personas.read"]}})).await;
-            assert!(
-                tokio::time::timeout(Duration::from_millis(100), listener.accept())
-                    .await
-                    .is_err()
-            );
+            respond(&mut recovered,200,json!({"data":{"accessToken":"lmxr_newchild_secret","refreshToken":"new-child-refresh","expiresInSeconds":3600,"deviceId":device,"organizationId":org,"delegationId":delegation,"runnerId":runner,"scopes":["runner.personas.read"]}})).await;
+            let (mut self_read, _) = listener.accept().await.unwrap();
+            read_request(&mut self_read).await;
+            respond(&mut self_read,200,json!({"data":{"runner":{"id":runner,"organizationId":org},"tokenScopes":["runner.personas.read"],"scopeContext":{"organizationId":org,"runnerId":runner,"deviceId":device,"delegationId":delegation,"grantedScopes":["runner.personas.read"],"effectiveTokenScopes":["runner.personas.read"]}}})).await;
         });
         assert_eq!(
             auth.scope_upgrade(org, &json!(["runner.personas.read"]), key)
@@ -3681,7 +4161,6 @@ mod tests {
                 .to_string(),
             "IDEMPOTENCY_CONFLICT"
         );
-        server.await.unwrap();
         let durable: ProtectedState =
             serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
         assert_eq!(durable.installation_id, installation);
@@ -3692,6 +4171,7 @@ mod tests {
         let status = auth.scope_status(org).await.unwrap();
         assert_eq!(status["scopes"], json!(["runner.personas.read"]));
         assert!(!status.to_string().contains("access") && !status.to_string().contains("refresh"));
+        server.await.unwrap();
     }
     #[tokio::test]
     async fn legacy_persona_metadata_null_device_keeps_rotated_child_usable() {

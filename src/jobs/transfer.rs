@@ -6,7 +6,7 @@ pub(super) async fn stream_events(
     journal: &Arc<Mutex<Journal>>,
 ) -> Result<bool> {
     let sender = snapshot(journal)?.event_sender;
-    let _sending = sender.lock().await;
+    let sending = Arc::new(sender.lock_owned().await);
     let mut sent = false;
     for stream in ["stdout", "stderr"] {
         let j = snapshot(journal)?;
@@ -38,25 +38,29 @@ pub(super) async fn stream_events(
         }
         bytes.truncate(size);
         if pending.is_none() {
-            let mut locked = journal.lock().unwrap();
-            if stream == "stdout" {
-                locked.stdout_pending = Some(size);
-                let mut decoder = crate::progress::Decoder::from_state(
-                    std::mem::take(&mut locked.progress_buffer),
-                    locked.progress_buffer_offset,
-                    locked.progress_discarding,
-                );
-                let context = crate::progress::Context::from_job(&locked.job, now_millis());
-                locked.progress_pending = Some(decoder.push(&bytes, offset, &context));
-                (
-                    locked.progress_buffer,
-                    locked.progress_buffer_offset,
-                    locked.progress_discarding,
-                ) = decoder.state();
-            } else {
-                locked.stderr_pending = Some(size)
-            }
-            persist(path, &locked)?;
+            let bytes = bytes.clone();
+            let stream = stream.to_owned();
+            update_while_sending(daemon, path, journal, sending.clone(), move |locked| {
+                if stream == "stdout" {
+                    locked.stdout_pending = Some(size);
+                    let mut decoder = crate::progress::Decoder::from_state(
+                        std::mem::take(&mut locked.progress_buffer),
+                        locked.progress_buffer_offset,
+                        locked.progress_discarding,
+                    );
+                    let context = crate::progress::Context::from_job(&locked.job, now_millis());
+                    locked.progress_pending = Some(decoder.push(&bytes, offset, &context));
+                    (
+                        locked.progress_buffer,
+                        locked.progress_buffer_offset,
+                        locked.progress_discarding,
+                    ) = decoder.state();
+                } else {
+                    locked.stderr_pending = Some(size)
+                }
+                Ok(())
+            })
+            .await?;
         }
         let current = snapshot(journal)?;
         let mut events = vec![
@@ -77,16 +81,19 @@ pub(super) async fn stream_events(
             async move { backend_job(daemon, journal, &lease, "POST", &route, body, None).await }
         })
         .await?;
-        let mut locked = journal.lock().unwrap();
-        if stream == "stdout" {
-            locked.stdout_pending = None;
-            locked.progress_pending = None;
-            locked.stdout_offset = offset + size as u64
-        } else {
-            locked.stderr_pending = None;
-            locked.stderr_offset = offset + size as u64
-        }
-        persist(path, &locked)?;
+        let stream = stream.to_owned();
+        update_while_sending(daemon, path, journal, sending.clone(), move |locked| {
+            if stream == "stdout" {
+                locked.stdout_pending = None;
+                locked.progress_pending = None;
+                locked.stdout_offset = offset + size as u64
+            } else {
+                locked.stderr_pending = None;
+                locked.stderr_offset = offset + size as u64
+            }
+            Ok(())
+        })
+        .await?;
         sent = true;
     }
     // Public statuses have their own durable event identity and can be sent
@@ -102,11 +109,35 @@ pub(super) async fn stream_events(
     // lease needed by required artifact and terminal delivery.
     if let Ok(Ok(delivered)) = tokio::time::timeout(
         Duration::from_secs(3),
-        send_pending_status(daemon, path, journal),
+        send_pending_status(daemon, path, journal, sending.clone()),
     )
     .await
     {
         sent |= delivered;
+    }
+    Ok(sent)
+}
+// A wake is bounded to four fair stdout/stderr rounds (256 KiB maximum).
+// A slow request may exceed the cooperative time budget; renewal has its own
+// task and the exact pending event stays owned until its durable ack finishes.
+const OUTPUT_ROUNDS_PER_WAKE: usize = 4;
+const OUTPUT_WAKE_BUDGET: Duration = Duration::from_millis(250);
+pub(super) async fn stream_event_batch(
+    daemon: &Daemon,
+    path: &Path,
+    journal: &Arc<Mutex<Journal>>,
+) -> Result<bool> {
+    let start = Instant::now();
+    let mut sent = false;
+    for _ in 0..OUTPUT_ROUNDS_PER_WAKE {
+        if !stream_events(daemon, path, journal).await? {
+            break;
+        }
+        sent = true;
+        tokio::task::yield_now().await;
+        if start.elapsed() >= OUTPUT_WAKE_BUDGET {
+            break;
+        }
     }
     Ok(sent)
 }
@@ -121,7 +152,9 @@ pub(super) async fn drain_events(
     path: &Path,
     journal: &Arc<Mutex<Journal>>,
 ) -> Result<()> {
-    while stream_events(daemon, path, journal).await? {}
+    while stream_event_batch(daemon, path, journal).await? {
+        tokio::task::yield_now().await;
+    }
     Ok(())
 }
 pub(super) async fn materialize_terminal(
@@ -186,10 +219,11 @@ pub(super) async fn materialize_terminal(
                 "contentType": artifact["contentType"],
             });
         }
-        let mut locked = journal.lock().unwrap();
-        locked.result = Some(result);
-        locked.transition(JournalPhase::TerminalPending)?;
-        persist(path, &locked)?;
+        update(daemon, path, journal, move |locked| {
+            locked.result = Some(result);
+            locked.transition(JournalPhase::TerminalPending)
+        })
+        .await?;
         return Ok(());
     }
     for stream in ["stdout", "stderr"] {
@@ -271,10 +305,11 @@ pub(super) async fn materialize_terminal(
         }
         result["artifacts"] = json!(artifacts);
     }
-    let mut locked = journal.lock().unwrap();
-    locked.result = Some(result);
-    locked.transition(JournalPhase::TerminalPending)?;
-    persist(path, &locked)?;
+    update(daemon, path, journal, move |locked| {
+        locked.result = Some(result);
+        locked.transition(JournalPhase::TerminalPending)
+    })
+    .await?;
     Ok(())
 }
 pub(super) async fn upload(
@@ -286,19 +321,26 @@ pub(super) async fn upload(
     content_type: &str,
     tag: &str,
 ) -> Result<Value> {
-    use sha2::{Digest, Sha256};
-    let mut file = std::fs::File::open(path)?;
-    let size = file.metadata()?.len();
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0; 262144];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
+    let hash_path = path.to_owned();
+    let (size, hash) = job_hash_io(daemon, journal, move || {
+        use sha2::{Digest, Sha256};
+        let mut file = std::fs::File::open(hash_path)?;
+        let size = file.metadata()?.len();
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0; 262144];
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
         }
-        hasher.update(&buf[..n]);
-    }
-    let hash = hex::encode(hasher.finalize());
+        Ok((size, hex::encode(hasher.finalize())))
+    })
+    .await?;
+    // No authority captured before hashing authorizes a later transfer.
+    let _ = transfer_authority(j, journal)?;
+    let mut buf = vec![0; 262144];
     let id = j.job["id"].as_str().context("BACKEND_PROTOCOL_ERROR")?;
     let key = format!("job-{id}-{tag}");
     let body = json!({"executionId":j.job["createdByExecutionId"],"nodeExecutionId":j.job["createdByNodeExecutionId"],"jobId":id,"name":name,"contentType":content_type,"sizeBytes":size,"checksumSha256":hash,"idempotencyKey":key});

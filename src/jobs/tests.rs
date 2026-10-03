@@ -605,6 +605,7 @@ fn fence_preserves_exact_lease() {
         delivery_diagnostic: None,
         first_failure_diagnostic: None,
         event_sender: Default::default(),
+        durable_writer: Default::default(),
         stdout_pending: None,
         stderr_pending: None,
         progress_buffer: Vec::new(),

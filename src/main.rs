@@ -296,7 +296,30 @@ fn compact_status(status: &Value) -> Value {
 async fn run_lifecycle(arguments: Vec<String>) -> Result<()> {
     let mut args = arguments.into_iter();
     let action = args.next().unwrap_or_else(|| "status".into());
+    // This matrix is evaluated before environment/path discovery. Help also
+    // stays independent of installation state.
+    let action_flags: &[&str] = match action.as_str() {
+        "status" => &["--rollback-preflight"],
+        "resume" | "repair" => &[],
+        "rollback" => &["--to", "--expected-operation"],
+        "prune" => &["--remove", "--retain"],
+        "--help" | "help" if args.len() == 0 => {
+            println!(
+                "loomex lifecycle status [--rollback-preflight] [--json] [directories]\nloomex lifecycle resume|repair [--json] [directories]\nloomex lifecycle rollback --to VERSION [--expected-operation UUID] [--json] [directories]\nloomex lifecycle prune --remove VERSION [--remove VERSION ...] --retain ROLLBACK_VERSION [--json] [directories]\ndirectories: --install-base DIR --state-dir DIR --launch-agents-dir DIR"
+            );
+            return Ok(());
+        }
+        _ => bail!("INVALID_ARGUMENT"),
+    };
+    let common_flags = [
+        "--json",
+        "--install-base",
+        "--state-dir",
+        "--launch-agents-dir",
+    ];
+    let mut seen = std::collections::HashSet::new();
     let mut json_output = false;
+    let mut rollback_preflight = false;
     let mut install_base = None;
     let mut state_dir = None;
     let mut launch_agents_dir = None;
@@ -305,54 +328,63 @@ async fn run_lifecycle(arguments: Vec<String>) -> Result<()> {
     let mut retain_versions = Vec::new();
     let mut expected_operation = None;
     while let Some(argument) = args.next() {
+        ensure!(
+            common_flags.contains(&argument.as_str()) || action_flags.contains(&argument.as_str()),
+            "INVALID_ARGUMENT"
+        );
+        ensure!(
+            matches!(argument.as_str(), "--remove" | "--retain") || seen.insert(argument.clone()),
+            "INVALID_ARGUMENT"
+        );
+        let mut value = || -> Result<String> {
+            let value = args.next().context("INVALID_ARGUMENT")?;
+            ensure!(
+                !value.is_empty() && !value.starts_with("--"),
+                "INVALID_ARGUMENT"
+            );
+            Ok(value)
+        };
         match argument.as_str() {
             "--json" => json_output = true,
-            "--install-base" => {
-                install_base = Some(PathBuf::from(
-                    args.next().context("--install-base requires a path")?,
-                ))
-            }
-            "--state-dir" => {
-                state_dir = Some(PathBuf::from(
-                    args.next().context("--state-dir requires a path")?,
-                ))
-            }
-            "--launch-agents-dir" => {
-                launch_agents_dir = Some(PathBuf::from(
-                    args.next().context("--launch-agents-dir requires a path")?,
-                ))
-            }
-            "--to" => version = Some(args.next().context("--to requires a version")?),
-            "--remove" => remove_versions.push(args.next().context("--remove requires a version")?),
-            "--retain" => retain_versions.push(args.next().context("--retain requires a version")?),
+            "--rollback-preflight" => rollback_preflight = true,
+            "--install-base" => install_base = Some(PathBuf::from(value()?)),
+            "--state-dir" => state_dir = Some(PathBuf::from(value()?)),
+            "--launch-agents-dir" => launch_agents_dir = Some(PathBuf::from(value()?)),
+            "--to" => version = Some(value()?),
+            "--remove" => remove_versions.push(value()?),
+            "--retain" => retain_versions.push(value()?),
             "--expected-operation" => {
-                ensure!(expected_operation.is_none(), "INVALID_REQUEST");
-                expected_operation = Some(
-                    uuid::Uuid::parse_str(
-                        &args.next().context("--expected-operation requires UUID")?,
-                    )
-                    .context("INVALID_REQUEST")?,
-                );
+                expected_operation =
+                    Some(uuid::Uuid::parse_str(&value()?).context("INVALID_ARGUMENT")?)
             }
-            _ => bail!("invalid lifecycle argument"),
+            _ => unreachable!(),
         }
     }
-    // Validate the command before filesystem discovery so malformed input is
-    // not misreported as an installation or service failure.
-    if !matches!(
-        action.as_str(),
-        "status" | "resume" | "rollback" | "repair" | "prune" | "--help" | "help"
-    ) {
-        bail!("INVALID_REQUEST");
+    ensure!(
+        !(action == "rollback" && version.is_none())
+            && !(action == "prune" && (remove_versions.is_empty() || retain_versions.is_empty())),
+        "INVALID_ARGUMENT"
+    );
+    for names in [&remove_versions, &retain_versions] {
+        ensure!(
+            names.len() <= 256
+                && names.iter().collect::<std::collections::HashSet<_>>().len() == names.len(),
+            "INVALID_ARGUMENT"
+        );
     }
-    if (action == "rollback" && version.is_none())
-        || (action != "rollback" && expected_operation.is_some())
-        || (action != "prune" && !remove_versions.is_empty())
-        || (action != "prune" && !retain_versions.is_empty())
-        || (action == "prune"
-            && (remove_versions.is_empty() || retain_versions.is_empty() || version.is_some()))
+    for name in version
+        .iter()
+        .chain(remove_versions.iter())
+        .chain(retain_versions.iter())
     {
-        bail!("INVALID_REQUEST");
+        let parts: Vec<_> = name.split('.').collect();
+        ensure!(
+            parts.len() == 3
+                && parts
+                    .iter()
+                    .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())),
+            "INVALID_ARGUMENT"
+        );
     }
     let mut paths = lifecycle::Paths::from_environment()?;
     if let Some(path) = install_base {
@@ -366,7 +398,13 @@ async fn run_lifecycle(arguments: Vec<String>) -> Result<()> {
     }
     paths.validate()?;
     let value = match action.as_str() {
-        "status" => lifecycle::status(&paths)?,
+        "status" => {
+            let mut status = lifecycle::status(&paths)?;
+            if rollback_preflight {
+                status["rollbackPreflight"] = lifecycle::rollback_preflight(&paths)?;
+            }
+            status
+        }
         "resume" => lifecycle::resume(&paths).await?,
         "rollback" => {
             lifecycle::rollback_with_expected(
@@ -378,15 +416,9 @@ async fn run_lifecycle(arguments: Vec<String>) -> Result<()> {
         }
         "repair" => lifecycle::repair(&paths).await?,
         "prune" => lifecycle::prune(&paths, &remove_versions, &retain_versions).await?,
-        "--help" | "help" => {
-            println!(
-                "loomex lifecycle status [--json] [--install-base DIR --state-dir DIR --launch-agents-dir DIR]\nloomex lifecycle resume|repair [--json] [directories]\nloomex lifecycle rollback --to VERSION [--expected-operation UUID] [--json] [directories]\nloomex lifecycle prune --remove VERSION [--remove VERSION ...] --retain ROLLBACK_VERSION [--json] [directories]"
-            );
-            return Ok(());
-        }
         _ => bail!("unknown lifecycle command"),
     };
-    if json_output || action != "status" {
+    if json_output || rollback_preflight || action != "status" {
         println!("{}", serde_json::to_string(&value)?);
     } else {
         println!("{}", lifecycle::readable(&value));

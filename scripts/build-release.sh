@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
-usage(){ echo "usage: $0 (--production | --unsigned-development) [--output DIR]" >&2; exit 2; }
-mode=""; output=""
-while (($#)); do case "$1" in --production|--unsigned-development) mode="$1"; shift;; --output) output="${2:?}"; shift 2;; *) usage;; esac; done
+usage(){ echo "usage: $0 (--production | --unsigned-development) [--output DIR] [--retain-failure-workspace DIR]" >&2; exit 2; }
+mode=""; output=""; failure_workspace=""
+while (($#)); do case "$1" in --production|--unsigned-development) mode="$1"; shift;; --output) output="${2:?}"; shift 2;; --retain-failure-workspace) failure_workspace="${2:?}"; shift 2;; *) usage;; esac; done
 [[ -n "$mode" ]] || usage
 repo="$(cd "$(dirname "$0")/.." && pwd -P)"; version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$repo/Cargo.toml" | head -1)"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "package version is not SemVer: $version" >&2; exit 1; }
@@ -17,7 +17,40 @@ if [[ "$mode" == "--production" ]]; then
   [[ -z "$(git -C "$repo" status --porcelain)" ]] || { echo "production release requires a clean source tree" >&2; exit 1; }
   revision="$(git -C "$repo" rev-parse --verify HEAD)"
 fi
-temporary="$(mktemp -d)"; trap 'rm -rf "$temporary"' EXIT
+if [[ -n "$failure_workspace" ]]; then
+  [[ ! -e "$failure_workspace" && ! -L "$failure_workspace" ]] || { echo "failure workspace already exists; refusing replacement" >&2; exit 1; }
+  [[ -d "$(dirname "$failure_workspace")" && ! -L "$(dirname "$failure_workspace")" ]] || { echo "failure workspace parent must be an existing directory" >&2; exit 1; }
+fi
+feedback_tool="$repo/scripts/build-feedback.py"
+temporary="$(mktemp -d)"
+export LOOMEX_BUILD_TEMP="$temporary"
+cleanup(){
+  result=$?
+  trap - EXIT
+  if ((result != 0)) && [[ -n "$failure_workspace" ]]; then
+    # Reserve the destination atomically. No failed evidence overwrites an
+    # existing directory; unsuccessful retention still cleans temporary data.
+    if mkdir -m 700 "$failure_workspace"; then
+      if ! python3 "$feedback_tool" failure "$temporary" "$result"; then
+        echo "Failure metadata unavailable; retaining private workspace for diagnosis" >&2
+      fi
+      if cp -R "$temporary/." "$failure_workspace/"; then
+        echo "Private failure workspace retained: $failure_workspace" >&2
+      else
+        echo "Failure workspace copy incomplete: $failure_workspace" >&2
+      fi
+    else
+      echo "Failure workspace retention unavailable: destination exists" >&2
+    fi
+  fi
+  rm -rf "$temporary"
+  exit "$result"
+}
+trap cleanup EXIT
+run_build(){
+  python3 "$feedback_tool" record "$temporary" "$@"
+  "$@" 2>&1 | python3 "$feedback_tool" log "$temporary/build.log"
+}
 revision="${revision:-$(git -C "$repo" rev-parse --verify HEAD 2>/dev/null || printf unknown)}"
 source_manifest="$temporary/source-content-manifest.json"
 build_root="$temporary/source"
@@ -31,16 +64,17 @@ if [[ "$mode" == "--production" ]]; then
 else
   python3 "$repo/scripts/artifact.py" source-manifest --source-root "$repo" --source-revision "$revision" --output "$source_manifest" --snapshot "$build_root"
 fi
+feedback_tool="$build_root/scripts/build-feedback.py"
 remap_flags="${RUSTFLAGS:-} --remap-path-prefix=$build_root=/loomex/src --remap-path-prefix=${HOME:?}=/loomex/home"
 remap_cflags="${CFLAGS:-} -ffile-prefix-map=$build_root=/loomex/src -ffile-prefix-map=${HOME:?}=/loomex/home"
-(cd "$build_root" && CARGO_TARGET_DIR="$temporary/target" RUSTFLAGS="$remap_flags" CFLAGS="$remap_cflags" cargo test --locked)
+(cd "$build_root" && CARGO_TARGET_DIR="$temporary/target" RUSTFLAGS="$remap_flags" CFLAGS="$remap_cflags" run_build cargo test --locked)
 python3 "$build_root/scripts/export-compatibility.py" --check
 if [[ "$mode" == "--production" ]]; then
-  (cd "$build_root" && CARGO_TARGET_DIR="$temporary/target" RUSTFLAGS="$remap_flags" CFLAGS="$remap_cflags" cargo build --locked --release --target aarch64-apple-darwin --bin loomex --bin loomex-runner --bin loomex-lifecycle-bootstrap)
+  (cd "$build_root" && CARGO_TARGET_DIR="$temporary/target" RUSTFLAGS="$remap_flags" CFLAGS="$remap_cflags" run_build cargo build --locked --release --target aarch64-apple-darwin --bin loomex --bin loomex-runner --bin loomex-lifecycle-bootstrap)
   binary_root="$temporary/target/aarch64-apple-darwin/release"
 else
   [[ "$(uname -s)-$(uname -m)" == "Darwin-arm64" ]] || { echo "unsigned development artifact requires a macOS arm64 host" >&2; exit 1; }
-  (cd "$build_root" && CARGO_TARGET_DIR="$temporary/target" RUSTFLAGS="$remap_flags" CFLAGS="$remap_cflags" cargo build --locked --profile distribution-dev --bin loomex --bin loomex-runner --bin loomex-lifecycle-bootstrap)
+  (cd "$build_root" && CARGO_TARGET_DIR="$temporary/target" RUSTFLAGS="$remap_flags" CFLAGS="$remap_cflags" run_build cargo build --locked --profile distribution-dev --bin loomex --bin loomex-runner --bin loomex-lifecycle-bootstrap)
   binary_root="$temporary/target/distribution-dev"
 fi
 payload="$temporary/payload"

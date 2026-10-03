@@ -725,7 +725,13 @@ impl Daemon {
             }
             "auth.cancel" => return self.auth.cancel_login(required(p, "flowId")?).await,
             "auth.recover" => return self.auth.reconcile().await,
-            "auth.status" => return self.auth.status().await,
+            "auth.status" => {
+                return match p.get("observation") {
+                    None => self.auth.status().await,
+                    Some(value) if value == "startup" => self.auth.startup_status().await,
+                    Some(_) => Err(anyhow::anyhow!("INVALID_REQUEST")),
+                };
+            }
             "auth.scope_status" => {
                 return self.auth.scope_status(required(p, "organizationId")?).await;
             }
@@ -4280,7 +4286,7 @@ pub(crate) async fn lifecycle_client(dir: &Path, method: &str, params: Value) ->
 async fn client_with_semantics(
     dir: &Path,
     method: &str,
-    params: Value,
+    mut params: Value,
     semantics: &[&str],
 ) -> Result<Value> {
     let socket = dir.join("control.sock");
@@ -4334,6 +4340,19 @@ async fn client_with_semantics(
             .is_none_or(|caps| required.iter().any(|cap| !caps.contains(&json!(cap))))
     {
         bail!("COMPATIBILITY_ERROR");
+    }
+    // Restored older controllers prove lack of this optional read capability
+    // in the negotiation response. Fall back on this same connection before
+    // dispatch only; actual status failures never authorize a retry.
+    if semantics.is_empty()
+        && method == "auth.status"
+        && params["observation"] == "startup"
+        && !selected["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("auth:startup-observation/v1"))
+    {
+        params.as_object_mut().unwrap().remove("observation");
     }
     exchange(&mut read, &mut write, method, params).await
 }
@@ -4412,6 +4431,69 @@ mod tests {
             .unwrap();
         assert_eq!(status["result"]["code"], "AUTH_REQUIRED");
         server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn lifecycle_startup_status_negotiates_option_and_never_retries_an_observed_failure() {
+        for (supported, failed) in [(false, false), (true, false), (false, true), (true, true)] {
+            let temp = tempfile::tempdir().unwrap();
+            let socket = temp.path().join("control.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut read = BufReader::new(read);
+                let negotiation: Value =
+                    serde_json::from_slice(&read_frame(&mut read).await.unwrap().unwrap()).unwrap();
+                assert_eq!(
+                    negotiation["params"]["requiredCapabilities"],
+                    json!(["method:auth.status"])
+                );
+                let capabilities = if supported {
+                    json!(["method:auth.status", "auth:startup-observation/v1"])
+                } else {
+                    json!(["method:auth.status"])
+                };
+                let agreement = json!({"protocol":PROTOCOL,"id":negotiation["id"],"result":{"selectedProtocol":PROTOCOL,"serverVersion":"0.4.4","maxFrameBytes":MAX_FRAME,"capabilities":capabilities}});
+                write
+                    .write_all(format!("{agreement}\n").as_bytes())
+                    .await
+                    .unwrap();
+                let request: Value =
+                    serde_json::from_slice(&read_frame(&mut read).await.unwrap().unwrap()).unwrap();
+                assert_eq!(request["method"], "auth.status");
+                assert_eq!(
+                    request["params"],
+                    if supported {
+                        json!({"observation":"startup"})
+                    } else {
+                        json!({})
+                    }
+                );
+                let response = if failed {
+                    json!({"protocol":PROTOCOL,"id":request["id"],"error":{"code":"AUTH_RECOVERY_PENDING","retryable":false}})
+                } else {
+                    json!({"protocol":PROTOCOL,"id":request["id"],"result":{"authenticated":false,"code":"AUTH_REQUIRED","loginPending":false}})
+                };
+                write
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+                drop(write);
+                assert!(read_frame(&mut read).await.unwrap().is_none());
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            let result =
+                lifecycle_client(temp.path(), "auth.status", json!({"observation":"startup"}))
+                    .await
+                    .unwrap();
+            assert_eq!(result.get("error").is_some(), failed);
+            server.await.unwrap();
+        }
     }
     #[tokio::test]
     async fn lifecycle_status_negotiates_across_a_new_auth_capability() {
@@ -7458,17 +7540,30 @@ mod conformance {
             daemon_lock(temp.path()).unwrap_err().to_string(),
             "DAEMON_ALREADY_RUNNING"
         );
+        // A fast public snapshot truthfully reports persisted logout intent;
+        // authenticated=false is not proof that native revocation/cleanup ended.
+        let pending = check_auth.status().await.unwrap();
+        assert_eq!(pending["code"], "LOGOUT_PENDING");
+        assert_eq!(pending["authenticated"], false);
+        assert_eq!(
+            daemon_lock(temp.path()).unwrap_err().to_string(),
+            "DAEMON_ALREADY_RUNNING"
+        );
         reply_http(held, 200, json!({"revoked":true})).await;
-        for _ in 0..100 {
-            if !check_auth.status().await.unwrap()["authenticated"]
-                .as_bool()
-                .unwrap()
-            {
-                break;
+        // Observe the ownership resource itself. The canceled awaiting caller
+        // cannot release it; only completion of the protected worker can do so.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let retry_lock = loop {
+            match daemon_lock(temp.path()) {
+                Ok(lock) => break lock,
+                Err(error) => assert_eq!(error.to_string(), "DAEMON_ALREADY_RUNNING"),
             }
-            tokio::task::yield_now().await;
-        }
-        let retry_lock = daemon_lock(temp.path()).unwrap();
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "offline worker retained ownership after completion"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
         let result = finish_offline_logout(retry_lock, check_auth).await.unwrap();
         assert_eq!(result["revoked"], true);
         assert_eq!(result["alreadyLoggedOut"], true);

@@ -1,6 +1,7 @@
 {
   "capabilities": [
     "auth:browser-pkce/v1",
+    "auth:startup-observation/v1",
     "authorization.prepare-commit/v1",
     "connection.projection/v2",
     "diagnostics.fingerprint/v1",
@@ -120,7 +121,7 @@
       "path": "contracts/backend-routes.json"
     },
     "methodCatalog": {
-      "digest": "sha256:a3e6b79cb39f193691dc93d7fab46d6fa9402228d05599e73735d00b50298542",
+      "digest": "sha256:6b07982831536ad3e7ff0cc2db497a91aaad59e795df66534967bb16d0a4f03c",
       "path": "contracts/method-catalog.json"
     }
   },
@@ -247,7 +248,7 @@
     {
       "classification": "local-control",
       "idempotent": true,
-      "inputSchemaDigest": "sha256:d0157ce84790721854763c7480015e84f7cb0c7fde53afb21c3a42908805bf35",
+      "inputSchemaDigest": "sha256:d791e43ac7fa9693f4d4caa2afe240bce151a30036399fa4164a6ea2ade2f6dd",
       "mutating": false,
       "name": "auth.status",
       "outputSchemaDigest": "sha256:5f9260d8a5d4fb206556d4b2a8a6fca6fb75a3a19b0b39f764ac5e8b4aa0de5d",
@@ -1617,7 +1618,7 @@
   "schemaVersion": "loomex.runner.compatibility-manifest/v1",
   "summary": {
     "backendRouteCount": 69,
-    "capabilityCount": 112,
+    "capabilityCount": 113,
     "methodClassifications": {
       "backend-auth": 7,
       "backend-proxy": 51,
