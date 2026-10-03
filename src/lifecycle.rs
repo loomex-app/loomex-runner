@@ -1911,6 +1911,13 @@ async fn healthy_restored_previous(
     healthy_service(paths, version, baseline, true).await
 }
 
+fn startup_health_budget() -> Duration {
+    // Readiness can precede startup credential work taking the shared Auth
+    // mutex. Include its existing wait and read limits, once, without changing
+    // Auth, ordinary RPC budgets or the maximum number of observations.
+    Duration::from_secs(5) + crate::auth::AUTH_LOCK_BUDGET + crate::auth::STORE_IO_BUDGET
+}
+
 async fn healthy_service(
     paths: &Paths,
     version: &str,
@@ -1921,7 +1928,7 @@ async fn healthy_service(
     if TEST_CANDIDATE_HEALTH_FAIL.load(Ordering::SeqCst) {
         bail!("candidate health is unconfirmed")
     }
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + startup_health_budget();
     let mut auth_store_unavailable = false;
     for _ in 0..20 {
         let interval = tokio::time::Instant::now() + Duration::from_millis(250);
@@ -4772,6 +4779,7 @@ mod tests {
         paths: &Paths,
         observations: Vec<Value>,
         reply_delay: Duration,
+        shared_auth: Option<crate::auth::Auth>,
     ) -> (
         tokio::task::JoinHandle<()>,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -4812,7 +4820,12 @@ mod tests {
                     .fetch_add(1, Ordering::SeqCst)
                     .min(observations.len() - 1);
                 tokio::time::sleep(reply_delay).await;
-                let reply = json!({"protocol":crate::control::PROTOCOL,"id":request["id"],"result":observations[index]});
+                let status = match &shared_auth {
+                    Some(auth) => auth.status().await.unwrap(),
+                    None => observations[index].clone(),
+                };
+                let reply =
+                    json!({"protocol":crate::control::PROTOCOL,"id":request["id"],"result":status});
                 write
                     .write_all(format!("{reply}\n").as_bytes())
                     .await
@@ -4844,6 +4857,7 @@ mod tests {
                 authenticated,
             ],
             Duration::ZERO,
+            None,
         );
         let result = healthy_candidate(&paths, "0.4.1", Some(&baseline)).await;
         let restored = healthy_restored_previous(&paths, "0.4.1", Some(&baseline)).await;
@@ -4854,7 +4868,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_auth_health_permanent_store_unavailable_stops_at_existing_budget() {
+    async fn startup_auth_health_permanent_store_unavailable_stops_at_attempt_limit() {
         let _serial = TEST_SERIAL.lock().await;
         let _scope = StopTestScope::start();
         TEST_MODE.store(false, Ordering::SeqCst);
@@ -4866,6 +4880,7 @@ mod tests {
             &paths,
             vec![json!({"authenticated":false,"code":"STORE_UNAVAILABLE","loginPending":false})],
             Duration::ZERO,
+            None,
         );
         let started = tokio::time::Instant::now();
         let result = healthy_candidate(&paths, "0.4.1", Some(&AuthBaseline::Initial)).await;
@@ -4917,6 +4932,7 @@ mod tests {
                 &paths,
                 vec![observation.clone(), authenticated.clone()],
                 Duration::ZERO,
+                None,
             );
             let started = tokio::time::Instant::now();
             let result = healthy_candidate(&paths, "0.4.1", Some(&baseline)).await;
@@ -4943,6 +4959,7 @@ mod tests {
             &paths,
             vec![json!({"authenticated":false,"code":"AUTH_REQUIRED","loginPending":false})],
             Duration::from_secs(30),
+            None,
         );
         let started = tokio::time::Instant::now();
         let result = healthy_candidate(&paths, "0.4.1", Some(&AuthBaseline::Initial)).await;
@@ -4954,8 +4971,92 @@ mod tests {
                 .contains("observation deadline exceeded")
         );
         assert_eq!(count.load(Ordering::SeqCst), 1);
-        assert!(started.elapsed() >= Duration::from_secs(5));
-        assert!(started.elapsed() < Duration::from_secs(6));
+        assert_eq!(startup_health_budget(), Duration::from_secs(22));
+        assert!(started.elapsed() >= startup_health_budget());
+        assert!(started.elapsed() < startup_health_budget() + Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn startup_auth_health_observes_shared_mutex_after_legitimate_refresh() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = StopTestScope::start();
+        TEST_MODE.store(false, Ordering::SeqCst);
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let paths = paths(temp.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            crate::api::Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+        let org = Uuid::new_v4().to_string();
+        let auth = crate::auth::Auth::test_enrolled(api, &org, &Uuid::new_v4().to_string());
+        let baseline = parse_auth_baseline(&auth.status().await.unwrap()).unwrap();
+        auth.test_fingerprint_access_near_expiry(&org)
+            .await
+            .unwrap();
+        let (entered, awaiting_response) = tokio::sync::oneshot::channel();
+        let backend = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 8192);
+            }
+            let headers = std::str::from_utf8(&request).unwrap();
+            assert!(headers.starts_with("POST "));
+            assert!(
+                headers
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .contains("delegations/refresh/")
+            );
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            assert!(length < 8192);
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).await.unwrap();
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            assert!(request["refreshToken"].is_string());
+            assert!(request["proof"].is_string());
+            entered.send(()).unwrap();
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            let body = json!({"data":{"accessToken":"lmxr_fixture_access","refreshToken":"lmxrr_fixture_refresh","expiresInSeconds":3600}}).to_string();
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        let worker_auth = auth.clone();
+        let refresh = tokio::spawn(async move { worker_auth.credential(&org).await });
+        awaiting_response.await.unwrap();
+        *TEST_RECOVERY_STATUS.lock().unwrap() =
+            Some(json!({"version":"0.4.2","activeJobs":0,"draining":false}));
+        assert_eq!(daemon_status(&paths).await.unwrap()["activeJobs"], 0);
+        let (socket, count) = auth_health_socket(
+            &paths,
+            vec![Value::Null],
+            Duration::ZERO,
+            Some(auth.clone()),
+        );
+        let started = tokio::time::Instant::now();
+        let result = healthy_candidate(&paths, "0.4.2", Some(&baseline)).await;
+        refresh.await.unwrap().unwrap();
+        backend.await.unwrap();
+        socket.abort();
+        assert_eq!(
+            parse_auth_baseline(&auth.status().await.unwrap()).unwrap(),
+            baseline
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() >= Duration::from_secs(6));
+        assert!(started.elapsed() < Duration::from_secs(8));
     }
 
     #[tokio::test]

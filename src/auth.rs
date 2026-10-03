@@ -23,8 +23,8 @@ use tokio::{
 
 const SERVICE: &str = "app.loomex.runner.v1";
 const ACCOUNT: &str = "installation";
-const STORE_IO_BUDGET: Duration = Duration::from_secs(2);
-const AUTH_LOCK_BUDGET: Duration = Duration::from_secs(15);
+pub(crate) const STORE_IO_BUDGET: Duration = Duration::from_secs(2);
+pub(crate) const AUTH_LOCK_BUDGET: Duration = Duration::from_secs(15);
 
 fn credential_store_code(error: &anyhow::Error) -> &'static str {
     match error.to_string().as_str() {
