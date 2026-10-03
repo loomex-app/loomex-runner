@@ -1825,9 +1825,9 @@ async fn capture_auth_baseline(
     parse_auth_baseline(&local_auth_status(paths).await?)
 }
 
-async fn require_auth_continuity(paths: &Paths, baseline: &AuthBaseline) -> Result<()> {
-    let candidate = parse_auth_baseline(&local_auth_status(paths).await?)
-        .context("candidate authentication is unconfirmed")?;
+fn require_auth_continuity(status: &Value, baseline: &AuthBaseline) -> Result<()> {
+    let candidate =
+        parse_auth_baseline(status).context("candidate authentication is unconfirmed")?;
     let matched = match (baseline, candidate) {
         (AuthBaseline::Initial, _) => true,
         (
@@ -1855,6 +1855,15 @@ async fn require_auth_continuity(paths: &Paths, baseline: &AuthBaseline) -> Resu
         "candidate authentication scope differs from previous service"
     );
     Ok(())
+}
+
+fn transient_auth_store_observation(status: &Value) -> bool {
+    // Only a read-only store availability failure is retryable. Pending auth,
+    // interaction/permission failures, malformed status and scope changes are
+    // definitive refusals; none can establish the captured baseline.
+    status["code"] == "STORE_UNAVAILABLE"
+        && status["authenticated"] == false
+        && status["loginPending"] == false
 }
 
 async fn drain_and_require_idle(paths: &Paths, required: bool) -> Result<()> {
@@ -1912,8 +1921,11 @@ async fn healthy_service(
     if TEST_CANDIDATE_HEALTH_FAIL.load(Ordering::SeqCst) {
         bail!("candidate health is unconfirmed")
     }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut auth_store_unavailable = false;
     for _ in 0..20 {
-        if let Ok(status) = daemon_status(paths).await
+        let interval = tokio::time::Instant::now() + Duration::from_millis(250);
+        if let Ok(Ok(status)) = tokio::time::timeout_at(deadline, daemon_status(paths)).await
             && status["version"] == version
             && status["activeJobs"].as_u64().is_some()
             && status["draining"] == false
@@ -1923,14 +1935,31 @@ async fn healthy_service(
                 if lifecycle_test_mode() && TEST_AUTH_STATUS.lock().unwrap().is_none() {
                     return Ok(());
                 }
-                require_auth_continuity(paths, baseline).await?;
+                let auth_status = tokio::time::timeout_at(deadline, local_auth_status(paths))
+                    .await
+                    .context(
+                        "candidate authentication is unconfirmed: observation deadline exceeded",
+                    )??;
+                if transient_auth_store_observation(&auth_status) {
+                    auth_store_unavailable = true;
+                } else {
+                    require_auth_continuity(&auth_status, baseline)?;
+                    return Ok(());
+                }
             } else if !restoring_previous && !lifecycle_test_mode() {
                 // An older journal cannot prove which authenticated scope it replaced.
                 bail!("lifecycle auth baseline is unavailable");
+            } else {
+                return Ok(());
             }
-            return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep_until(interval.min(deadline)).await;
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+    if auth_store_unavailable {
+        bail!("candidate authentication is unconfirmed: STORE_UNAVAILABLE");
     }
     bail!("candidate health is unconfirmed")
 }
@@ -4735,6 +4764,198 @@ mod tests {
             *TEST_RECOVERY_STATUS.lock().unwrap() = None;
             *TEST_AUTH_STATUS.lock().unwrap() = None;
         }
+    }
+
+    // Owner-only socket exercises the actual lifecycle negotiation/envelope;
+    // no native credential store, service or lifecycle writer is involved.
+    fn auth_health_socket(
+        paths: &Paths,
+        observations: Vec<Value>,
+        reply_delay: Duration,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let socket = paths.state_dir.join("control.sock");
+        fs::create_dir_all(&paths.state_dir).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = count.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut read = BufReader::new(read);
+                let mut line = String::new();
+                read.read_line(&mut line).await.unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], "protocol.negotiate");
+                assert_eq!(
+                    request["params"]["requiredCapabilities"],
+                    json!(["method:auth.status"])
+                );
+                let reply = json!({"protocol":crate::control::PROTOCOL,"id":request["id"],"result":{
+                    "selectedProtocol":crate::control::PROTOCOL,"serverVersion":"0.4.0",
+                    "maxFrameBytes":crate::control::MAX_FRAME,"capabilities":["method:auth.status"]}});
+                write
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+                line.clear();
+                read.read_line(&mut line).await.unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], "auth.status");
+                assert_eq!(request["params"], json!({}));
+                let index = observed
+                    .fetch_add(1, Ordering::SeqCst)
+                    .min(observations.len() - 1);
+                tokio::time::sleep(reply_delay).await;
+                let reply = json!({"protocol":crate::control::PROTOCOL,"id":request["id"],"result":observations[index]});
+                write
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        (server, count)
+    }
+
+    #[tokio::test]
+    async fn startup_auth_health_reobserves_transient_store_read_before_scope_admission() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = StopTestScope::start();
+        TEST_MODE.store(false, Ordering::SeqCst);
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let paths = paths(temp.path());
+        let installation = Uuid::new_v4();
+        let organization = Uuid::new_v4();
+        let authenticated = json!({"authenticated":true,"code":"AUTHENTICATED","installationId":installation,"activeOrganization":organization,"loginPending":false});
+        let baseline = parse_auth_baseline(&authenticated).unwrap();
+        *TEST_RECOVERY_STATUS.lock().unwrap() =
+            Some(json!({"version":"0.4.1","activeJobs":0,"draining":false}));
+        let (server, count) = auth_health_socket(
+            &paths,
+            vec![
+                json!({"authenticated":false,"code":"STORE_UNAVAILABLE","loginPending":false}),
+                authenticated.clone(),
+                json!({"authenticated":false,"code":"STORE_UNAVAILABLE","loginPending":false}),
+                authenticated,
+            ],
+            Duration::ZERO,
+        );
+        let result = healthy_candidate(&paths, "0.4.1", Some(&baseline)).await;
+        let restored = healthy_restored_previous(&paths, "0.4.1", Some(&baseline)).await;
+        server.abort();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(restored.is_ok(), "{restored:?}");
+        assert_eq!(count.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn startup_auth_health_permanent_store_unavailable_stops_at_existing_budget() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = StopTestScope::start();
+        TEST_MODE.store(false, Ordering::SeqCst);
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let paths = paths(temp.path());
+        *TEST_RECOVERY_STATUS.lock().unwrap() =
+            Some(json!({"version":"0.4.1","activeJobs":0,"draining":false}));
+        let (server, count) = auth_health_socket(
+            &paths,
+            vec![json!({"authenticated":false,"code":"STORE_UNAVAILABLE","loginPending":false})],
+            Duration::ZERO,
+        );
+        let started = tokio::time::Instant::now();
+        let result = healthy_candidate(&paths, "0.4.1", Some(&AuthBaseline::Initial)).await;
+        server.abort();
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "candidate authentication is unconfirmed: STORE_UNAVAILABLE"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 20);
+        assert!(started.elapsed() >= Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(6));
+    }
+
+    #[tokio::test]
+    async fn startup_auth_health_definitive_refusals_do_not_retry() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = StopTestScope::start();
+        TEST_MODE.store(false, Ordering::SeqCst);
+        let installation = Uuid::new_v4();
+        let organization = Uuid::new_v4();
+        let authenticated = json!({"authenticated":true,"code":"AUTHENTICATED","installationId":installation,"activeOrganization":organization,"loginPending":false});
+        let baseline = parse_auth_baseline(&authenticated).unwrap();
+        let mut observations = vec![
+            json!({"authenticated":false,"code":"AUTH_REQUIRED","installationId":installation,"loginPending":false}),
+            json!({"authenticated":true,"code":"AUTHENTICATED","installationId":Uuid::new_v4(),"activeOrganization":organization,"loginPending":false}),
+            json!({"authenticated":true,"code":"AUTHENTICATED","installationId":installation,"activeOrganization":Uuid::new_v4(),"loginPending":false}),
+            json!({"authenticated":true,"code":"AUTHENTICATED","installationId":installation,"activeOrganization":organization,"loginPending":true}),
+            json!({"authenticated":true,"code":"STORE_UNAVAILABLE","loginPending":false}),
+            json!({"authenticated":false,"code":"STORE_UNAVAILABLE","loginPending":true}),
+            json!({"authenticated":false,"code":"STORE_UNAVAILABLE"}),
+        ];
+        for code in [
+            "AUTH_RECOVERY_PENDING",
+            "LOGOUT_PENDING",
+            "STORE_ACCESS_REQUIRED",
+            "STORE_ACCESS_DENIED",
+            "STORE_OPERATION_PENDING",
+            "STORE_INVALID",
+            "UNEXPECTED",
+        ] {
+            observations.push(json!({"authenticated":false,"code":code,"loginPending":false}));
+        }
+        for observation in observations {
+            let temp = tempfile::tempdir_in("/tmp").unwrap();
+            let paths = paths(temp.path());
+            *TEST_RECOVERY_STATUS.lock().unwrap() =
+                Some(json!({"version":"0.4.1","activeJobs":0,"draining":false}));
+            let (server, count) = auth_health_socket(
+                &paths,
+                vec![observation.clone(), authenticated.clone()],
+                Duration::ZERO,
+            );
+            let started = tokio::time::Instant::now();
+            let result = healthy_candidate(&paths, "0.4.1", Some(&baseline)).await;
+            server.abort();
+            assert!(result.is_err(), "{observation}");
+            assert_eq!(count.load(Ordering::SeqCst), 1, "{observation}");
+            assert!(
+                started.elapsed() < Duration::from_millis(250),
+                "{observation}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_auth_health_stalled_read_cannot_extend_observation_deadline() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = StopTestScope::start();
+        TEST_MODE.store(false, Ordering::SeqCst);
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let paths = paths(temp.path());
+        *TEST_RECOVERY_STATUS.lock().unwrap() =
+            Some(json!({"version":"0.4.1","activeJobs":0,"draining":false}));
+        let (server, count) = auth_health_socket(
+            &paths,
+            vec![json!({"authenticated":false,"code":"AUTH_REQUIRED","loginPending":false})],
+            Duration::from_secs(30),
+        );
+        let started = tokio::time::Instant::now();
+        let result = healthy_candidate(&paths, "0.4.1", Some(&AuthBaseline::Initial)).await;
+        server.abort();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("observation deadline exceeded")
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() >= Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(6));
     }
 
     #[tokio::test]
