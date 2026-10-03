@@ -2532,13 +2532,7 @@ async fn reconcile_service_stop(paths: &Paths, operation: &mut Operation) -> Res
             Some("stopped_service_start_failed" | "stopped_service_health_failed")
         )
     {
-        match restore_activation(paths, operation).await {
-            Ok(()) => return Ok(json!({"resumed":true,"operation":operation})),
-            Err(_) if operation.phase == "service_stop_pending" => {
-                return Ok(service_stop_pending(operation));
-            }
-            Err(error) => return Err(error),
-        }
+        return restore_failed_candidate(paths, operation).await;
     }
     if stop.request == StopRequest::ObservedStopped {
         let resources = operation
@@ -2563,8 +2557,23 @@ async fn reconcile_service_stop(paths: &Paths, operation: &mut Operation) -> Res
                     .file_name()
                     .and_then(|name| name.to_str())
                     .context("restart version missing")?;
-                // Real health also verifies loaded label + exact native process
-                // identity before accepting an interrupted bootstrap.
+                // An older resume owner may have replaced a health-failure
+                // checkpoint with its generic protection message. That message
+                // is never evidence of failure or restoration authorization.
+                // Verify the exact loaded candidate before any new health
+                // observation; only an actual failed observation below can
+                // establish a new categorical failure for this operation.
+                let generic_loaded_candidate = stop.direction == StopDirection::ActivateCandidate
+                    && operation.phase == "recovery_required"
+                    && operation.checkpoint.as_deref()
+                        == Some("observed state could not be reconciled safely")
+                    && matches!(observe_label(paths).await, LabelObservation::Loaded { .. });
+                if generic_loaded_candidate {
+                    ensure!(
+                        restarted_service_identity_matches(paths, target).await,
+                        "candidate recovery process identity is unconfirmed"
+                    );
+                }
                 let health = if stop.direction == StopDirection::RestorePrevious {
                     healthy_restored_previous(paths, version, operation.auth_baseline.as_ref())
                         .await
@@ -2591,6 +2600,23 @@ async fn reconcile_service_stop(paths: &Paths, operation: &mut Operation) -> Res
                         )?;
                         return Ok(json!({"resumed":true,"operation":operation}));
                     }
+                } else if generic_loaded_candidate
+                    && operation.kind == OperationKind::Update
+                    && operation.previous_target.is_some()
+                {
+                    // Missing captured auth cannot be reconstructed from the
+                    // failed read, the generic checkpoint or the old receipt.
+                    ensure!(
+                        operation.auth_baseline.is_some(),
+                        "lifecycle auth baseline is unavailable"
+                    );
+                    set_checkpoint(
+                        paths,
+                        operation,
+                        "recovery_required",
+                        "stopped_service_health_failed",
+                    )?;
+                    return restore_failed_candidate(paths, operation).await;
                 }
             }
         }
@@ -2598,6 +2624,21 @@ async fn reconcile_service_stop(paths: &Paths, operation: &mut Operation) -> Res
     match observe_service_stop(paths, operation, false).await? {
         Some(singleton) => complete_stopped_transition(paths, operation, singleton).await,
         None => Ok(service_stop_pending(operation)),
+    }
+}
+
+// Both a newly retained failure and a freshly re-observed historical failure
+// use the original restoration owner. This never admits ordinary downgrade or
+// substitutes counters for exact stopped-process/singleton proof.
+async fn restore_failed_candidate(paths: &Paths, operation: &mut Operation) -> Result<Value> {
+    ensure!(
+        operation.auth_baseline.is_some(),
+        "lifecycle auth baseline is unavailable"
+    );
+    match restore_activation(paths, operation).await {
+        Ok(()) => Ok(json!({"resumed":true,"operation":operation})),
+        Err(_) if operation.phase == "service_stop_pending" => Ok(service_stop_pending(operation)),
+        Err(error) => Err(error),
     }
 }
 
@@ -3314,6 +3355,11 @@ pub async fn resume(paths: &Paths) -> Result<Value> {
                             "candidate_drain_release_pending"
                         }
                         Some("previous_drain_release_pending") => "previous_drain_release_pending",
+                        // The transition owner has already established these
+                        // categorical failures. Do not erase them at the outer
+                        // error boundary and strand an exact loaded candidate.
+                        Some("stopped_service_start_failed") => "stopped_service_start_failed",
+                        Some("stopped_service_health_failed") => "stopped_service_health_failed",
                         _ => "observed state could not be reconciled safely",
                     };
                     set_checkpoint(paths, &mut operation, "recovery_required", checkpoint)?;
@@ -5720,6 +5766,306 @@ mod tests {
                 .is_none()
         );
         operation
+    }
+
+    #[tokio::test]
+    async fn pending_resume_health_failure_retains_its_categorical_checkpoint() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = StopTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let mut original = previous_drained_recovery_fixture(&paths);
+        original.auth_baseline = Some(AuthBaseline::Authenticated {
+            installation_id: Uuid::new_v4(),
+            active_organization: Some(Uuid::new_v4()),
+        });
+        original.schema = OPERATION_SCHEMA.into();
+        state::write_json(
+            &paths.state_dir.join("install-receipt.json"),
+            &json!({"version":"1.2.4","versionPath":original.previous_target}),
+        )
+        .unwrap();
+        fs::write(
+            &original.resources.as_ref().unwrap().staged_launch_agent,
+            b"candidate-plist",
+        )
+        .unwrap();
+        prepare_service_stop(&paths, &mut original, StopDirection::ActivateCandidate)
+            .await
+            .unwrap();
+        request_service_stop(&paths, &mut original).await.unwrap();
+        assert!(
+            observe_service_stop(&paths, &mut original, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        TEST_LABEL_PRESENT.store(false, Ordering::SeqCst);
+        TEST_CANDIDATE_HEALTH_FAIL.store(true, Ordering::SeqCst);
+        let result = resume(&paths).await;
+        TEST_CANDIDATE_HEALTH_FAIL.store(false, Ordering::SeqCst);
+        let result = result.unwrap();
+        assert_eq!(result["resumed"], false);
+        assert_eq!(result["operation"]["phase"], "recovery_required");
+        assert_eq!(
+            result["operation"]["checkpoint"],
+            "stopped_service_health_failed"
+        );
+        let saved: Operation = state::read_json(&paths.operation()).unwrap();
+        assert_eq!(saved.id, original.id);
+        assert_eq!(saved.auth_baseline, original.auth_baseline);
+        assert_eq!(saved.package, original.package);
+        assert_eq!(saved.previous_target, original.previous_target);
+        assert_eq!(saved.service_stops.len(), 1);
+        assert_eq!(saved.service_stops[0].request, StopRequest::ObservedStopped);
+        assert_eq!(
+            fs::read_link(paths.current()).unwrap(),
+            original.package.unwrap().target
+        );
+    }
+
+    async fn historical_failed_candidate_fixture(paths: &Paths) -> Operation {
+        let mut operation = previous_drained_recovery_fixture(paths);
+        replace_fixture_previous_catalog(paths);
+        operation.auth_baseline = Some(AuthBaseline::Authenticated {
+            installation_id: Uuid::new_v4(),
+            active_organization: Some(Uuid::new_v4()),
+        });
+        operation.schema = OPERATION_SCHEMA.into();
+        state::write_json(
+            &paths.state_dir.join("install-receipt.json"),
+            &json!({"version":"1.2.4","versionPath":operation.previous_target}),
+        )
+        .unwrap();
+        fs::write(
+            &operation.resources.as_ref().unwrap().staged_launch_agent,
+            b"candidate-plist",
+        )
+        .unwrap();
+        prepare_service_stop(paths, &mut operation, StopDirection::ActivateCandidate)
+            .await
+            .unwrap();
+        request_service_stop(paths, &mut operation).await.unwrap();
+        TEST_LABEL_PRESENT.store(false, Ordering::SeqCst);
+        TEST_CANDIDATE_HEALTH_FAIL.store(true, Ordering::SeqCst);
+        let failed = resume(paths).await;
+        TEST_CANDIDATE_HEALTH_FAIL.store(false, Ordering::SeqCst);
+        assert_eq!(
+            failed.unwrap()["operation"]["checkpoint"],
+            "stopped_service_health_failed"
+        );
+        let mut historical: Operation = state::read_json(&paths.operation()).unwrap();
+        // Exact historical decoder fixture: the previous owner's catch erased
+        // the established failure. This is disposable test data, never a live
+        // journal edit or authorization inferred from this generic string.
+        historical.checkpoint = Some("observed state could not be reconciled safely".into());
+        save_operation(paths, &historical).unwrap();
+        TEST_LABEL_PRESENT.store(true, Ordering::SeqCst);
+        *TEST_LABEL_OBSERVATION.lock().unwrap() = Some(LabelObservation::Loaded {
+            pid: 222222,
+            program: paths.versions().join("1.2.3/bin/loomex-runner"),
+        });
+        *TEST_RECOVERY_STATUS.lock().unwrap() =
+            Some(json!({"version":"1.2.3","activeJobs":0,"draining":true}));
+        historical
+    }
+
+    #[tokio::test]
+    async fn historical_generic_candidate_with_fresh_healthy_auth_completes_without_restoration() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = StopTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let original = historical_failed_candidate_fixture(&paths).await;
+        let candidate = original.package.as_ref().unwrap().target.clone();
+        let receipt = fs::read(paths.state_dir.join("install-receipt.json")).unwrap();
+        let AuthBaseline::Authenticated {
+            installation_id,
+            active_organization,
+        } = original.auth_baseline.clone().unwrap()
+        else {
+            panic!("fixture baseline")
+        };
+        *TEST_RECOVERY_STATUS.lock().unwrap() =
+            Some(json!({"version":"1.2.3","activeJobs":0,"draining":false}));
+        *TEST_AUTH_STATUS.lock().unwrap() = Some(
+            json!({"authenticated":true,"code":"AUTHENTICATED","installationId":installation_id,"activeOrganization":active_organization,"loginPending":false}),
+        );
+        let result = resume(&paths).await.unwrap();
+        assert_eq!(result["resumed"], true);
+        assert_eq!(result["operation"]["phase"], "completed");
+        assert_eq!(
+            result["operation"]["checkpoint"],
+            "stopped_service_healthy_after_reconciliation"
+        );
+        let saved: Operation = state::read_json(&paths.operation()).unwrap();
+        assert_eq!(saved.id, original.id);
+        assert_eq!(saved.auth_baseline, original.auth_baseline);
+        assert_eq!(saved.package, original.package);
+        assert_eq!(saved.resources, original.resources);
+        assert_eq!(saved.service_stops, original.service_stops);
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(fs::read_link(paths.current()).unwrap(), candidate);
+        assert_eq!(fs::read(launch_agent(&paths)).unwrap(), b"candidate-plist");
+        assert_eq!(
+            fs::read(paths.state_dir.join("install-receipt.json")).unwrap(),
+            receipt
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_candidate_health_failure_restores_same_operation_only_after_exit_and_singleton()
+     {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = StopTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let original = historical_failed_candidate_fixture(&paths).await;
+        let previous = original.previous_target.clone().unwrap();
+        let candidate = original.package.as_ref().unwrap().target.clone();
+        assert!(validate_rollback_target(&previous, "1.2.4").is_err());
+        let receipt = fs::read(paths.state_dir.join("install-receipt.json")).unwrap();
+        TEST_CANDIDATE_HEALTH_FAIL.store(true, Ordering::SeqCst);
+        let pending = resume(&paths).await;
+        TEST_CANDIDATE_HEALTH_FAIL.store(false, Ordering::SeqCst);
+        assert_eq!(pending.unwrap()["pending"], true);
+        let stopping: Operation = state::read_json(&paths.operation()).unwrap();
+        assert_eq!(stopping.id, original.id);
+        assert_eq!(stopping.service_stops.len(), 2);
+        assert_eq!(
+            stopping.service_stops[1].direction,
+            StopDirection::RestorePrevious
+        );
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 2);
+        assert_eq!(fs::read_link(paths.current()).unwrap(), candidate);
+        // Job/IO counters do not prove actual native ownership released. Hold
+        // the real singleton while process/label absence is observed.
+        TEST_LABEL_PRESENT.store(false, Ordering::SeqCst);
+        *TEST_LABEL_OBSERVATION.lock().unwrap() = None;
+        let native_owner = stopped_singleton(&paths, false).unwrap();
+        assert_eq!(resume(&paths).await.unwrap()["pending"], true);
+        assert_eq!(fs::read_link(paths.current()).unwrap(), candidate);
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 2);
+        drop(native_owner);
+        *TEST_RECOVERY_FAULT.lock().unwrap() = Some("before_stop_bootstrap");
+        assert_eq!(
+            resume(&paths).await.unwrap()["operation"]["phase"],
+            "recovery_required"
+        );
+        assert_eq!(fs::read_link(paths.current()).unwrap(), previous);
+        *TEST_RECOVERY_FAULT.lock().unwrap() = None;
+        *TEST_RECOVERY_STATUS.lock().unwrap() =
+            Some(json!({"version":"1.2.4","activeJobs":0,"draining":false}));
+        *TEST_LABEL_OBSERVATION.lock().unwrap() = Some(LabelObservation::Loaded {
+            pid: 333333,
+            program: previous.join("bin/loomex-runner"),
+        });
+        let AuthBaseline::Authenticated {
+            installation_id,
+            active_organization,
+        } = original.auth_baseline.clone().unwrap()
+        else {
+            panic!("fixture baseline")
+        };
+        *TEST_AUTH_STATUS.lock().unwrap() = Some(
+            json!({"authenticated":true,"code":"AUTHENTICATED","installationId":installation_id,"activeOrganization":Uuid::new_v4(),"loginPending":false}),
+        );
+        assert_ne!(
+            resume(&paths).await.unwrap()["operation"]["phase"],
+            "rolled_back"
+        );
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 2);
+        *TEST_AUTH_STATUS.lock().unwrap() = Some(
+            json!({"authenticated":true,"code":"AUTHENTICATED","installationId":installation_id,"activeOrganization":active_organization,"loginPending":false}),
+        );
+        let result = resume(&paths).await.unwrap();
+        assert_eq!(result["operation"]["phase"], "rolled_back");
+        let saved: Operation = state::read_json(&paths.operation()).unwrap();
+        assert_eq!(saved.id, original.id);
+        assert_eq!(saved.package, original.package);
+        assert_eq!(saved.auth_baseline, original.auth_baseline);
+        assert_eq!(saved.resources, original.resources);
+        assert_eq!(saved.service_stops.len(), 2);
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            fs::read(paths.state_dir.join("install-receipt.json")).unwrap(),
+            receipt
+        );
+        assert_eq!(fs::read(launch_agent(&paths)).unwrap(), b"previous-plist");
+    }
+
+    #[tokio::test]
+    async fn historical_candidate_health_failure_refuses_missing_baseline_busy_identity_and_tamper()
+    {
+        let _serial = TEST_SERIAL.lock().await;
+        for case in [
+            "missing_baseline",
+            "active_work",
+            "wrong_process",
+            "tampered_candidate",
+            "tampered_previous",
+            "tampered_backup",
+            "changed_receipt",
+        ] {
+            let _scope = StopTestScope::start();
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let mut original = historical_failed_candidate_fixture(&paths).await;
+            let candidate = original.package.as_ref().unwrap().target.clone();
+            match case {
+                "missing_baseline" => {
+                    original.auth_baseline = None;
+                    original.schema = PRE_AUTH_OPERATION_SCHEMA.into();
+                    save_operation(&paths, &original).unwrap();
+                }
+                "active_work" => TEST_DRAIN_HAS_ACTIVE_WORK.store(true, Ordering::SeqCst),
+                "wrong_process" => {
+                    *TEST_PROCESS_OBSERVATION.lock().unwrap() =
+                        Some(ProcessObservation::Present(ProcessIdentity {
+                            pid: 222222,
+                            uid: unsafe { libc::geteuid() } + 1,
+                            started_seconds: 1,
+                            started_micros: 0,
+                            executable: candidate.join("bin/loomex-runner"),
+                        }))
+                }
+                "tampered_candidate" => fs::write(candidate.join("bin/loomex"), b"tamper").unwrap(),
+                "tampered_previous" => fs::write(
+                    original
+                        .previous_target
+                        .as_ref()
+                        .unwrap()
+                        .join("bin/loomex"),
+                    b"tamper",
+                )
+                .unwrap(),
+                "tampered_backup" => fs::write(
+                    &original.resources.as_ref().unwrap().launch_agent_backup,
+                    b"tamper",
+                )
+                .unwrap(),
+                "changed_receipt" => {
+                    fs::write(paths.state_dir.join("install-receipt.json"), b"changed").unwrap()
+                }
+                _ => unreachable!(),
+            }
+            TEST_CANDIDATE_HEALTH_FAIL.store(true, Ordering::SeqCst);
+            let result = resume(&paths).await;
+            TEST_CANDIDATE_HEALTH_FAIL.store(false, Ordering::SeqCst);
+            TEST_DRAIN_HAS_ACTIVE_WORK.store(false, Ordering::SeqCst);
+            assert_eq!(result.unwrap()["resumed"], false, "{case}");
+            let saved: Operation = state::read_json(&paths.operation()).unwrap();
+            assert_eq!(saved.id, original.id, "{case}");
+            assert_eq!(saved.auth_baseline, original.auth_baseline, "{case}");
+            assert_eq!(saved.service_stops.len(), 1, "{case}");
+            assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1, "{case}");
+            assert_eq!(fs::read_link(paths.current()).unwrap(), candidate, "{case}");
+            assert_eq!(
+                fs::read(launch_agent(&paths)).unwrap(),
+                b"candidate-plist",
+                "{case}"
+            );
+        }
     }
 
     #[tokio::test]
