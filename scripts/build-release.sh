@@ -65,8 +65,12 @@ else
   python3 "$repo/scripts/artifact.py" source-manifest --source-root "$repo" --source-revision "$revision" --output "$source_manifest" --snapshot "$build_root"
 fi
 feedback_tool="$build_root/scripts/build-feedback.py"
-remap_flags="${RUSTFLAGS:-} --remap-path-prefix=$build_root=/loomex/src --remap-path-prefix=${HOME:?}=/loomex/home"
-remap_cflags="${CFLAGS:-} -ffile-prefix-map=$build_root=/loomex/src -ffile-prefix-map=${HOME:?}=/loomex/home"
+# Cargo/rustc canonicalize snapshot paths (macOS /var resolves to /private/var).
+# Keep the lexical snapshot/temporary paths for manifest and failure ownership,
+# while remapping both exact source spellings used by Rust and C compilers.
+canonical_build_root="$(cd "$build_root" && pwd -P)"
+remap_flags="${RUSTFLAGS:-} --remap-path-prefix=$canonical_build_root=/loomex/src --remap-path-prefix=$build_root=/loomex/src --remap-path-prefix=${HOME:?}=/loomex/home"
+remap_cflags="${CFLAGS:-} -ffile-prefix-map=$canonical_build_root=/loomex/src -ffile-prefix-map=$build_root=/loomex/src -ffile-prefix-map=${HOME:?}=/loomex/home"
 (cd "$build_root" && CARGO_TARGET_DIR="$temporary/target" RUSTFLAGS="$remap_flags" CFLAGS="$remap_cflags" run_build cargo test --locked)
 python3 "$build_root/scripts/export-compatibility.py" --check
 if [[ "$mode" == "--production" ]]; then
@@ -143,12 +147,16 @@ PY
     echo "WARNING: building unsigned development artifact for isolated testing only" >&2
   fi
 fi
-python3 - "$payload" "${HOME:?}" <<'PY'
+python3 - "$payload" "${HOME:?}" "$build_root" "$canonical_build_root" <<'PY'
 import sys
 from pathlib import Path
-root=Path(sys.argv[1]); needle=sys.argv[2].encode()
+root=Path(sys.argv[1])
+needles=[(sys.argv[2].encode(), 'home'), (sys.argv[3].encode(), 'source'), (sys.argv[4].encode(), 'source')]
 for path in root.rglob('*'):
- if path.is_file() and needle in path.read_bytes(): raise SystemExit(f'payload embeds build home path: {path.relative_to(root)}')
+ if path.is_file():
+  content=path.read_bytes()
+  for needle, label in needles:
+   if needle in content: raise SystemExit(f'payload embeds build {label} path: {path.relative_to(root)}')
 PY
 release_stage="$temporary/release"
 arguments=(create --payload "$payload" --output "$release_stage" --project loomex-runner --version "$version" --platform darwin-arm64 --source-revision "$revision" --bootstrap "$payload/bin/loomex-lifecycle-bootstrap")
