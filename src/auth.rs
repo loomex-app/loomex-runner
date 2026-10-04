@@ -1451,7 +1451,7 @@ impl Auth {
                 self.refresh_child(state, org).await?;
             }
             let child = &state.children[org];
-            let credential = child.signed(&state);
+            let credential = child.signed(state);
             let response = self
                 .api
                 .request("GET", "v1/self/", None, Some(&credential), None)
