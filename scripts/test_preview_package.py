@@ -84,9 +84,50 @@ class PreviewPackageTests(unittest.TestCase):
             self.assertIn('LOOMEX_API_ORIGIN must be a configured HTTPS origin', result.stderr)
             self.assertFalse((Path(directory) / 'output').exists())
 
+    def local_fixture(self,directory):
+        root,project,source,_=self.fixture(directory)
+        (root/'metadata/preview-origin.json').unlink()
+        value={'schema':'app.loomex.runner.local-development-origin/v1','apiOrigin':'http://127.0.0.1:28080/','webAppOrigin':None,'sourceRevision':source['sourceRevision'],'version':project['version']}
+        (root/'metadata/local-development-origin.json').write_text(canonical(value))
+        return root,value
+
+    def test_local_metadata_is_canonical_inventory_bound_and_profile_sealed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root,original=self.local_fixture(directory)
+            self.assertEqual(self.validate(root).returncode,0)
+            for key,value in [('apiOrigin','http://external.example/'),('apiOrigin','https://cloud.example/'),('webAppOrigin','https://web.example/'),('sourceRevision','b'*40),('version','9.9.9'),('schema','other'),('extra',True)]:
+                (root/'metadata/local-development-origin.json').write_text(canonical({**original,key:value}))
+                self.assertNotEqual(self.validate(root).returncode,0,(key,value))
+            (root/'metadata/local-development-origin.json').write_text(canonical(original))
+            (root/'metadata/preview-origin.json').write_text(canonical({'schema':'app.loomex.runner.preview-origin/v1','apiOrigin':'https://preview.example/','sourceRevision':'a'*40,'version':'0.4.9'}))
+            self.assertNotEqual(self.validate(root).returncode,0)
+
+    def test_local_builder_rejects_cloud_substitution_before_build(self):
+        cases=[('http://external.example/',None),('https://cloud.example/',None),('http://127.0.0.1:28080/','https://cloud.example/'),('http://127.0.0.1:28080/','')]
+        for origin,compiled in cases:
+            with tempfile.TemporaryDirectory() as directory:
+                env=dict(os.environ);env.pop('LOOMEX_API_ORIGIN',None);env.pop('LOOMEX_WEB_APP_ORIGIN',None)
+                if compiled is not None:env['LOOMEX_API_ORIGIN']=compiled
+                result=subprocess.run(['/bin/bash',str(ROOT/'scripts/build-release.sh'),'--unsigned-development','--local-development-api-origin',origin,'--output',str(Path(directory)/'output')],capture_output=True,text=True,env=env)
+                self.assertNotEqual(result.returncode,0);self.assertFalse((Path(directory)/'output').exists());self.assertNotIn('Compiling ',result.stdout)
+
+    def test_local_qualification_rejects_dirty_source_before_build(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);(root/'scripts').mkdir()
+            for name in ['build-release.sh','release-set.py','artifact.py']:shutil.copy2(ROOT/'scripts'/name,root/'scripts'/name)
+            shutil.copy2(ROOT/'Cargo.toml',root/'Cargo.toml')
+            subprocess.run(['git','init','-q',str(root)],check=True)
+            subprocess.run(['git','-C',str(root),'add','.'],check=True)
+            subprocess.run(['git','-C',str(root),'-c','user.name=Fixture','-c','user.email=fixture@example.test','commit','-qm','Fixture'],check=True)
+            (root/'untracked-source').write_text('dirty')
+            env=dict(os.environ);env.pop('LOOMEX_API_ORIGIN',None);env.pop('LOOMEX_WEB_APP_ORIGIN',None)
+            result=subprocess.run(['/bin/bash',str(root/'scripts/build-release.sh'),'--unsigned-development','--local-development-api-origin','http://127.0.0.1:28080/','--output',str(root/'output')],capture_output=True,text=True,env=env)
+            self.assertNotEqual(result.returncode,0);self.assertIn('requires clean immutable source',result.stderr);self.assertFalse((root/'output').exists())
+
     def test_release_builder_uses_clean_archived_source_and_retains_signing_gates(self):
         script = (ROOT / 'scripts/build-release.sh').read_text()
         self.assertEqual(script.count('"$mode" == "--production" || "$mode" == "--unsigned-cloud-preview"'), 2)
+        self.assertIn('"$mode" == "--unsigned-cloud-preview" || -n "$local_origin"',script)
         self.assertIn('production and cloud preview releases require a clean source tree', script)
         self.assertIn('git -C "$repo" archive "$revision"', script)
         self.assertIn('LOOMEX_CODESIGN_IDENTITY:?production requires', script)

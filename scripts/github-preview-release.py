@@ -58,6 +58,7 @@ def local_inventory(directory):
             payload=Path(temp)/f'{name}-payload';pack.safe_extract(root/'payload.tar.gz',payload)
             if pack.artifact.inventory(payload) != m['payload']['files']:raise ValueError('component payload file inventory differs')
             component_inventories[name]=m['payload']['files']
+            if name=='runner':pack.verify_deployment(payload,c,manifest['deployment'])
             source=m['sourceContent'];source_root=payload if name=='runner' else root
             if source['file'] != ('metadata/source-content-manifest.json' if name=='runner' else 'source-content.json') or pack.sha(source_root/source['file']) != source['sha256']:raise ValueError('source content binding differs')
             source_content=pack.read(source_root/source['file'])
@@ -136,7 +137,7 @@ def main():
     try:
         directory,manifest,inventory,component_inventories=local_inventory(a.assets)
         digest=inventory['release-set.json']['sha256'];tag=manifest['releaseTag']
-        review={'releaseTag':tag,'releaseSetSha256':digest,'components':manifest['components'],'cloudApiOrigin':manifest['cloudApiOrigin'],'developmentOnly':True,'assets':inventory,'componentInventories':component_inventories}
+        review={'releaseTag':tag,'releaseSetSha256':digest,'components':manifest['components'],'deployment':manifest['deployment'],'developmentOnly':True,'assets':inventory,'componentInventories':component_inventories}
         if a.action=='inspect':print(json.dumps(review,indent=2,sort_keys=True));return
         if a.approve_manifest_sha256!=digest:raise ValueError('explicit operator approval must match the inspected release-set SHA256')
         remote_prerequisites(manifest)

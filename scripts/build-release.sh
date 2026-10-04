@@ -1,13 +1,25 @@
 #!/bin/bash
 set -euo pipefail
-usage(){ echo "usage: $0 (--production | --unsigned-development | --unsigned-cloud-preview) [--output DIR] [--retain-failure-workspace DIR]" >&2; exit 2; }
-mode=""; output=""; failure_workspace=""
-while (($#)); do case "$1" in --production|--unsigned-development|--unsigned-cloud-preview) [[ -z "$mode" ]] || usage; mode="$1"; shift;; --output) output="${2:?}"; shift 2;; --retain-failure-workspace) failure_workspace="${2:?}"; shift 2;; *) usage;; esac; done
+usage(){ echo "usage: $0 (--production | --unsigned-development | --unsigned-cloud-preview) [--output DIR] [--retain-failure-workspace DIR] [--local-development-api-origin LOOPBACK_URL]" >&2; exit 2; }
+mode=""; output=""; failure_workspace=""; local_origin=""
+while (($#)); do case "$1" in --production|--unsigned-development|--unsigned-cloud-preview) [[ -z "$mode" ]] || usage; mode="$1"; shift;; --output) output="${2:?}"; shift 2;; --retain-failure-workspace) failure_workspace="${2:?}"; shift 2;; --local-development-api-origin) local_origin="${2:?}"; shift 2;; *) usage;; esac; done
 [[ -n "$mode" ]] || usage
 repo="$(cd "$(dirname "$0")/.." && pwd -P)"; version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$repo/Cargo.toml" | head -1)"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "package version is not SemVer: $version" >&2; exit 1; }
 output="${output:-$repo/release/loomex-runner-$version-darwin-arm64}"
 [[ ! -e "$output" ]] || { echo "output already exists; refusing to replace it: $output" >&2; exit 1; }
+if [[ -n "$local_origin" ]]; then
+  [[ "$mode" == "--unsigned-development" ]] || { echo "local profile requires --unsigned-development" >&2; exit 1; }
+  [[ -z "${LOOMEX_API_ORIGIN+x}" ]] || { echo "local profile rejects a compile-pinned API origin" >&2; exit 1; }
+  python3 - "$repo" "$local_origin" <<'PYLOCAL'
+import runpy,sys,os
+validator=runpy.run_path(sys.argv[1]+'/scripts/release-set.py')['validate_deployment']
+if 'LOOMEX_WEB_APP_ORIGIN' in os.environ and not os.environ['LOOMEX_WEB_APP_ORIGIN']: raise SystemExit('empty compile-pinned web origin is invalid')
+validator({'profile':'local-development','apiOrigin':sys.argv[2],'webAppOrigin':os.environ.get('LOOMEX_WEB_APP_ORIGIN')})
+PYLOCAL
+  [[ -z "$(git -C "$repo" status --porcelain --untracked-files=all)" ]] || { echo "qualified local profile requires clean immutable source" >&2; exit 1; }
+  revision="$(git -C "$repo" rev-parse --verify HEAD)"
+fi
 if [[ "$mode" == "--production" || "$mode" == "--unsigned-cloud-preview" ]]; then
   python3 "$repo/scripts/verify-production-config.py"
   [[ -z "$(git -C "$repo" status --porcelain)" ]] || { echo "production and cloud preview releases require a clean source tree" >&2; exit 1; }
@@ -59,7 +71,7 @@ run_build(){
 revision="${revision:-$(git -C "$repo" rev-parse --verify HEAD 2>/dev/null || printf unknown)}"
 source_manifest="$temporary/source-content-manifest.json"
 build_root="$temporary/source"
-if [[ "$mode" == "--production" || "$mode" == "--unsigned-cloud-preview" ]]; then
+if [[ "$mode" == "--production" || "$mode" == "--unsigned-cloud-preview" || -n "$local_origin" ]]; then
   python3 "$repo/scripts/artifact.py" source-manifest --source-root "$repo" --source-revision "$revision" --output "$source_manifest"
   mkdir "$build_root"
   git -C "$repo" archive "$revision" | tar -x -C "$temporary/source"
@@ -115,6 +127,15 @@ origin=urlunsplit(('https',authority,'/','',''))
 metadata={'schema':'app.loomex.runner.preview-origin/v1','apiOrigin':origin,'sourceRevision':revision,'version':version}
 Path(out).write_text(json.dumps(metadata,sort_keys=True,separators=(',',':'))+'\n')
 PY
+fi
+if [[ -n "$local_origin" ]]; then
+  python3 - "$payload/metadata/local-development-origin.json" "$revision" "$version" "$local_origin" <<'PYLOCAL'
+import json,os,sys
+from pathlib import Path
+out,revision,version,origin=sys.argv[1:]
+value={'schema':'app.loomex.runner.local-development-origin/v1','apiOrigin':origin,'webAppOrigin':os.environ.get('LOOMEX_WEB_APP_ORIGIN') or None,'sourceRevision':revision,'version':version}
+Path(out).write_text(json.dumps(value,sort_keys=True,separators=(',',':'))+'\n')
+PYLOCAL
 fi
 cp "$build_root/contracts/compatibility-manifest.json" "$payload/metadata/compatibility-manifest.json"
 cp "$source_manifest" "$payload/metadata/source-content-manifest.json"

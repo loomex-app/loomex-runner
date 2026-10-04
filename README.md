@@ -264,3 +264,5 @@ does not reuse a cache or bypass tests. Repeated unchanged immutable builds have
 not been benchmarked here.
 
 Paired GitHub preview distribution, unified runner/plugin installation, offline envelopes and explicit draft/publication checkpoints are described in [public distribution](docs/public-distribution.md). Preview requires explicit unsigned-development consent; the existing production signing gates remain required.
+
+The paired public distribution contract is `app.loomex.release-set/v2`. Its explicit `local-development` profile supports the 1.0.0 release against an existing loopback backend; `cloud-preview` retains the configured HTTPS cloud path. Both require unsigned development opt-in. See [public distribution](docs/public-distribution.md) for exact profile qualification and installation.

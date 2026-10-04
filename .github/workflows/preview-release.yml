@@ -139,7 +139,7 @@ jobs:
           if [[ "$INCLUDE_OFFLINE" == true ]]; then options+=(--offline); fi
           python scripts/release-set.py --runner-release "$RUNNER_TEMP/runner-envelope" --plugin-archive "$PLUGIN_ARCHIVE" \
             --plugin-source-root ../component-inputs/plugin --installer "$RUNNER_TEMP/loomex-install-darwin-arm64" --compatibility "$RUNNER_TEMP/compatibility-gate.json" \
-            --backend-source-revision "$BACKEND_REF" --release-tag "$PAIRED_TAG" --output "$RUNNER_TEMP/public-release-set" "${options[@]}"
+            --deployment-profile cloud-preview --api-origin "$(python -c 'import json,os; print(json.loads(__import__("tarfile").open(os.environ["RUNNER_TEMP"]+"/runner-envelope/payload.tar.gz").extractfile("metadata/preview-origin.json").read())["apiOrigin"])')" --backend-source-revision "$BACKEND_REF" --release-tag "$PAIRED_TAG" --output "$RUNNER_TEMP/public-release-set" "${options[@]}"
           digest="$(python -c 'import hashlib,os; from pathlib import Path; print(hashlib.sha256((Path(os.environ["RUNNER_TEMP"])/"public-release-set/release-set.json").read_bytes()).hexdigest())')"
           LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 "$RUNNER_TEMP/loomex-install-darwin-arm64" --offline "$RUNNER_TEMP/public-release-set" --manifest-sha256 "$digest" --allow-unsigned-preview --verify-only
           python scripts/github-preview-release.py inspect --assets "$RUNNER_TEMP/public-release-set"

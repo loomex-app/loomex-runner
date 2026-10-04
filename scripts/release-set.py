@@ -5,6 +5,7 @@ import argparse
 import importlib.util
 import json
 import os
+import ipaddress
 from pathlib import Path
 import re
 import shutil
@@ -32,15 +33,38 @@ def sha(path): return artifact.digest(path)
 def canonical(value): return artifact.canonical(value)
 def contract_digest(value): return 'sha256:' + __import__('hashlib').sha256((json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(',',':'))+'\n').encode()).hexdigest()
 
+def validate_deployment(value):
+    if not isinstance(value,dict) or value.get('profile') not in ('cloud-preview','local-development') or set(value)!=({'profile','apiOrigin'} if value['profile']=='cloud-preview' else {'profile','apiOrigin','webAppOrigin'}):
+        raise ValueError('unsupported deployment profile schema')
+    def origin(raw):
+        if not isinstance(raw,str) or any(c.isspace() for c in raw) or '?' in raw or '#' in raw: raise ValueError('canonical deployment origin required')
+        u=urlsplit(raw)
+        if not u.hostname or u.username is not None or u.password is not None or u.path!='/' or u.query or u.fragment: raise ValueError('canonical deployment root required')
+        if value['profile']=='cloud-preview':
+            try: ipaddress.ip_address(u.hostname); dns=False
+            except ValueError: dns=u.hostname!='localhost' and all(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?',label) for label in u.hostname.split('.'))
+            if u.scheme!='https' or not dns: raise ValueError('configured canonical cloud HTTPS DNS root required')
+        else:
+            try: loopback=ipaddress.ip_address(u.hostname).is_loopback
+            except ValueError: loopback=u.hostname=='localhost'
+            if u.scheme!='http' or not loopback: raise ValueError('local-development requires HTTP loopback origin')
+        host=u.hostname.encode('idna').decode('ascii').lower()
+        if ':' in host: host='['+host+']'
+        port=u.port
+        if port is not None and not 0<port<=65535: raise ValueError('invalid origin port')
+        expected=f"{u.scheme}://{host}"+(f':{port}' if port is not None and port != (443 if u.scheme=='https' else 80) else '')+'/'
+        if raw!=expected: raise ValueError('canonical deployment origin required')
+    origin(value['apiOrigin'])
+    if value['profile']=='local-development' and value['webAppOrigin'] is not None: origin(value['webAppOrigin'])
+    return value
+
 def validate_manifest(value):
-    keys = {'schema','releaseTag','platform','developmentOnly','protocolVersion','cloudApiOrigin','components','evidence','installer'}
-    if not isinstance(value, dict) or set(value) != keys or value['schema'] != 'app.loomex.release-set/v1':
+    keys = {'schema','releaseTag','platform','developmentOnly','protocolVersion','deployment','components','evidence','installer'}
+    if not isinstance(value, dict) or set(value) != keys or value['schema'] != 'app.loomex.release-set/v2':
         raise ValueError('release-set schema mismatch')
     if value['platform'] != 'darwin-arm64' or value['developmentOnly'] is not True or value['protocolVersion'] != 'loomex.local-control/v2':
         raise ValueError('unsupported platform/class/protocol')
-    origin = urlsplit(value['cloudApiOrigin'])
-    if origin.scheme != 'https' or not origin.hostname or origin.username or origin.password or origin.path != '/' or origin.query or origin.fragment:
-        raise ValueError('configured canonical cloud HTTPS root required')
+    validate_deployment(value['deployment'])
     if set(value['components']) != {'runner','plugin'}:
         raise ValueError('both paired components required')
     versions=[]; names=[]
@@ -90,6 +114,18 @@ def clean_revision(root):
         raise ValueError('release-set packaging requires clean immutable runner checkout')
     return head
 
+def verify_deployment(payload, component, deployment):
+    validate_deployment(deployment)
+    local=deployment['profile']=='local-development'
+    file='metadata/local-development-origin.json' if local else 'metadata/preview-origin.json'
+    other='metadata/preview-origin.json' if local else 'metadata/local-development-origin.json'
+    if (payload/other).exists(): raise ValueError('runner deployment profile substitution')
+    value=read(payload/file)
+    expected={'schema':'app.loomex.runner.local-development-origin/v1' if local else 'app.loomex.runner.preview-origin/v1','apiOrigin':deployment['apiOrigin'],'sourceRevision':component['sourceRevision'],'version':component['version']}
+    if local: expected['webAppOrigin']=deployment['webAppOrigin']
+    if value!=expected or (payload/file).read_bytes()!=canonical(value): raise ValueError('runner deployment metadata differs from exact reviewed profile/origins/source')
+    return value
+
 def package(args):
     output=Path(args.output).absolute()
     if any(parent.is_symlink() for parent in output.parents) or os.path.lexists(output): raise ValueError('output already exists; no overwrite')
@@ -112,10 +148,10 @@ def package(args):
         temporary=Path(temporary)
         verified=temporary/'runner-payload'
         subprocess.run(['python3',str(ROOT/'scripts/artifact.py'),'extract','--release',str(runner),'--project','loomex-runner','--platform','darwin-arm64','--allow-unsigned-development','--extract',str(verified)],check=True)
-        preview=read(verified/'metadata/preview-origin.json')
-        if preview.get('schema') != 'app.loomex.runner.preview-origin/v1' or preview.get('sourceRevision') != source or preview.get('version') != runner_manifest['version']:
-            raise ValueError('manifest-bound preview cloud configuration required')
-        origin=preview['apiOrigin']
+        deployment={'profile':args.deployment_profile,'apiOrigin':args.api_origin}
+        if args.deployment_profile=='local-development': deployment['webAppOrigin']=args.web_app_origin
+        elif args.web_app_origin is not None: raise ValueError('cloud web origin belongs to existing compiled configuration')
+        verify_deployment(verified,runner_manifest,deployment)
         extracted=temporary/'plugin-envelope';safe_extract(plugin_archive,extracted)
         plugin_manifest=read(extracted/'manifest.json'); public=read(extracted/'public-distribution.json')
         plugin_members={p.relative_to(extracted).as_posix() for p in extracted.rglob('*') if p.is_file()}
@@ -160,7 +196,7 @@ def package(args):
         components={}
         for name,m,path,repo in [('runner',runner_manifest,runner_archive,REPOSITORY),('plugin',plugin_manifest,stage/plugin_archive.name,'loomex-app/loomex-codex-plugin')]:
             components[name]={'version':m['version'],'sourceRevision':m['sourceRevision'],'repository':repo,'releaseTag':tag,'manifestSha256':sha((runner if name=='runner' else extracted)/'manifest.json'),'asset':asset(path,tag)}
-        manifest={'schema':'app.loomex.release-set/v1','releaseTag':tag,'platform':'darwin-arm64','developmentOnly':True,'protocolVersion':'loomex.local-control/v2','cloudApiOrigin':origin,'components':components,'evidence':{'asset':asset(stage/'compatibility.json',tag),'backendSourceRevision':revision,'passed':True},'installer':asset(stage/installer.name,tag)}
+        manifest={'schema':'app.loomex.release-set/v2','releaseTag':tag,'platform':'darwin-arm64','developmentOnly':True,'protocolVersion':'loomex.local-control/v2','deployment':deployment,'components':components,'evidence':{'asset':asset(stage/'compatibility.json',tag),'backendSourceRevision':revision,'passed':True},'installer':asset(stage/installer.name,tag)}
         validate_manifest(manifest)
         (stage/'release-set.json').write_bytes(canonical(manifest))
         manifest_digest=sha(stage/'release-set.json')
@@ -180,7 +216,7 @@ def package(args):
 
 def release_notes(manifest,digest):
     runner=manifest['components']['runner']; plugin=manifest['components']['plugin']
-    return f'Unsigned development preview for macOS ARM64 only. Not Developer ID signed or notarized. Explicit opt-in required.\n\nRunner {runner["version"]}: {runner["sourceRevision"]}\nPlugin {plugin["version"]}: {plugin["sourceRevision"]}\nBackend qualified source: {manifest["evidence"]["backendSourceRevision"]}\nRelease-set SHA256: {digest}\nCloud API origin: {manifest["cloudApiOrigin"]}\nProtocol: {manifest["protocolVersion"]}\n\nLicense: existing Proprietary decision; no new license grant.\n\nInspect all assets and inventories before the separate operator publication checkpoint. Installation defaults to runner and plugin; --runner-only is supported. No login or organization selection is forced.\n'
+    return f'Unsigned development preview for macOS ARM64 only. Not Developer ID signed or notarized. Explicit opt-in required.\n\nRunner {runner["version"]}: {runner["sourceRevision"]}\nPlugin {plugin["version"]}: {plugin["sourceRevision"]}\nBackend qualified source: {manifest["evidence"]["backendSourceRevision"]}\nRelease-set SHA256: {digest}\nDeployment profile: {manifest["deployment"]["profile"]}\nAPI origin: {manifest["deployment"]["apiOrigin"]}\nWeb app origin: {manifest["deployment"].get("webAppOrigin", "compiled cloud build configuration")}\nProtocol: {manifest["protocolVersion"]}\n\nLicense: existing Proprietary decision; no new license grant.\n\nInspect all assets and inventories before the separate operator publication checkpoint. Installation defaults to runner and plugin; --runner-only is supported. No login or organization selection is forced.\n'
 
 def launcher_script(manifest,digest):
     base=f'https://github.com/{REPOSITORY}/releases/download/{manifest["releaseTag"]}'
@@ -212,6 +248,9 @@ def main():
     parser.add_argument('--backend-source-revision',required=True)
     parser.add_argument('--release-tag',required=True)
     parser.add_argument('--output',required=True)
+    parser.add_argument('--deployment-profile',choices=['cloud-preview','local-development'],required=True)
+    parser.add_argument('--api-origin',required=True)
+    parser.add_argument('--web-app-origin')
     parser.add_argument('--offline',action='store_true')
     args=parser.parse_args()
     try: print(json.dumps(package(args),sort_keys=True))

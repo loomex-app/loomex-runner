@@ -1,5 +1,5 @@
 {
-  "$comment": "Semantic verification additionally requires exact paired versions/tag, repository identities, frozen GitHub URL, unique assets, HTTPS root origin and packaged compatibility/source hashes. Schema validation alone is insufficient.",
+  "$comment": "Semantic verification also requires canonical deployment-specific origins and exact inventory-bound runner deployment metadata; local-development accepts HTTP loopback only, cloud-preview requires HTTPS DNS origins. Exact source/pair/artifact evidence remains mandatory.",
   "$defs": {
     "asset": {
       "additionalProperties": false,
@@ -69,14 +69,10 @@
       "type": "object"
     }
   },
-  "$id": "app.loomex.release-set/v1",
+  "$id": "app.loomex.release-set/v2",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
-    "cloudApiOrigin": {
-      "format": "uri",
-      "type": "string"
-    },
     "components": {
       "additionalProperties": false,
       "properties": {
@@ -92,6 +88,52 @@
         "plugin"
       ],
       "type": "object"
+    },
+    "deployment": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "apiOrigin": {
+              "format": "uri",
+              "type": "string"
+            },
+            "profile": {
+              "const": "cloud-preview"
+            }
+          },
+          "required": [
+            "profile",
+            "apiOrigin"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "apiOrigin": {
+              "format": "uri",
+              "type": "string"
+            },
+            "profile": {
+              "const": "local-development"
+            },
+            "webAppOrigin": {
+              "format": "uri",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "profile",
+            "apiOrigin",
+            "webAppOrigin"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "developmentOnly": {
       "const": true
@@ -131,7 +173,7 @@
       "type": "string"
     },
     "schema": {
-      "const": "app.loomex.release-set/v1"
+      "const": "app.loomex.release-set/v2"
     }
   },
   "required": [
@@ -140,10 +182,10 @@
     "platform",
     "developmentOnly",
     "protocolVersion",
-    "cloudApiOrigin",
     "components",
     "evidence",
-    "installer"
+    "installer",
+    "deployment"
   ],
   "title": "Frozen paired unsigned preview release set",
   "type": "object"

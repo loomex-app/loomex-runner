@@ -12,7 +12,7 @@ use std::{
 };
 use url::Url;
 
-const SCHEMA: &str = "app.loomex.release-set/v1";
+const SCHEMA: &str = "app.loomex.release-set/v2";
 const REPOSITORY: &str = "loomex-app/loomex-runner";
 const MAX_MANIFEST: u64 = 1024 * 1024;
 const MAX_EXPANDED: u64 = 2 * 1024 * 1024 * 1024;
@@ -48,6 +48,65 @@ struct Evidence {
     passed: bool,
 }
 #[derive(Debug, Deserialize)]
+#[serde(tag = "profile", rename_all = "kebab-case", deny_unknown_fields)]
+enum Deployment {
+    CloudPreview {
+        #[serde(rename = "apiOrigin")]
+        api_origin: String,
+    },
+    LocalDevelopment {
+        #[serde(rename = "apiOrigin")]
+        api_origin: String,
+        #[serde(rename = "webAppOrigin")]
+        web_app_origin: Value,
+    },
+}
+impl Deployment {
+    fn api_origin(&self) -> &str {
+        match self {
+            Self::CloudPreview { api_origin } | Self::LocalDevelopment { api_origin, .. } => {
+                api_origin
+            }
+        }
+    }
+    fn local(&self) -> bool {
+        matches!(self, Self::LocalDevelopment { .. })
+    }
+    fn web_app_origin(&self) -> Value {
+        match self {
+            Self::LocalDevelopment { web_app_origin, .. } => web_app_origin.clone(),
+            _ => Value::Null,
+        }
+    }
+}
+fn deployment_origin(raw: &str, local: bool) -> Result<()> {
+    let origin = Url::parse(raw)?;
+    ensure!(
+        origin.username().is_empty()
+            && origin.password().is_none()
+            && origin.path() == "/"
+            && origin.query().is_none()
+            && origin.fragment().is_none()
+            && origin.as_str() == raw,
+        "canonical deployment root origin required"
+    );
+    let host = origin.host_str().context("origin host missing")?;
+    let ip = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>();
+    if local {
+        ensure!(
+            origin.scheme() == "http"
+                && (host == "localhost" || ip.is_ok_and(|ip| ip.is_loopback())),
+            "local-development requires HTTP loopback origin"
+        );
+    } else {
+        ensure!(
+            origin.scheme() == "https" && host != "localhost" && ip.is_err(),
+            "cloud preview requires HTTPS DNS origin"
+        );
+    }
+    Ok(())
+}
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ReleaseSet {
     schema: String,
@@ -55,7 +114,7 @@ struct ReleaseSet {
     platform: String,
     development_only: bool,
     protocol_version: String,
-    cloud_api_origin: String,
+    deployment: Deployment,
     components: Components,
     evidence: Evidence,
     installer: Asset,
@@ -131,22 +190,17 @@ fn validate(s: &ReleaseSet) -> Result<()> {
         s.protocol_version == "loomex.local-control/v2",
         "unsupported protocol"
     );
-    let origin = Url::parse(&s.cloud_api_origin)?;
-    ensure!(
-        origin.scheme() == "https"
-            && origin.host_str().is_some()
-            && origin.username().is_empty()
-            && origin.password().is_none()
-            && origin.path() == "/"
-            && origin.query().is_none()
-            && origin.fragment().is_none(),
-        "cloud API origin must be HTTPS without credentials, path, query or fragment"
-    );
-    let host = origin.host_str().unwrap();
-    ensure!(
-        host != "localhost" && host.parse::<std::net::IpAddr>().is_err(),
-        "preview cloud origin must use a DNS host"
-    );
+    deployment_origin(s.deployment.api_origin(), s.deployment.local())?;
+    if let Deployment::LocalDevelopment { web_app_origin, .. } = &s.deployment {
+        if !web_app_origin.is_null() {
+            deployment_origin(
+                web_app_origin
+                    .as_str()
+                    .context("web app origin must be string or null")?,
+                true,
+            )?;
+        }
+    }
     for (name, c) in [
         ("runner", &s.components.runner),
         ("plugin", &s.components.plugin),
@@ -253,7 +307,7 @@ fn extract(archive: &Path, root: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn verify_envelope(root: &Path, c: &Component) -> Result<Value> {
+fn verify_envelope(root: &Path, c: &Component, deployment: &Deployment) -> Result<Value> {
     ensure!(
         hash_file(&root.join("manifest.json"))? == c.manifest_sha256,
         "component manifest digest mismatch"
@@ -379,15 +433,31 @@ fn verify_envelope(root: &Path, c: &Component) -> Result<Value> {
             "native bootstrap binding missing"
         );
         verify_bound_file(root, bootstrap)?;
-        let mut preview: Value = serde_json::from_slice(
-            &fs::read(payload.join("metadata/preview-origin.json"))
-                .context("cloud preview metadata missing")?,
-        )?;
+        let local = deployment.local();
+        let file = if local {
+            "metadata/local-development-origin.json"
+        } else {
+            "metadata/preview-origin.json"
+        };
+        let other = if local {
+            "metadata/preview-origin.json"
+        } else {
+            "metadata/local-development-origin.json"
+        };
         ensure!(
-            preview["schema"] == "app.loomex.runner.preview-origin/v1"
-                && preview["sourceRevision"] == c.source_revision
-                && preview["version"] == c.version,
-            "preview metadata identity mismatch"
+            !payload.join(other).exists(),
+            "runner deployment profile substitution"
+        );
+        let bytes = fs::read(payload.join(file)).context("runner deployment metadata missing")?;
+        let mut preview: Value = serde_json::from_slice(&bytes)?;
+        let mut expected = serde_json::json!({"schema":if local {"app.loomex.runner.local-development-origin/v1"} else {"app.loomex.runner.preview-origin/v1"}, "sourceRevision":c.source_revision,"version":c.version,"apiOrigin":deployment.api_origin()});
+        if local {
+            expected["webAppOrigin"] = deployment.web_app_origin();
+        }
+        ensure!(
+            preview == expected
+                && canonical_digest(&preview)? == hex::encode(Sha256::digest(&bytes)),
+            "runner deployment metadata differs from reviewed profile/origins/source"
         );
         let contract: Value = serde_json::from_slice(&fs::read(
             payload.join("metadata/compatibility-manifest.json"),
@@ -883,12 +953,12 @@ fn main() -> Result<()> {
     let plugin = stage.path().join("plugin");
     extract(&stage.path().join(&s.components.runner.asset.file), &runner)?;
     extract(&stage.path().join(&s.components.plugin.asset.file), &plugin)?;
-    let origin = verify_envelope(&runner, &s.components.runner)?;
+    let origin = verify_envelope(&runner, &s.components.runner, &s.deployment)?;
     ensure!(
-        origin["apiOrigin"] == s.cloud_api_origin,
+        origin["apiOrigin"] == s.deployment.api_origin(),
         "preview origin differs from verified runner payload"
     );
-    let plugin_contract = verify_envelope(&plugin, &s.components.plugin)?;
+    let plugin_contract = verify_envelope(&plugin, &s.components.plugin, &s.deployment)?;
     evidence(
         &stage.path().join(&s.evidence.asset.file),
         &s,
@@ -913,8 +983,13 @@ fn main() -> Result<()> {
     let mut runner_base = home.join("Library/Application Support/Loomex/runner");
     let mut runner_args = vec![
         "--allow-unsigned-development".into(),
-        "--preview-api-origin".into(),
-        s.cloud_api_origin.clone(),
+        (if s.deployment.local() {
+            "--development-api-origin"
+        } else {
+            "--preview-api-origin"
+        })
+        .into(),
+        s.deployment.api_origin().to_owned(),
     ];
     if authorize_keychain_transition {
         runner_args.push("--authorize-keychain-transition".into());
@@ -993,7 +1068,9 @@ mod tests {
             platform: "darwin-arm64".into(),
             development_only: true,
             protocol_version: "loomex.local-control/v2".into(),
-            cloud_api_origin: "https://api.example.com".into(),
+            deployment: Deployment::CloudPreview {
+                api_origin: "https://api.example.com/".into(),
+            },
             components: Components {
                 runner: Component {
                     version: "0.5.1".into(),
@@ -1036,14 +1113,49 @@ mod tests {
         s.components.runner.asset.url = "https://evil.example/x".into();
         assert!(validate(&s).is_err());
         s = fixture();
-        s.cloud_api_origin = "http://127.0.0.1:8000".into();
+        s.deployment = Deployment::CloudPreview {
+            api_origin: "http://127.0.0.1:8000/".into(),
+        };
         assert!(validate(&s).is_err());
+    }
+    #[test]
+    fn deployment_profiles_are_discriminated_and_canonical() {
+        let mut s = fixture();
+        s.deployment = Deployment::LocalDevelopment {
+            api_origin: "http://127.0.0.1:28080/".into(),
+            web_app_origin: Value::Null,
+        };
+        assert!(validate(&s).is_ok());
+        for raw in [
+            "https://api.example.test/",
+            "http://external.example/",
+            "http://127.0.0.1:28080/path",
+            "http://user@127.0.0.1:28080/",
+            "http://127.0.0.1:28080",
+        ] {
+            assert!(deployment_origin(raw, true).is_err());
+        }
+        for raw in [
+            "http://127.0.0.1:28080/",
+            "https://127.0.0.1/",
+            "https://api.example.test/path",
+            "https://API.example.test/",
+        ] {
+            assert!(deployment_origin(raw, false).is_err());
+        }
+        for raw in [
+            r#"{"profile":"local-development","apiOrigin":"http://127.0.0.1:28080/"}"#,
+            r#"{"profile":"cloud-preview","apiOrigin":"https://api.example.test/","webAppOrigin":null}"#,
+            r#"{"profile":"other","apiOrigin":"https://api.example.test/"}"#,
+        ] {
+            assert!(serde_json::from_str::<Deployment>(raw).is_err());
+        }
     }
     #[test]
     fn malformed_schema() {
         assert!(
             serde_json::from_str::<ReleaseSet>(
-                r#"{"schema":"app.loomex.release-set/v1","unexpected":true}"#
+                r#"{"schema":"app.loomex.release-set/v2","unexpected":true}"#
             )
             .is_err()
         );

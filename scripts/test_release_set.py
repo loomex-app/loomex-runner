@@ -27,7 +27,7 @@ def put(path,value,mode=0o644):
 def archive(root,out):pack.artifact.deterministic_tar(root,out,0)
 def file_record(path,root):return {'path':path.relative_to(root).as_posix(),'size':path.stat().st_size,'sha256':pack.sha(path),'mode':path.stat().st_mode&0o777}
 
-def fixture(root,installer):
+def fixture(root,installer,profile=None):
     assets=root/'assets';assets.mkdir()
     tag='preview-runner-v0.5.2-plugin-v0.16.2';origin='https://api.example.test/'
     components={};contracts={}
@@ -36,7 +36,8 @@ def fixture(root,installer):
         provenance={'schema':'app.loomex.source-content/v1','sourceRevision':revision,'files':[{'path':'fixture','type':'file','tracked':True,'mode':'100644','size':1,'sha256':'c'*64}]}
         if kind=='runner':
             put(payload/'metadata/source-content-manifest.json',provenance)
-            put(payload/'metadata/preview-origin.json',{'schema':'app.loomex.runner.preview-origin/v1','apiOrigin':origin,'sourceRevision':revision,'version':version})
+            metadata = {'schema':'app.loomex.runner.local-development-origin/v1','apiOrigin':'http://127.0.0.1:28080/','webAppOrigin':None,'sourceRevision':revision,'version':version} if profile=='local-development' else {'schema':'app.loomex.runner.preview-origin/v1','apiOrigin':origin,'sourceRevision':revision,'version':version}
+            put(payload/('metadata/local-development-origin.json' if profile=='local-development' else 'metadata/preview-origin.json'),metadata)
             contracts[kind]={'protocol':'loomex.local-control/v2','fixture':kind}
             put(payload/'metadata/compatibility-manifest.json',contracts[kind])
             source_name='metadata/source-content-manifest.json';source_root=payload
@@ -47,7 +48,7 @@ set -euo pipefail
 release="$1"; shift
 echo "$*" >> "$FIXTURE_STATE/runner-args.log"
 base=""
-while (($#)); do case "$1" in --install-base) base="$2";shift 2;; --preview-api-origin) shift 2;; *) shift;; esac; done
+while (($#)); do case "$1" in --install-base) base="$2";shift 2;; --preview-api-origin|--development-api-origin) shift 2;; *) shift;; esac; done
 [[ -n "$base" ]]
 if [[ ! -f "$base/installed" ]]; then
   /bin/mkdir -p "$base/current/bin"
@@ -88,7 +89,9 @@ if [[ ! -f "$base/installed" ]]; then echo plugin >> "$FIXTURE_STATE/owners.log"
     evidence={'schema':'app.loomex.release-qualification/v1','sourceRevisions':{'runner':'a'*40,'plugin':'b'*40,'backend':'d'*40},'compatibility':{'schemaVersion':'loomex/compatibility-manifest/v1','verification':{'sourceRevisions':{'plugin':'b'*40,'backend':'d'*40}},'components':{k:{'digest':pack.contract_digest(v)} for k,v in contracts.items()}}}
     put(assets/'compatibility.json',evidence)
     target=assets/'loomex-install-darwin-arm64';shutil.copy2(installer,target)
-    manifest={'schema':'app.loomex.release-set/v1','releaseTag':tag,'platform':'darwin-arm64','developmentOnly':True,'protocolVersion':'loomex.local-control/v2','cloudApiOrigin':origin,'components':components,'evidence':{'asset':pack.asset(assets/'compatibility.json',tag),'backendSourceRevision':'d'*40,'passed':True},'installer':pack.asset(target,tag)}
+    manifest={'schema':'app.loomex.release-set/v2','releaseTag':tag,'platform':'darwin-arm64','developmentOnly':True,'protocolVersion':'loomex.local-control/v2','deployment':{'profile':'cloud-preview','apiOrigin':origin},'components':components,'evidence':{'asset':pack.asset(assets/'compatibility.json',tag),'backendSourceRevision':'d'*40,'passed':True},'installer':pack.asset(target,tag)}
+    if profile:
+        manifest['schema']='app.loomex.release-set/v2';manifest.pop('deployment');manifest['deployment']={'profile':profile,'apiOrigin':'http://127.0.0.1:28080/' if profile=='local-development' else origin,'webAppOrigin':None}
     put(assets/'release-set.json',manifest)
     return assets,manifest
 
@@ -118,6 +121,30 @@ class SchemaTests(unittest.TestCase):
             for value in ['file:///tmp/x','https://example.test/run','https://github.com/loomex-app/loomex-runner/releases/latest/download/runner.tar.gz']:
                 bad=copy.deepcopy(m);bad['components']['runner']['asset']['url']=value
                 with self.assertRaises(ValueError):pack.validate_manifest(bad)
+    def test_local_deployment_is_explicit_and_loopback_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d);_,m=fixture(p,put(p/'installer','fixture',0o755),'local-development')
+            self.assertEqual(pack.validate_manifest(m),m)
+            for origin in ['https://api.example.test/','http://example.test/','http://127.0.0.1:28080/path','http://127.0.0.1:28080/?token=x','http://user@127.0.0.1:28080/','http://127.0.0.1:28080','http://127.0.0.1:28080/\n']:
+                bad=copy.deepcopy(m);bad['deployment']['apiOrigin']=origin
+                with self.subTest(origin=origin), self.assertRaises(ValueError):pack.validate_manifest(bad)
+            bad=copy.deepcopy(m);bad['deployment']['profile']='other'
+            with self.assertRaises(ValueError):pack.validate_manifest(bad)
+            bad=copy.deepcopy(m);bad['deployment']['profile']='cloud-preview'
+            with self.assertRaises(ValueError):pack.validate_manifest(bad)
+
+    def test_deployment_metadata_rejects_other_profile_origin_source_and_web(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d);_,m=fixture(p,put(p/'installer','fixture',0o755),'local-development')
+            payload=p/'runner-payload';component=m['components']['runner'];deployment=m['deployment']
+            pack.verify_deployment(payload,component,deployment)
+            path=payload/'metadata/local-development-origin.json';original=pack.read(path)
+            for key,value in [('apiOrigin','http://127.0.0.1:28081/'),('webAppOrigin','http://127.0.0.1:5173/'),('version','9.9.9'),('sourceRevision','e'*40),('schema','other')]:
+                put(path,{**original,key:value})
+                with self.subTest(key=key),self.assertRaises(ValueError):pack.verify_deployment(payload,component,deployment)
+            put(path,original);put(payload/'metadata/preview-origin.json',{})
+            with self.assertRaises(ValueError):pack.verify_deployment(payload,component,deployment)
+
     def test_workflow_order_layout_and_no_publication(self):
         text=(ROOT/'.github/workflows/preview-release.yml').read_text()
         self.assertLess(text.index('npm run build'),text.index('run-integration-compatibility-gate.sh'))
@@ -170,6 +197,23 @@ case "$*" in
 esac
 ''',0o755)
         self.env['PATH']=f'{self.bin}:/usr/bin:/bin'
+    def local_fixture(self):
+        shutil.rmtree(self.assets)
+        for name in ['runner-envelope','runner-payload','plugin-envelope','plugin-payload']:shutil.rmtree(self.root/name)
+        self.assets,self.manifest=fixture(self.root,self.installer,'local-development')
+    def test_local_profile_calls_only_existing_development_owner_option(self):
+        self.local_fixture();result=self.invoke(['--runner-only']);self.assertEqual(result.returncode,0,result.stderr)
+        args=(self.state/'runner-args.log').read_text()
+        self.assertIn('--development-api-origin http://127.0.0.1:28080/',args);self.assertNotIn('--preview-api-origin',args)
+    def test_profile_and_origin_substitution_prevents_owner_invocation(self):
+        self.local_fixture()
+        for profile,origin in [('cloud-preview','https://api.example.test/'),('local-development','http://127.0.0.1:28081/')]:
+            self.manifest['deployment'].update(profile=profile,apiOrigin=origin);self.update_manifest()
+            result=self.invoke();self.assertNotEqual(result.returncode,0);self.assert_no_owner()
+    def test_local_profile_still_requires_both_unsafe_optins(self):
+        self.local_fixture();self.assertNotEqual(self.invoke(optin=False).returncode,0);self.assert_no_owner()
+        self.env.pop('LOOMEX_ALLOW_UNSAFE_DEV_INSTALL');self.assertNotEqual(self.invoke().returncode,0);self.assert_no_owner()
+
     def test_missing_codex_durable_manual_guidance(self):
         result=self.invoke();self.assertEqual(result.returncode,0,result.stderr)
         self.assertIn(str(self.plugin),result.stdout);self.assertIn('Codex CLI is unavailable',result.stdout)

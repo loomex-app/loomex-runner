@@ -15,11 +15,11 @@ spec=importlib.util.spec_from_file_location('github_preview',Path(__file__).with
 release=importlib.util.module_from_spec(spec);spec.loader.exec_module(release)
 
 
-def local_fixture(root,offline_extra=None,offline=False):
+def local_fixture(root,offline_extra=None,offline=False,profile=None):
     spec=importlib.util.spec_from_file_location('release_set_tests',Path(__file__).with_name('test_release_set.py'))
     fixtures=importlib.util.module_from_spec(spec);spec.loader.exec_module(fixtures)
     installer=fixtures.put(root/'fixture-installer','fixture native installer',0o755)
-    assets,manifest=fixtures.fixture(root,installer)
+    assets,manifest=fixtures.fixture(root,installer,profile)
     digest=release.pack.sha(assets/'release-set.json')
     fixtures.put(assets/'install-preview.sh',release.pack.launcher_script(manifest,digest),0o755)
     fixtures.put(assets/'RELEASE-NOTES.md',release.pack.release_notes(manifest,digest))
@@ -39,6 +39,16 @@ class ApprovalBindingRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             assets,_,_=local_fixture(Path(d),offline=True)
             release.local_inventory(assets)
+
+    def test_local_development_inventory_and_profile_notes_are_bound(self):
+        with tempfile.TemporaryDirectory() as d:
+            assets,manifest,digest=local_fixture(Path(d),offline=True,profile='local-development')
+            release.local_inventory(assets)
+            notes=(assets/'RELEASE-NOTES.md').read_text()
+            self.assertIn('Deployment profile: local-development',notes);self.assertIn('http://127.0.0.1:28080/',notes)
+            (assets/'RELEASE-NOTES.md').write_text(notes.replace('http://127.0.0.1:28080/','https://cloud.example/'));checksum(assets)
+            self.assertEqual(release.pack.sha(assets/'release-set.json'),digest)
+            with self.assertRaisesRegex(ValueError,'notes'):release.local_inventory(assets)
 
     def test_replaced_installation_guidance_cannot_reuse_manifest_approval(self):
         with tempfile.TemporaryDirectory() as d:
@@ -76,7 +86,7 @@ class OfflineLauncherRegressionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,"offline"):release.local_inventory(assets)
 
 def remote_manifest():
-    return {'releaseTag':'preview-runner-v0.5.2-plugin-v0.16.2','components':{'runner':{'version':'0.5.2','sourceRevision':'a'*40},'plugin':{'version':'0.16.2','sourceRevision':'b'*40}},'cloudApiOrigin':'https://api.example.test/','protocolVersion':'loomex.local-control/v2','evidence':{'backendSourceRevision':'d'*40}}
+    return {'releaseTag':'preview-runner-v0.5.2-plugin-v0.16.2','components':{'runner':{'version':'0.5.2','sourceRevision':'a'*40},'plugin':{'version':'0.16.2','sourceRevision':'b'*40}},'deployment':{'profile':'cloud-preview','apiOrigin':'https://api.example.test/'},'protocolVersion':'loomex.local-control/v2','evidence':{'backendSourceRevision':'d'*40}}
 
 class DraftReadbackRegressionTests(unittest.TestCase):
     def invoke_with_readbacks(self,action,initial,final):

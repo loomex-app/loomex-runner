@@ -57,5 +57,20 @@ if preview.exists():
     if (source['sourceRevision']!=value['sourceRevision'] or not source['files']
             or any(entry['tracked'] is not True or entry['type']=='missing' for entry in source['files'])):
         raise SystemExit('runner preview requires revision-controlled source')
+local=root/'metadata/local-development-origin.json'
+if local.exists():
+    value=json.loads(local.read_text())
+    validator=runpy.run_path(str(source_root/'scripts/release-set.py'))['validate_deployment']
+    try: validator({'profile':'local-development','apiOrigin':value.get('apiOrigin'),'webAppOrigin':value.get('webAppOrigin')})
+    except (ValueError,TypeError,KeyError): raise SystemExit('runner local development origin metadata mismatch')
+    if (preview.exists() or set(value)!={'schema','apiOrigin','webAppOrigin','sourceRevision','version'}
+            or value['schema']!='app.loomex.runner.local-development-origin/v1' or value['version']!=args.expected_version
+            or not isinstance(value['sourceRevision'],str) or not re.fullmatch('[0-9a-f]{40}',value['sourceRevision'])
+            or local.read_bytes()!=(json.dumps(value,sort_keys=True,separators=(',',':'))+'\n').encode() or not has_build):
+        raise SystemExit('runner local development origin metadata mismatch')
+    source=json.loads(source_manifest.read_text())
+    if (source['sourceRevision']!=value['sourceRevision'] or not source['files']
+            or any(entry['tracked'] is not True or entry['type']=='missing' for entry in source['files'])):
+        raise SystemExit('runner local profile requires revision-controlled source')
 plist=(root/"launchd/app.loomex.runner.template.plist").read_text()
 if plist.count("__LOOMEX_DAEMON__")!=1 or plist.count("__LOOMEX_STATE_DIR__")!=3 or plist.count("__LOOMEX_DEV_API_ORIGIN_ENTRY__")!=1 or plist.count("__LOOMEX_PROVIDER_EXECUTABLE_ENTRIES__")!=1: raise SystemExit("LaunchAgent template placeholders are invalid")
