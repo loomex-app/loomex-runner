@@ -135,5 +135,38 @@ class PreviewPackageTests(unittest.TestCase):
         self.assertIn('LOOMEX_MANIFEST_SIGNING_KEY:?production requires', script)
 
 
+class CheckedArchiveTests(unittest.TestCase):
+    def run_snapshot_block(self,mode='padding'):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);repo=root/'repo';repo.mkdir();stage=root/'stage';stage.mkdir();tools=root/'tools';tools.mkdir()
+            archive=root/'fixture.tar'
+            subprocess.run(['git','-C',str(ROOT),'archive','--output',str(archive),'HEAD'],check=True)
+            subprocess.run(['/usr/bin/tar','-xf',str(archive),'-C',str(repo)],check=True)
+            subprocess.run(['git','init','-q',str(repo)],check=True)
+            subprocess.run(['git','-C',str(repo),'add','.'],check=True)
+            subprocess.run(['git','-C',str(repo),'-c','user.name=Fixture','-c','user.email=fixture@example.test','commit','-qm','Fixture'],check=True)
+            revision=subprocess.check_output(['git','-C',str(repo),'rev-parse','HEAD'],text=True).strip()
+            manifest=stage/'source-content-manifest.json'
+            subprocess.run([sys.executable,str(ROOT/'scripts/artifact.py'),'source-manifest','--source-root',str(repo),'--source-revision',revision,'--output',str(manifest)],check=True)
+            if mode=='tamper':
+                value=json.loads(manifest.read_text());next(f for f in value['files'] if f['path']=='README.md')['sha256']='0'*64;manifest.write_text(canonical(value))
+            script=(ROOT/'scripts/build-release.sh').read_text();start=script.index('  mkdir "$build_root"');end=script.index('  snapshot_version=',start);block=script[start:end]
+            producer=tools/'git'
+            producer.write_text('#!/bin/bash\nset -e\n'+('exit 23\n' if mode=='git-error' else '/usr/bin/git "$@"\nexec '+sys.executable+' -c \'import os,signal; signal.signal(signal.SIGPIPE,signal.SIG_DFL); data=b"\\0"*65536; [os.write(1,data) for _ in range(64)]\'\n'))
+            producer.chmod(0o755)
+            if mode=='tar-error':
+                consumer=tools/'tar';consumer.write_text('#!/bin/bash\nexit 24\n');consumer.chmod(0o755)
+            env={**os.environ,'PATH':str(tools)+':'+str(Path(sys.executable).parent)+':/usr/bin:/bin','repo':str(repo),'revision':revision,'temporary':str(stage),'build_root':str(stage/'source'),'source_manifest':str(manifest)}
+            result=subprocess.run(['/bin/bash','-c','set -euo pipefail\n'+block],env=env,capture_output=True,text=True)
+            return result
+
+    def test_valid_archive_with_padding_is_fully_collected_before_tar(self):
+        result=self.run_snapshot_block();self.assertEqual(result.returncode,0,result.stderr)
+    def test_archive_and_extraction_errors_propagate(self):
+        self.assertEqual(self.run_snapshot_block('git-error').returncode,23)
+        self.assertEqual(self.run_snapshot_block('tar-error').returncode,24)
+    def test_source_integrity_verifier_still_rejects_changed_content(self):
+        result=self.run_snapshot_block('tamper');self.assertNotEqual(result.returncode,0);self.assertIn('source content',result.stderr)
+
 if __name__ == '__main__':
     unittest.main()

@@ -74,7 +74,10 @@ build_root="$temporary/source"
 if [[ "$mode" == "--production" || "$mode" == "--unsigned-cloud-preview" || -n "$local_origin" ]]; then
   python3 "$repo/scripts/artifact.py" source-manifest --source-root "$repo" --source-revision "$revision" --output "$source_manifest"
   mkdir "$build_root"
-  git -C "$repo" archive "$revision" | tar -x -C "$temporary/source"
+  # Collect the checked producer fully: bsdtar may stop at the tar end marker
+  # while git still writes archive padding, which otherwise trips pipefail.
+  git -C "$repo" archive "$revision" > "$temporary/source.tar"
+  tar -xf "$temporary/source.tar" -C "$build_root"
   python3 "$repo/scripts/artifact.py" verify-source --source-root "$build_root" --manifest "$source_manifest"
   snapshot_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$build_root/Cargo.toml" | head -1)"
   [[ "$snapshot_version" == "$version" ]] || { echo "snapshot version changed during build" >&2; exit 1; }
