@@ -3,3 +3,6 @@
 *.sock
 .DS_Store
 /release/
+/scripts/distribution-installer/target/
+__pycache__/
+*.pyc

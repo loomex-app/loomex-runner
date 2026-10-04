@@ -274,6 +274,20 @@ pub async fn execute_with_supervisor(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command.as_std_mut().process_group(0);
+    // Reserve a live guardian before the parent can send TERM. Ignored signal
+    // dispositions survive exec, so this also covers loader/startup time before
+    // `maybe_run_supervisor` runs. The target resets TERM before its own exec.
+    // Installing this only in the supervisor races cancellation after spawn:
+    // TERM can kill the sole group member, then KILL sees a zombie-only group
+    // (EPERM on macOS) rather than the guardian's retained live reservation.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::signal(libc::SIGTERM, libc::SIG_IGN) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     command.kill_on_drop(true);
     let child = command.spawn().context("spawn execution guardian")?;
     let pid = child.id().context("guardian has no PID")?;

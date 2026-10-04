@@ -262,3 +262,5 @@ remain private source material. Default cleanup and successful-build cleanup
 still remove the temporary workspace. Retention provides diagnostic evidence and
 does not reuse a cache or bypass tests. Repeated unchanged immutable builds have
 not been benchmarked here.
+
+Paired GitHub preview distribution, unified runner/plugin installation, offline envelopes and explicit draft/publication checkpoints are described in [public distribution](docs/public-distribution.md). Preview requires explicit unsigned-development consent; the existing production signing gates remain required.

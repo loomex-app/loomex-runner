@@ -1,21 +1,26 @@
 #!/bin/bash
 set -euo pipefail
-usage(){ echo "usage: $0 (--production | --unsigned-development) [--output DIR] [--retain-failure-workspace DIR]" >&2; exit 2; }
+usage(){ echo "usage: $0 (--production | --unsigned-development | --unsigned-cloud-preview) [--output DIR] [--retain-failure-workspace DIR]" >&2; exit 2; }
 mode=""; output=""; failure_workspace=""
-while (($#)); do case "$1" in --production|--unsigned-development) mode="$1"; shift;; --output) output="${2:?}"; shift 2;; --retain-failure-workspace) failure_workspace="${2:?}"; shift 2;; *) usage;; esac; done
+while (($#)); do case "$1" in --production|--unsigned-development|--unsigned-cloud-preview) [[ -z "$mode" ]] || usage; mode="$1"; shift;; --output) output="${2:?}"; shift 2;; --retain-failure-workspace) failure_workspace="${2:?}"; shift 2;; *) usage;; esac; done
 [[ -n "$mode" ]] || usage
 repo="$(cd "$(dirname "$0")/.." && pwd -P)"; version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$repo/Cargo.toml" | head -1)"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "package version is not SemVer: $version" >&2; exit 1; }
 output="${output:-$repo/release/loomex-runner-$version-darwin-arm64}"
 [[ ! -e "$output" ]] || { echo "output already exists; refusing to replace it: $output" >&2; exit 1; }
-if [[ "$mode" == "--production" ]]; then
+if [[ "$mode" == "--production" || "$mode" == "--unsigned-cloud-preview" ]]; then
   python3 "$repo/scripts/verify-production-config.py"
+  [[ -z "$(git -C "$repo" status --porcelain)" ]] || { echo "production and cloud preview releases require a clean source tree" >&2; exit 1; }
+  revision="$(git -C "$repo" rev-parse --verify HEAD)"
+fi
+if [[ "$mode" == "--unsigned-cloud-preview" ]]; then
+  export LOOMEX_PREVIEW_SOURCE_REVISION="$revision"
+fi
+if [[ "$mode" == "--production" ]]; then
   : "${LOOMEX_CODESIGN_IDENTITY:?production requires LOOMEX_CODESIGN_IDENTITY}"; : "${LOOMEX_NOTARY_PROFILE:?production requires LOOMEX_NOTARY_PROFILE}"; : "${LOOMEX_MANIFEST_SIGNING_KEY:?production requires LOOMEX_MANIFEST_SIGNING_KEY}"
   security find-identity -v -p codesigning | grep -Fq "$LOOMEX_CODESIGN_IDENTITY" || { echo "configured production signing identity is unavailable" >&2; exit 1; }
   [[ "$LOOMEX_CODESIGN_IDENTITY" == Developer\ ID\ Application:* ]] || { echo "production requires a Developer ID Application identity" >&2; exit 1; }
   openssl rsa -in "$LOOMEX_MANIFEST_SIGNING_KEY" -check -noout >/dev/null
-  [[ -z "$(git -C "$repo" status --porcelain)" ]] || { echo "production release requires a clean source tree" >&2; exit 1; }
-  revision="$(git -C "$repo" rev-parse --verify HEAD)"
 fi
 if [[ -n "$failure_workspace" ]]; then
   [[ ! -e "$failure_workspace" && ! -L "$failure_workspace" ]] || { echo "failure workspace already exists; refusing replacement" >&2; exit 1; }
@@ -54,7 +59,7 @@ run_build(){
 revision="${revision:-$(git -C "$repo" rev-parse --verify HEAD 2>/dev/null || printf unknown)}"
 source_manifest="$temporary/source-content-manifest.json"
 build_root="$temporary/source"
-if [[ "$mode" == "--production" ]]; then
+if [[ "$mode" == "--production" || "$mode" == "--unsigned-cloud-preview" ]]; then
   python3 "$repo/scripts/artifact.py" source-manifest --source-root "$repo" --source-revision "$revision" --output "$source_manifest"
   mkdir "$build_root"
   git -C "$repo" archive "$revision" | tar -x -C "$temporary/source"
@@ -92,10 +97,25 @@ import json,sys
 from pathlib import Path
 version,out,mode=sys.argv[1:]
 metadata={"project":"loomex-runner","version":version,"platform":"darwin-arm64","stateSchema":"app.loomex.runner.state/v1"}
-if mode == '--unsigned-development':
+if mode in ('--unsigned-development', '--unsigned-cloud-preview'):
     metadata['build']={'profile':'distribution-dev','optimizationLevel':'2','debugAssertions':True,'classification':'development'}
 Path(out).write_text(json.dumps(metadata,sort_keys=True,indent=2)+"\n")
 PY
+if [[ "$mode" == "--unsigned-cloud-preview" ]]; then
+  python3 - "$payload/metadata/preview-origin.json" "$revision" "$version" <<'PY'
+import json,os,sys
+from pathlib import Path
+from urllib.parse import urlsplit,urlunsplit
+out,revision,version=sys.argv[1:]
+url=urlsplit(os.environ['LOOMEX_API_ORIGIN'])
+host=url.hostname.encode('idna').decode('ascii').lower()
+if ':' in host: host='['+host+']'
+authority=host + (f':{url.port}' if url.port not in (None,443) else '')
+origin=urlunsplit(('https',authority,'/','',''))
+metadata={'schema':'app.loomex.runner.preview-origin/v1','apiOrigin':origin,'sourceRevision':revision,'version':version}
+Path(out).write_text(json.dumps(metadata,sort_keys=True,separators=(',',':'))+'\n')
+PY
+fi
 cp "$build_root/contracts/compatibility-manifest.json" "$payload/metadata/compatibility-manifest.json"
 cp "$source_manifest" "$payload/metadata/source-content-manifest.json"
 cp "$build_root/scripts/app.loomex.runner.template.plist" "$payload/launchd/app.loomex.runner.template.plist"

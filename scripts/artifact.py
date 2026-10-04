@@ -191,18 +191,22 @@ def verify_or_extract(args: argparse.Namespace) -> None:
             if destination.exists(): raise SystemExit("extraction destination already exists")
             shutil.copytree(root,destination)
 
-parser=argparse.ArgumentParser(); sub=parser.add_subparsers(required=True)
-source_make=sub.add_parser("source-manifest")
-source_make.add_argument("--source-root",required=True); source_make.add_argument("--source-revision",required=True); source_make.add_argument("--output",required=True); source_make.add_argument("--snapshot"); source_make.set_defaults(run=write_source)
-source_check=sub.add_parser("verify-source")
-source_check.add_argument("--source-root"); source_check.add_argument("--manifest",required=True); source_check.set_defaults(run=verify_source)
-make=sub.add_parser("create")
-for name in ("payload","output","project","version","platform","source_revision"): make.add_argument("--"+name.replace("_","-"),required=True)
-make.add_argument("--signing-key"); make.add_argument("--unsigned-development",action="store_true"); make.set_defaults(run=create)
-make.add_argument("--bootstrap")
-for command in ("verify","extract"):
-    item=sub.add_parser(command); item.add_argument("--release",required=True); item.add_argument("--project",required=True); item.add_argument("--platform",required=True); item.add_argument("--public-key"); item.add_argument("--allow-unsigned-development",action="store_true"); item.add_argument("--allow-legacy-source-provenance",action="store_true"); item.add_argument("--source-root")
-    if command=="extract": item.add_argument("--extract",required=True)
-    else: item.set_defaults(extract=None)
-    item.set_defaults(run=verify_or_extract)
-args=parser.parse_args(); args.run(args)
+def main() -> None:
+    parser=argparse.ArgumentParser(); sub=parser.add_subparsers(required=True)
+    source_make=sub.add_parser("source-manifest")
+    source_make.add_argument("--source-root",required=True); source_make.add_argument("--source-revision",required=True); source_make.add_argument("--output",required=True); source_make.add_argument("--snapshot"); source_make.set_defaults(run=write_source)
+    source_check=sub.add_parser("verify-source")
+    source_check.add_argument("--source-root"); source_check.add_argument("--manifest",required=True); source_check.set_defaults(run=verify_source)
+    make=sub.add_parser("create")
+    for name in ("payload","output","project","version","platform","source_revision"): make.add_argument("--"+name.replace("_","-"),required=True)
+    make.add_argument("--signing-key"); make.add_argument("--unsigned-development",action="store_true"); make.set_defaults(run=create)
+    make.add_argument("--bootstrap")
+    for command in ("verify","extract"):
+        item=sub.add_parser(command); item.add_argument("--release",required=True); item.add_argument("--project",required=True); item.add_argument("--platform",required=True); item.add_argument("--public-key"); item.add_argument("--allow-unsigned-development",action="store_true"); item.add_argument("--allow-legacy-source-provenance",action="store_true"); item.add_argument("--source-root")
+        if command=="extract": item.add_argument("--extract",required=True)
+        else: item.set_defaults(extract=None)
+        item.set_defaults(run=verify_or_extract)
+    args=parser.parse_args(); args.run(args)
+
+if __name__ == "__main__":
+    main()

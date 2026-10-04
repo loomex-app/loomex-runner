@@ -1,0 +1,150 @@
+{
+  "$comment": "Semantic verification additionally requires exact paired versions/tag, repository identities, frozen GitHub URL, unique assets, HTTPS root origin and packaged compatibility/source hashes. Schema validation alone is insufficient.",
+  "$defs": {
+    "asset": {
+      "additionalProperties": false,
+      "properties": {
+        "file": {
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "size": {
+          "maximum": 2147483648,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "url": {
+          "format": "uri",
+          "type": "string"
+        }
+      },
+      "required": [
+        "file",
+        "url",
+        "size",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "component": {
+      "additionalProperties": false,
+      "properties": {
+        "asset": {
+          "$ref": "#/$defs/asset"
+        },
+        "manifestSha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "releaseTag": {
+          "type": "string"
+        },
+        "repository": {
+          "enum": [
+            "loomex-app/loomex-runner",
+            "loomex-app/loomex-codex-plugin"
+          ]
+        },
+        "sourceRevision": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "version": {
+          "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "sourceRevision",
+        "repository",
+        "releaseTag",
+        "manifestSha256",
+        "asset"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "app.loomex.release-set/v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "cloudApiOrigin": {
+      "format": "uri",
+      "type": "string"
+    },
+    "components": {
+      "additionalProperties": false,
+      "properties": {
+        "plugin": {
+          "$ref": "#/$defs/component"
+        },
+        "runner": {
+          "$ref": "#/$defs/component"
+        }
+      },
+      "required": [
+        "runner",
+        "plugin"
+      ],
+      "type": "object"
+    },
+    "developmentOnly": {
+      "const": true
+    },
+    "evidence": {
+      "additionalProperties": false,
+      "properties": {
+        "asset": {
+          "$ref": "#/$defs/asset"
+        },
+        "backendSourceRevision": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "passed": {
+          "const": true
+        }
+      },
+      "required": [
+        "asset",
+        "backendSourceRevision",
+        "passed"
+      ],
+      "type": "object"
+    },
+    "installer": {
+      "$ref": "#/$defs/asset"
+    },
+    "platform": {
+      "const": "darwin-arm64"
+    },
+    "protocolVersion": {
+      "const": "loomex.local-control/v2"
+    },
+    "releaseTag": {
+      "pattern": "^preview-runner-v[0-9]+\\.[0-9]+\\.[0-9]+-plugin-v[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "type": "string"
+    },
+    "schema": {
+      "const": "app.loomex.release-set/v1"
+    }
+  },
+  "required": [
+    "schema",
+    "releaseTag",
+    "platform",
+    "developmentOnly",
+    "protocolVersion",
+    "cloudApiOrigin",
+    "components",
+    "evidence",
+    "installer"
+  ],
+  "title": "Frozen paired unsigned preview release set",
+  "type": "object"
+}

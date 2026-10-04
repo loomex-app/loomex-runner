@@ -24,11 +24,19 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("name: Required plugin/backend compatibility gate", text)
         self.assertIn("needs: compatibility", text)
         self.assertIn("--required", text)
-        self.assertIn("--plugin-root component-inputs/plugin", text)
-        self.assertIn("--backend-root component-inputs/backend", text)
+        self.assertIn("--plugin-root ../component-inputs/plugin", text)
+        self.assertIn("--backend-root ../component-inputs/backend", text)
         self.assertIn("LOOMEX_COMPONENT_READ_TOKEN", text)
         self.assertIn('test "${PLUGIN_REPOSITORY%%/*}" = "loomex-app"', text)
         self.assertIn('test "${BACKEND_REPOSITORY%%/*}" = "loomex-app"', text)
+
+    def test_component_checkouts_are_outside_clean_runner_source(self):
+        text = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("path: runner-source", text)
+        self.assertIn("working-directory: runner-source", text)
+        self.assertIn("path: component-inputs/plugin", text)
+        self.assertIn("--plugin-root ../component-inputs/plugin", text)
+        self.assertIn("--backend-root ../component-inputs/backend", text)
 
     def test_release_identity_checks_are_fail_closed(self):
         text = WORKFLOW.read_text(encoding="utf-8")

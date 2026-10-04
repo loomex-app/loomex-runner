@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-import argparse,json,subprocess,sys
+import argparse,json,subprocess,sys,runpy,re
 from pathlib import Path
+from urllib.parse import urlsplit,urlunsplit
 
 parser=argparse.ArgumentParser(); parser.add_argument("root"); parser.add_argument("--expected-version",required=True); parser.add_argument("--source-root"); parser.add_argument("--allow-legacy-source-provenance",action="store_true"); args=parser.parse_args()
 root=Path(args.root).resolve()
@@ -31,5 +32,30 @@ if source_manifest.is_file():
     if provenance.returncode: raise SystemExit(f"runner source content mismatch: {provenance.stderr.strip() or provenance.stdout.strip()}")
 elif not args.allow_legacy_source_provenance:
     raise SystemExit("runner source content manifest missing; explicit legacy compatibility required")
+preview=root/'metadata/preview-origin.json'
+if preview.exists():
+    value=json.loads(preview.read_text())
+    valid_origin=runpy.run_path(str(source_root/'scripts/verify-production-config.py'))['valid_origin']
+    origin=value.get('apiOrigin') if isinstance(value,dict) else None
+    canonical_origin=None
+    if isinstance(origin,str) and valid_origin(origin):
+        url=urlsplit(origin); host=url.hostname.encode('idna').decode('ascii').lower()
+        if ':' in host: host='['+host+']'
+        authority=host+(f':{url.port}' if url.port not in (None,443) else '')
+        canonical_origin=urlunsplit(('https',authority,'/','',''))
+    if (not isinstance(value,dict) or set(value)!={'schema','apiOrigin','sourceRevision','version'}
+            or value['schema']!='app.loomex.runner.preview-origin/v1'
+            or value['version']!=args.expected_version
+            or not isinstance(value['apiOrigin'],str) or not valid_origin(value['apiOrigin'])
+            or not value['apiOrigin'].endswith('/')
+            or canonical_origin!=value['apiOrigin']
+            or not isinstance(value['sourceRevision'],str) or not re.fullmatch('[0-9a-f]{40}',value['sourceRevision'])
+            or preview.read_bytes()!=(json.dumps(value,sort_keys=True,separators=(',',':'))+'\n').encode()
+            or not has_build):
+        raise SystemExit('runner preview origin metadata mismatch')
+    source=json.loads(source_manifest.read_text())
+    if (source['sourceRevision']!=value['sourceRevision'] or not source['files']
+            or any(entry['tracked'] is not True or entry['type']=='missing' for entry in source['files'])):
+        raise SystemExit('runner preview requires revision-controlled source')
 plist=(root/"launchd/app.loomex.runner.template.plist").read_text()
 if plist.count("__LOOMEX_DAEMON__")!=1 or plist.count("__LOOMEX_STATE_DIR__")!=3 or plist.count("__LOOMEX_DEV_API_ORIGIN_ENTRY__")!=1 or plist.count("__LOOMEX_PROVIDER_EXECUTABLE_ENTRIES__")!=1: raise SystemExit("LaunchAgent template placeholders are invalid")

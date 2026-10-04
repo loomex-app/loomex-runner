@@ -586,6 +586,73 @@ struct DelayedJournalObserver {
     release: Mutex<std::sync::mpsc::Receiver<()>>,
     identity: Mutex<Option<ProcessIdentity>>,
 }
+
+struct StartupObserver {
+    ready_path: std::path::PathBuf,
+}
+impl ExecutionObserver for StartupObserver {
+    fn before_spawn(&self, _: &ExecutionRequest) -> Result<()> {
+        Ok(())
+    }
+    fn spawned(&self, identity: &ProcessIdentity) -> Result<()> {
+        let started = Instant::now();
+        while !ready(&self.ready_path) {
+            if started.elapsed() >= READINESS_TIMEOUT {
+                let output = std::process::Command::new("/bin/ps")
+                    .args([
+                        "-p",
+                        &identity.pid.to_string(),
+                        "-o",
+                        "pid=,pgid=,stat=,args=",
+                    ])
+                    .output()?;
+                anyhow::bail!(
+                    "guardian did not survive TERM before supervisor initialization; {}; process={:?}",
+                    bounded_contents(&self.ready_path.with_file_name("startup-stderr")),
+                    String::from_utf8_lossy(&output.stdout),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn cancellation_before_supervisor_initialization_retains_live_guardian() {
+    let root = tempfile::tempdir().unwrap();
+    let wrapper = root.path().join("delayed-supervisor");
+    // This TERM occurs before any Rust supervisor code can install its handler.
+    // The shell uses only builtins before exec, so the guardian is the sole
+    // live member of its process group throughout this startup boundary.
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\nexec 2> startup-stderr\nkill -TERM \"$$\"\nprintf ready > startup-ready\nexec \"$LOOMEX_TEST_SUPERVISOR\" \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut req = request(root.path(), "touch should-not-exist");
+    req.env.insert(
+        "LOOMEX_TEST_SUPERVISOR".into(),
+        env!("CARGO_BIN_EXE_loomex-runner").into(),
+    );
+    req.observer = Arc::new(StartupObserver {
+        ready_path: root.path().join("startup-ready"),
+    });
+    let outcome = tokio::time::timeout(
+        CLEANUP_TIMEOUT,
+        execute_with_supervisor(req, Arc::new(AtomicBool::new(true)), &wrapper),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(outcome.canceled);
+    assert!(outcome.managed_group_stopped);
+    assert!(!outcome.indeterminate, "{:?}", outcome.error);
+    assert!(!live_group_member(outcome.identity.pgid));
+    assert!(!root.path().join("should-not-exist").exists());
+}
+
 impl DelayedJournalObserver {
     fn delay(&self) -> Result<()> {
         if let Some(ready) = self.ready.lock().unwrap().take() {

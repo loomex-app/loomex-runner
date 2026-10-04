@@ -38,6 +38,7 @@ struct Arguments {
     public_key: Option<PathBuf>,
     allow_unsigned_development: bool,
     development_api_origin: Option<String>,
+    preview_api_origin: Option<String>,
     providers: Vec<String>,
     install_base: Option<PathBuf>,
     state_dir: Option<PathBuf>,
@@ -48,7 +49,7 @@ struct Arguments {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: loomex-lifecycle-bootstrap install RELEASE [--public-key FILE | --allow-unsigned-development --development-api-origin LOOPBACK_URL] [--authorize-keychain-transition] [--settled-abandonment UUID] [--provider-executable PROVIDER=/absolute/path] [--install-base DIR --state-dir DIR --launch-agents-dir DIR]\n       loomex-lifecycle-bootstrap uninstall [--install-base DIR --state-dir DIR --launch-agents-dir DIR]"
+        "usage: loomex-lifecycle-bootstrap install RELEASE [--public-key FILE | --allow-unsigned-development (--development-api-origin LOOPBACK_URL | --preview-api-origin HTTPS_URL)] [--authorize-keychain-transition] [--settled-abandonment UUID] [--provider-executable PROVIDER=/absolute/path] [--install-base DIR --state-dir DIR --launch-agents-dir DIR]\n       loomex-lifecycle-bootstrap uninstall [--install-base DIR --state-dir DIR --launch-agents-dir DIR]"
     );
     std::process::exit(2)
 }
@@ -93,6 +94,18 @@ fn parse() -> (String, Arguments) {
                         .to_string_lossy()
                         .into_owned(),
                 )
+            }
+            "--preview-api-origin" => {
+                if command != "install" || parsed.preview_api_origin.is_some() {
+                    usage();
+                }
+                parsed.preview_api_origin = Some(
+                    values
+                        .next()
+                        .unwrap_or_else(|| usage())
+                        .to_string_lossy()
+                        .into_owned(),
+                );
             }
             "--provider-executable" => parsed.providers.push(
                 values
@@ -185,6 +198,7 @@ async fn verify_release(release: &Path, manifest: &Value, args: &Arguments) -> R
     } else {
         if args.allow_unsigned_development
             || args.development_api_origin.is_some()
+            || args.preview_api_origin.is_some()
             || args.authorize_keychain_transition
         {
             bail!("production release rejects development options")
@@ -490,6 +504,338 @@ fn parse_origin(value: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
+fn parse_preview_origin(value: &str) -> Result<String> {
+    let url = url::Url::parse(value)?;
+    let raw_authority = value
+        .strip_prefix("https://")
+        .map(|rest| rest.split_once('/').unwrap_or((rest, "")));
+    if value.chars().any(char::is_whitespace)
+        || value.contains(['\\', '@'])
+        || raw_authority.is_none_or(|(_, path)| !path.is_empty())
+        || url.scheme() != "https"
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+        || url.port() == Some(0)
+    {
+        bail!("preview API origin must be an HTTPS root URL without credentials")
+    }
+    Ok(url.to_string())
+}
+
+fn validate_preview_identity(
+    manifest: &Value,
+    compiled_revision: Option<&str>,
+    compiled_version: &str,
+) -> Result<()> {
+    if manifest["version"] != compiled_version
+        || manifest["sourceRevision"].as_str() != compiled_revision
+        || compiled_revision.is_none()
+    {
+        bail!("preview release does not match bootstrap source identity")
+    }
+    Ok(())
+}
+
+// Called only after extracting and verifying the exact envelope inventory and
+// source-content binding. A preview uses its compiled service origin, never the
+// generic loopback-only runtime development override.
+fn development_origin(
+    payload: &Path,
+    manifest: &Value,
+    args: &Arguments,
+    compiled_origin: Option<&str>,
+) -> Result<Option<String>> {
+    let metadata = payload.join("metadata/preview-origin.json");
+    if !metadata.exists() {
+        if args.preview_api_origin.is_some() {
+            bail!("preview release origin metadata is missing")
+        }
+        return Ok(Some(parse_origin(
+            args.development_api_origin
+                .as_deref()
+                .context("development release requires --development-api-origin")?,
+        )?));
+    }
+    if args.development_api_origin.is_some() {
+        bail!("preview release rejects --development-api-origin")
+    }
+    let requested = parse_preview_origin(
+        args.preview_api_origin
+            .as_deref()
+            .context("preview release requires --preview-api-origin")?,
+    )?;
+    let bytes = fs::read(metadata)?;
+    let value: Value = serde_json::from_slice(&bytes)?;
+    let mut canonical = serde_json::to_vec(&value)?;
+    canonical.push(b'\n');
+    let revision = manifest["sourceRevision"]
+        .as_str()
+        .context("preview source revision is missing")?;
+    if bytes != canonical
+        || value.as_object().map(|object| object.len()) != Some(4)
+        || value["schema"] != "app.loomex.runner.preview-origin/v1"
+        || value["version"] != manifest["version"]
+        || value["sourceRevision"] != manifest["sourceRevision"]
+        || revision.len() != 40
+        || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("preview release origin metadata is invalid")
+    }
+    let bound = value["apiOrigin"]
+        .as_str()
+        .context("preview API origin binding is missing")?;
+    if parse_preview_origin(bound)? != bound
+        || bound != requested
+        || parse_preview_origin(compiled_origin.context("preview compiled API origin is missing")?)?
+            != bound
+    {
+        bail!("preview API origin does not match release binding")
+    }
+    let source: Value = serde_json::from_slice(&fs::read(
+        payload.join("metadata/source-content-manifest.json"),
+    )?)?;
+    let files = source["files"]
+        .as_array()
+        .context("preview source inventory is missing")?;
+    if files.is_empty()
+        || files
+            .iter()
+            .any(|file| file["tracked"] != true || file["type"] == "missing")
+    {
+        bail!("preview release requires revision-controlled source")
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+
+    fn write_preview(path: &Path, value: &Value) {
+        let mut bytes = serde_json::to_vec(value).unwrap();
+        bytes.push(b'\n');
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn preview_source_revision_and_package_version_match_the_compiled_bootstrap() {
+        let manifest = json!({"version":"0.4.9","sourceRevision":"a".repeat(40)});
+        assert!(validate_preview_identity(&manifest, Some(&"a".repeat(40)), "0.4.9").is_ok());
+        assert!(validate_preview_identity(&manifest, None, "0.4.9").is_err());
+        assert!(validate_preview_identity(&manifest, Some(&"b".repeat(40)), "0.4.9").is_err());
+        assert!(validate_preview_identity(&manifest, Some(&"a".repeat(40)), "9.9.9").is_err());
+    }
+
+    fn fixture() -> (tempfile::TempDir, Value, Arguments) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("metadata")).unwrap();
+        let manifest =
+            json!({"developmentOnly":true,"version":"0.4.9","sourceRevision":"a".repeat(40)});
+        let metadata = json!({"schema":"app.loomex.runner.preview-origin/v1","apiOrigin":"https://preview.example/","version":manifest["version"],"sourceRevision":manifest["sourceRevision"]});
+        write_preview(&dir.path().join("metadata/preview-origin.json"), &metadata);
+        state::write_json(
+            &dir.path().join("metadata/source-content-manifest.json"),
+            &json!({"files":[{"path":"Cargo.toml","tracked":true,"type":"file"}]}),
+        )
+        .unwrap();
+        let args = Arguments {
+            preview_api_origin: Some("https://preview.example".into()),
+            allow_unsigned_development: true,
+            ..Arguments::default()
+        };
+        (dir, manifest, args)
+    }
+
+    #[test]
+    fn preview_requires_requested_compiled_and_metadata_origins_to_match() {
+        let (dir, manifest, mut args) = fixture();
+        assert_eq!(
+            development_origin(
+                dir.path(),
+                &manifest,
+                &args,
+                Some("https://preview.example")
+            )
+            .unwrap(),
+            None
+        );
+        assert!(development_origin(dir.path(), &manifest, &args, None).is_err());
+        assert!(
+            development_origin(dir.path(), &manifest, &args, Some("https://other.example"))
+                .is_err()
+        );
+        args.preview_api_origin = Some("https://other.example".into());
+        assert!(
+            development_origin(
+                dir.path(),
+                &manifest,
+                &args,
+                Some("https://preview.example")
+            )
+            .is_err()
+        );
+        args.preview_api_origin = None;
+        assert!(
+            development_origin(
+                dir.path(),
+                &manifest,
+                &args,
+                Some("https://preview.example")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn malformed_preview_origins_and_development_override_are_rejected() {
+        for origin in [
+            "http://preview.example",
+            "https://user:pass@preview.example",
+            "https://preview.example/path",
+            "https://preview.example/path/../",
+            "https://@preview.example/",
+            "https://preview.example:0/",
+            "https:\\\\preview.example",
+            "https://preview.example/?",
+            "https://preview.example/#fragment",
+            " https://preview.example",
+            "https://preview.example\n",
+        ] {
+            assert!(parse_preview_origin(origin).is_err(), "{origin:?}");
+        }
+        let (dir, manifest, mut args) = fixture();
+        args.development_api_origin = Some("http://127.0.0.1:9".into());
+        assert!(
+            development_origin(
+                dir.path(),
+                &manifest,
+                &args,
+                Some("https://preview.example")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn missing_metadata_preserves_loopback_development_install_policy() {
+        let (dir, manifest, mut args) = fixture();
+        fs::remove_file(dir.path().join("metadata/preview-origin.json")).unwrap();
+        assert!(
+            development_origin(
+                dir.path(),
+                &manifest,
+                &args,
+                Some("https://preview.example")
+            )
+            .is_err()
+        );
+        args.preview_api_origin = None;
+        assert!(development_origin(dir.path(), &manifest, &args, None).is_err());
+        args.development_api_origin = Some("http://127.0.0.1:9".into());
+        assert_eq!(
+            development_origin(dir.path(), &manifest, &args, None).unwrap(),
+            Some("http://127.0.0.1:9/".into())
+        );
+        args.development_api_origin = Some("https://preview.example".into());
+        assert!(development_origin(dir.path(), &manifest, &args, None).is_err());
+    }
+
+    #[test]
+    fn preview_metadata_and_source_identity_cannot_be_changed() {
+        let (dir, manifest, args) = fixture();
+        let metadata = dir.path().join("metadata/preview-origin.json");
+        let original: Value = state::read_json(&metadata).unwrap();
+        for (key, value) in [
+            ("schema", json!("wrong")),
+            ("version", json!("9.9.9")),
+            ("sourceRevision", json!("b".repeat(40))),
+            ("apiOrigin", json!("https://other.example/")),
+            ("extra", json!(true)),
+        ] {
+            let mut changed = original.clone();
+            changed[key] = value;
+            write_preview(&metadata, &changed);
+            assert!(
+                development_origin(
+                    dir.path(),
+                    &manifest,
+                    &args,
+                    Some("https://preview.example")
+                )
+                .is_err(),
+                "{key}"
+            );
+        }
+        write_preview(&metadata, &original);
+        for files in [
+            json!([]),
+            json!([{"tracked":false,"type":"file"}]),
+            json!([{"tracked":true,"type":"missing"}]),
+        ] {
+            state::write_json(
+                &dir.path().join("metadata/source-content-manifest.json"),
+                &json!({"files":files}),
+            )
+            .unwrap();
+            assert!(
+                development_origin(
+                    dir.path(),
+                    &manifest,
+                    &args,
+                    Some("https://preview.example")
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn changing_bound_preview_bytes_invalidates_payload_inventory() {
+        let (dir, _, _) = fixture();
+        let mut expected = Vec::new();
+        for name in ["preview-origin.json", "source-content-manifest.json"] {
+            let path = dir.path().join("metadata").join(name);
+            let details = fs::metadata(&path).unwrap();
+            expected.push(json!({"path":format!("metadata/{name}"),"sha256":state::digest(&fs::read(&path).unwrap()),"size":details.len(),"mode":details.permissions().mode() & 0o777}));
+        }
+        inventory(dir.path(), &expected).unwrap();
+        fs::write(dir.path().join("metadata/preview-origin.json"), b"tampered").unwrap();
+        assert!(inventory(dir.path(), &expected).is_err());
+    }
+
+    #[tokio::test]
+    async fn production_rejects_preview_or_development_flags_before_signature_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = json!({"developmentOnly":false});
+        for args in [
+            Arguments {
+                preview_api_origin: Some("https://preview.example".into()),
+                ..Arguments::default()
+            },
+            Arguments {
+                development_api_origin: Some("http://127.0.0.1:9".into()),
+                ..Arguments::default()
+            },
+            Arguments {
+                allow_unsigned_development: true,
+                ..Arguments::default()
+            },
+        ] {
+            assert!(
+                verify_release(dir.path(), &manifest, &args)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("production release rejects development options")
+            );
+        }
+    }
+}
+
 fn inventory(root: &Path, expected: &[Value]) -> Result<()> {
     let mut actual = Vec::new();
     fn visit(root: &Path, dir: &Path, output: &mut Vec<Value>) -> Result<()> {
@@ -676,30 +1022,33 @@ async fn install(args: Arguments) -> Result<()> {
     let release = fs::canonicalize(args.release.as_ref().context("release is required")?)?;
     let manifest = read_manifest(&release)?;
     verify_release(&release, &manifest, &args).await?;
+    if args.preview_api_origin.is_some() {
+        validate_preview_identity(
+            &manifest,
+            option_env!("LOOMEX_PREVIEW_SOURCE_REVISION"),
+            env!("CARGO_PKG_VERSION"),
+        )?;
+    }
     let paths = paths(&args)?;
     let version = manifest["version"].as_str().unwrap();
     let origin = if manifest["developmentOnly"] == true {
-        Some(parse_origin(
-            args.development_api_origin
-                .as_deref()
-                .context("development release requires --development-api-origin")?,
-        )?)
-    } else {
-        None
-    };
-    if manifest["developmentOnly"] == true {
         // Verify the inventoried candidate and its exact code identity before
         // any lifecycle intent, drain, pointer change, or version retirement.
         let signing_stage =
             std::env::temp_dir().join(format!("loomex-development-signing-{}", Uuid::new_v4()));
         let result = async {
             let payload = extract(&release, &manifest, &signing_stage).await?;
-            verify_development_signing(&payload, &paths, &args).await
+            let origin =
+                development_origin(&payload, &manifest, &args, option_env!("LOOMEX_API_ORIGIN"))?;
+            verify_development_signing(&payload, &paths, &args).await?;
+            Ok::<_, anyhow::Error>(origin)
         }
         .await;
         let _ = fs::remove_dir_all(&signing_stage);
-        result?;
-    }
+        result?
+    } else {
+        None
+    };
     let mut providers = providers(&args.providers)?;
     // Updating a running installation without provider flags preserves the
     // existing, receipt-bound executable selection.  This prevents a retry or

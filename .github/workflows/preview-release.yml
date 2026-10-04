@@ -1,0 +1,151 @@
+name: Paired unsigned public preview candidate
+on:
+  workflow_dispatch:
+    inputs:
+      plugin_ref:
+        description: Full 40-character plugin source SHA (loomex-app/loomex-codex-plugin)
+        required: true
+        type: string
+      backend_repository:
+        description: Backend owner/name under loomex-app
+        required: true
+        type: string
+      backend_ref:
+        description: Full 40-character backend source SHA
+        required: true
+        type: string
+      offline:
+        description: Include optional combined offline envelope
+        default: true
+        type: boolean
+permissions:
+  contents: read
+jobs:
+  qualify-build-once:
+    runs-on: macos-14
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: runner-source
+    steps:
+      - name: Checkout exact runner source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          path: runner-source
+          fetch-depth: 1
+      - name: Validate immutable references and supported host
+        env:
+          PLUGIN_REF: ${{ inputs.plugin_ref }}
+          BACKEND_REPOSITORY: ${{ inputs.backend_repository }}
+          BACKEND_REF: ${{ inputs.backend_ref }}
+        run: |
+          set -euo pipefail
+          test "$(uname -s)-$(uname -m)" = Darwin-arm64
+          [[ "$PLUGIN_REF" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BACKEND_REF" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$BACKEND_REPOSITORY" =~ ^loomex-app/[A-Za-z0-9_.-]+$ ]]
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - name: Checkout exact plugin source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: loomex-app/loomex-codex-plugin
+          ref: ${{ inputs.plugin_ref }}
+          path: component-inputs/plugin
+          fetch-depth: 1
+      - name: Checkout exact backend source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: ${{ inputs.backend_repository }}
+          ref: ${{ inputs.backend_ref }}
+          path: component-inputs/backend
+          token: ${{ secrets.LOOMEX_COMPONENT_READ_TOKEN || github.token }}
+          fetch-depth: 1
+      - name: Configure build-only Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.20.0
+          cache: npm
+          cache-dependency-path: component-inputs/plugin/package-lock.json
+      - name: Configure build-only Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: component-inputs/backend/requirements.lock
+      - name: Configure pinned Rust
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # reviewed master 2026-10-04
+        with:
+          toolchain: 1.88.0
+          targets: aarch64-apple-darwin
+      - name: Build plugin before any compiled contract export
+        working-directory: component-inputs/plugin
+        run: |
+          npm ci
+          npm run build
+      - name: Install backend qualification dependencies
+        working-directory: component-inputs/backend
+        run: python -m pip install --requirement requirements.lock
+      - name: Required clean source pair compatibility gate
+        env:
+          DJANGO_SETTINGS_MODULE: config.settings.test
+          DJANGO_ENV_FILE: /dev/null
+          HOME: ${{ runner.temp }}/qualification-home
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          mkdir -p "$HOME"
+          ./scripts/run-integration-compatibility-gate.sh --required \
+            --plugin-root ../component-inputs/plugin --backend-root ../component-inputs/backend \
+            --plugin-node node --backend-python python --output "$RUNNER_TEMP/compatibility-gate.json"
+      - name: Validate preview and distribution policy tests
+        run: |
+          python scripts/test_preview_package.py
+          python scripts/test_release_workflow_contract.py
+          python scripts/test_release_set.py
+          python scripts/test_github_preview_release.py
+          CARGO_TARGET_DIR="$RUNNER_TEMP/installer-target" cargo test --locked --manifest-path scripts/distribution-installer/Cargo.toml
+      - name: Build one manifest-bound cloud preview runner
+        env:
+          LOOMEX_API_ORIGIN: ${{ vars.LOOMEX_API_ORIGIN }}
+          LOOMEX_WEB_APP_ORIGIN: ${{ vars.LOOMEX_WEB_APP_ORIGIN }}
+        run: ./scripts/build-release.sh --unsigned-cloud-preview --output "$RUNNER_TEMP/runner-envelope"
+      - name: Build one compiled plugin envelope
+        working-directory: component-inputs/plugin
+        run: ./scripts/build-release.sh --unsigned-development --output "$RUNNER_TEMP/plugin-envelope"
+      - name: Bind paired versions and archive plugin
+        env:
+          PLUGIN_REF: ${{ inputs.plugin_ref }}
+        run: |
+          runner_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          plugin_version="$(node -p 'require("../component-inputs/plugin/package.json").version')"
+          [[ "$runner_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$plugin_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          tag="preview-runner-v${runner_version}-plugin-v${plugin_version}"
+          python ../component-inputs/plugin/scripts/package-public-release.py \
+            --release "$RUNNER_TEMP/plugin-envelope" --release-tag "$tag" --source-revision "$PLUGIN_REF" \
+            --unsigned-preview --qualify-clean-source --output "$RUNNER_TEMP/plugin-public/loomex-plugin-${plugin_version}-darwin-arm64-preview.tar.gz"
+          echo "PAIRED_TAG=$tag" >> "$GITHUB_ENV"
+          echo "PLUGIN_ARCHIVE=$RUNNER_TEMP/plugin-public/loomex-plugin-${plugin_version}-darwin-arm64-preview.tar.gz" >> "$GITHUB_ENV"
+      - name: Build one self-contained native installer
+        run: |
+          CARGO_TARGET_DIR="$RUNNER_TEMP/installer-target" cargo build --locked --release --target aarch64-apple-darwin --manifest-path scripts/distribution-installer/Cargo.toml
+          cp "$RUNNER_TEMP/installer-target/aarch64-apple-darwin/release/loomex-install" "$RUNNER_TEMP/loomex-install-darwin-arm64"
+      - name: Create exact paired public release-set assets
+        env:
+          BACKEND_REF: ${{ inputs.backend_ref }}
+          INCLUDE_OFFLINE: ${{ inputs.offline }}
+        run: |
+          options=()
+          if [[ "$INCLUDE_OFFLINE" == true ]]; then options+=(--offline); fi
+          python scripts/release-set.py --runner-release "$RUNNER_TEMP/runner-envelope" --plugin-archive "$PLUGIN_ARCHIVE" \
+            --plugin-source-root ../component-inputs/plugin --installer "$RUNNER_TEMP/loomex-install-darwin-arm64" --compatibility "$RUNNER_TEMP/compatibility-gate.json" \
+            --backend-source-revision "$BACKEND_REF" --release-tag "$PAIRED_TAG" --output "$RUNNER_TEMP/public-release-set" "${options[@]}"
+          digest="$(python -c 'import hashlib,os; from pathlib import Path; print(hashlib.sha256((Path(os.environ["RUNNER_TEMP"])/"public-release-set/release-set.json").read_bytes()).hexdigest())')"
+          LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 "$RUNNER_TEMP/loomex-install-darwin-arm64" --offline "$RUNNER_TEMP/public-release-set" --manifest-sha256 "$digest" --allow-unsigned-preview --verify-only
+          python scripts/github-preview-release.py inspect --assets "$RUNNER_TEMP/public-release-set"
+      - name: Upload reviewed candidate bytes without creating a GitHub release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: paired-preview-${{ github.sha }}
+          path: ${{ runner.temp }}/public-release-set/*
+          if-no-files-found: error
