@@ -51,6 +51,30 @@ class CompatibilityExportTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("contains duplicate values", result.stderr)
 
+    def test_native_authoring_starts_are_optional_strict_backend_methods(self) -> None:
+        catalog = json.loads(CATALOG.read_text())
+        methods = {value["name"]: value for value in catalog["methods"]}
+        self.assertIn("authoring.chat-native/v1", catalog["capabilities"])
+        for name, inputs, core in [
+            ("builder.start", {"prompt", "idempotencyKey"}, "workflow_builder"),
+            ("editor.start", {"prompt", "idempotencyKey", "workflowId", "expectedVersion", "expectedDefinitionChecksum"}, "workflow_editor"),
+        ]:
+            method = methods[name]
+            self.assertEqual(set(method["inputSchema"]["properties"]), inputs)
+            self.assertEqual(set(method["inputSchema"]["required"]), inputs)
+            self.assertFalse(method["inputSchema"]["additionalProperties"])
+            self.assertEqual(method["transportRetry"], "never_after_send")
+            output = method["outputSchema"]["oneOf"][0]
+            self.assertEqual(output["properties"]["systemWorkflowKey"]["const"], core)
+            self.assertEqual(output["properties"]["nextAction"]["const"], "run_get")
+            self.assertNotIn("executionPolicy", output["properties"])
+            self.assertIn(name, methods["workflow.operations.get"]["inputSchema"]["properties"]["operation"]["enum"])
+        manifest = json.loads(MANIFEST.read_text())
+        exported = {method["name"]: method for method in manifest["methods"]}
+        for name in ["builder.start", "editor.start"]:
+            self.assertEqual(exported[name]["classification"], "backend-proxy")
+            self.assertEqual(exported[name]["routeIds"], [name])
+
     def test_startup_auth_observation_changes_only_optional_read_contract(self) -> None:
         catalog = json.loads(CATALOG.read_text())
         method = next(value for value in catalog["methods"] if value["name"] == "auth.status")

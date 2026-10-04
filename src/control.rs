@@ -30,6 +30,10 @@ use tokio::{
 };
 use uuid::Uuid;
 
+#[cfg(test)]
+#[path = "control_native_authoring_tests.rs"]
+mod native_authoring_tests;
+
 pub const PROTOCOL: &str = "loomex.local-control/v2";
 pub const MAX_FRAME: usize = 1_048_576;
 pub const VALIDATION_ERRORS_CAPABILITY: &str = "error.validation-issues/v1";
@@ -231,6 +235,29 @@ impl Daemon {
             })
             .await
     }
+    async fn native_authoring_backend(
+        &self,
+        org: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        key: Option<&str>,
+        account: &str,
+    ) -> Result<Value> {
+        let identity = self.auth.current_child_identity(org).await?;
+        ensure!(identity.0 == account, "AUTH_IDENTITY_CHANGED");
+        let credential = self.auth.credential(org).await?;
+        ensure!(credential.subject == account, "AUTH_IDENTITY_CHANGED");
+        let result = self
+            .api
+            .request(method, path, body, Some(&credential), key)
+            .await?;
+        ensure!(
+            self.auth.current_child_identity(org).await? == identity,
+            "AUTH_IDENTITY_CHANGED"
+        );
+        Ok(result)
+    }
     pub async fn granted(&self, path: &Path, org: &str) -> Result<PathBuf> {
         let install = self.auth.installation_id().await?;
         self.public.lock().await.require_grant(path, org, &install)
@@ -305,6 +332,12 @@ impl Daemon {
             .find(|entry| entry["name"] == method)
             .context("METHOD_NOT_FOUND")?;
         validate_params(&params, &entry["inputSchema"])?;
+        if method == "editor.start" {
+            ensure!(
+                lowercase_sha256(required(&params, "expectedDefinitionChecksum")?),
+                "INVALID_REQUEST"
+            );
+        }
         if method == "runs.continuation.requeue" {
             // Preserve the owner-issued checkpoint digest verbatim. Recovery
             // is an explicit mutation; reads and monitoring never reach it.
@@ -447,7 +480,52 @@ impl Daemon {
                 if record["expired"] == true {
                     bail!("RESULT_EXPIRED");
                 }
-                if matches!(
+                if matches!(method, "builder.start" | "editor.start") {
+                    if record["status"] == "rejected_before_execution"
+                        && record["rejection"]["code"] == "RUNNER_PROOF_STALE"
+                        && record["rejection"]["httpStatus"] == 422
+                    {
+                        // The backend's authenticated stale-proof rejection is
+                        // before its handler. Consume that narrow nonexecution
+                        // fact durably before sending the exact operation again.
+                        // A crash or uncertain retry then remains pending and
+                        // can only reconcile; not_found never grants a replay.
+                        state::write_json(
+                            path,
+                            &json!({"digest":identity,"method":method,"status":"pending"}),
+                        )?;
+                        None
+                    } else {
+                        // An uncertain native start is reconciled through its exact
+                        // owner-bound receipt. A pending local journal never permits
+                        // another start request, even with the original key.
+                        let query =
+                            json!({"operation":method,"idempotencyKey":params["idempotencyKey"]});
+                        let (verb, route, body) = backend_route("workflow.operations.get", &query)?;
+                        let receipt = self
+                            .native_authoring_backend(
+                                scope.as_deref().context("ORGANIZATION_REQUIRED")?,
+                                &verb,
+                                &route,
+                                body,
+                                None,
+                                scoped_account.as_deref().context("ORGANIZATION_REQUIRED")?,
+                            )
+                            .await?;
+                        ensure!(
+                            receipt["operation"] == method
+                                && receipt["idempotencyKey"] == params["idempotencyKey"]
+                                && receipt["status"] == "completed",
+                            "NETWORK_AMBIGUOUS"
+                        );
+                        let response = receipt
+                            .get("response")
+                            .cloned()
+                            .context("BACKEND_PROTOCOL_ERROR")?;
+                        verify_native_authoring_start(method, &response)?;
+                        Some(response)
+                    }
+                } else if matches!(
                     method,
                     "personas.chat_context.create"
                         | "personas.memory.write"
@@ -508,6 +586,16 @@ impl Daemon {
             let result = self
                 .restore_cached_follow_continuation(scope.as_deref(), method, &params, cached)
                 .await?;
+            if fenced_authoring_method(method) {
+                ensure!(
+                    self.auth
+                        .current_child_identity(scope.as_deref().context("ORGANIZATION_REQUIRED")?)
+                        .await?
+                        .0
+                        == scoped_account.as_deref().context("ORGANIZATION_REQUIRED")?,
+                    "AUTH_IDENTITY_CHANGED"
+                );
+            }
             let result =
                 self.spool_response(&params, result, scope.as_deref(), scoped_account.as_deref())?;
             if let Some(path) = operation.as_ref() {
@@ -523,16 +611,37 @@ impl Daemon {
             }
             result
         } else {
-            let result = normalize_catalog_output(
-                self.fingerprints
-                    .measure(
-                        method,
-                        "total",
-                        self.handle(method, &params, scope.as_deref()),
-                    )
-                    .await?,
-                &entry["outputSchema"],
-            )?;
+            let attempt = self
+                .fingerprints
+                .measure(
+                    method,
+                    "total",
+                    self.handle(method, &params, scope.as_deref(), scoped_account.as_deref()),
+                )
+                .await;
+            if let Err(error) = &attempt {
+                if matches!(method, "builder.start" | "editor.start")
+                    && error.downcast_ref::<ApiError>().is_some_and(|api| {
+                        api.status == Some(422) && api.code == "RUNNER_PROOF_STALE"
+                    })
+                {
+                    state::write_json(
+                        operation.as_ref().context("INTERNAL")?,
+                        &json!({"digest":identity,"method":method,"status":"rejected_before_execution","rejection":{"code":"RUNNER_PROOF_STALE","httpStatus":422}}),
+                    )?;
+                }
+            }
+            if fenced_authoring_method(method) {
+                ensure!(
+                    self.auth
+                        .current_child_identity(scope.as_deref().context("ORGANIZATION_REQUIRED")?)
+                        .await?
+                        .0
+                        == scoped_account.as_deref().context("ORGANIZATION_REQUIRED")?,
+                    "AUTH_IDENTITY_CHANGED"
+                );
+            }
+            let result = normalize_catalog_output(attempt?, &entry["outputSchema"])?;
             let execution = params
                 .get("runId")
                 .or_else(|| result.get("executionId"))
@@ -694,7 +803,13 @@ impl Daemon {
         );
         projected
     }
-    async fn handle(&self, method: &str, p: &Value, scope: Option<&str>) -> Result<Value> {
+    async fn handle(
+        &self,
+        method: &str,
+        p: &Value,
+        scope: Option<&str>,
+        account: Option<&str>,
+    ) -> Result<Value> {
         let key = p.get("idempotencyKey").and_then(Value::as_str);
         match method {
             "protocol.negotiate" => return negotiate(p),
@@ -880,6 +995,33 @@ impl Daemon {
             return self.preparation_get(&org, p).await;
         }
         match method {
+            "builder.start" | "editor.start" => {
+                let (verb, route, body) = backend_route(method, p)?;
+                let result = self
+                    .native_authoring_backend(
+                        &org,
+                        &verb,
+                        &route,
+                        body,
+                        key,
+                        account.context("ORGANIZATION_REQUIRED")?,
+                    )
+                    .await
+                    .map_err(|error| {
+                        if error.downcast_ref::<ApiError>().is_some_and(|api| {
+                            matches!(
+                                api.code.as_str(),
+                                "NETWORK_UNAVAILABLE" | "INVALID_API_RESPONSE"
+                            )
+                        }) {
+                            anyhow::anyhow!("NETWORK_AMBIGUOUS")
+                        } else {
+                            error
+                        }
+                    })?;
+                verify_native_authoring_start(method, &result)?;
+                return Ok(result);
+            }
             "runs.start_handoff.issue" => return self.issue_run_start_handoff(&org, p).await,
             "runs.start_handoff.restore" => return self.restore_run_start_handoff(&org, p).await,
             "runs.start_handoff.approve" => return self.approve_run_start_handoff(&org, p).await,
@@ -973,34 +1115,46 @@ impl Daemon {
             // not a reason to wake the chat model. Coalesce it locally until
             // a user-visible state change, an event page that must be read,
             // or the caller's bounded wait deadline.
-            self.wait_for_meaningful_run_update(&org, p).await?
+            self.wait_for_meaningful_run_update(&org, p, account.context("ORGANIZATION_REQUIRED")?)
+                .await?
         } else {
             let (verb, route, body) = backend_route(method, p)?;
-            self.backend(&org, &verb, &route, body, key)
+            let response = if fenced_authoring_method(method) {
+                self.native_authoring_backend(
+                    &org,
+                    &verb,
+                    &route,
+                    body,
+                    key,
+                    account.context("ORGANIZATION_REQUIRED")?,
+                )
                 .await
-                .map_err(|error| {
-                    // A lost mutation transport response does not establish
-                    // that the owner route never ran. Keep the exact journal
-                    // and require explicit same-key reconciliation, not retry.
-                    if (method == "runs.continuation.requeue"
-                        || matches!(
-                            method,
-                            "personas.chat_context.create"
-                                | "personas.memory.write"
-                                | "personas.memory.update"
-                        ))
-                        && error.downcast_ref::<ApiError>().is_some_and(|api| {
-                            matches!(
-                                api.code.as_str(),
-                                "NETWORK_UNAVAILABLE" | "INVALID_API_RESPONSE"
-                            )
-                        })
-                    {
-                        anyhow::anyhow!("NETWORK_AMBIGUOUS")
-                    } else {
-                        error
-                    }
-                })?
+            } else {
+                self.backend(&org, &verb, &route, body, key).await
+            };
+            response.map_err(|error| {
+                // A lost mutation transport response does not establish
+                // that the owner route never ran. Keep the exact journal
+                // and require explicit same-key reconciliation, not retry.
+                if (method == "runs.continuation.requeue"
+                    || matches!(
+                        method,
+                        "personas.chat_context.create"
+                            | "personas.memory.write"
+                            | "personas.memory.update"
+                    ))
+                    && error.downcast_ref::<ApiError>().is_some_and(|api| {
+                        matches!(
+                            api.code.as_str(),
+                            "NETWORK_UNAVAILABLE" | "INVALID_API_RESPONSE"
+                        )
+                    })
+                {
+                    anyhow::anyhow!("NETWORK_AMBIGUOUS")
+                } else {
+                    error
+                }
+            })?
         };
         if method == "runs.continuation.requeue" {
             ensure!(
@@ -1190,7 +1344,12 @@ impl Daemon {
     /// active execution look like a natural point to end the chat turn. The
     /// runner owns this coalescing because it is below both MCP and any host
     /// lifecycle integration and therefore behaves the same for every client.
-    async fn wait_for_meaningful_run_update(&self, org: &str, params: &Value) -> Result<Value> {
+    async fn wait_for_meaningful_run_update(
+        &self,
+        org: &str,
+        params: &Value,
+        account: &str,
+    ) -> Result<Value> {
         let requested = params
             .get("timeoutSeconds")
             .and_then(Value::as_u64)
@@ -1206,7 +1365,9 @@ impl Daemon {
             let timeout = remaining.as_secs().clamp(1, 45);
             request["timeoutSeconds"] = json!(timeout);
             let (verb, route, body) = backend_route("runs.wait", &request)?;
-            let result = self.backend(org, &verb, &route, body, None).await?;
+            let result = self
+                .native_authoring_backend(org, &verb, &route, body, None, account)
+                .await?;
             if !automated_progress_only(&result) || Instant::now() >= deadline {
                 return Ok(result);
             }
@@ -3297,6 +3458,8 @@ fn automated_progress_only(result: &Value) -> bool {
     active
         && result.get("waitState").and_then(Value::as_str) == Some("automated_progress")
         && result.get("humanRequest").is_none_or(Value::is_null)
+        && result.get("requiresAgentResponse") != Some(&Value::Bool(true))
+        && result.get("agentRequest").is_none_or(Value::is_null)
         && result.get("hasMoreEvents").and_then(Value::as_bool) == Some(false)
         && events.iter().all(|event| {
             event
@@ -3379,6 +3542,30 @@ fn required<'a>(p: &'a Value, key: &str) -> Result<&'a str> {
         .filter(|v| !v.is_empty())
         .context("INVALID_REQUEST")
 }
+fn lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+fn verify_native_authoring_start(method: &str, result: &Value) -> Result<()> {
+    let catalog: Value = serde_json::from_str(include_str!("../contracts/method-catalog.json"))?;
+    let schema = &catalog["methods"]
+        .as_array()
+        .context("INTERNAL")?
+        .iter()
+        .find(|entry| entry["name"] == method)
+        .context("INTERNAL")?["outputSchema"]["oneOf"][0];
+    validate_params(result, schema).map_err(|_| anyhow::anyhow!("BACKEND_PROTOCOL_ERROR"))?;
+    ensure!(
+        result["sessionId"] == result["builderSessionId"]
+            && result["systemWorkflowDefinitionChecksum"]
+                .as_str()
+                .is_some_and(lowercase_sha256),
+        "BACKEND_PROTOCOL_ERROR"
+    );
+    Ok(())
+}
 fn account_scoped_method(method: &str) -> bool {
     method.starts_with("personas.")
         || method.starts_with("persona.roles.")
@@ -3391,23 +3578,46 @@ fn account_scoped_method(method: &str) -> bool {
             "runs.prepare"
                 | "runs.commit"
                 | "runs.continuation.requeue"
+                | "runs.get"
+                | "runs.wait"
+                | "runs.events"
+                | "runs.result"
                 | "runs.start_handoff.issue"
                 | "runs.start_handoff.approve_headless"
                 | "runs.start_handoff.restore"
                 | "runs.start_handoff.get"
                 | "runs.start_handoff.commit"
                 | "builder.prepare"
+                | "builder.start"
+                | "builder.get"
                 | "builder.commit"
                 | "builder.respond"
                 | "builder.finalize"
                 | "editor.prepare"
+                | "editor.start"
                 | "editor.commit"
                 | "editor.respond"
                 | "editor.finalize"
                 | "workflows.patch"
                 | "interactions.respond"
+                | "interactions.get"
                 | "interactions.decide"
+                | "workflow.operations.get"
         )
+}
+fn fenced_authoring_method(method: &str) -> bool {
+    matches!(
+        method,
+        "builder.start"
+            | "editor.start"
+            | "builder.get"
+            | "interactions.get"
+            | "workflow.operations.get"
+            | "runs.get"
+            | "runs.wait"
+            | "runs.events"
+            | "runs.result"
+    )
 }
 pub(crate) fn validate_params(p: &Value, schema: &Value) -> Result<()> {
     let map = p.as_object().context("INVALID_REQUEST")?;
@@ -3529,6 +3739,7 @@ pub fn backend_route(method: &str, p: &Value) -> Result<(String, String, Option<
         }
     }
     if method == "workflow.operations.get"
+        || matches!(method, "builder.start" | "editor.start")
         || method == "personas.operations.get"
         || matches!(
             method,
@@ -3619,6 +3830,11 @@ pub fn backend_route(method: &str, p: &Value) -> Result<(String, String, Option<
             ),
         ),
         "builder.catalog" => ("GET", "v2/builder/catalog/".into()),
+        "builder.start" => ("POST", "v2/workflow-builder/start/".into()),
+        "editor.start" => {
+            body["workflowId"] = p["workflowId"].clone();
+            ("POST", "v2/workflow-edit/start/".into())
+        }
         "builder.create" => ("POST", "v1/workflow-builder/sessions/".into()),
         "builder.get" => (
             "GET",

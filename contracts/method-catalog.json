@@ -1941,7 +1941,9 @@
             "enum": [
               "workflows.create",
               "workflows.update",
-              "workflows.publish"
+              "workflows.publish",
+              "builder.start",
+              "editor.start"
             ]
           },
           "idempotencyKey": {
@@ -1965,7 +1967,9 @@
                 "enum": [
                   "workflows.create",
                   "workflows.update",
-                  "workflows.publish"
+                  "workflows.publish",
+                  "builder.start",
+                  "editor.start"
                 ]
               },
               "idempotencyKey": {
@@ -2481,6 +2485,129 @@
       "appOnly": false
     },
     {
+      "name": "builder.start",
+      "mutating": true,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "prompt": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "prompt",
+          "idempotencyKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "schemaVersion": {
+                "type": "string",
+                "const": "loomex.native-authoring-session/v1"
+              },
+              "sessionId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "builderSessionId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "executionId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "status": {
+                "type": "string",
+                "const": "queued"
+              },
+              "systemWorkflowKey": {
+                "type": "string",
+                "const": "workflow_builder"
+              },
+              "systemWorkflowVersionId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "systemWorkflowDefinitionChecksum": {
+                "type": "string",
+                "minLength": 64,
+                "maxLength": 64,
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "nextAction": {
+                "type": "string",
+                "const": "run_get"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "schemaVersion",
+              "sessionId",
+              "builderSessionId",
+              "executionId",
+              "status",
+              "systemWorkflowKey",
+              "systemWorkflowVersionId",
+              "systemWorkflowDefinitionChecksum",
+              "nextAction"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "transportRetry": "never_after_send",
+      "appOnly": false
+    },
+    {
       "name": "builder.prepare",
       "mutating": true,
       "idempotent": true,
@@ -2890,6 +3017,146 @@
               }
             },
             "required": [],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "transportRetry": "never_after_send",
+      "appOnly": false
+    },
+    {
+      "name": "editor.start",
+      "mutating": true,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "prompt": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "workflowId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "expectedVersion": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "expectedDefinitionChecksum": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "required": [
+          "prompt",
+          "idempotencyKey",
+          "workflowId",
+          "expectedVersion",
+          "expectedDefinitionChecksum"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "schemaVersion": {
+                "type": "string",
+                "const": "loomex.native-authoring-session/v1"
+              },
+              "sessionId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "builderSessionId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "executionId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "status": {
+                "type": "string",
+                "const": "queued"
+              },
+              "systemWorkflowKey": {
+                "type": "string",
+                "const": "workflow_editor"
+              },
+              "systemWorkflowVersionId": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "systemWorkflowDefinitionChecksum": {
+                "type": "string",
+                "minLength": 64,
+                "maxLength": 64,
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "nextAction": {
+                "type": "string",
+                "const": "run_get"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "schemaVersion",
+              "sessionId",
+              "builderSessionId",
+              "executionId",
+              "status",
+              "systemWorkflowKey",
+              "systemWorkflowVersionId",
+              "systemWorkflowDefinitionChecksum",
+              "nextAction"
+            ],
             "additionalProperties": false
           },
           {
@@ -4460,6 +4727,132 @@
               "details": {
                 "type": "object",
                 "additionalProperties": true
+              },
+              "requiresAgentResponse": {
+                "type": "boolean"
+              },
+              "agentRequest": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "requestType": {
+                    "type": "string",
+                    "const": "plugin_agent"
+                  },
+                  "answerChannel": {
+                    "type": "string",
+                    "const": "current_chat"
+                  }
+                },
+                "required": [
+                  "id",
+                  "requestType",
+                  "answerChannel"
+                ],
+                "additionalProperties": false
+              },
+              "nativeAuthoringBinding": {
+                "type": "object",
+                "properties": {
+                  "schemaVersion": {
+                    "type": "string",
+                    "const": "loomex.native-authoring/v1"
+                  },
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "create",
+                      "edit"
+                    ]
+                  },
+                  "systemKey": {
+                    "type": "string",
+                    "enum": [
+                      "workflow_builder",
+                      "workflow_editor"
+                    ]
+                  },
+                  "sessionId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "runnerId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "workflowVersionId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "definitionChecksum": {
+                    "type": "string",
+                    "minLength": 64,
+                    "maxLength": 64,
+                    "pattern": "^[0-9a-f]{64}$"
+                  }
+                },
+                "required": [
+                  "schemaVersion",
+                  "mode",
+                  "systemKey",
+                  "sessionId",
+                  "runnerId",
+                  "workflowVersionId",
+                  "definitionChecksum"
+                ],
+                "additionalProperties": false
+              },
+              "nativeAuthoringResult": {
+                "type": "object",
+                "properties": {
+                  "schemaVersion": {
+                    "type": "string",
+                    "const": "loomex.native-authoring-result/v1"
+                  },
+                  "status": {
+                    "type": "string",
+                    "const": "accepted"
+                  },
+                  "workflowId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "draft": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "format": "uuid"
+                      },
+                      "revision": {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      "definitionChecksum": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64,
+                        "pattern": "^[0-9a-f]{64}$"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "revision",
+                      "definitionChecksum"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "schemaVersion",
+                  "status",
+                  "workflowId",
+                  "draft"
+                ],
+                "additionalProperties": false
               }
             },
             "required": [
@@ -4620,6 +5013,132 @@
               "details": {
                 "type": "object",
                 "additionalProperties": true
+              },
+              "requiresAgentResponse": {
+                "type": "boolean"
+              },
+              "agentRequest": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "requestType": {
+                    "type": "string",
+                    "const": "plugin_agent"
+                  },
+                  "answerChannel": {
+                    "type": "string",
+                    "const": "current_chat"
+                  }
+                },
+                "required": [
+                  "id",
+                  "requestType",
+                  "answerChannel"
+                ],
+                "additionalProperties": false
+              },
+              "nativeAuthoringBinding": {
+                "type": "object",
+                "properties": {
+                  "schemaVersion": {
+                    "type": "string",
+                    "const": "loomex.native-authoring/v1"
+                  },
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "create",
+                      "edit"
+                    ]
+                  },
+                  "systemKey": {
+                    "type": "string",
+                    "enum": [
+                      "workflow_builder",
+                      "workflow_editor"
+                    ]
+                  },
+                  "sessionId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "runnerId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "workflowVersionId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "definitionChecksum": {
+                    "type": "string",
+                    "minLength": 64,
+                    "maxLength": 64,
+                    "pattern": "^[0-9a-f]{64}$"
+                  }
+                },
+                "required": [
+                  "schemaVersion",
+                  "mode",
+                  "systemKey",
+                  "sessionId",
+                  "runnerId",
+                  "workflowVersionId",
+                  "definitionChecksum"
+                ],
+                "additionalProperties": false
+              },
+              "nativeAuthoringResult": {
+                "type": "object",
+                "properties": {
+                  "schemaVersion": {
+                    "type": "string",
+                    "const": "loomex.native-authoring-result/v1"
+                  },
+                  "status": {
+                    "type": "string",
+                    "const": "accepted"
+                  },
+                  "workflowId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "draft": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "format": "uuid"
+                      },
+                      "revision": {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      "definitionChecksum": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64,
+                        "pattern": "^[0-9a-f]{64}$"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "revision",
+                      "definitionChecksum"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "schemaVersion",
+                  "status",
+                  "workflowId",
+                  "draft"
+                ],
+                "additionalProperties": false
               }
             },
             "required": [
@@ -4780,6 +5299,132 @@
               "details": {
                 "type": "object",
                 "additionalProperties": true
+              },
+              "requiresAgentResponse": {
+                "type": "boolean"
+              },
+              "agentRequest": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "requestType": {
+                    "type": "string",
+                    "const": "plugin_agent"
+                  },
+                  "answerChannel": {
+                    "type": "string",
+                    "const": "current_chat"
+                  }
+                },
+                "required": [
+                  "id",
+                  "requestType",
+                  "answerChannel"
+                ],
+                "additionalProperties": false
+              },
+              "nativeAuthoringBinding": {
+                "type": "object",
+                "properties": {
+                  "schemaVersion": {
+                    "type": "string",
+                    "const": "loomex.native-authoring/v1"
+                  },
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "create",
+                      "edit"
+                    ]
+                  },
+                  "systemKey": {
+                    "type": "string",
+                    "enum": [
+                      "workflow_builder",
+                      "workflow_editor"
+                    ]
+                  },
+                  "sessionId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "runnerId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "workflowVersionId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "definitionChecksum": {
+                    "type": "string",
+                    "minLength": 64,
+                    "maxLength": 64,
+                    "pattern": "^[0-9a-f]{64}$"
+                  }
+                },
+                "required": [
+                  "schemaVersion",
+                  "mode",
+                  "systemKey",
+                  "sessionId",
+                  "runnerId",
+                  "workflowVersionId",
+                  "definitionChecksum"
+                ],
+                "additionalProperties": false
+              },
+              "nativeAuthoringResult": {
+                "type": "object",
+                "properties": {
+                  "schemaVersion": {
+                    "type": "string",
+                    "const": "loomex.native-authoring-result/v1"
+                  },
+                  "status": {
+                    "type": "string",
+                    "const": "accepted"
+                  },
+                  "workflowId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "draft": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "format": "uuid"
+                      },
+                      "revision": {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      "definitionChecksum": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64,
+                        "pattern": "^[0-9a-f]{64}$"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "revision",
+                      "definitionChecksum"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "schemaVersion",
+                  "status",
+                  "workflowId",
+                  "draft"
+                ],
+                "additionalProperties": false
               }
             },
             "required": [
@@ -4940,6 +5585,132 @@
               "details": {
                 "type": "object",
                 "additionalProperties": true
+              },
+              "requiresAgentResponse": {
+                "type": "boolean"
+              },
+              "agentRequest": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "requestType": {
+                    "type": "string",
+                    "const": "plugin_agent"
+                  },
+                  "answerChannel": {
+                    "type": "string",
+                    "const": "current_chat"
+                  }
+                },
+                "required": [
+                  "id",
+                  "requestType",
+                  "answerChannel"
+                ],
+                "additionalProperties": false
+              },
+              "nativeAuthoringBinding": {
+                "type": "object",
+                "properties": {
+                  "schemaVersion": {
+                    "type": "string",
+                    "const": "loomex.native-authoring/v1"
+                  },
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "create",
+                      "edit"
+                    ]
+                  },
+                  "systemKey": {
+                    "type": "string",
+                    "enum": [
+                      "workflow_builder",
+                      "workflow_editor"
+                    ]
+                  },
+                  "sessionId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "runnerId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "workflowVersionId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "definitionChecksum": {
+                    "type": "string",
+                    "minLength": 64,
+                    "maxLength": 64,
+                    "pattern": "^[0-9a-f]{64}$"
+                  }
+                },
+                "required": [
+                  "schemaVersion",
+                  "mode",
+                  "systemKey",
+                  "sessionId",
+                  "runnerId",
+                  "workflowVersionId",
+                  "definitionChecksum"
+                ],
+                "additionalProperties": false
+              },
+              "nativeAuthoringResult": {
+                "type": "object",
+                "properties": {
+                  "schemaVersion": {
+                    "type": "string",
+                    "const": "loomex.native-authoring-result/v1"
+                  },
+                  "status": {
+                    "type": "string",
+                    "const": "accepted"
+                  },
+                  "workflowId": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "draft": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "format": "uuid"
+                      },
+                      "revision": {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      "definitionChecksum": {
+                        "type": "string",
+                        "minLength": 64,
+                        "maxLength": 64,
+                        "pattern": "^[0-9a-f]{64}$"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "revision",
+                      "definitionChecksum"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "schemaVersion",
+                  "status",
+                  "workflowId",
+                  "draft"
+                ],
+                "additionalProperties": false
               }
             },
             "required": [
@@ -10981,6 +11752,9 @@
     "method:personas.operations.get",
     "method:auth.scope_upgrade",
     "method:auth.scope_status",
-    "diagnostics.fingerprint/v1"
+    "diagnostics.fingerprint/v1",
+    "method:builder.start",
+    "method:editor.start",
+    "authoring.chat-native/v1"
   ]
 }

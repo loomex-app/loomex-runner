@@ -2,6 +2,7 @@
   "capabilities": [
     "auth:browser-pkce/v1",
     "auth:startup-observation/v1",
+    "authoring.chat-native/v1",
     "authorization.prepare-commit/v1",
     "connection.projection/v2",
     "diagnostics.fingerprint/v1",
@@ -27,6 +28,7 @@
     "method:builder.get",
     "method:builder.prepare",
     "method:builder.respond",
+    "method:builder.start",
     "method:builder.validate",
     "method:connection.get",
     "method:connection.views.create",
@@ -37,6 +39,7 @@
     "method:editor.finalize",
     "method:editor.prepare",
     "method:editor.respond",
+    "method:editor.start",
     "method:follow.session.lifecycle",
     "method:interactions.decide",
     "method:interactions.draft.delete",
@@ -117,11 +120,11 @@
   "catalogVersion": "0.3.8",
   "generatedFrom": {
     "backendRoutes": {
-      "digest": "sha256:ed8c73ba7af276f96ea0bfb314ae19c4a538cf14989e3e3e03d61b515cc98a10",
+      "digest": "sha256:e90600c3265c2b61324aa7aa0921c38052ff8f09492c443f9cc5b8168c1ba7b9",
       "path": "contracts/backend-routes.json"
     },
     "methodCatalog": {
-      "digest": "sha256:6b07982831536ad3e7ff0cc2db497a91aaad59e795df66534967bb16d0a4f03c",
+      "digest": "sha256:4337cdcbf5041ad8128d09455e90d701afc295bf38da10457a7f20c83b96e536",
       "path": "contracts/method-catalog.json"
     }
   },
@@ -330,6 +333,18 @@
     {
       "classification": "backend-proxy",
       "idempotent": true,
+      "inputSchemaDigest": "sha256:159e8716c3a63f439f5ceafb8204bd1e09ad8fa94cfce57493fc57e2bfd0342b",
+      "mutating": true,
+      "name": "builder.start",
+      "outputSchemaDigest": "sha256:885fd6ca1dae6f73b836c085fe5dd8981e813f8d16adc849719f1f9c4244902f",
+      "routeIds": [
+        "builder.start"
+      ],
+      "transportRetry": "never_after_send"
+    },
+    {
+      "classification": "backend-proxy",
+      "idempotent": true,
       "inputSchemaDigest": "sha256:d6cc4d915d5ae43565bf864490611b065fd6d48375f469b32289b92407c4f28f",
       "mutating": false,
       "name": "builder.validate",
@@ -434,6 +449,18 @@
       "outputSchemaDigest": "sha256:e4071c881332b575db817ff94cef673d4ecda3c21305db90ec2aa3c8321a0b57",
       "routeIds": [
         "editor.session.respond"
+      ],
+      "transportRetry": "never_after_send"
+    },
+    {
+      "classification": "backend-proxy",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:4d4f54b142b2feb08b715c3833e86a64a1df04196995ba6d134a639110209bcd",
+      "mutating": true,
+      "name": "editor.start",
+      "outputSchemaDigest": "sha256:34973eda68f20877d9609ac8ed4f32e9470df5fa0efb54617cd9fbd8293189a8",
+      "routeIds": [
+        "editor.start"
       ],
       "transportRetry": "never_after_send"
     },
@@ -922,7 +949,7 @@
       "inputSchemaDigest": "sha256:f63aad9a2dcb72fe66bcb95fba2de4971851b849ed7797adfe45ba425f8df597",
       "mutating": false,
       "name": "runs.events",
-      "outputSchemaDigest": "sha256:a859f67add5334abb2b75efe04d2c030bd91220e6012dcc880aa9410acacf1d5",
+      "outputSchemaDigest": "sha256:37fda534233340030036cc5be4cd0f7030b235d7e6356c90434e387416b8b354",
       "routeIds": [
         "execution.detail"
       ],
@@ -934,7 +961,7 @@
       "inputSchemaDigest": "sha256:f63aad9a2dcb72fe66bcb95fba2de4971851b849ed7797adfe45ba425f8df597",
       "mutating": false,
       "name": "runs.get",
-      "outputSchemaDigest": "sha256:a859f67add5334abb2b75efe04d2c030bd91220e6012dcc880aa9410acacf1d5",
+      "outputSchemaDigest": "sha256:37fda534233340030036cc5be4cd0f7030b235d7e6356c90434e387416b8b354",
       "routeIds": [
         "execution.detail"
       ],
@@ -970,7 +997,7 @@
       "inputSchemaDigest": "sha256:f63aad9a2dcb72fe66bcb95fba2de4971851b849ed7797adfe45ba425f8df597",
       "mutating": false,
       "name": "runs.result",
-      "outputSchemaDigest": "sha256:a859f67add5334abb2b75efe04d2c030bd91220e6012dcc880aa9410acacf1d5",
+      "outputSchemaDigest": "sha256:37fda534233340030036cc5be4cd0f7030b235d7e6356c90434e387416b8b354",
       "routeIds": [
         "execution.detail"
       ],
@@ -1044,7 +1071,7 @@
       "inputSchemaDigest": "sha256:f63aad9a2dcb72fe66bcb95fba2de4971851b849ed7797adfe45ba425f8df597",
       "mutating": false,
       "name": "runs.wait",
-      "outputSchemaDigest": "sha256:a859f67add5334abb2b75efe04d2c030bd91220e6012dcc880aa9410acacf1d5",
+      "outputSchemaDigest": "sha256:37fda534233340030036cc5be4cd0f7030b235d7e6356c90434e387416b8b354",
       "routeIds": [
         "execution.detail"
       ],
@@ -1063,10 +1090,10 @@
     {
       "classification": "backend-proxy",
       "idempotent": true,
-      "inputSchemaDigest": "sha256:51570cfdec1aa18d4ee474dd45d387379af0f14d79d0952317b6fb46b51006e5",
+      "inputSchemaDigest": "sha256:959b2c504716ce4304c1729bc78e5088f354a70d815fb559f2eaef51cc39ff56",
       "mutating": false,
       "name": "workflow.operations.get",
-      "outputSchemaDigest": "sha256:e77517293f04d7dc0c1f29cb582410b9c34303b09b2e99d4a46e814d4ae62759",
+      "outputSchemaDigest": "sha256:60f8cc2449a329d9b40a1b2c42e4c871bc9c215ca33a406e55857bc20d94d17e",
       "routeIds": [
         "workflow.operation.get"
       ],
@@ -1321,6 +1348,12 @@
       "source": "src/control.rs"
     },
     {
+      "id": "builder.start",
+      "method": "POST",
+      "pathTemplate": "v2/workflow-builder/start/",
+      "source": "src/control.rs"
+    },
+    {
       "id": "daemon.job.complete",
       "method": "POST",
       "pathTemplate": "v1/jobs/{jobId}/complete/",
@@ -1402,6 +1435,12 @@
       "id": "editor.session.respond",
       "method": "POST",
       "pathTemplate": "v1/workflow-edit/sessions/{sessionId}/responses/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "editor.start",
+      "method": "POST",
+      "pathTemplate": "v2/workflow-edit/start/",
       "source": "src/control.rs"
     },
     {
@@ -1617,14 +1656,14 @@
   ],
   "schemaVersion": "loomex.runner.compatibility-manifest/v1",
   "summary": {
-    "backendRouteCount": 69,
-    "capabilityCount": 113,
+    "backendRouteCount": 71,
+    "capabilityCount": 116,
     "methodClassifications": {
       "backend-auth": 7,
-      "backend-proxy": 51,
+      "backend-proxy": 53,
       "daemon-lifecycle": 1,
       "local-control": 36
     },
-    "methodCount": 95
+    "methodCount": 97
   }
 }

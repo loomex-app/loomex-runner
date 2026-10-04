@@ -421,6 +421,18 @@
       "method": "POST",
       "pathTemplate": "v1/personas/{personId}/memory-tools/{operation}/",
       "source": "src/control.rs"
+    },
+    {
+      "id": "builder.start",
+      "method": "POST",
+      "pathTemplate": "v2/workflow-builder/start/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "editor.start",
+      "method": "POST",
+      "pathTemplate": "v2/workflow-edit/start/",
+      "source": "src/control.rs"
     }
   ],
   "daemonRouteIds": [
@@ -1037,6 +1049,20 @@
       "method": "auth.scope_status",
       "classification": "local-control",
       "routeIds": []
+    },
+    {
+      "method": "builder.start",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "builder.start"
+      ]
+    },
+    {
+      "method": "editor.start",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "editor.start"
+      ]
     }
   ]
 }

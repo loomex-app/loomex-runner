@@ -38,6 +38,16 @@
       "method": "personas.operations.get",
       "identity": "idempotencyKey",
       "operation": "chat_context.create"
+    },
+    "builder.start": {
+      "method": "workflow.operations.get",
+      "identity": "idempotencyKey",
+      "operation": "builder.start"
+    },
+    "editor.start": {
+      "method": "workflow.operations.get",
+      "identity": "idempotencyKey",
+      "operation": "editor.start"
     }
   }
 }
