@@ -1,5 +1,7 @@
 #!/bin/bash
 set -euo pipefail
+# Imported validators must not add bytecode to the immutable source snapshot.
+export PYTHONDONTWRITEBYTECODE=1
 usage(){ echo "usage: $0 (--production | --unsigned-development | --unsigned-cloud-preview) [--output DIR] [--retain-failure-workspace DIR] [--local-development-api-origin LOOPBACK_URL]" >&2; exit 2; }
 mode=""; output=""; failure_workspace=""; local_origin=""
 while (($#)); do case "$1" in --production|--unsigned-development|--unsigned-cloud-preview) [[ -z "$mode" ]] || usage; mode="$1"; shift;; --output) output="${2:?}"; shift 2;; --retain-failure-workspace) failure_workspace="${2:?}"; shift 2;; --local-development-api-origin) local_origin="${2:?}"; shift 2;; *) usage;; esac; done

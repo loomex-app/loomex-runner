@@ -160,6 +160,33 @@ class CheckedArchiveTests(unittest.TestCase):
             result=subprocess.run(['/bin/bash','-c','set -euo pipefail\n'+block],env=env,capture_output=True,text=True)
             return result
 
+    def test_actual_local_validator_keeps_archived_source_inventory_exact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);repo=root/'repo';repo.mkdir();archive=root/'fixture.tar'
+            subprocess.run(['git','-C',str(ROOT),'archive','--output',str(archive),'HEAD'],check=True)
+            subprocess.run(['/usr/bin/tar','-xf',str(archive),'-C',str(repo)],check=True)
+            subprocess.run(['git','init','-q',str(repo)],check=True)
+            subprocess.run(['git','-C',str(repo),'add','.'],check=True)
+            subprocess.run(['git','-C',str(repo),'-c','user.name=Fixture','-c','user.email=fixture@example.test','commit','-qm','Fixture'],check=True)
+            revision=subprocess.check_output(['git','-C',str(repo),'rev-parse','HEAD'],text=True).strip()
+            manifest=root/'source-content.json'
+            subprocess.run([sys.executable,str(ROOT/'scripts/artifact.py'),'source-manifest','--source-root',str(repo),'--source-revision',revision,'--output',str(manifest)],check=True)
+            source=root/'source';shutil.copytree(repo,source,ignore=shutil.ignore_patterns('.git'))
+            payload=root/'payload';payload.mkdir();_,local=PreviewPackageTests().local_fixture(payload)
+            (payload/'metadata/source-content-manifest.json').write_bytes(manifest.read_bytes())
+            (payload/'metadata/local-development-origin.json').write_text(canonical({**local,'sourceRevision':revision}))
+            script=(ROOT/'scripts/build-release.sh').read_text()
+            policy=next((line for line in script.splitlines() if line.startswith('export PYTHONDONTWRITEBYTECODE=')),'')
+            env=dict(os.environ);env.pop('PYTHONDONTWRITEBYTECODE',None)
+            command=[sys.executable,str(source/'scripts/validate_package.py'),str(payload),'--expected-version','0.4.9','--source-root',str(source)]
+            result=subprocess.run(['/bin/bash','-c','set -euo pipefail\n'+policy+'\nexec "$@"','fixture',*command],capture_output=True,text=True,env=env)
+            self.assertEqual(result.returncode,0,result.stderr)
+            expected={f['path'] for f in json.loads(manifest.read_text())['files']}
+            actual={p.relative_to(source).as_posix() for p in source.rglob('*') if p.is_file()}
+            self.assertEqual(actual,expected,'local validator generated unmanifested archived source bytes')
+            result=subprocess.run([sys.executable,str(source/'scripts/artifact.py'),'verify-source','--source-root',str(source),'--manifest',str(manifest)],capture_output=True,text=True,env=env)
+            self.assertEqual(result.returncode,0,result.stderr)
+
     def test_valid_archive_with_padding_is_fully_collected_before_tar(self):
         result=self.run_snapshot_block();self.assertEqual(result.returncode,0,result.stderr)
     def test_archive_and_extraction_errors_propagate(self):
