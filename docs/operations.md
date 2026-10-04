@@ -204,6 +204,77 @@ stall is a system availability dependency; a returned categorical code alone
 does not identify its cause.
 
 
+### Explicit recovery of the observed pre-dispatch compatibility refusal
+
+Ordinary `lifecycle resume` remains observation-only for a historical process-bearing
+`Prepared` stop. `Prepared`, an unchanged process, idle counters, or a journal hash
+alone cannot prove that a previous `launchctl` child was never started. Unknown,
+accepted and unconfirmed requests remain protected.
+
+The qualified lifecycle owner has one explicit recovery for the reviewed 0.4.8
+controller / 0.5.0 candidate compatibility refusal:
+
+```text
+loomex lifecycle resume --expected-operation UUID --dispatch-reviewed-unsent-stop \
+  --expected-journal-sha256 SHA256 --unsent-refusal-evidence FILE --json
+```
+
+All four recovery arguments are required together. The flag is deliberate operator
+authorization for the reviewed unsent incident; evidence alone never authorizes an
+effect. `FILE` must be a regular, current-user-owned, private file opened without
+following symlinks, no larger than 256 KiB. Read-only evidence and integrity
+descriptors are opened nonblocking before descriptor type checks, so a FIFO or
+nonregular replacement cannot wait for a writer while holding the lifecycle lock. Its strict typed object has schema
+`app.loomex.runner.prepared-stop-refusal/v1`, `beforeOperation`, `refusedOperation`,
+`controllerCliSha256`, `controllerManifestSha256`, and `failureCode`. The operation
+objects are the complete frozen lifecycle snapshots, not summaries or edited
+journal state. Tokens, credentials and raw command output are excluded. The only
+accepted failure code is `LIFECYCLE_ROLLBACK_COMPATIBILITY_MISMATCH`.
+
+The before snapshot must be the same v4 Update at
+`pending_active_work` / `daemon_has_active_work` with no service-stop history.
+The refused snapshot must exactly match the current parsed journal and its reviewed
+raw-byte SHA-256, at `recovery_required` / `observed state could not be reconciled safely`,
+with one first `ActivateCandidate`, process-bearing `Prepared` stop. Only the known
+phase, checkpoint, update timestamp and newly captured stop may differ between
+snapshots. Identity, creation timestamp, candidate, prior target, resources and
+pre-drain AuthBaseline must agree. Missing or unknown provenance fails closed.
+
+The owner revalidates immutable owned package bytes, actual prior CLI hash
+`87c6e905950251e1777b3c3d2d4d47d692c9a5b089188ca1df8b4498e8fef69e`, prior compiled
+manifest `29fa7e75eaffba163f3a106eab19ef1da2800cc94ca40880017c5c85cb9d2f07`, and candidate/controller
+manifest `6eac15418a6fcef070007ee793b3a1a7bb52ee2398d29ba456f2cb03a4d9c3c2`.
+It then requires fresh exact prior-version drained zero managed work, the recorded
+loaded PID, UID, executable and birth time, unchanged pointer, configuration,
+receipt, inventory and drain, under the existing lifecycle writer lock. These
+locally observed before/after snapshots and categorical refusal have the existing
+same-user operational trust boundary; they are not an externally signed audit
+proof. A rewritten history or unknown possibly-sent request is outside this route.
+
+The captured AuthBaseline is verified across all three snapshots. The retained
+drained-idle daemon cannot admit a fresh `auth.status` read without reopening its
+zero-work acknowledgement, so this action follows standard activation ordering:
+pre-drain capture, untouched credential namespace, then existing bounded real
+post-start auth continuity before completion. It does not query or rotate secrets
+or claim fresh pre-stop token validation. Native worker process exit and the secure
+installation singleton remain required after stop; zero counters alone cannot
+license pointer replacement.
+
+Private lifecycle schema v7 stores the original journal and canonical typed-evidence
+digests, retaining the same operation and stop history. One atomic checkpoint marks
+that attempt `Unconfirmed` before dispatch. Drift detected afterward prevents
+spawn but preserves uncertainty. Crash, timeout, wait failure and even a returned
+spawn failure never permit automatic retry in this route. Ordinary resume only
+observes that consumed intent. Older v1–v6 owners reject v7 before effects.
+
+After verified terminal activation, the new schema-aware bootstrap helper must
+receive the exact original release/configuration to finish its receipt and original
+bootstrap journal through the existing terminal reconciliation branch. An old
+helper that rejects v7 cannot finalize it. Controller and target product versions
+need not match, but package/configuration identity and compatible contract bytes
+must. No second install intent, restaging, manual journal removal or second stop is
+part of this finalization.
+
 ### Abandoning an exact pending update
 
 A newer lifecycle CLI can abandon a captured `Update` only before service stop

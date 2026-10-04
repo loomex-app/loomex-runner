@@ -300,12 +300,18 @@ async fn run_lifecycle(arguments: Vec<String>) -> Result<()> {
     // stays independent of installation state.
     let action_flags: &[&str] = match action.as_str() {
         "status" => &["--rollback-preflight"],
-        "resume" | "repair" => &[],
+        "resume" => &[
+            "--expected-operation",
+            "--dispatch-reviewed-unsent-stop",
+            "--expected-journal-sha256",
+            "--unsent-refusal-evidence",
+        ],
+        "repair" => &[],
         "rollback" => &["--to", "--expected-operation"],
         "prune" => &["--remove", "--retain"],
         "--help" | "help" if args.len() == 0 => {
             println!(
-                "loomex lifecycle status [--rollback-preflight] [--json] [directories]\nloomex lifecycle resume|repair [--json] [directories]\nloomex lifecycle rollback --to VERSION [--expected-operation UUID] [--json] [directories]\nloomex lifecycle prune --remove VERSION [--remove VERSION ...] --retain ROLLBACK_VERSION [--json] [directories]\ndirectories: --install-base DIR --state-dir DIR --launch-agents-dir DIR"
+                "loomex lifecycle status [--rollback-preflight] [--json] [directories]\nloomex lifecycle resume [--expected-operation UUID --dispatch-reviewed-unsent-stop --expected-journal-sha256 SHA256 --unsent-refusal-evidence FILE] [--json] [directories]\nloomex lifecycle repair [--json] [directories]\nloomex lifecycle rollback --to VERSION [--expected-operation UUID] [--json] [directories]\nloomex lifecycle prune --remove VERSION [--remove VERSION ...] --retain ROLLBACK_VERSION [--json] [directories]\ndirectories: --install-base DIR --state-dir DIR --launch-agents-dir DIR"
             );
             return Ok(());
         }
@@ -327,6 +333,9 @@ async fn run_lifecycle(arguments: Vec<String>) -> Result<()> {
     let mut remove_versions = Vec::new();
     let mut retain_versions = Vec::new();
     let mut expected_operation = None;
+    let mut dispatch_reviewed_unsent_stop = false;
+    let mut expected_journal_sha256 = None;
+    let mut unsent_refusal_evidence = None;
     while let Some(argument) = args.next() {
         ensure!(
             common_flags.contains(&argument.as_str()) || action_flags.contains(&argument.as_str()),
@@ -347,6 +356,16 @@ async fn run_lifecycle(arguments: Vec<String>) -> Result<()> {
         match argument.as_str() {
             "--json" => json_output = true,
             "--rollback-preflight" => rollback_preflight = true,
+            "--dispatch-reviewed-unsent-stop" => dispatch_reviewed_unsent_stop = true,
+            "--expected-journal-sha256" => {
+                let digest = value()?;
+                ensure!(
+                    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                    "INVALID_ARGUMENT"
+                );
+                expected_journal_sha256 = Some(digest);
+            }
+            "--unsent-refusal-evidence" => unsent_refusal_evidence = Some(PathBuf::from(value()?)),
             "--install-base" => install_base = Some(PathBuf::from(value()?)),
             "--state-dir" => state_dir = Some(PathBuf::from(value()?)),
             "--launch-agents-dir" => launch_agents_dir = Some(PathBuf::from(value()?)),
@@ -365,6 +384,19 @@ async fn run_lifecycle(arguments: Vec<String>) -> Result<()> {
             && !(action == "prune" && (remove_versions.is_empty() || retain_versions.is_empty())),
         "INVALID_ARGUMENT"
     );
+    if action == "resume" {
+        ensure!(
+            (dispatch_reviewed_unsent_stop
+                && expected_operation.is_some()
+                && expected_journal_sha256.is_some()
+                && unsent_refusal_evidence.is_some())
+                || (!dispatch_reviewed_unsent_stop
+                    && expected_operation.is_none()
+                    && expected_journal_sha256.is_none()
+                    && unsent_refusal_evidence.is_none()),
+            "INVALID_ARGUMENT"
+        );
+    }
     for names in [&remove_versions, &retain_versions] {
         ensure!(
             names.len() <= 256
@@ -404,6 +436,19 @@ async fn run_lifecycle(arguments: Vec<String>) -> Result<()> {
                 status["rollbackPreflight"] = lifecycle::rollback_preflight(&paths)?;
             }
             status
+        }
+        "resume" if dispatch_reviewed_unsent_stop => {
+            lifecycle::resume_reviewed_unsent_stop(
+                &paths,
+                expected_operation.context("INVALID_ARGUMENT")?,
+                expected_journal_sha256
+                    .as_deref()
+                    .context("INVALID_ARGUMENT")?,
+                unsent_refusal_evidence
+                    .as_deref()
+                    .context("INVALID_ARGUMENT")?,
+            )
+            .await?
         }
         "resume" => lifecycle::resume(&paths).await?,
         "rollback" => {
@@ -453,6 +498,29 @@ mod tests {
                 "00000000-0000-0000-0000-000000000001",
                 "--expected-operation",
                 "00000000-0000-0000-0000-000000000001",
+            ],
+        ] {
+            assert!(
+                run_lifecycle(args.into_iter().map(str::to_owned).collect())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reviewed_stop_flags_require_all_bindings_and_resume_only() {
+        for args in [
+            vec!["resume", "--dispatch-reviewed-unsent-stop"],
+            vec!["resume", "--expected-journal-sha256", "invalid"],
+            vec!["resume", "--unsent-refusal-evidence", "file"],
+            vec!["repair", "--dispatch-reviewed-unsent-stop"],
+            vec![
+                "rollback",
+                "--to",
+                "0.5.0",
+                "--unsent-refusal-evidence",
+                "file",
             ],
         ] {
             assert!(

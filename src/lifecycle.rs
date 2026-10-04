@@ -94,6 +94,7 @@ fn lifecycle_test_mode() -> bool {
 pub const OPERATION_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v4";
 // Prune has different recovery semantics. Older lifecycle owners must reject
 // an interrupted prune instead of interpreting it as an activation journal.
+const REVIEWED_STOP_OPERATION_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v7";
 const PRUNE_OPERATION_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v6";
 const ABANDONMENT_OPERATION_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v5";
 const PRE_AUTH_OPERATION_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v2";
@@ -162,6 +163,29 @@ pub struct Operation {
     pub auth_baseline: Option<AuthBaseline>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prune: Option<PruneIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_unsent_stop: Option<ReviewedUnsentStop>,
+}
+
+// An owner-reviewed local refusal is provenance, not an external audit proof.
+// This schema marks its one authorized stop attempt consumed before dispatch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReviewedUnsentStop {
+    operation_id: Uuid,
+    original_journal_sha256: String,
+    evidence_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PreparedStopRefusalEvidence {
+    schema: String,
+    before_operation: Operation,
+    refused_operation: Operation,
+    controller_cli_sha256: String,
+    controller_manifest_sha256: String,
+    failure_code: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -263,6 +287,7 @@ impl Operation {
             abandonment: None,
             auth_baseline: None,
             prune: None,
+            reviewed_unsent_stop: None,
         }
     }
 
@@ -270,6 +295,7 @@ impl Operation {
         if !matches!(
             self.schema.as_str(),
             OPERATION_SCHEMA
+                | REVIEWED_STOP_OPERATION_SCHEMA
                 | PRUNE_OPERATION_SCHEMA
                 | LEGACY_OPERATION_SCHEMA
                 | PRE_AUTH_OPERATION_SCHEMA
@@ -411,7 +437,9 @@ impl Operation {
             ensure!(
                 matches!(
                     self.schema.as_str(),
-                    OPERATION_SCHEMA | ABANDONMENT_OPERATION_SCHEMA
+                    OPERATION_SCHEMA
+                        | ABANDONMENT_OPERATION_SCHEMA
+                        | REVIEWED_STOP_OPERATION_SCHEMA
                 ) && self.kind != OperationKind::Uninstall,
                 "invalid lifecycle auth baseline"
             );
@@ -423,7 +451,7 @@ impl Operation {
         }
         if matches!(
             self.schema.as_str(),
-            OPERATION_SCHEMA | ABANDONMENT_OPERATION_SCHEMA
+            OPERATION_SCHEMA | ABANDONMENT_OPERATION_SCHEMA | REVIEWED_STOP_OPERATION_SCHEMA
         ) && matches!(
             self.kind,
             OperationKind::Install | OperationKind::Update | OperationKind::Rollback
@@ -432,6 +460,28 @@ impl Operation {
             ensure!(
                 self.auth_baseline.is_some(),
                 "lifecycle auth baseline is missing"
+            );
+        }
+        ensure!(
+            (self.schema == REVIEWED_STOP_OPERATION_SCHEMA) == self.reviewed_unsent_stop.is_some(),
+            "reviewed service-stop intent/schema mismatch"
+        );
+        if let Some(reviewed) = &self.reviewed_unsent_stop {
+            ensure!(
+                reviewed.operation_id == self.id
+                    && valid_digest(&reviewed.original_journal_sha256)
+                    && valid_digest(&reviewed.evidence_sha256)
+                    && self.kind == OperationKind::Update
+                    && self.abandonment.is_none()
+                    && self.prune.is_none()
+                    && self.auth_baseline.is_some()
+                    && self
+                        .service_stops
+                        .first()
+                        .is_some_and(|stop| stop.direction == StopDirection::ActivateCandidate
+                            && stop.process.is_some()
+                            && stop.request != StopRequest::Prepared),
+                "invalid reviewed service-stop intent"
             );
         }
         if let Some(resources) = &self.resources {
@@ -794,7 +844,7 @@ fn streaming_file_digest_checked(
     );
     let mut file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
     ensure!(
         same_file_identity(&before, &file.metadata()?),
@@ -1512,7 +1562,7 @@ async fn prepare_service_stop(
         }
         LabelObservation::Unknown => bail!("service label identity unavailable"),
     };
-    if operation.abandonment.is_none() {
+    if operation.abandonment.is_none() && operation.reviewed_unsent_stop.is_none() {
         operation.schema = if operation.auth_baseline.is_some() {
             OPERATION_SCHEMA
         } else {
@@ -1639,6 +1689,13 @@ async fn request_service_stop(paths: &Paths, operation: &mut Operation) -> Resul
         )?;
         #[cfg(test)]
         recovery_fault("after_abandonment_stop_dispatch_intent")?;
+    }
+    if operation.reviewed_unsent_stop.is_some()
+        && stop.direction == StopDirection::ActivateCandidate
+    {
+        require_reviewed_stop_fresh(paths, operation).await?;
+        #[cfg(test)]
+        recovery_fault("before_reviewed_stop_dispatch")?;
     }
     let request = if lifecycle_test_mode() {
         #[cfg(test)]
@@ -3315,6 +3372,260 @@ fn remove_operation_resources(paths: &Paths, operation: &Operation) -> Result<()
         remove_regular_and_sync(path)?;
     }
     Ok(())
+}
+
+const REFUSAL_EVIDENCE_SCHEMA: &str = "app.loomex.runner.prepared-stop-refusal/v1";
+const REFUSAL_CONTROLLER_CLI_SHA256: &str =
+    "87c6e905950251e1777b3c3d2d4d47d692c9a5b089188ca1df8b4498e8fef69e";
+const REFUSAL_CONTROLLER_MANIFEST_SHA256: &str =
+    "29fa7e75eaffba163f3a106eab19ef1da2800cc94ca40880017c5c85cb9d2f07";
+const REFUSAL_CANDIDATE_MANIFEST_SHA256: &str =
+    "6eac15418a6fcef070007ee793b3a1a7bb52ee2398d29ba456f2cb03a4d9c3c2";
+
+fn read_refusal_evidence(path: &Path) -> Result<(PreparedStopRefusalEvidence, String)> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let before = file.metadata()?;
+    ensure!(
+        before.is_file()
+            && before.uid() == unsafe { libc::geteuid() }
+            && before.mode() & 0o077 == 0
+            && before.len() <= 256 * 1024,
+        "unsafe prepared-stop refusal evidence"
+    );
+    let mut bytes = Vec::new();
+    (&mut file).take(256 * 1024 + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= 256 * 1024
+            && same_file_identity(&before, &file.metadata()?)
+            && same_file_identity(&before, &fs::symlink_metadata(path)?),
+        "prepared-stop refusal evidence changed"
+    );
+    let raw: Value = serde_json::from_slice(&bytes)?;
+    for name in ["beforeOperation", "refusedOperation"] {
+        let object = raw[name]
+            .as_object()
+            .context("refusal operation is not an object")?;
+        ensure!(
+            object.keys().all(|key| [
+                "schema",
+                "id",
+                "kind",
+                "phase",
+                "createdAt",
+                "updatedAt",
+                "detail",
+                "package",
+                "previousTarget",
+                "resources",
+                "checkpoint",
+                "serviceStops",
+                "abandonment",
+                "authBaseline",
+                "prune",
+                "reviewedUnsentStop"
+            ]
+            .contains(&key.as_str())),
+            "unknown refusal operation field"
+        );
+    }
+    Ok((serde_json::from_value(raw)?, state::digest(&bytes)))
+}
+
+fn known_refusal_controller(
+    previous_version: &str,
+    candidate_version: &str,
+    cli_digest: &str,
+    manifest_digest: &str,
+) -> bool {
+    #[cfg(test)]
+    if TEST_MODE.load(Ordering::SeqCst)
+        && previous_version == "1.2.4"
+        && candidate_version == "1.2.3"
+        && cli_digest == state::digest(b"fixture")
+        && manifest_digest == state::digest(b"fixture-pre-native-authoring-manifest")
+    {
+        return true;
+    }
+    previous_version == "0.4.8"
+        && candidate_version == "0.5.0"
+        && cli_digest == REFUSAL_CONTROLLER_CLI_SHA256
+        && manifest_digest == REFUSAL_CONTROLLER_MANIFEST_SHA256
+}
+
+fn verify_refusal_evidence(
+    paths: &Paths,
+    operation: &Operation,
+    evidence: &PreparedStopRefusalEvidence,
+) -> Result<()> {
+    let before = &evidence.before_operation;
+    before.validate()?;
+    evidence.refused_operation.validate()?;
+    operation.validate()?;
+    ensure!(
+        evidence.schema == REFUSAL_EVIDENCE_SCHEMA
+            && evidence.failure_code == "LIFECYCLE_ROLLBACK_COMPATIBILITY_MISMATCH"
+            && evidence.refused_operation == *operation
+            && before.schema == OPERATION_SCHEMA
+            && before.kind == OperationKind::Update
+            && before.phase == "pending_active_work"
+            && before.checkpoint.as_deref() == Some("daemon_has_active_work")
+            && before.service_stops.is_empty()
+            && before.auth_baseline.is_some()
+            && before.abandonment.is_none()
+            && before.prune.is_none()
+            && before.reviewed_unsent_stop.is_none()
+            && operation.phase == "recovery_required"
+            && operation.checkpoint.as_deref()
+                == Some("observed state could not be reconciled safely")
+            && operation.service_stops.len() == 1
+            && before.created_at > 0
+            && before.id != Uuid::nil()
+            && before.created_at <= before.updated_at
+            && before.updated_at <= operation.updated_at
+            && operation.updated_at <= state::now(),
+        "unsupported prepared-stop refusal provenance"
+    );
+    let stop = &operation.service_stops[0];
+    ensure!(
+        stop.direction == StopDirection::ActivateCandidate
+            && stop.request == StopRequest::Prepared
+            && stop.process.is_some(),
+        "prepared-stop refusal has uncertain or advanced stop history"
+    );
+    let mut normalized = operation.clone();
+    normalized.phase.clone_from(&before.phase);
+    normalized.checkpoint.clone_from(&before.checkpoint);
+    normalized.updated_at = before.updated_at;
+    normalized.service_stops.clear();
+    ensure!(
+        normalized == *before,
+        "prepared-stop refusal operation delta changed"
+    );
+    verify_stop_binding(paths, operation, stop, false)?;
+    let previous = operation
+        .previous_target
+        .as_ref()
+        .context("prior target missing")?;
+    let prior_version = previous
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("prior version missing")?;
+    validate_retained_target_metadata(previous, prior_version)?;
+    let cli_digest = streaming_file_digest(&previous.join("bin/loomex"))?.0;
+    let manifest_digest =
+        streaming_file_digest(&previous.join("metadata/compatibility-manifest.json"))?.0;
+    ensure!(
+        evidence.controller_cli_sha256 == cli_digest
+            && evidence.controller_manifest_sha256 == manifest_digest
+            && known_refusal_controller(
+                prior_version,
+                &stop.package.version,
+                &cli_digest,
+                &manifest_digest
+            )
+            && state::digest(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/contracts/compatibility-manifest.json"
+            ))) == REFUSAL_CANDIDATE_MANIFEST_SHA256,
+        "prepared-stop refusal controller is not the reviewed pre-dispatch implementation"
+    );
+    Ok(())
+}
+
+async fn require_reviewed_stop_fresh(paths: &Paths, operation: &Operation) -> Result<()> {
+    let stop = operation
+        .service_stops
+        .first()
+        .context("reviewed stop missing")?;
+    verify_stop_binding(paths, operation, stop, false)?;
+    let baseline = operation
+        .auth_baseline
+        .as_ref()
+        .context("reviewed stop auth baseline missing")?;
+    // The retained drained-idle daemon cannot admit auth.status without
+    // reopening its zero-work acknowledgement. The reviewed evidence binds
+    // its pre-drain baseline; the existing post-start health owner verifies
+    // real auth continuity before any completed activation claim.
+    ensure!(
+        !matches!(baseline, AuthBaseline::Initial),
+        "reviewed stop prior auth baseline missing"
+    );
+    let version = stop
+        .target
+        .as_ref()
+        .and_then(|target| target.file_name())
+        .and_then(|value| value.to_str())
+        .context("reviewed stop prior version missing")?;
+    ensure!(
+        candidate_drain_can_be_released(&daemon_status(paths).await?, version),
+        "reviewed stop requires fresh drained zero managed work"
+    );
+    let process = stop
+        .process
+        .as_ref()
+        .context("reviewed stop native process missing")?;
+    ensure!(
+        matches!(observe_label(paths).await, LabelObservation::Loaded {pid, program}
+            if pid == process.pid && (program == process.executable
+                || program == paths.current().join("bin/loomex-runner")))
+            && observe_recorded_process(process) == ProcessObservation::Present(process.clone()),
+        "reviewed stop native process identity changed"
+    );
+    verify_stop_binding(paths, operation, stop, false)
+}
+
+/// Explicit authorization for the narrow, locally reviewed 0.4.8 pre-dispatch
+/// compatibility refusal. Neither Prepared nor a journal digest proves unsentness.
+/// The evidence has a same-user observation trust boundary, not signed audit authority.
+pub async fn resume_reviewed_unsent_stop(
+    paths: &Paths,
+    expected_operation: Uuid,
+    expected_journal_sha256: &str,
+    evidence_path: &Path,
+) -> Result<Value> {
+    ensure!(valid_digest(expected_journal_sha256), "INVALID_ARGUMENT");
+    let _lock = LifecycleLock::acquire(paths)?;
+    ensure!(
+        regular_digest(&paths.operation())?.as_deref() == Some(expected_journal_sha256),
+        "reviewed stop journal digest changed"
+    );
+    let mut operation: Operation = state::read_json(&paths.operation())?;
+    ensure!(
+        operation.id == expected_operation,
+        "reviewed stop operation changed"
+    );
+    let (evidence, raw_evidence_digest) = read_refusal_evidence(evidence_path)?;
+    verify_refusal_evidence(paths, &operation, &evidence)?;
+    require_reviewed_stop_fresh(paths, &operation).await?;
+    // LifecycleLock fences supported lifecycle writers; these final byte checks
+    // reject changes while bounded native/auth observations were in flight.
+    ensure!(
+        regular_digest(&paths.operation())?.as_deref() == Some(expected_journal_sha256)
+            && streaming_file_digest(evidence_path)?.0 == raw_evidence_digest,
+        "reviewed stop evidence or journal changed before authorization"
+    );
+    operation.schema = REVIEWED_STOP_OPERATION_SCHEMA.into();
+    operation.reviewed_unsent_stop = Some(ReviewedUnsentStop {
+        operation_id: operation.id,
+        original_journal_sha256: expected_journal_sha256.into(),
+        evidence_sha256: state::digest(&serde_json::to_vec(&evidence)?),
+    });
+    operation.service_stops[0].request = StopRequest::Unconfirmed;
+    // One atomic checkpoint consumes the reviewed authorization BEFORE any
+    // launchctl effect. A crash here is observation-only, never replay permission.
+    set_checkpoint(
+        paths,
+        &mut operation,
+        "service_stop_pending",
+        "reviewed_stop_dispatching",
+    )?;
+    #[cfg(test)]
+    recovery_fault("after_reviewed_stop_authorized")?;
+    request_service_stop(paths, &mut operation).await?;
+    reconcile_service_stop(paths, &mut operation).await
 }
 
 pub async fn resume(paths: &Paths) -> Result<Value> {
@@ -6344,6 +6655,575 @@ mod tests {
             assert_eq!(saved.service_stops, original.service_stops, "{case}");
             assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1, "{case}");
             assert_eq!(TEST_RESTART_COUNT.load(Ordering::SeqCst), 0, "{case}");
+        }
+    }
+
+    fn reviewed_stop_fixture(paths: &Paths) -> (Operation, PathBuf, String) {
+        let mut before = previous_drained_recovery_fixture(paths);
+        let previous = before.previous_target.as_ref().unwrap();
+        let manifest = previous.join("metadata/compatibility-manifest.json");
+        fs::write(&manifest, b"fixture-pre-native-authoring-manifest").unwrap();
+        let inventory_path = paths.state_dir.join("owned-versions.json");
+        let mut inventory: Value = state::read_json(&inventory_path).unwrap();
+        for entry in inventory["inventories"].as_array_mut().unwrap() {
+            if entry["path"] == json!(previous) {
+                for file in entry["files"].as_array_mut().unwrap() {
+                    if file["path"] == "metadata/compatibility-manifest.json" {
+                        file["sha256"] =
+                            json!(state::digest(b"fixture-pre-native-authoring-manifest"));
+                        file["size"] = json!(b"fixture-pre-native-authoring-manifest".len());
+                    }
+                }
+            }
+        }
+        state::write_json(&inventory_path, &inventory).unwrap();
+        before.schema = OPERATION_SCHEMA.into();
+        before.auth_baseline = Some(AuthBaseline::SignedOut {
+            installation_id: None,
+        });
+        before.phase = "pending_active_work".into();
+        before.checkpoint = Some("daemon_has_active_work".into());
+        fs::write(
+            &before.resources.as_ref().unwrap().staged_launch_agent,
+            b"candidate-plist",
+        )
+        .unwrap();
+        save_operation(paths, &before).unwrap();
+        *TEST_AUTH_STATUS.lock().unwrap() = Some(json!({
+            "code":"AUTH_REQUIRED", "authenticated":false,"loginPending":false
+        }));
+        let evidence_path = paths.state_dir.join("reviewed-refusal.json");
+        (
+            before,
+            evidence_path,
+            state::digest(b"fixture-pre-native-authoring-manifest"),
+        )
+    }
+
+    async fn capture_reviewed_refusal(paths: &Paths) -> (Operation, PathBuf, String) {
+        let (before, evidence_path, manifest_digest) = reviewed_stop_fixture(paths);
+        let mut refused = before.clone();
+        prepare_service_stop(paths, &mut refused, StopDirection::ActivateCandidate)
+            .await
+            .unwrap();
+        // The frozen old-controller refusal predicate occurs before dispatch:
+        // the candidate's compatible manifest differs from that controller's.
+        assert_ne!(
+            streaming_file_digest(
+                &refused
+                    .package
+                    .as_ref()
+                    .unwrap()
+                    .target
+                    .join("metadata/compatibility-manifest.json")
+            )
+            .unwrap()
+            .0,
+            manifest_digest
+        );
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 0);
+        set_checkpoint(
+            paths,
+            &mut refused,
+            "recovery_required",
+            "observed state could not be reconciled safely",
+        )
+        .unwrap();
+        let evidence = PreparedStopRefusalEvidence {
+            schema: REFUSAL_EVIDENCE_SCHEMA.into(),
+            before_operation: before,
+            refused_operation: refused.clone(),
+            controller_cli_sha256: state::digest(b"fixture"),
+            controller_manifest_sha256: manifest_digest,
+            failure_code: "LIFECYCLE_ROLLBACK_COMPATIBILITY_MISMATCH".into(),
+        };
+        state::write_json(&evidence_path, &evidence).unwrap();
+        (
+            refused,
+            evidence_path,
+            regular_digest(&paths.operation()).unwrap().unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn reviewed_stop_explicit_exact_refusal_dispatches_once_ordinary_resume_never_replays() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = StopTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let (original, evidence_path, digest) = capture_reviewed_refusal(&paths).await;
+        assert_eq!(resume(&paths).await.unwrap()["pending"], true);
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 0);
+        // Ordinary observation changes checkpoint/timestamp, so the reviewed
+        // snapshot must still be restored by the fixture owner before consent.
+        save_operation(&paths, &original).unwrap();
+        assert_eq!(regular_digest(&paths.operation()).unwrap().unwrap(), digest);
+        let result = resume_reviewed_unsent_stop(&paths, original.id, &digest, &evidence_path)
+            .await
+            .unwrap();
+        assert_eq!(result["pending"], true);
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1);
+        let saved: Operation = state::read_json(&paths.operation()).unwrap();
+        assert_eq!(saved.id, original.id);
+        assert_eq!(saved.schema, REVIEWED_STOP_OPERATION_SCHEMA);
+        assert_eq!(saved.service_stops.len(), 1);
+        assert_eq!(saved.service_stops[0].request, StopRequest::Accepted);
+        assert_eq!(
+            saved
+                .reviewed_unsent_stop
+                .as_ref()
+                .unwrap()
+                .original_journal_sha256,
+            digest
+        );
+        assert_eq!(resume(&paths).await.unwrap()["pending"], true);
+        let fresh_digest = regular_digest(&paths.operation()).unwrap().unwrap();
+        assert!(
+            resume_reviewed_unsent_stop(&paths, original.id, &fresh_digest, &evidence_path)
+                .await
+                .is_err()
+        );
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fs::read_link(paths.current()).unwrap(),
+            original.previous_target.unwrap()
+        );
+        assert_eq!(fs::read(launch_agent(&paths)).unwrap(), b"previous-plist");
+        assert!(paths.state_dir.join("drain.json").exists());
+    }
+
+    #[tokio::test]
+    async fn reviewed_stop_unknown_provenance_or_changed_approval_is_rejected_without_writes() {
+        let _serial = TEST_SERIAL.lock().await;
+        for case in [
+            "operation",
+            "digest",
+            "failure",
+            "controller",
+            "before_stop",
+            "before_phase",
+            "before_resources",
+            "time",
+            "uncertain",
+            "accepted",
+            "extra_stop",
+            "current_delta",
+            "missing_evidence",
+            "public_evidence",
+            "symlink_evidence",
+        ] {
+            let _scope = StopTestScope::start();
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let (mut original, evidence_path, mut digest) = capture_reviewed_refusal(&paths).await;
+            let mut evidence: PreparedStopRefusalEvidence =
+                state::read_json(&evidence_path).unwrap();
+            let mut expected_id = original.id;
+            match case {
+                "operation" => expected_id = Uuid::new_v4(),
+                "digest" => digest = "0".repeat(64),
+                "failure" => evidence.failure_code = "UNKNOWN".into(),
+                "controller" => evidence.controller_cli_sha256 = "0".repeat(64),
+                "before_stop" => {
+                    evidence.before_operation.service_stops = original.service_stops.clone()
+                }
+                "before_phase" => evidence.before_operation.phase = "recovery_required".into(),
+                "before_resources" => {
+                    evidence.before_operation.detail = Some("different review".into())
+                }
+                "time" => {
+                    original.updated_at = state::now() + 100;
+                    evidence.refused_operation = original.clone();
+                }
+                "uncertain" => {
+                    original.service_stops[0].request = StopRequest::Unconfirmed;
+                    evidence.refused_operation = original.clone();
+                }
+                "accepted" => {
+                    original.service_stops[0].request = StopRequest::Accepted;
+                    evidence.refused_operation = original.clone();
+                }
+                "extra_stop" => {
+                    original
+                        .service_stops
+                        .push(original.service_stops[0].clone());
+                    evidence.refused_operation = original.clone();
+                }
+                "current_delta" => original.detail = Some("unreviewed change".into()),
+                _ => {}
+            }
+            state::write_json(&evidence_path, &evidence).unwrap();
+            // The malformed-history case cannot use save_operation's validator.
+            state::write_json(&paths.operation(), &original).unwrap();
+            if case != "digest" {
+                digest = regular_digest(&paths.operation()).unwrap().unwrap();
+            }
+            match case {
+                "missing_evidence" => fs::remove_file(&evidence_path).unwrap(),
+                "public_evidence" => {
+                    fs::set_permissions(&evidence_path, fs::Permissions::from_mode(0o644)).unwrap()
+                }
+                "symlink_evidence" => {
+                    let target = evidence_path.with_extension("real");
+                    fs::rename(&evidence_path, &target).unwrap();
+                    std::os::unix::fs::symlink(target, &evidence_path).unwrap();
+                }
+                _ => {}
+            }
+            let bytes = fs::read(paths.operation()).unwrap();
+            assert!(
+                resume_reviewed_unsent_stop(&paths, expected_id, &digest, &evidence_path)
+                    .await
+                    .is_err(),
+                "{case}"
+            );
+            assert_eq!(fs::read(paths.operation()).unwrap(), bytes, "{case}");
+            assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 0, "{case}");
+            assert_eq!(TEST_RESTART_COUNT.load(Ordering::SeqCst), 0, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reviewed_stop_fresh_work_auth_native_or_artifact_drift_never_dispatches() {
+        let _serial = TEST_SERIAL.lock().await;
+        for case in [
+            "work",
+            "undrained",
+            "status_unknown",
+            "version",
+            "auth_baseline",
+            "process",
+            "label",
+            "inventory",
+            "plist",
+            "drain",
+            "candidate",
+            "lock",
+        ] {
+            let _scope = StopTestScope::start();
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let (original, evidence_path, digest) = capture_reviewed_refusal(&paths).await;
+            let _held_lock = if case == "lock" {
+                Some(LifecycleLock::acquire(&paths).unwrap())
+            } else {
+                None
+            };
+            match case {
+                "work" => {
+                    *TEST_RECOVERY_STATUS.lock().unwrap() =
+                        Some(json!({"version":"1.2.4", "activeJobs":1,"draining":true}))
+                }
+                "undrained" => {
+                    *TEST_RECOVERY_STATUS.lock().unwrap() =
+                        Some(json!({"version":"1.2.4", "activeJobs":0,"draining":false}))
+                }
+                "status_unknown" => TEST_STATUS_UNAVAILABLE.store(true, Ordering::SeqCst),
+                "version" => {
+                    *TEST_RECOVERY_STATUS.lock().unwrap() =
+                        Some(json!({"version":"other", "activeJobs":0,"draining":true}))
+                }
+                "auth_baseline" => {
+                    let mut changed = original.clone();
+                    changed.auth_baseline = Some(AuthBaseline::SignedOut {
+                        installation_id: Some(Uuid::new_v4()),
+                    });
+                    save_operation(&paths, &changed).unwrap();
+                }
+                "process" => {
+                    let mut process = original.service_stops[0].process.clone().unwrap();
+                    process.started_micros += 1;
+                    *TEST_PROCESS_OBSERVATION.lock().unwrap() =
+                        Some(ProcessObservation::Present(process));
+                }
+                "label" => {
+                    *TEST_LABEL_OBSERVATION.lock().unwrap() = Some(LabelObservation::Unknown)
+                }
+                "inventory" => {
+                    fs::write(paths.state_dir.join("owned-versions.json"), b"{}").unwrap()
+                }
+                "plist" => fs::write(launch_agent(&paths), b"changed").unwrap(),
+                "drain" => fs::write(paths.state_dir.join("drain.json"), b"changed").unwrap(),
+                "candidate" => fs::write(
+                    original.package.as_ref().unwrap().target.join("bin/loomex"),
+                    b"changed",
+                )
+                .unwrap(),
+                _ => {}
+            }
+            let bytes = fs::read(paths.operation()).unwrap();
+            assert!(
+                resume_reviewed_unsent_stop(&paths, original.id, &digest, &evidence_path)
+                    .await
+                    .is_err(),
+                "{case}"
+            );
+            assert_eq!(fs::read(paths.operation()).unwrap(), bytes, "{case}");
+            assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 0, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reviewed_stop_consumed_guard_rejects_drift_and_surviving_native_ownership() {
+        let _serial = TEST_SERIAL.lock().await;
+        for case in ["work", "process", "artifact", "old_worker", "singleton"] {
+            let _scope = StopTestScope::start();
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let (original, evidence_path, digest) = capture_reviewed_refusal(&paths).await;
+            *TEST_RECOVERY_FAULT.lock().unwrap() = Some("after_reviewed_stop_authorized");
+            assert!(
+                resume_reviewed_unsent_stop(&paths, original.id, &digest, &evidence_path)
+                    .await
+                    .is_err()
+            );
+            *TEST_RECOVERY_FAULT.lock().unwrap() = None;
+            let mut consumed: Operation = state::read_json(&paths.operation()).unwrap();
+            if ["work", "process", "artifact"].contains(&case) {
+                match case {
+                    "work" => {
+                        *TEST_RECOVERY_STATUS.lock().unwrap() =
+                            Some(json!({"version":"1.2.4", "activeJobs":1,"draining":true}))
+                    }
+                    "process" => {
+                        *TEST_PROCESS_OBSERVATION.lock().unwrap() =
+                            Some(ProcessObservation::Unknown)
+                    }
+                    "artifact" => fs::write(launch_agent(&paths), b"changed after intent").unwrap(),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    request_service_stop(&paths, &mut consumed).await.is_err(),
+                    "{case}"
+                );
+                assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 0, "{case}");
+            } else {
+                // Simulate disappearance of the launchd label after a possibly
+                // sent request. Actual old worker/process and singleton proof
+                // still control replacement; idle counters cannot bypass it.
+                TEST_LABEL_PRESENT.store(false, Ordering::SeqCst);
+                let _worker = if case == "singleton" {
+                    Some(stopped_singleton(&paths, false).unwrap())
+                } else {
+                    *TEST_PROCESS_OBSERVATION.lock().unwrap() = Some(ProcessObservation::Present(
+                        original.service_stops[0].process.clone().unwrap(),
+                    ));
+                    None
+                };
+                assert_eq!(resume(&paths).await.unwrap()["pending"], true, "{case}");
+            }
+            assert_eq!(
+                fs::read_link(paths.current()).unwrap(),
+                original.previous_target.unwrap(),
+                "{case}"
+            );
+            assert!(paths.state_dir.join("drain.json").exists(), "{case}");
+            assert_eq!(TEST_RESTART_COUNT.load(Ordering::SeqCst), 0, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reviewed_stop_terminal_exact_package_preflight_keeps_identity_without_second_effect() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = StopTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let (original, evidence_path, digest) = capture_reviewed_refusal(&paths).await;
+        assert_eq!(
+            resume_reviewed_unsent_stop(&paths, original.id, &digest, &evidence_path)
+                .await
+                .unwrap()["pending"],
+            true
+        );
+        TEST_LABEL_PRESENT.store(false, Ordering::SeqCst);
+        assert_eq!(
+            resume(&paths).await.unwrap()["operation"]["phase"],
+            "completed"
+        );
+        let completed = fs::read(paths.operation()).unwrap();
+        let result = preflight_package(&paths, original.kind, original.package.clone().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(result["reconciled"], true);
+        assert_eq!(
+            result["transaction"]["operation"]["id"],
+            original.id.to_string()
+        );
+        assert_eq!(
+            result["transaction"]["operation"]["schema"],
+            REVIEWED_STOP_OPERATION_SCHEMA
+        );
+        assert_eq!(fs::read(paths.operation()).unwrap(), completed);
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1);
+        // Frozen c6c .5.0 decoder's exact accepted schema set excludes v7.
+        assert!(
+            ![
+                OPERATION_SCHEMA,
+                PRUNE_OPERATION_SCHEMA,
+                LEGACY_OPERATION_SCHEMA,
+                PRE_AUTH_OPERATION_SCHEMA,
+                PRE_AUTH_ABANDONMENT_SCHEMA,
+                ABANDONMENT_OPERATION_SCHEMA
+            ]
+            .contains(&REVIEWED_STOP_OPERATION_SCHEMA)
+        );
+    }
+
+    #[tokio::test]
+    async fn reviewed_stop_special_file_evidence_refuses_promptly_and_releases_writer_lock() {
+        let _serial = TEST_SERIAL.lock().await;
+        for case in ["fifo", "directory", "socket"] {
+            let _scope = StopTestScope::start();
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let (original, evidence_path, digest) = capture_reviewed_refusal(&paths).await;
+            fs::remove_file(&evidence_path).unwrap();
+            let cpath = std::ffi::CString::new(evidence_path.as_os_str().as_bytes()).unwrap();
+            let _socket = match case {
+                "fifo" => {
+                    assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+                    None
+                }
+                "directory" => {
+                    fs::create_dir(&evidence_path).unwrap();
+                    fs::set_permissions(&evidence_path, fs::Permissions::from_mode(0o700)).unwrap();
+                    None
+                }
+                "socket" => {
+                    let socket = std::os::unix::net::UnixListener::bind(&evidence_path).unwrap();
+                    fs::set_permissions(&evidence_path, fs::Permissions::from_mode(0o600)).unwrap();
+                    Some(socket)
+                }
+                _ => unreachable!(),
+            };
+            let bytes = fs::read(paths.operation()).unwrap();
+            let copy = paths.clone();
+            let evidence_copy = evidence_path.clone();
+            let (send, recv) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result = rt.block_on(resume_reviewed_unsent_stop(
+                    &copy,
+                    original.id,
+                    &digest,
+                    &evidence_copy,
+                ));
+                send.send(result.map(|_| ())).unwrap();
+            });
+            let bounded = recv.recv_timeout(Duration::from_millis(700));
+            let held = LifecycleLock::acquire(&paths).is_err();
+            // Keep a regression failure bounded too: an unrepaired FIFO open
+            // gets a disposable writer solely to release/join its test worker.
+            if matches!(bounded, Err(std::sync::mpsc::RecvTimeoutError::Timeout)) && case == "fifo"
+            {
+                let writer =
+                    unsafe { libc::open(cpath.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+                if writer >= 0 {
+                    unsafe { libc::close(writer) };
+                }
+                let _ = recv.recv_timeout(Duration::from_secs(2));
+            }
+            worker.join().unwrap();
+            assert!(
+                matches!(bounded, Ok(Err(_))),
+                "{case}: special evidence did not promptly refuse"
+            );
+            assert!(!held, "{case}: lifecycle writer lock remained held");
+            assert_eq!(fs::read(paths.operation()).unwrap(), bytes, "{case}");
+            assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 0, "{case}");
+            assert_eq!(TEST_RESTART_COUNT.load(Ordering::SeqCst), 0, "{case}");
+            assert!(streaming_file_digest(&evidence_path).is_err(), "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reviewed_stop_real_idle_drain_socket_does_not_reopen_auth_admission() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = StopTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        state::write_json(
+            &paths.state_dir.join("drain.json"),
+            &json!({"draining":true}),
+        )
+        .unwrap();
+        *TEST_AUTH_STATUS.lock().unwrap() = None;
+        let api = crate::api::Api::for_test_origin("http://127.0.0.1:9").unwrap();
+        let auth = crate::auth::Auth::test_unauthed(api.clone());
+        let daemon = std::sync::Arc::new(
+            crate::control::Daemon::new(paths.state_dir.clone(), api, auth).unwrap(),
+        );
+        let serving = tokio::spawn(crate::control::serve(daemon.clone()));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !paths.state_dir.join("control.sock").exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let status = crate::control::lifecycle_client(&paths.state_dir, "status.get", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(status["result"]["activeJobs"], 0);
+        assert_eq!(status["result"]["draining"], true);
+        let auth = crate::control::lifecycle_client(
+            &paths.state_dir,
+            "auth.status",
+            json!({"observation":"startup"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(auth["error"]["code"], "RUNNER_NOT_READY");
+        assert_eq!(daemon.managed_work(), 0);
+        serving.abort();
+        let _ = serving.await;
+    }
+
+    #[tokio::test]
+    async fn reviewed_stop_authorization_crash_and_spawn_uncertainty_are_consumed_once() {
+        let _serial = TEST_SERIAL.lock().await;
+        for case in [
+            "after_reviewed_stop_authorized",
+            "before_reviewed_stop_dispatch",
+            "spawn",
+            "wait",
+        ] {
+            let _scope = StopTestScope::start();
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let (original, evidence_path, digest) = capture_reviewed_refusal(&paths).await;
+            match case {
+                "spawn" => TEST_BOOTOUT_FAIL.store(true, Ordering::SeqCst),
+                "wait" => TEST_STOP_WAIT_UNCONFIRMED.store(true, Ordering::SeqCst),
+                _ => *TEST_RECOVERY_FAULT.lock().unwrap() = Some(case),
+            }
+            let _ = resume_reviewed_unsent_stop(&paths, original.id, &digest, &evidence_path).await;
+            *TEST_RECOVERY_FAULT.lock().unwrap() = None;
+            TEST_BOOTOUT_FAIL.store(false, Ordering::SeqCst);
+            TEST_STOP_WAIT_UNCONFIRMED.store(false, Ordering::SeqCst);
+            let saved: Operation = state::read_json(&paths.operation()).unwrap();
+            assert_eq!(saved.schema, REVIEWED_STOP_OPERATION_SCHEMA, "{case}");
+            assert_eq!(
+                saved.service_stops[0].request,
+                StopRequest::Unconfirmed,
+                "{case}"
+            );
+            let count = TEST_STOP_COUNT.load(Ordering::SeqCst);
+            assert_eq!(resume(&paths).await.unwrap()["pending"], true, "{case}");
+            assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), count, "{case}");
+            let fresh = regular_digest(&paths.operation()).unwrap().unwrap();
+            assert!(
+                resume_reviewed_unsent_stop(&paths, original.id, &fresh, &evidence_path)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), count, "{case}");
+            let mut downgraded = saved.clone();
+            downgraded.schema = OPERATION_SCHEMA.into();
+            assert!(downgraded.validate().is_err());
+            let mut stripped = saved;
+            stripped.reviewed_unsent_stop = None;
+            assert!(stripped.validate().is_err());
         }
     }
 
