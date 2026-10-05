@@ -111,6 +111,13 @@ class PreviewPackageTests(unittest.TestCase):
                 result=subprocess.run(['/bin/bash',str(ROOT/'scripts/build-release.sh'),'--unsigned-development','--local-development-api-origin',origin,'--output',str(Path(directory)/'output')],capture_output=True,text=True,env=env)
                 self.assertNotEqual(result.returncode,0);self.assertFalse((Path(directory)/'output').exists());self.assertNotIn('Compiling ',result.stdout)
 
+    def test_localhost_subdomain_is_a_valid_local_origin(self):
+        validator = ROOT / 'scripts/validate_development_origin.py'
+        result = subprocess.run([sys.executable, str(validator),
+            'http://api.loomex.localhost:28080'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'http://api.loomex.localhost:28080/')
+
     def test_local_qualification_rejects_dirty_source_before_build(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);(root/'scripts').mkdir()
