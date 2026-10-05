@@ -6,15 +6,18 @@ provider CLIs, and delivers results and artifacts. The `loomex` CLI lets you che
 and manage the service. The [Loomex Codex plugin](https://github.com/loomex-app/loomex-codex-plugin)
 adds workflow browsing, creation, run following, and Personas to Codex chat.
 
-## Version 1.0.0 preview
+## Version 1.0.0 release
 
 [Download the paired 1.0.0 release](https://github.com/loomex-app/loomex-runner/releases/tag/preview-runner-v1.0.0-plugin-v1.0.0).
 It contains runner **1.0.0**, plugin **1.0.0**, and their verified installer under
 the immutable tag `preview-runner-v1.0.0-plugin-v1.0.0`.
+The published tag, asset names, and `--allow-unsigned-preview` installer flag retain
+their original technical names; they do not describe the release classification.
 
-This is an **unsigned local-development prerelease for macOS Apple Silicon**.
+This is the **1.0.0 release for macOS Apple Silicon**, distributed with an unsigned
+local-development profile.
 It is not Developer ID signed or notarized. Installation requires explicit
-unsigned-development consent. It has not been promoted to a latest stable release.
+unsigned-development consent.
 
 Before installing, you need:
 
@@ -41,8 +44,8 @@ alone.
 Download the release-specific launcher to a new directory:
 
 ```sh
-mkdir loomex-1.0.0-preview
-cd loomex-1.0.0-preview
+mkdir loomex-1.0.0
+cd loomex-1.0.0
 /usr/bin/curl --fail --show-error --location --proto '=https' --proto-redir '=https' \
   --output install-preview.sh \
   https://github.com/loomex-app/loomex-runner/releases/download/preview-runner-v1.0.0-plugin-v1.0.0/install-preview.sh
@@ -57,7 +60,7 @@ printf '%s\n' 'dd509a052ec437d5be7362ee29163f0db9cd60170f04d0b2cfad335d010f4d6b 
 ```
 
 Proceed only after the checksum check succeeds and you accept this unsigned
-preview. This is the explicit install step:
+release. This is the explicit install step:
 
 ```sh
 LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 /bin/bash ./install-preview.sh --allow-unsigned-preview
@@ -68,7 +71,7 @@ The launcher pins `release-set.json` to SHA-256
 and verifies the native installer before running it. The native installer verifies
 both component archives, nested file inventories, and compatibility evidence
 before delegating activation to each component's lifecycle manager. Checksums
-establish byte integrity; this unsigned preview has no publisher signature.
+establish byte integrity; this unsigned release has no publisher signature.
 
 The installer does not force login, organization selection, hook trust, or a
 workflow run. Review and trust the plugin's lifecycle hooks separately in Codex.
