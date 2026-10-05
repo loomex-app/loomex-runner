@@ -237,7 +237,7 @@ fn request_proof(
 fn validate_origin(raw: &str, development: bool) -> anyhow::Result<Url> {
     let origin = Url::parse(raw).map_err(|_| anyhow::anyhow!("INVALID_API_ORIGIN"))?;
     let loopback = match origin.host() {
-        Some(url::Host::Domain("localhost")) => true,
+        Some(url::Host::Domain(host)) => host == "localhost" || host.ends_with(".localhost"),
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
         _ => false,
@@ -897,6 +897,8 @@ mod tests {
         assert!(validate_origin("http://example.com", false).is_err());
         assert!(validate_origin("https://example.com", true).is_err());
         assert!(validate_origin("http://127.0.0.1:8080", true).is_ok());
+        assert!(validate_origin("http://api.loomex.localhost:28080", true).is_ok());
+        assert!(validate_origin("http://localhost.example.com:28080", true).is_err());
         assert!(validate_origin("https://user:pass@example.com", false).is_err());
     }
     #[test]
