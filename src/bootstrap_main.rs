@@ -488,16 +488,15 @@ mod signing_tests {
 
 fn parse_origin(value: &str) -> Result<String> {
     let url = url::Url::parse(value)?;
+    let host = url.host_str();
     if !matches!(url.scheme(), "http" | "https")
         || url.username() != ""
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
         || url.path() != "/"
-        || !matches!(
-            url.host_str(),
-            Some("localhost") | Some("127.0.0.1") | Some("::1")
-        )
+        || !matches!(host, Some("localhost") | Some("127.0.0.1") | Some("::1"))
+            && !host.is_some_and(|hostname| hostname.ends_with(".localhost"))
     {
         bail!("development API origin must be a loopback root URL")
     }
@@ -739,6 +738,11 @@ mod preview_tests {
         assert_eq!(
             development_origin(dir.path(), &manifest, &args, None).unwrap(),
             Some("http://127.0.0.1:9/".into())
+        );
+        args.development_api_origin = Some("http://api.loomex.localhost:28080".into());
+        assert_eq!(
+            development_origin(dir.path(), &manifest, &args, None).unwrap(),
+            Some("http://api.loomex.localhost:28080/".into())
         );
         args.development_api_origin = Some("https://preview.example".into());
         assert!(development_origin(dir.path(), &manifest, &args, None).is_err());

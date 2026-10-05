@@ -27,7 +27,7 @@ def canonical_origin(raw: str) -> str:
     except ValueError as error:
         raise ValueError("development API origin has an invalid port") from error
     hostname = parsed.hostname.lower()
-    if hostname != "localhost":
+    if hostname != "localhost" and not hostname.endswith(".localhost"):
         try:
             address = ipaddress.ip_address(hostname)
         except ValueError as error:
