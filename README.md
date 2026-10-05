@@ -1,63 +1,132 @@
 # Loomex runner
 
-Current workspace installation and delivery status: [authoritative reliability status](../planning/plugin-runner-integration/reliability-persona-performance-2026-10-03/current-status.md). Source package versions and historical examples below do not establish an installed candidate.
+Loomex runs AI workflows on your Mac. The runner is a per-user background service
+that authenticates with Loomex, executes approved workflow jobs through local
+provider CLIs, and delivers results and artifacts. The `loomex` CLI lets you check
+and manage the service. The [Loomex Codex plugin](https://github.com/loomex-app/loomex-codex-plugin)
+adds workflow browsing, creation, run following, and Personas to Codex chat.
 
-A fresh macOS per-user execution service. `loomex-runner` is the private daemon;
-`loomex` is the public CLI. This project has no old runner imports, state migration,
-or legacy command aliases.
+## Version 1.0.0 preview
 
-The product version is sourced from the package metadata in `Cargo.toml` at
-build time. It is separate from
-the local-control protocol (`loomex.local-control/v2`) and the method-catalog
-contract version (`0.3.8`); those compatibility identifiers change
-independently of the product release version.
+[Download the paired 1.0.0 release](https://github.com/loomex-app/loomex-runner/releases/tag/preview-runner-v1.0.0-plugin-v1.0.0).
+It contains runner **1.0.0**, plugin **1.0.0**, and their verified installer under
+the immutable tag `preview-runner-v1.0.0-plugin-v1.0.0`.
 
-`contracts/compatibility-manifest.json` is the deterministic compatibility
-export. It is generated from the local method catalog and the explicit runner
-backend-route descriptor, so it records every local method's classification,
-schema digests, and allowed backend endpoint templates without scraping source.
-Regenerate it with `./scripts/export-compatibility.py`; CI and release builds
-use `--check` to reject stale exports. Release payloads retain the generated
-manifest at `metadata/compatibility-manifest.json` for cached-package review.
+This is an **unsigned local-development prerelease for macOS Apple Silicon**.
+It is not Developer ID signed or notarized. Installation requires explicit
+unsigned-development consent. It has not been promoted to a latest stable release.
 
-For a source-integration check, export the backend's registered route surface
-and the plugin's evaluated package components, then compare the three
-components without invoking a daemon or changing application data:
+Before installing, you need:
+
+- A Mac with Apple Silicon (`arm64`), using a normal foreground user session.
+- A compatible Loomex backend already running at **`http://127.0.0.1:28080/`**.
+  The download does not install or start a backend. This release has no configured
+  web app origin and cannot be redirected to a hosted cloud backend.
+- Codex desktop or CLI for the plugin. The unified installer uses the Codex CLI
+  for registration when available; otherwise it reports the local marketplace
+  root for supported GUI import.
+- The provider CLIs required by your workflows, with their own account access.
+  Loomex installation does not sign you into a provider or establish model access.
+
+The plugin bundles its Node runtime; installing these release assets does not
+require Rust, npm, Python, or a source checkout.
+
+## Install
+
+Use the paired release above, including when you only want the plugin. Do not
+mix assets from different releases or independently select `latest` components.
+The default installs both the runner and plugin; `--runner-only` installs the runner
+alone.
+
+Download the release-specific launcher to a new directory:
 
 ```sh
-LOOMEX_PLUGIN_NODE="$HOME/Library/Application Support/Loomex/plugin/current/plugin/runtime/bin/node" \
-  ./scripts/run-integration-compatibility-gate.sh \
-  --required \
-  --plugin-root ../plugin --backend-root ../backend \
-  --backend-python ../backend/.venv/bin/python
+mkdir loomex-1.0.0-preview
+cd loomex-1.0.0-preview
+/usr/bin/curl --fail --show-error --location --proto '=https' --proto-redir '=https' \
+  --output install-preview.sh \
+  https://github.com/loomex-app/loomex-runner/releases/download/preview-runner-v1.0.0-plugin-v1.0.0/install-preview.sh
 ```
 
-`./scripts/run-integration-compatibility-gate.sh` performs the same comparison
-when passed those two artifact paths, or explicit `--plugin-root` and
-`--backend-root` checkouts. It reports a skip when neither pair is supplied.
-Pass `--required` for a release or cross-repository gate: it fails without a
-complete input pair, accepts only clean Git checkout roots, and requires both
-exports to record a full immutable `source.headRevision` and
-`source.workingTree: "clean"`. Root exports must match the supplied checkout
-revision. Runner-only CI tests this required behavior but does not claim an
-integration result because it does not check out the plugin and backend.
+Inspect the script and compare its checksum with the immutable release assets:
 
-The production release workflow makes this check a required job. It accepts
-full commit SHAs for the plugin and backend repositories, checks out those
-exact commits, builds the plugin with the supported Node runtime, exports the
-backend route contract with the supported Python environment, and runs the
-gate in `--required` mode before signing or publishing the runner. Private
-repositories under the `loomex-app` organization require the explicitly
-configured `LOOMEX_COMPONENT_READ_TOKEN` secret with read-only access. The
-workflow retains the compatibility result as release evidence.
+```sh
+cat install-preview.sh
+printf '%s\n' 'dd509a052ec437d5be7362ee29163f0db9cd60170f04d0b2cfad335d010f4d6b  install-preview.sh' \
+  | /usr/bin/shasum -a 256 -c -
+```
 
-The result is `loomex/compatibility-manifest/v1`. It proves declared method,
-capability, and route compatibility only; it is not a deployment, credentials,
-or installed-host acceptance claim.
+Proceed only after the checksum check succeeds and you accept this unsigned
+preview. This is the explicit install step:
 
-## Build and test
+```sh
+LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 /bin/bash ./install-preview.sh --allow-unsigned-preview
+```
 
-Rust 1.88+ is required; development distribution qualification pins Rust 1.88.0. Dependency resolution is pinned by `Cargo.lock`.
+The launcher pins `release-set.json` to SHA-256
+`906cca85109be51819ebe6ba5c3d8de6b4ff9bbe8b427f86f5592f1ce0906cdd`
+and verifies the native installer before running it. The native installer verifies
+both component archives, nested file inventories, and compatibility evidence
+before delegating activation to each component's lifecycle manager. Checksums
+establish byte integrity; this unsigned preview has no publisher signature.
+
+The installer does not force login, organization selection, hook trust, or a
+workflow run. Review and trust the plugin's lifecycle hooks separately in Codex.
+If registration cannot finish, follow the reported Codex prerequisite and retry
+the same release set. An interrupted operation must retain its original verified
+assets and lifecycle state; do not delete journals or installed versions manually.
+A Keychain transition requires separate explicit authorization through the native
+owner; see [installation and Keychain policy](docs/release.md).
+
+For the offline archive, custom installation bases, and verification details,
+see [public distribution](docs/public-distribution.md).
+
+## Get started
+
+After successful installation, check the installed runner using its stable path:
+
+```sh
+loomex="$HOME/Library/Application Support/Loomex/runner/current/bin/loomex"
+"$loomex" --version
+"$loomex" status
+"$loomex" diagnostics
+"$loomex" login
+```
+
+`login` opens the backend's browser approval flow; the runner completes the
+credential exchange. In a fresh Codex chat, use `$loomex:loomex-connect` to check
+the connection and select your organization, then `$loomex:loomex-browse` to find
+a workflow. Review its required inputs, workspace, provider, and execution policy
+before choosing **Start**. See the [plugin README](https://github.com/loomex-app/loomex-codex-plugin#readme)
+for the chat entry points.
+
+Jobs run with your OS user's host permissions. A workspace approval is an exact
+execution binding, not a filesystem sandbox. Loomex credentials remain with the
+runner; provider credentials remain with their provider CLIs. Diagnostics can
+identify provider executables without proving account access to a particular model.
+
+## Update, recovery, and removal
+
+Review and install a complete new paired release to update. The lifecycle manager
+drains execution admission and defers replacement while managed work remains.
+Retained versions are eligible for rollback only after compatibility and integrity
+checks; retaining their files alone does not establish a safe downgrade.
+
+```sh
+"$loomex" lifecycle status --rollback-preflight --json
+"$loomex" lifecycle --help
+```
+
+Use the documented [operations](docs/operations.md) and
+[release lifecycle](docs/release.md) for resume, rollback, pruning, and uninstall.
+Uninstall drains work and revokes Loomex credentials before removing owned files;
+it preserves provider credentials and workspace files. Plugin removal and Codex
+registration are separate steps covered in the
+[plugin lifecycle guide](https://github.com/loomex-app/loomex-codex-plugin/blob/main/docs/release.md).
+
+## Development and contracts
+
+Source builds require Rust 1.88+ and the locked dependencies:
 
 ```sh
 cargo test --locked
@@ -65,204 +134,16 @@ cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-Production artifacts must compile with `LOOMEX_API_ORIGIN` set to the deployment's
-HTTPS origin. Runtime origin overrides are rejected for that build. An unsigned
-development/debug build may instead set `LOOMEX_DEV_API_ORIGIN` to an explicit
-loopback origin. The workflow-editor link separately requires
-`LOOMEX_WEB_APP_ORIGIN` at build time. Production accepts an HTTPS origin; debug
-builds also accept an explicit loopback HTTP origin. The frontend must use the
-same backend and organization as the runner. Neither address is inferred from
-the other.
+Read [architecture](docs/architecture.md), [release qualification](docs/release.md),
+and [public distribution](docs/public-distribution.md) for builds, deployment
+profiles, compatibility gates, and packaging. The local-control protocol is
+`loomex.local-control/v2`; product versions and protocol versions change
+independently. Low-level `loomex rpc METHOD JSON` calls use the
+[method catalog](contracts/method-catalog.json); ambiguous mutations must be
+reconciled with their original UUID idempotency key.
 
-```sh
-LOOMEX_DEV_API_ORIGIN=http://127.0.0.1:8000 cargo run --bin loomex-runner
-cargo run --bin loomex -- status
-cargo run --bin loomex -- login
-```
-
-For a local workspace frontend served at `http://127.0.0.1:5173/workspace/`,
-compile the debug runner with `LOOMEX_WEB_APP_ORIGIN=http://127.0.0.1:5173`.
-The value is the origin, without `/workspace/`; the plugin adds the workflow
-builder route. Run the frontend with `VITE_APP_BASE_PATH=/workspace/` and its
-`VITE_WORKSPACE_API_BASE_URL` pointed at the runner's local backend. Restarting
-the frontend or changing a LaunchAgent environment cannot retrofit a runner
-binary built without the web origin.
-
-`login` opens the same-origin approval page using a runner-owned loopback callback
-and PKCE. The daemon completes credential exchange; the CLI observes local state.
-The plugin uses the same local methods. Organization selection and workspace approval
-are separate explicit steps. See `contracts/method-catalog.json` for exact inputs
-and outputs. `loomex rpc METHOD JSON` makes a credential-free local request.
-
-Optional custom UI resources persist view state in owner-only SQLite under the
-same runner state directory. Sessions use revision compare-and-swap and keep raw
-mutation arguments in a separate exact-operation journal. See
-`contracts/presentation-sessions.md` for the local contract and retention rules.
-
-## Execution and authority
-
-The daemon alone stores Loomex credentials, using native macOS Keychain service
-`app.loomex.runner.v1`, account `installation`. Device authority discovers and
-enrolls organizations; isolated child credentials sign organization requests.
-Refresh expirations are absolute. Protected pending rotation state is persisted
-before transmission and permits only the backend's explicit recovery protocol.
-Provider login stores remain owned by Codex, Claude, and Gemini CLI.
-
-`loomex diagnostics` distinguishes provider executable availability from model
-access. The installed executable can be verified without using credentials,
-but these CLIs do not provide a stable account-scoped model entitlement list;
-`modelAccess: unknown` is therefore the honest discovery result. A workflow's
-catalog model resolution is not proof that the signed-in provider account can
-run it. A model rejected during execution is reported with a stable, safe
-provider error and requires a newly prepared run with a supported model.
-
-The local newline-JSON socket is `~/.local/share/loomex/runner/control.sock`.
-`LOOMEX_STATE_DIR`, when present, names that exact runner state directory. The
-socket is owner-only and checks the peer UID; it carries no bearer token or proof.
-Every connection first calls `protocol.negotiate` with supported protocols and
-required capabilities. The CLI and plugin verify the selected protocol, required
-capabilities and frame size before sending an action on that same connection.
-Incompatible or unnegotiated connections receive `COMPATIBILITY_ERROR` without
-performing the requested action.
-
-A remembered workspace is an exact canonical directory and inode bound to the
-organization and installation. It is an execution authorization prerequisite,
-not a filesystem sandbox. A separate prepare/commit exchange binds the immutable
-workflow, input, workspace, organization, installation, execution policy, and
-provider configuration. The daemon writes local commit authorization before the
-backend can enqueue work. Every job must present that exact preparation and
-binding digest. A backend-supplied workspace path cannot grant authority.
-
-Only `host_user/v1` argv jobs are supported. Processes have the OS user's host
-permissions. There are no product concurrency, execution-time, cumulative output,
-or cumulative artifact limits. Bounded transport chunks do not truncate totals.
-Finite renewable leases represent execution authority, not runtime deadlines.
-Loss of authority requests cancellation independently of blocked HTTP requests.
-
-The executor writes output to disk, supervises an owned process group, and records
-spawn intent and process identity durably. Restarted commands are never replayed.
-Terminal delivery and artifact uploads resume from durable evidence. Cancellation
-reports managed-group observation separately from detached descendants or external
-effects, which full-host execution cannot prove reversed.
-
-Declared `artifactOutputs` contain explicit relative regular-file paths. The daemon
-rejects escapes, uploads complete streams and files in resumable chunks, and only
-then submits the terminal result. Artifact downloads verify the complete SHA256
-before publishing the destination file.
-
-## Data and service lifecycle
-
-Before upgrading, run the candidate CLI's read-only
-`lifecycle status --rollback-preflight --json` against the installation. Its
-`rollbackPreflight` detail reports each owned version's integrity and eligibility
-under that CLI's compiled compatibility manifest, including the current version
-that would become the fallback. Run the candidate binary directly so the report
-uses the new controller's contract. `compatibility_manifest_mismatch` means
-ordinary rollback and prune retention are unsupported through that controller;
-retaining bytes alone does not qualify a downgrade. The report does not contact
-the daemon or authorize activation. Every mutation still verifies fresh state,
-identity, inventory and daemon admission independently.
-
-The lifecycle command option matrix is explicit: `status` accepts
-`--rollback-preflight`; `rollback` requires `--to` and optionally accepts
-`--expected-operation`; `prune` requires repeatable `--remove` and `--retain`;
-`resume` and `repair` have no action-specific flags. All five accept `--json`
-and the three directory overrides. Help accepts no options and requires no
-installation discovery. Missing values, duplicate single-value flags, duplicate
-prune versions and flags for another action fail with `INVALID_ARGUMENT` before
-filesystem discovery. A valid version absent from ownership fails with
-`VERSION_NOT_OWNED`.
-
-The local CLI can prune exact superseded installed runner versions after an
-update. Historical example only: `loomex lifecycle prune --remove 0.3.73 --retain 0.3.76` (repeat
-`--remove` for each reviewed version). The active version is retained
-automatically; `--retain` must name at least one verified, noncurrent rollback
-version. Prune requires a healthy idle daemon, an exact current receipt, and
-unreferenced owned version bytes. It uses the existing daemon drain fence to
-block new managed work, then restarts the same service after an atomic ownership
-index update. Interrupted pruning resumes with `loomex lifecycle resume` and
-its exact v6 journal; older runner binaries reject that unfinished journal.
-After completion, the journal is removed and the v1 ownership index remains
-compatible with retained older runners. Prune never touches workspaces, run
-evidence, provider credentials, or a version used by a live process.
-
-Drain stops new execution admission and defers updates while jobs remain. The
-installer never transfers a running job to a replacement binary. Run deletion
-first confirms the backend tombstone, then removes generated local evidence for
-that run; it never removes workspace files or provider credentials. Successfully
-delivered output journals and idle response caches expire after 30 days. Active,
-undelivered, and blocked recovery evidence is preserved. Idempotency cache expiry
-retains a minimal tombstone so an old key cannot replay a write.
-
-Large local responses are immutable paged references with a complete checksum.
-`responses.read` reads bounded pages and refreshes last access; `responses.delete`
-removes the reference explicitly. A lost mutation response is ambiguous: use the
-same idempotency key to reconcile instead of issuing a new logical operation.
-
-Packaging, signing, installation, and operational acceptance are documented in
-[docs/release.md](docs/release.md). Unit and fake-backend tests do not deploy the
-backend, apply migrations, exercise real account login, or qualify signed provider
-execution from a user's installed LaunchAgent. Those remain explicit release checks.
-
-For the local protocol and trust boundaries, read [architecture](docs/architecture.md). For recovery, cancellation, retention and service operation, read [operations](docs/operations.md).
-
-During ordinary operation `activeJobs` counts managed jobs. While draining, it also includes pending session/admission and helper work, so an idle acknowledgement cannot precede a late journal write. The daemon stops admission before acknowledging drain; update activation waits for this count to reach zero.
-
-Control operations capture their organization when admitted and serialize only requests using the same idempotency key. Drain remains responsive during transfers and includes local control writers and response spooling in its pending work count. Once a persistent drain becomes idle, it rejects new work; cancellation and read requests can join a drain only while existing work remains. Repeated drain requests are read-only after the durable drain marker exists.
-
-`follow.session.lifecycle` is a strict hook bridge. Every callback carries an
-event UUID, a compact session identity, and either a
-`loomex.follow-session.continuation/v1` record or a
-`loomex.follow-session.tool-association/v1` record. Lifecycle continuations use
-the `generated_markdown` source and carry the exact run UUID plus an opaque
-runner-minted receipt, emitted in commit or accepted-interaction result details
-and verified against owner, installation, run, trigger, and expiry. Run-tool
-associations carry matching run IDs from the
-documented request and response. `loomex_interaction_get` and
-`loomex_interaction_view` instead carry the request UUID alone in their request
-projection and carry run plus request UUIDs in their response projection; all
-three request UUIDs must match the current authenticated pending interaction.
-Unknown tools, missing associations, and mismatched identities are inert. The runner records
-handoff and terminal receipts only after the matching tool response and a fresh
-authenticated run projection agree on the run identity. A live follow may use
-the session-scoped `unverified` task sentinel; recovery scheduling rejects that
-sentinel and needs a separately verified host task ID.
-
-An MCP App response handoff is recorded by the runner before the app calls `ui/message`. Start first uses the app-only, non-idempotent `runs.start_handoff.issue` operation. Its reference alone never authorizes execution. The mounted app then calls app-only `runs.start_handoff.approve` in response to the user’s explicit Start gesture. That call travels through the existing MCP bridge and owner-checked local-control socket; it does not use browser networking. Chat can then call `runs.start_handoff.commit` with the opaque reference.
-
-After an interrupted issue, a remount can explicitly call read-only `runs.start_handoff.restore` with the original issue idempotency key; it owner-checks the existing handoff and returns only the safe status projection. Restore never authorizes Start. A prepared handoff requires a new explicit Start gesture, and the app-only approval is never automatically replayed after an ambiguous response. That host request is not assumed to trigger `UserPromptSubmit`, and its pending
-record is never recovered from a workspace or cwd. Only an exact associated
-`loomex_run_wait` call promotes it to the native Codex session that actually
-began monitoring. This keeps list-only and detail-only turns inert while
-allowing the explicit follow protocol to survive host prompt-routing gaps.
-
-Uninstall first drains without cancelling active work, waits for idle, and stops the daemon. It then calls `loomex logout --offline`, which takes the same exclusive daemon lock and performs only native credential revocation and cleanup. Failed revocation preserves files and protected retry state; retrying this command does not restart execution or require a socket.
-
-Artifact content reads and downloads require both `artifactId` and the explicit
-`executionId` returned by that execution's scoped artifact listing. Every page
-forwards that same execution ID to the backend, including workflow-shared inputs.
-The backend retains execution, organization, and artifact provenance checks; the
-runner never infers an execution from an artifact ID or recent session state.
-
-## Local build iteration and failure evidence
-
-`scripts/build-dev-fast.sh` builds incremental Rust 1.88 dev binaries for local
-iteration. Its outputs are development binaries and do not establish package,
-distribution-dev, signing or immutable release qualification. Use
-`scripts/build-release.sh --unsigned-development` for qualified development
-artifacts; the immutable source snapshot, locked tests, compatibility check,
-distribution-dev guards, package validation and home-path checks remain required.
-
-The immutable builder accepts `--retain-failure-workspace DIR`. On failure it
-reserves a new owner-only directory and retains the private source snapshot,
-compiler/dependency outputs, sanitized Cargo log, invocation metadata and SHA-256
-identities of dependency build outputs. It refuses an existing destination.
-Logs redact configured secrets and build/home paths; source and compiler outputs
-remain private source material. Default cleanup and successful-build cleanup
-still remove the temporary workspace. Retention provides diagnostic evidence and
-does not reuse a cache or bypass tests. Repeated unchanged immutable builds have
-not been benchmarked here.
-
-Paired GitHub preview distribution, unified runner/plugin installation, offline envelopes and explicit draft/publication checkpoints are described in [public distribution](docs/public-distribution.md). Preview requires explicit unsigned-development consent; the existing production signing gates remain required.
-
-The paired public distribution contract is `app.loomex.release-set/v2`. Its explicit `local-development` profile supports the 1.0.0 release against an existing loopback backend; `cloud-preview` retains the configured HTTPS cloud path. Both require unsigned development opt-in. See [public distribution](docs/public-distribution.md) for exact profile qualification and installation.
+The published runner was built from
+[`031ea7aa612786cb76b24bf98fe3c0644058c71c`](https://github.com/loomex-app/loomex-runner/commit/031ea7aa612786cb76b24bf98fe3c0644058c71c),
+paired with plugin
+[`349cbbbca34bfe172714088f633bc7bf656b378c`](https://github.com/loomex-app/loomex-codex-plugin/commit/349cbbbca34bfe172714088f633bc7bf656b378c).
+Later source or documentation changes do not change those immutable release bytes.
