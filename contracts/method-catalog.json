@@ -1,6 +1,6 @@
 {
   "protocol": "loomex.local-control/v2",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "maxFrameBytes": 1048576,
   "methods": [
     {
@@ -6819,6 +6819,13 @@
           "limit": {
             "type": "integer",
             "minimum": 0
+          },
+          "format": {
+            "type": "string",
+            "enum": [
+              "base64",
+              "utf8"
+            ]
           }
         },
         "required": [
@@ -6863,6 +6870,47 @@
               "responseRef",
               "offset",
               "dataBase64",
+              "nextOffset",
+              "sizeBytes",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "offset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "nextOffset": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              },
+              "dataUtf8": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "responseRef",
+              "offset",
+              "dataUtf8",
               "nextOffset",
               "sizeBytes",
               "checksumSha256"
@@ -11755,6 +11803,7 @@
     "diagnostics.fingerprint/v1",
     "method:builder.start",
     "method:editor.start",
-    "authoring.chat-native/v1"
+    "authoring.chat-native/v1",
+    "transfer.response-utf8/v1"
   ]
 }

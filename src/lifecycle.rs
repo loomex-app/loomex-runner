@@ -3449,10 +3449,16 @@ fn known_refusal_controller(
     {
         return true;
     }
+    // The frozen manifest is part of the real historical refusal proof. The
+    // test-only synthetic controller above has its own exact fixture identity.
     previous_version == "0.4.8"
         && candidate_version == "0.5.0"
         && cli_digest == REFUSAL_CONTROLLER_CLI_SHA256
         && manifest_digest == REFUSAL_CONTROLLER_MANIFEST_SHA256
+        && state::digest(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/contracts/compatibility-manifest.json"
+        ))) == REFUSAL_CANDIDATE_MANIFEST_SHA256
 }
 
 fn verify_refusal_evidence(
@@ -3525,11 +3531,7 @@ fn verify_refusal_evidence(
                 &stop.package.version,
                 &cli_digest,
                 &manifest_digest
-            )
-            && state::digest(include_bytes!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/contracts/compatibility-manifest.json"
-            ))) == REFUSAL_CANDIDATE_MANIFEST_SHA256,
+            ),
         "prepared-stop refusal controller is not the reviewed pre-dispatch implementation"
     );
     Ok(())

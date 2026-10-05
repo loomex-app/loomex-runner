@@ -799,3 +799,119 @@ async fn native_agent_task_spool_preserves_complete_schema_and_owner_binding() {
     );
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn native_task_uses_bounded_readable_pages_below_ipc_limit() {
+    let temp = tempfile::tempdir().unwrap();
+    let api = Api::for_test_origin("http://127.0.0.1:1").unwrap();
+    let owner = daemon(temp.path(), api.clone(), "owner");
+    owner.public.lock().await.active_organization = Some("org".into());
+    let request_id = Uuid::new_v4();
+    let run_id = Uuid::new_v4();
+    let result = json!({"humanRequest":{"id":request_id,"status":"pending","execution":{"id":run_id},"type":"plugin_agent","answerChannel":"current_chat","schemaDigest":"c".repeat(64),
+        "responseSchema":{"type":"object","properties":{"output":{"type":"object"}},"required":["output"]},
+        "agentTask":{"strategy":"current_chat","executionStrategy":"current_chat","promptContext":{"nodeInput":{"definition":"طراحی🙂".repeat(22000)}}}}});
+    let expected = serde_json::to_vec(&result).unwrap();
+    assert!(expected.len() > 262144 && expected.len() < MAX_FRAME);
+    let reference = owner
+        .spool_response(
+            &json!({"requestId":request_id}),
+            result.clone(),
+            Some("org"),
+            Some("owner"),
+        )
+        .unwrap();
+    assert_eq!(
+        reference["details"]["nativeAuthoringTask"]["requestId"],
+        json!(request_id)
+    );
+    assert_eq!(
+        reference["details"]["nativeAuthoringTask"]["requestStatus"],
+        "pending"
+    );
+    let id = reference["responseRef"].as_str().unwrap();
+    let meta: Value = state::read_json(
+        &temp
+            .path()
+            .join("responses")
+            .join(format!("{id}.meta.json")),
+    )
+    .unwrap();
+    assert_eq!(meta["executionId"], json!(run_id));
+    let mut reconstructed = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = owner
+            .dispatch(
+                "responses.read",
+                json!({"responseRef":id,"format":"utf8","offset":offset,"limit":262144}),
+            )
+            .await
+            .unwrap();
+        let text = page["dataUtf8"].as_str().unwrap();
+        assert!(text.len() <= 32768);
+        assert!(page.get("dataBase64").is_none());
+        assert_eq!(page["offset"], json!(offset));
+        assert_eq!(page["checksumSha256"], reference["checksumSha256"]);
+        if offset == 0 {
+            assert_eq!(page["details"]["checksumVerified"], true);
+        } else {
+            assert!(page.get("details").is_none());
+        }
+        reconstructed.extend_from_slice(text.as_bytes());
+        if page["nextOffset"].is_null() {
+            break;
+        }
+        offset = page["nextOffset"].as_u64().unwrap();
+        assert_eq!(offset as usize, reconstructed.len());
+    }
+    assert_eq!(reconstructed, expected);
+    assert_eq!(state::digest(&reconstructed), reference["checksumSha256"]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&reconstructed).unwrap(),
+        result
+    );
+    let invalid_offset = expected.iter().position(|byte| *byte >= 128).unwrap() + 1;
+    assert!(
+        owner
+            .dispatch(
+                "responses.read",
+                json!({"responseRef":id,"format":"utf8","offset":invalid_offset})
+            )
+            .await
+            .is_err()
+    );
+    let other = daemon(temp.path(), api, "different-owner");
+    other.public.lock().await.active_organization = Some("org".into());
+    assert_eq!(
+        other
+            .dispatch("responses.read", json!({"responseRef":id,"format":"utf8"}))
+            .await
+            .unwrap_err()
+            .to_string(),
+        "RESPONSE_NOT_FOUND"
+    );
+    assert!(
+        owner
+            .dispatch("responses.read", json!({"responseRef":id}))
+            .await
+            .unwrap()["dataBase64"]
+            .is_string()
+    );
+    // Tampering cannot yield a first readable page bearing a verified digest.
+    let mut changed = expected.clone();
+    changed[0] = b'[';
+    state::atomic_write(
+        &temp.path().join("responses").join(format!("{id}.json")),
+        &changed,
+    )
+    .unwrap();
+    assert_eq!(
+        owner
+            .dispatch("responses.read", json!({"responseRef":id,"format":"utf8"}))
+            .await
+            .unwrap_err()
+            .to_string(),
+        "RESPONSE_CHECKSUM_INVALID"
+    );
+}

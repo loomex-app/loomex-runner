@@ -48,6 +48,10 @@ Protocol input and output changes require synchronized plugin schemas, new diges
 
 ## Follow lifecycle and recovery coordination
 
+Native current-chat interaction reads share the existing immutable response spool. The daemon spools these reads above 192 KiB to leave room for the plugin's 256 KiB model envelope, even when they fit one IPC frame. Metadata retains the exact request, execution and schema digest; spool ownership remains bound to organization and authenticated account. `transfer.response-utf8/v1` advertises readable JSON-fragment pages of at most 32 KiB; the default base64 format and 256 KiB binary pages are unchanged. Byte offsets, complete coverage and SHA-256 remain authoritative. Paging does not alter request status, accept a response, restart execution or create a second store. The plugin negotiates this capability; unrelated CLI health reads do not require it.
+
+The first UTF-8 response page streams the immutable file through SHA-256 using a bounded heap buffer and returns `details.checksumVerified: true`; a mismatch fails with `RESPONSE_CHECKSUM_INVALID`. Consumers still require contiguous byte coverage through `nextOffset: null`. Native response-reference metadata retains request status and identity, allowing a fresh unchanged pending read (same schema, size and checksum) to reuse its already hydrated task without a new read loop. Spool transport never grants submission authority.
+
 `follow.sqlite3` is the one durable controller for a live follow. It has no
 internal scheduler. The hook envelope contains a stable event UUID, session
 identity, and either a receipt-bearing v1 generated-markdown continuation

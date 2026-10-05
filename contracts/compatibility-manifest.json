@@ -112,19 +112,20 @@
     "presentation.sessions/v1",
     "recovery.coordination/v1",
     "transfer.chunked/v1",
+    "transfer.response-utf8/v1",
     "workflows.atomic-draft-create/v1",
     "workflows.canonical-authoring-contract/v1",
     "workflows.patch.notes-preserve/v1",
     "workflows.runtime-draft-mutations/v1"
   ],
-  "catalogVersion": "0.3.8",
+  "catalogVersion": "0.3.9",
   "generatedFrom": {
     "backendRoutes": {
       "digest": "sha256:e90600c3265c2b61324aa7aa0921c38052ff8f09492c443f9cc5b8168c1ba7b9",
       "path": "contracts/backend-routes.json"
     },
     "methodCatalog": {
-      "digest": "sha256:4337cdcbf5041ad8128d09455e90d701afc295bf38da10457a7f20c83b96e536",
+      "digest": "sha256:39bb63c8b865a48d56127e4971265c028e962c75bcb1499cca54552ece7c6b2c",
       "path": "contracts/method-catalog.json"
     }
   },
@@ -888,10 +889,10 @@
     {
       "classification": "local-control",
       "idempotent": true,
-      "inputSchemaDigest": "sha256:a942afc596ded5ec73a14aa00d8bcf88d04b2cf5bad62a4caa39cea258140856",
+      "inputSchemaDigest": "sha256:3f5b22ec7e475bd63b4df49782d48f265e6d7120c9c1a1b340334b8408277120",
       "mutating": false,
       "name": "responses.read",
-      "outputSchemaDigest": "sha256:f1f8b190ca84df4dfc9cbf547625ef164c5eda2d2f087dc9495c485e86ed3197",
+      "outputSchemaDigest": "sha256:d06da84471cbb93aa14357b5d4309f179903d1fa5060d298aeb7159eedbafc81",
       "routeIds": [],
       "transportRetry": "before_response_once"
     },
@@ -1657,7 +1658,7 @@
   "schemaVersion": "loomex.runner.compatibility-manifest/v1",
   "summary": {
     "backendRouteCount": 71,
-    "capabilityCount": 116,
+    "capabilityCount": 117,
     "methodClassifications": {
       "backend-auth": 7,
       "backend-proxy": 53,

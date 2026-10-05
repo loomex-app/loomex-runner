@@ -674,7 +674,20 @@ impl Daemon {
         account: Option<&str>,
     ) -> Result<Value> {
         let bytes = serde_json::to_vec(&result)?;
-        if bytes.len() <= MAX_FRAME - 1024 {
+        let native_task = result.get("humanRequest").filter(|request| {
+            request["type"] == "plugin_agent"
+                && request["answerChannel"] == "current_chat"
+                && request["agentTask"]["strategy"] == "current_chat"
+                && request["agentTask"]["executionStrategy"] == "current_chat"
+        });
+        // Native task reads have a model-response budget below the IPC frame.
+        // Reserve room for the model envelope; cumulative context is unlimited.
+        let budget = if native_task.is_some() {
+            192 * 1024
+        } else {
+            MAX_FRAME - 1024
+        };
+        if bytes.len() <= budget {
             return Ok(result);
         }
         let reference = Uuid::new_v4();
@@ -695,11 +708,13 @@ impl Daemon {
                 .dir
                 .join("responses")
                 .join(format!("{reference}.meta.json")),
-            &json!({"executionId":params["runId"],"lastAccessAt":state::now(),"ownerScope":account.map(|account|json!({"organizationId":organization,"accountSubject":account}))}),
+            &json!({"executionId":native_task.map(|request|&request["execution"]["id"]).unwrap_or(&params["runId"]),"lastAccessAt":state::now(),"ownerScope":account.map(|account|json!({"organizationId":organization,"accountSubject":account}))}),
         )?;
-        Ok(
-            json!({"responseRef":reference,"sizeBytes":bytes.len(),"encoding":"json","nextOffset":0,"checksumSha256":checksum}),
-        )
+        let mut reference = json!({"responseRef":reference,"sizeBytes":bytes.len(),"encoding":"json","nextOffset":0,"checksumSha256":checksum});
+        if let Some(request) = native_task {
+            reference["details"] = json!({"nativeAuthoringTask":{"requestId":request["id"],"executionId":request["execution"]["id"],"schemaDigest":request["schemaDigest"],"requestStatus":request["status"]}});
+        }
+        Ok(reference)
     }
 
     async fn require_spool_owner(&self, params: &Value) -> Result<()> {
@@ -4175,6 +4190,7 @@ fn find_executable_with(
         .and_then(|p| std::fs::canonicalize(p).ok()))
 }
 async fn read_spool(dir: &Path, p: &Value) -> Result<Value> {
+    use sha2::{Digest, Sha256};
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let id = required(p, "responseRef")?;
     Uuid::parse_str(id)?;
@@ -4190,14 +4206,59 @@ async fn read_spool(dir: &Path, p: &Value) -> Result<Value> {
     if offset > size {
         bail!("INVALID_REQUEST")
     };
-    let limit = p["limit"].as_u64().unwrap_or(262144).clamp(1, 262144);
+    let utf8 = p["format"] == "utf8";
+    let checksum = std::fs::read_to_string(dir.join("responses").join(format!("{id}.sha256")))?;
+    // Verify the complete immutable snapshot once at the start of a readable
+    // transfer. Streaming keeps cumulative task size independent of frame size.
+    // Page coverage and request freshness are still required by the consumer.
+    if utf8 && offset == 0 {
+        let mut hash = Sha256::new();
+        // Keep this buffer on the heap: read_spool is part of the shared
+        // dispatch future, including methods which never read a response.
+        let mut block = vec![0; 32768];
+        loop {
+            let count = file.read(&mut block).await?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&block[..count]);
+        }
+        ensure!(
+            format!("{:x}", hash.finalize()) == checksum,
+            "RESPONSE_CHECKSUM_INVALID"
+        );
+    }
+    // 32 KiB also bounds JSON escaping in both model-facing channels.
+    // Never split a UTF-8 scalar; offsets always remain raw byte offsets.
+    let cap = if utf8 { 32768 } else { 262144 };
+    let limit = p["limit"]
+        .as_u64()
+        .unwrap_or(cap)
+        .clamp(if utf8 { 4 } else { 1 }, cap);
     file.seek(std::io::SeekFrom::Start(offset)).await?;
     let mut buf = vec![0; (limit.min(size - offset)) as usize];
     file.read_exact(&mut buf).await?;
+    if utf8 {
+        match std::str::from_utf8(&buf) {
+            Ok(_) => {}
+            Err(error) if error.error_len().is_none() && offset + (buf.len() as u64) < size => {
+                buf.truncate(error.valid_up_to());
+            }
+            Err(_) => bail!("INVALID_REQUEST"),
+        }
+        ensure!(!buf.is_empty() || offset == size, "INVALID_REQUEST");
+    }
     let next = offset + buf.len() as u64;
-    Ok(
-        json!({"responseRef":id,"checksumSha256":std::fs::read_to_string(dir.join("responses").join(format!("{id}.sha256")))?,"offset":offset,"dataBase64":STANDARD.encode(buf),"nextOffset":if next<size{Some(next)}else{None},"sizeBytes":size}),
-    )
+    let mut page = json!({"responseRef":id,"checksumSha256":checksum,"offset":offset,"nextOffset":if next<size{Some(next)}else{None},"sizeBytes":size});
+    if utf8 && offset == 0 {
+        page["details"] = json!({"checksumVerified":true});
+    }
+    if utf8 {
+        page["dataUtf8"] = json!(std::str::from_utf8(&buf)?);
+    } else {
+        page["dataBase64"] = json!(STANDARD.encode(buf));
+    }
+    Ok(page)
 }
 
 fn daemon_lock(dir: &Path) -> Result<std::fs::File> {
