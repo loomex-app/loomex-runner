@@ -326,6 +326,10 @@ struct Pending {
     // recovery is repeatable on compatible backends until the server deadline.
     #[serde(default)]
     recovery_used: bool,
+    // Kept until proof-bound cancellation confirms that the older operation
+    // cannot issue credentials. Never sent to the backend. Old stores omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseded: Option<Box<Pending>>,
 }
 impl Pending {
     fn can_recover(&self) -> bool {
@@ -490,6 +494,7 @@ impl Auth {
                 body: json!({"refreshToken":state.children[org].refresh,"proof":"synthetic-memory-store-proof"}),
                 started_at: now(),
                 recovery_used: false,
+                superseded: None,
             });
         }
         auth.store
@@ -715,6 +720,7 @@ impl Auth {
         if let Some(login) = state.login.as_ref().filter(|login| {
             login.authorization_url.is_some()
                 && login.received_code.is_none()
+                && state.pending.is_none()
                 && login.expires_at > now()
         }) {
             if !self.listeners.lock().await.contains_key(&login.flow_id) {
@@ -750,11 +756,30 @@ impl Auth {
         let (state_name, actions, login) = if state.logout_pending {
             ("logout_pending", vec!["auth.logout"], Value::Null)
         } else if state.pending.is_some() {
-            (
-                "recovery_pending",
-                vec!["auth.recover", "auth.logout"],
-                Value::Null,
-            )
+            if let Some(login) = state.login.as_ref().filter(|login| {
+                state.device.is_none()
+                    && login.transaction_id.is_some()
+                    && state.pending.as_ref().is_some_and(|pending| {
+                        matches!(
+                            pending.target,
+                            Target::BrowserExchange | Target::Bootstrap | Target::BrowserCancel
+                        )
+                    })
+            }) {
+                (
+                    "recovery_pending",
+                    vec!["auth.recover", "auth.cancel"],
+                    json!({
+                        "flowId":flow_identity(&state,login),"authorizationUrl":login.authorization_url,"expiresAt":login.expires_at,
+                    }),
+                )
+            } else {
+                (
+                    "recovery_pending",
+                    vec!["auth.recover", "auth.logout"],
+                    Value::Null,
+                )
+            }
         } else if state.device.is_some() {
             (
                 "authenticated",
@@ -782,6 +807,8 @@ impl Auth {
                     vec!["auth.cancel"]
                 } else if status == "authentication_completing" {
                     vec!["auth.recover"]
+                } else if login.transaction_id.is_some() {
+                    vec!["auth.cancel"]
                 } else {
                     vec!["auth.login"]
                 };
@@ -839,15 +866,12 @@ impl Auth {
         let reused = state
             .login
             .as_ref()
-            .filter(|login| {
-                login.key == key
-                    && login.authorization_url.is_none()
-                    && login.redirect_uri.is_some()
-                    && login.expires_at > now()
-            })
+            .filter(|login| login.key == key && login.redirect_uri.is_some())
             .cloned();
         let (login, listener) = if let Some(login) = reused {
-            let listener = if self.listeners.lock().await.contains_key(&login.flow_id) {
+            let listener = if login.expires_at <= now()
+                || self.listeners.lock().await.contains_key(&login.flow_id)
+            {
                 None
             } else {
                 Some(
@@ -923,6 +947,21 @@ impl Auth {
         login.expires_at = data["expiresAt"]
             .as_u64()
             .ok_or_else(|| anyhow!("INVALID_API_RESPONSE"))?;
+        if let Some(status) = data.get("status") {
+            ensure!(
+                matches!(
+                    status.as_str(),
+                    Some("pending" | "approved" | "consumed" | "denied" | "revoked" | "expired")
+                ),
+                "INVALID_API_RESPONSE"
+            );
+            if status != "pending" {
+                // Start recovery returns a transaction reference, never new
+                // approval authority. A decided flow can only be reconciled or
+                // proof-canceled, even if its bootstrap deadline is still live.
+                login.expires_at = 0;
+            }
+        }
         self.save(&state).await?;
         Ok(login_projection(state.login.as_ref().unwrap()))
     }
@@ -1133,28 +1172,63 @@ impl Auth {
     pub async fn cancel_login(&self, flow_id: &str) -> Result<Value> {
         let _guard = self.auth_guard().await?;
         let mut state = self.required().await?;
-        let login = state
-            .login
-            .as_ref()
-            .ok_or_else(|| anyhow!("LOGIN_REQUIRED"))?;
-        ensure!(login.flow_id == flow_id, "LOGIN_FLOW_MISMATCH");
-        let state_value = login
-            .browser_state
-            .as_deref()
-            .ok_or_else(|| anyhow!("LOGIN_REQUIRED"))?;
-        let proof = key_proof(&state.private_key, "browser-cancel", state_value);
-        let body = json!({"transactionId":login.transaction_id,"state":state_value,"proof":proof});
-        self.begin(
-            &mut state,
-            Target::BrowserCancel,
-            "v2/browser-authorities/cancel/".into(),
-            body,
-        )
-        .await?;
+        self.cancel_login_locked(&mut state, flow_id).await?;
         if let Some(listener) = self.listeners.lock().await.remove(flow_id) {
             listener.abort()
         }
         Ok(json!({"canceled":true}))
+    }
+    async fn cancel_login_locked(&self, state: &mut ProtectedState, flow_id: &str) -> Result<()> {
+        ensure!(state.device.is_none(), "AUTH_ALREADY_COMPLETED");
+        let login = state
+            .login
+            .as_ref()
+            .ok_or_else(|| anyhow!("LOGIN_REQUIRED"))?;
+        ensure!(
+            flow_identity(state, login) == flow_id,
+            "LOGIN_FLOW_MISMATCH"
+        );
+        ensure!(login.transaction_id.is_some(), "AUTH_RECOVERY_PENDING");
+        if state
+            .pending
+            .as_ref()
+            .is_some_and(|pending| matches!(pending.target, Target::BrowserCancel))
+        {
+            return self.recover(state).await;
+        }
+        ensure!(
+            state.pending.as_ref().is_none_or(|pending| matches!(
+                pending.target,
+                Target::BrowserExchange | Target::Bootstrap
+            )),
+            "AUTH_RECOVERY_PENDING"
+        );
+        let revoke_approved =
+            state.pending.is_some() || login.received_code.is_some() || login.expires_at <= now();
+        let state_value = login
+            .browser_state
+            .as_deref()
+            .ok_or_else(|| anyhow!("LOGIN_REQUIRED"))?;
+        let purpose = if revoke_approved {
+            "browser-cancel-recovery"
+        } else {
+            "browser-cancel"
+        };
+        let proof = key_proof(&state.private_key, purpose, state_value);
+        let body = json!({"transactionId":login.transaction_id,"state":state_value,"proof":proof,
+            "revokeApproved":revoke_approved});
+        // Persist the cancellation intent and its displaced operation together
+        // before transmission. Ambiguity always recovers this exact intent.
+        state.pending = Some(Pending {
+            target: Target::BrowserCancel,
+            route: "v2/browser-authorities/cancel/".into(),
+            body,
+            started_at: now(),
+            recovery_used: false,
+            superseded: state.pending.take().map(Box::new),
+        });
+        self.save(state).await?;
+        self.transmit(state, false).await
     }
     pub async fn organizations(&self) -> Result<Value> {
         let _guard = self.auth_guard().await?;
@@ -1568,6 +1642,24 @@ impl Auth {
         let _guard = self.auth_guard().await?;
         if let Some(mut state) = self.load().await? {
             if state.device.is_none() && (state.pending.is_some() || !state.children.is_empty()) {
+                if state
+                    .login
+                    .as_ref()
+                    .is_some_and(|login| login.transaction_id.is_some())
+                    && state.pending.as_ref().is_some_and(|pending| {
+                        matches!(
+                            pending.target,
+                            Target::BrowserExchange | Target::Bootstrap | Target::BrowserCancel
+                        )
+                    })
+                {
+                    // Explicit uninstall/logout may abandon this browser-owned
+                    // authority without recovering expired issuance material.
+                    // Deletion still follows confirmed remote revocation.
+                    let result = self.logout_locked().await?;
+                    self.store_operation(true, |store| store.delete()).await?;
+                    return Ok(result);
+                }
                 // A lost bootstrap reply can represent an active remote authority.
                 // Preserve its only proof and reconcile through the existing one-use
                 // recovery protocol before claiming revocation or deleting anything.
@@ -1599,20 +1691,7 @@ impl Auth {
                 .filter(|login| login.transaction_id.is_some())
             {
                 let flow = login.flow_id.clone();
-                let state_value = login
-                    .browser_state
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("LOGIN_REQUIRED"))?;
-                let proof = key_proof(&state.private_key, "browser-cancel", state_value);
-                let body =
-                    json!({"transactionId":login.transaction_id,"state":state_value,"proof":proof});
-                self.begin(
-                    &mut state,
-                    Target::BrowserCancel,
-                    "v2/browser-authorities/cancel/".into(),
-                    body,
-                )
-                .await?;
+                self.cancel_login_locked(&mut state, &flow).await?;
                 if let Some(listener) = self.listeners.lock().await.remove(&flow) {
                     listener.abort()
                 }
@@ -1685,6 +1764,7 @@ impl Auth {
             body,
             started_at: now(),
             recovery_used: false,
+            superseded: None,
         });
         self.save(state).await?;
         match self.transmit(state, false).await {
@@ -1773,13 +1853,14 @@ impl Auth {
                     body: json!({"bootstrapGrant":grant,"proof":proof}),
                     started_at: now(),
                     recovery_used: false,
+                    superseded: None,
                 });
                 self.save(state).await?;
                 return Box::pin(self.transmit(state, false)).await;
             }
             Target::BrowserCancel => {
                 if data["canceled"] != true {
-                    state.pending = None;
+                    state.pending = pending.superseded.map(|pending| *pending);
                     self.save(state).await?;
                     bail!("LOGIN_ALREADY_APPROVED")
                 }
@@ -2086,6 +2167,7 @@ mod tests {
             body: json!({"refreshToken":"original","proof":"identical"}),
             started_at: now(),
             recovery_used: false,
+            superseded: None,
         });
         auth.save(&state).await.unwrap();
         let copy = auth.clone();
@@ -2106,6 +2188,7 @@ mod tests {
             body: json!({"refreshToken":"original","proof":"identical"}),
             started_at: now(),
             recovery_used: false,
+            superseded: None,
         });
         auth.save(&state).await.unwrap();
         let before = auth.store.load().unwrap();
@@ -2143,6 +2226,7 @@ mod tests {
             body: json!({"refreshToken":"original","proof":"identical"}),
             started_at: 100,
             recovery_used: false,
+            superseded: None,
         });
         store.save(&serde_json::to_vec(&state).unwrap()).unwrap();
         let mut restored: ProtectedState =
@@ -2357,6 +2441,7 @@ mod tests {
             body: json!({"refreshToken":"secret"}),
             started_at: now(),
             recovery_used: false,
+            superseded: None,
         });
         auth.save(&state).await.unwrap();
         assert_eq!(auth.connection(None, 0).await["state"], "recovery_pending");
@@ -2720,6 +2805,7 @@ mod tests {
             body: json!({"refreshToken":"old-refresh","proof":"original-proof"}),
             started_at: old_start,
             recovery_used: false,
+            superseded: None,
         });
         auth.save(&state).await.unwrap();
         let server = tokio::spawn(async move {
@@ -2764,6 +2850,225 @@ mod tests {
         assert_eq!(durable.children["org"].refresh, "fresh-refresh");
         assert!(durable.children["org"].usable());
     }
+    #[tokio::test]
+    async fn expired_browser_exchange_can_be_canceled_without_replaying_exchange() {
+        let (auth, store, listener) = test_auth().await;
+        let mut state = ProtectedState::fresh();
+        let identity = state.installation_id.clone();
+        state.login = Some(Login {
+            flow_id: "expired-flow".into(),
+            transaction_id: Some(uuid::Uuid::new_v4().to_string()),
+            browser_state: Some("s".repeat(48)),
+            expires_at: 0,
+            ..Login::default()
+        });
+        state.pending = Some(Pending {
+            target: Target::BrowserExchange,
+            route: "v2/browser-authorities/exchange/".into(),
+            body: json!({"proof":"retained-exchange-proof"}),
+            started_at: now(),
+            recovery_used: true,
+            superseded: None,
+        });
+        auth.save(&state).await.unwrap();
+        let projection = auth.connection(None, 0).await;
+        assert_eq!(projection["login"]["flowId"], "expired-flow");
+        assert!(
+            projection["actions"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("auth.cancel"))
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            assert_eq!(request["revokeApproved"], true);
+            assert!(request.get("superseded").is_none());
+            assert!(!request.to_string().contains("retained-exchange-proof"));
+            respond(&mut stream, 200, json!({"data":{"canceled":true}})).await;
+        });
+        assert_eq!(
+            auth.cancel_login("expired-flow").await.unwrap()["canceled"],
+            true
+        );
+        server.await.unwrap();
+        let saved: ProtectedState =
+            serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+        assert_eq!(saved.installation_id, identity);
+        assert!(saved.pending.is_none() && saved.login.is_none() && saved.device.is_none());
+    }
+
+    #[tokio::test]
+    async fn browser_cancel_ambiguity_retains_superseded_proof_until_exact_recovery() {
+        let (auth, store, listener) = test_auth().await;
+        let mut state = ProtectedState::fresh();
+        state.login = Some(Login {
+            flow_id: "recovery-flow".into(),
+            transaction_id: Some(uuid::Uuid::new_v4().to_string()),
+            browser_state: Some("s".repeat(48)),
+            expires_at: 0,
+            ..Login::default()
+        });
+        state.pending = Some(Pending {
+            target: Target::Bootstrap,
+            route: "v2/device-authorities/bootstrap/".into(),
+            body: json!({"bootstrapGrant":"original-grant","proof":"original-proof"}),
+            started_at: now(),
+            recovery_used: true,
+            superseded: None,
+        });
+        auth.save(&state).await.unwrap();
+        let server_store = store.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let first = read_request(&mut stream).await;
+            let saved: ProtectedState =
+                serde_json::from_slice(&server_store.load().unwrap().unwrap()).unwrap();
+            let pending = saved.pending.unwrap();
+            assert!(matches!(pending.target, Target::BrowserCancel));
+            assert_eq!(pending.superseded.unwrap().body["proof"], "original-proof");
+            respond(
+                &mut stream,
+                503,
+                json!({"error":{"code":"NETWORK_UNAVAILABLE","message":"Unavailable"}}),
+            )
+            .await;
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let second = read_request(&mut stream).await;
+            assert_eq!(second["proof"], first["proof"]);
+            assert_eq!(second["transactionId"], first["transactionId"]);
+            assert_eq!(second["revokeApproved"], true);
+            assert_eq!(second["recovery"], true);
+            respond(&mut stream, 200, json!({"data":{"canceled":true}})).await;
+        });
+        assert!(auth.cancel_login("recovery-flow").await.is_err());
+        let saved: ProtectedState =
+            serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+        assert!(saved.pending.unwrap().superseded.is_some());
+        // Re-read the persisted intent rather than create a replacement proof.
+        assert_eq!(
+            auth.cancel_login("recovery-flow").await.unwrap()["canceled"],
+            true
+        );
+        server.await.unwrap();
+        assert_eq!(auth.connection(None, 0).await["state"], "signed_out");
+    }
+
+    #[tokio::test]
+    async fn unsupported_browser_revocation_preserves_original_operation() {
+        let (auth, store, listener) = test_auth().await;
+        let mut state = ProtectedState::fresh();
+        state.login = Some(Login {
+            flow_id: "old-backend".into(),
+            transaction_id: Some(uuid::Uuid::new_v4().to_string()),
+            browser_state: Some("s".repeat(48)),
+            expires_at: 0,
+            ..Login::default()
+        });
+        state.pending = Some(Pending {
+            target: Target::Bootstrap,
+            route: "v2/device-authorities/bootstrap/".into(),
+            body: json!({"proof":"original-proof"}),
+            started_at: now(),
+            recovery_used: false,
+            superseded: None,
+        });
+        auth.save(&state).await.unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            respond(&mut stream, 200, json!({"data":{"canceled":false}})).await;
+        });
+        assert_eq!(
+            auth.cancel_login("old-backend")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "LOGIN_ALREADY_APPROVED"
+        );
+        server.await.unwrap();
+        let saved: ProtectedState =
+            serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+        assert_eq!(saved.pending.unwrap().body["proof"], "original-proof");
+        assert!(saved.login.is_some());
+    }
+
+    #[tokio::test]
+    async fn retrying_expired_start_keeps_original_request_identity() {
+        let (auth, store, listener) = test_auth().await;
+        let mut state = ProtectedState::fresh();
+        let key = uuid::Uuid::new_v4().to_string();
+        state.login = Some(Login {
+            key: key.clone(),
+            runner_name: "Runner".into(),
+            flow_id: "original-flow".into(),
+            browser_state: Some("s".repeat(48)),
+            code_verifier: Some("v".repeat(43)),
+            redirect_uri: Some("http://127.0.0.1:39217/oauth/callback".into()),
+            expires_at: now() - 60,
+            ..Login::default()
+        });
+        auth.save(&state).await.unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            assert_eq!(request["state"], "s".repeat(48));
+            assert_eq!(
+                request["redirectUri"],
+                "http://127.0.0.1:39217/oauth/callback"
+            );
+            respond(&mut stream,201,json!({"data":{"transactionId":uuid::Uuid::new_v4().to_string(),
+                "expiresAt":0,"authorizationPath":"/api/v1/runner-control/runner/v2/browser-authorities/authorize/"}})).await;
+        });
+        auth.login("Runner", &key).await.unwrap();
+        server.await.unwrap();
+        let saved: ProtectedState =
+            serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+        assert_eq!(saved.login.unwrap().flow_id, "original-flow");
+        assert_eq!(
+            auth.connection(None, 0).await["actions"],
+            json!(["auth.cancel"])
+        );
+    }
+
+    #[tokio::test]
+    async fn retrying_decided_start_does_not_reopen_approval_or_browser() {
+        let (auth, store, listener) = test_auth().await;
+        let mut state = ProtectedState::fresh();
+        let key = uuid::Uuid::new_v4().to_string();
+        state.login = Some(Login {
+            key: key.clone(),
+            runner_name: "Runner".into(),
+            flow_id: "original-flow".into(),
+            browser_state: Some("s".repeat(48)),
+            code_verifier: Some("v".repeat(43)),
+            redirect_uri: Some("http://127.0.0.1:39217/oauth/callback".into()),
+            expires_at: now() - 60,
+            ..Login::default()
+        });
+        auth.save(&state).await.unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            assert_eq!(request["state"], "s".repeat(48));
+            assert_eq!(
+                request["redirectUri"],
+                "http://127.0.0.1:39217/oauth/callback"
+            );
+            respond(&mut stream,201,json!({"data":{"transactionId":uuid::Uuid::new_v4().to_string(),
+                "expiresAt":now()+600,"status":"approved","authorizationPath":"/api/v1/runner-control/runner/v2/browser-authorities/authorize/"}})).await;
+        });
+        auth.login("Runner", &key).await.unwrap();
+        server.await.unwrap();
+        let saved: ProtectedState =
+            serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+        assert_eq!(saved.login.unwrap().flow_id, "original-flow");
+        assert_eq!(
+            auth.connection(None, 0).await["actions"],
+            json!(["auth.cancel"])
+        );
+    }
+
     #[tokio::test]
     async fn repeated_expired_child_refresh_fails_closed_with_latest_material_saved() {
         let (auth, store, listener) = test_auth().await;
@@ -2861,6 +3166,7 @@ mod tests {
             body: json!({"bootstrapGrant":"original-grant","proof":"original-proof"}),
             started_at: old_start,
             recovery_used: false,
+            superseded: None,
         });
         auth.save(&state).await.unwrap();
         let server = tokio::spawn(async move {
@@ -2902,6 +3208,7 @@ mod tests {
             body: json!({"idempotencyKey":"original-key"}),
             started_at: old_start,
             recovery_used: false,
+            superseded: None,
         });
         auth.save(&state).await.unwrap();
         let server = tokio::spawn(async move {
@@ -2960,6 +3267,7 @@ mod tests {
             body: json!({"idempotencyKey":"original-key"}),
             started_at: now().saturating_sub(1_200),
             recovery_used: false,
+            superseded: None,
         });
         auth.save(&state).await.unwrap();
         assert_eq!(
@@ -2986,6 +3294,7 @@ mod tests {
                 body: json!({"bootstrapGrant":"original-grant","proof":"original-proof"}),
                 started_at: now(),
                 recovery_used: outcome == "exhausted",
+                superseded: None,
             });
             auth.save(&state).await.unwrap();
             let server_store = store.clone();
@@ -3288,6 +3597,7 @@ mod tests {
             body: json!({"refreshToken":"spent-refresh","proof":"spent-proof"}),
             started_at: now().saturating_sub(100),
             recovery_used: true,
+            superseded: None,
         });
         auth.save(&state).await.unwrap();
         let server_store = store.clone();
@@ -3431,6 +3741,7 @@ mod tests {
             body: json!({"refreshToken":"original-refresh","proof":"original-proof"}),
             started_at: now().saturating_sub(31),
             recovery_used: false,
+            superseded: None,
         });
         auth.save(&state).await.unwrap();
         let server_store = store.clone();
@@ -4379,6 +4690,7 @@ mod tests {
             body: json!({"refreshToken":refresh,"proof":proof}),
             started_at: now(),
             recovery_used: false,
+            superseded: None,
         });
         auth.save(&state).await.unwrap();
         let server = tokio::spawn(async move {

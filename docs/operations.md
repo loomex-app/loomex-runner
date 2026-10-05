@@ -2,6 +2,14 @@
 
 This guide covers the per-user `loomex-runner` daemon and `loomex` CLI. It describes current source behavior; production use still depends on the open release gates.
 
+## Expired or interrupted sign-in
+
+Refresh Connection before acting. An expired browser page cannot approve a new installation. If the runner offers **Restart sign-in**, explicitly cancel that exact flow, verify signed-out state, then choose Sign in. This uses the existing `auth.cancel` operation; it does not clear Keychain manually or change provider logins.
+
+Browser exchange/bootstrap recovery retains its original proof until a confirmed outcome. If recovery is no longer possible, explicit cancellation writes a proof-bound revocation intent before sending it. The optional `Pending.superseded` field retains the displaced operation locally and is never transmitted. A lost cancellation response recovers the same proof, transaction and intent. Old records without that field still decode. A definitive refusal by an older backend preserves original evidence instead of claiming revocation. Deploy compatible backend recovery cancellation before this runner/plugin.
+
+Cancellation of an already locally authenticated installation is refused; use the existing logout operation with active-work protection. Offline uninstall uses the same cancellation owner when an interrupted browser sign-in has a known transaction. Legacy bootstrap records without that binding still require credential recovery and confirmed logout before deletion. No sign-in or execution is automatically replayed.
+
 The daemon creates `presentation.sqlite3` on first startup after durable UI support is installed. No separate migration command is required. The file and its WAL live inside the owner-only runner state directory. Active UI sessions and unresolved operation records are retained across daemon restarts. Inactive and resolved views are swept after 30 days; explicit view deletion removes its journal, and run deletion removes views bound to the deleted execution subtree.
 
 ## Runtime layout and basic checks
