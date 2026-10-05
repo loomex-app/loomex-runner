@@ -125,6 +125,8 @@ class SchemaTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d);_,m=fixture(p,put(p/'installer','fixture',0o755),'local-development')
             self.assertEqual(pack.validate_manifest(m),m)
+            local_subdomain=copy.deepcopy(m);local_subdomain['deployment']['apiOrigin']='http://api.loomex.localhost:28080/'
+            self.assertEqual(pack.validate_manifest(local_subdomain),local_subdomain)
             for origin in ['https://api.example.test/','http://example.test/','http://127.0.0.1:28080/path','http://127.0.0.1:28080/?token=x','http://user@127.0.0.1:28080/','http://127.0.0.1:28080','http://127.0.0.1:28080/\n']:
                 bad=copy.deepcopy(m);bad['deployment']['apiOrigin']=origin
                 with self.subTest(origin=origin), self.assertRaises(ValueError):pack.validate_manifest(bad)

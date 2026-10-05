@@ -46,7 +46,7 @@ def validate_deployment(value):
             if u.scheme!='https' or not dns: raise ValueError('configured canonical cloud HTTPS DNS root required')
         else:
             try: loopback=ipaddress.ip_address(u.hostname).is_loopback
-            except ValueError: loopback=u.hostname=='localhost'
+            except ValueError: loopback=u.hostname=='localhost' or u.hostname.endswith('.localhost')
             if u.scheme!='http' or not loopback: raise ValueError('local-development requires HTTP loopback origin')
         host=u.hostname.encode('idna').decode('ascii').lower()
         if ':' in host: host='['+host+']'
