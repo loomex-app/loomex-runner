@@ -1,8 +1,8 @@
-# Paired public preview distribution
+# Paired public distribution
 
-Public distribution is an explicitly unsigned preview for **macOS ARM64**. The repositories retain their existing **Proprietary** license decision. Production Developer ID signing, notarization and manifest signature gates remain required and unchanged; preview is not a production assurance.
+Public distribution currently uses explicitly unsigned development builds for **macOS ARM64**. The repositories retain their existing **Proprietary** license decision. Production Developer ID signing, notarization and manifest signature gates remain required and unchanged; release naming does not supply signing assurance.
 
-The authoritative download is one frozen paired tag in `loomex-app/loomex-runner`, named `preview-runner-v<RUNNER>-plugin-v<PLUGIN>`. Never combine independent `latest` downloads. `release-set.json` uses `app.loomex.release-set/v2` and binds exact component versions, full source SHAs, repository/tag, manifest hash, artifact URL/size/hash, platform, `developmentOnly`, protocol and compatibility evidence. `compatibility.json` wraps the successful existing required clean plugin/backend gate and binds its original component digests plus exact runner/plugin/backend source SHAs. The actual compiled plugin export is compared with the required gate; a stale source export fails packaging.
+The authoritative download is one frozen paired tag in `loomex-app/loomex-runner`, named `runner-v<RUNNER>-plugin-v<PLUGIN>`. Never combine independent `latest` downloads. `release-set.json` uses `app.loomex.release-set/v2` and binds exact component versions, full source SHAs, repository/tag, manifest hash, artifact URL/size/hash, platform, `developmentOnly`, protocol and compatibility evidence. `compatibility.json` wraps the successful existing required clean plugin/backend gate and binds its original component digests plus exact runner/plugin/backend source SHAs. The actual compiled plugin export is compared with the required gate; a stale source export fails packaging.
 
 The v2 manifest seals a deployment profile. `cloud-preview` binds a canonical HTTPS DNS API origin and preserves the existing compiled cloud configuration. `local-development` binds a canonical HTTP loopback API origin and an exact optional loopback frontend origin (`null` means none). These profiles cannot be substituted under one approval digest. The 1.0.0 local development release uses `http://127.0.0.1:28080/` with no frontend origin; it requires an already running compatible local backend. The download does not install or start a backend.
 
@@ -14,10 +14,10 @@ The workflow builds each component and native installer once, packages and inspe
 
 ## Install the reviewed set
 
-Download and inspect the release-specific `install-preview.sh` and independently review the release-set digest in the immutable release notes. Run the downloaded script with both explicit preview opt-ins:
+Download and inspect the release-specific `install.sh` and independently review the release-set digest in the immutable release notes. Run the downloaded script with both explicit preview opt-ins:
 
 ```sh
-LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 /bin/bash ./install-preview.sh --allow-unsigned-preview
+LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 /bin/bash ./install.sh --allow-unsigned-development
 ```
 
 Add `--runner-only` to install the runner alone. The native installer verifies its own manifest-bound bytes, both component archives, every nested payload file, source-content bindings, compiled compatibility descriptors and qualification evidence before either lifecycle mutation. Initial download URLs must be exact frozen GitHub release asset URLs; native redirects permit only GitHub's HTTPS asset hosts. Archive traversal, links, devices, duplicate entries, unsafe modes, oversized downloads/expansion and wrong pairs fail closed. The launcher is ordinary transport and never evaluates downloaded configuration.
@@ -34,7 +34,7 @@ The optional `<PAIRED-TAG>-offline.tar.gz` contains the same installer, manifest
 
 ```sh
 LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 ./loomex-install-darwin-arm64 \
-  --offline "$PWD" --manifest-sha256 REVIEWED_RELEASE_SET_SHA256 --allow-unsigned-preview
+  --offline "$PWD" --manifest-sha256 REVIEWED_RELEASE_SET_SHA256 --allow-unsigned-development
 ```
 
 Offline execution verifies the current native installer against the exact release-set inventory. A colocated checksum is integrity evidence and does not supply independent authenticity for an unsigned preview. Never copy an installer from another set.
@@ -47,15 +47,29 @@ Inspect the complete build-once directory first:
 python3 scripts/github-preview-release.py inspect --assets /absolute/reviewed-assets
 ```
 
-After separate explicit operator authorization, create and upload an immutable-ready **draft prerelease**:
+After separate explicit operator authorization, create and upload an immutable-ready **draft release**:
 
 ```sh
 python3 scripts/github-preview-release.py stage-draft --assets /absolute/reviewed-assets \
   --approve-manifest-sha256 REVIEWED_RELEASE_SET_SHA256
 ```
 
-The tool requires repository immutable releases already enabled and both existing remote paired tags resolving to their exact component source SHAs. It never creates/moves tags, rebuilds bytes, overwrites assets, or enables repository settings. A partial/ambiguous draft upload is inspected and resumed with `resume-draft` using the same assets and digest; identical remote hashes are retained, differing assets fail closed. Inspect all draft assets before separately authorizing `publish` with the same digest. Publication rechecks the inventory and requires a terminal immutable prerelease readback. It never marks the preview as latest.
+The tool requires repository immutable releases already enabled and both existing remote paired tags resolving to their exact component source SHAs. It never creates/moves tags, rebuilds bytes, overwrites assets, or enables repository settings. A partial/ambiguous draft upload is inspected and resumed with `resume-draft` using the same assets and digest; identical remote hashes are retained, differing assets fail closed. Inspect all draft assets before separately authorizing `publish` with the same digest. Publication rechecks the inventory and requires a terminal immutable release readback. New regular releases become latest after verified publication; historical preview-tag publication remains non-latest.
 
 The standard production workflow still builds only a signed Actions artifact. Production public release-set policy requires a separately qualified signed distribution path.
 
 GitHub recommends attaching all assets to a draft before immutable publication: [release management](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository), [release APIs](https://docs.github.com/en/rest/releases/releases), [immutable repository check](https://docs.github.com/en/rest/repos/repos#check-if-immutable-releases-are-enabled-for-a-repository). Supported marketplace/plugin commands are documented in [OpenAI plugin packaging](https://developers.openai.com/plugins/build/plugins). The CLI JSON contracts were additionally inspected read-only on the installed Codex CLI on 2026-10-04.
+
+## Release naming and easy installation
+
+New GitHub artifacts use `install.sh`,
+`loomex-runner-<VERSION>-darwin-arm64.tar.gz`,
+`loomex-plugin-<VERSION>-darwin-arm64.tar.gz`, and
+`runner-v<RUNNER>-plugin-v<PLUGIN>-offline.tar.gz`.
+The README uses `/releases/latest/download/install.sh` only to download the
+launcher. That launcher seals one frozen pair and verifies the native helper
+and manifest digests. Release notes provide the version-pinned curl command.
+The filenames do not change signing status, backend requirements or execution authority.
+Previously published preview-tag releases remain immutable and readable; the
+new writer produces only current names. The old unsigned flag is a parser alias
+for existing reviewed invocations, not another installation mechanism.

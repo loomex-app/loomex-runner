@@ -120,12 +120,12 @@ jobs:
           plugin_version="$(node -p 'require("../component-inputs/plugin/package.json").version')"
           [[ "$runner_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           [[ "$plugin_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          tag="preview-runner-v${runner_version}-plugin-v${plugin_version}"
+          tag="runner-v${runner_version}-plugin-v${plugin_version}"
           python ../component-inputs/plugin/scripts/package-public-release.py \
             --release "$RUNNER_TEMP/plugin-envelope" --release-tag "$tag" --source-revision "$PLUGIN_REF" \
-            --unsigned-preview --qualify-clean-source --output "$RUNNER_TEMP/plugin-public/loomex-plugin-${plugin_version}-darwin-arm64-preview.tar.gz"
+            --unsigned-development --qualify-clean-source --output "$RUNNER_TEMP/plugin-public/loomex-plugin-${plugin_version}-darwin-arm64.tar.gz"
           echo "PAIRED_TAG=$tag" >> "$GITHUB_ENV"
-          echo "PLUGIN_ARCHIVE=$RUNNER_TEMP/plugin-public/loomex-plugin-${plugin_version}-darwin-arm64-preview.tar.gz" >> "$GITHUB_ENV"
+          echo "PLUGIN_ARCHIVE=$RUNNER_TEMP/plugin-public/loomex-plugin-${plugin_version}-darwin-arm64.tar.gz" >> "$GITHUB_ENV"
       - name: Build one self-contained native installer
         run: |
           CARGO_TARGET_DIR="$RUNNER_TEMP/installer-target" cargo build --locked --release --target aarch64-apple-darwin --manifest-path scripts/distribution-installer/Cargo.toml
@@ -141,7 +141,7 @@ jobs:
             --plugin-source-root ../component-inputs/plugin --installer "$RUNNER_TEMP/loomex-install-darwin-arm64" --compatibility "$RUNNER_TEMP/compatibility-gate.json" \
             --deployment-profile cloud-preview --api-origin "$(python -c 'import json,os; print(json.loads(__import__("tarfile").open(os.environ["RUNNER_TEMP"]+"/runner-envelope/payload.tar.gz").extractfile("metadata/preview-origin.json").read())["apiOrigin"])')" --backend-source-revision "$BACKEND_REF" --release-tag "$PAIRED_TAG" --output "$RUNNER_TEMP/public-release-set" "${options[@]}"
           digest="$(python -c 'import hashlib,os; from pathlib import Path; print(hashlib.sha256((Path(os.environ["RUNNER_TEMP"])/"public-release-set/release-set.json").read_bytes()).hexdigest())')"
-          LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 "$RUNNER_TEMP/loomex-install-darwin-arm64" --offline "$RUNNER_TEMP/public-release-set" --manifest-sha256 "$digest" --allow-unsigned-preview --verify-only
+          LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 "$RUNNER_TEMP/loomex-install-darwin-arm64" --offline "$RUNNER_TEMP/public-release-set" --manifest-sha256 "$digest" --allow-unsigned-development --verify-only
           python scripts/github-preview-release.py inspect --assets "$RUNNER_TEMP/public-release-set"
       - name: Upload reviewed candidate bytes without creating a GitHub release
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

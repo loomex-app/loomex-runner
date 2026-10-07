@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create-only, build-time paired preview release packager. Never installs or publishes."""
+"""Create-only, build-time paired release packager. Never installs or publishes."""
 from __future__ import annotations
 import argparse
 import importlib.util
@@ -82,8 +82,8 @@ def validate_manifest(value):
         if c['repository'] != ('loomex-app/loomex-runner' if name=='runner' else 'loomex-app/loomex-codex-plugin') or c['releaseTag'] != value['releaseTag']:
             raise ValueError('wrong component release pair')
         validate_asset(c['asset'])
-    expected=f"preview-runner-v{value['components']['runner']['version']}-plugin-v{value['components']['plugin']['version']}"
-    if value['releaseTag'] != expected:
+    expected=f"runner-v{value['components']['runner']['version']}-plugin-v{value['components']['plugin']['version']}"
+    if value['releaseTag'] not in (expected, "preview-"+expected):
         raise ValueError('tag differs from component version pair')
     e=value['evidence']
     if set(e) != {'asset','backendSourceRevision','passed'} or e['passed'] is not True or not re.fullmatch(r'[0-9a-f]{40}',e['backendSourceRevision']):
@@ -159,7 +159,7 @@ def package(args):
         if plugin_members != expected_plugin_members: raise ValueError('plugin outer inventory includes unreviewed members')
         public_inventory=[f for f in artifact.inventory(extracted) if f['path']!='public-distribution.json']
         if public.get('files') != public_inventory: raise ValueError('plugin outer public inventory differs from actual bytes')
-        pv=plugin_manifest.get('version'); tag=f"preview-runner-v{runner_manifest['version']}-plugin-v{pv}"
+        pv=plugin_manifest.get('version'); tag=f"runner-v{runner_manifest['version']}-plugin-v{pv}"
         if args.release_tag != tag or public.get('releaseTag') != tag or public.get('sourceRevision') != plugin_manifest.get('sourceRevision') or public.get('manifestSha256') != sha(extracted/'manifest.json') or plugin_manifest.get('developmentOnly') is not True or plugin_manifest.get('project') != 'loomex-plugin' or plugin_manifest.get('platform') != 'darwin-arm64':
             raise ValueError('plugin public archive belongs to different pair')
         plugin_source=plugin_manifest['sourceRevision']
@@ -186,7 +186,7 @@ def package(args):
         if not expected or expected['sha256'] != sha(launcher) or expected['size'] != launcher.stat().st_size or expected['mode'] != ('100755' if launcher.stat().st_mode & 0o111 else '100644'):
             raise ValueError('runner launcher differs from source provenance')
         (wrapper/'scripts').mkdir();shutil.copy2(launcher,wrapper/'scripts/install.sh')
-        runner_archive=stage/f"loomex-runner-{runner_manifest['version']}-darwin-arm64-preview.tar.gz"
+        runner_archive=stage/f"loomex-runner-{runner_manifest['version']}-darwin-arm64.tar.gz"
         artifact.deterministic_tar(wrapper,runner_archive,0)
         shutil.copy2(plugin_archive,stage/plugin_archive.name)
         if installer.name != 'loomex-install-darwin-arm64': raise ValueError('native installer asset must be loomex-install-darwin-arm64')
@@ -200,12 +200,12 @@ def package(args):
         validate_manifest(manifest)
         (stage/'release-set.json').write_bytes(canonical(manifest))
         manifest_digest=sha(stage/'release-set.json')
-        (stage/'install-preview.sh').write_text(launcher_script(manifest,manifest_digest))
-        (stage/'install-preview.sh').chmod(0o755)
+        (stage/'install.sh').write_text(launcher_script(manifest,manifest_digest))
+        (stage/'install.sh').chmod(0o755)
         if args.offline:
             offline=temporary/'offline';shutil.copytree(stage,offline)
             # Offline invocation still verifies current_exe against installer hash and externally reviewed manifest SHA.
-            (offline/'INSTALL.txt').write_text(f'Explicit unsigned preview only. Verify release-set.json against independently reviewed SHA256 {manifest_digest}.\nLOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 ./loomex-install-darwin-arm64 --offline "$PWD" --manifest-sha256 {manifest_digest} --allow-unsigned-preview\n')
+            (offline/'INSTALL.txt').write_text(offline_instructions(manifest,manifest_digest))
             artifact.deterministic_tar(offline,stage/f'{tag}-offline.tar.gz',0)
         (stage/'RELEASE-NOTES.md').write_text(release_notes(manifest,manifest_digest))
         (stage/'SHA256SUMS').write_text(''.join(f'{sha(p)}  {p.name}\n' for p in sorted(stage.iterdir()) if p.is_file()))
@@ -214,21 +214,36 @@ def package(args):
         for p in stage.iterdir(): shutil.copy2(p,output/p.name)
     return {'releaseTag':tag,'releaseSetSha256':manifest_digest,'output':str(output),'developmentOnly':True}
 
+def legacy_names(manifest): return manifest['releaseTag'].startswith('preview-')
+def launcher_name(manifest): return 'install-preview.sh' if legacy_names(manifest) else 'install.sh'
+def unsigned_flag(manifest): return '--allow-unsigned-preview' if legacy_names(manifest) else '--allow-unsigned-development'
+def offline_instructions(manifest,digest):
+    classification='Explicit unsigned preview only.' if legacy_names(manifest) else 'Unsigned distribution; explicit opt-in required.'
+    return f'{classification} Verify release-set.json against independently reviewed SHA256 {digest}.\nLOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 ./loomex-install-darwin-arm64 --offline "$PWD" --manifest-sha256 {digest} {unsigned_flag(manifest)}\n'
+
 def release_notes(manifest,digest):
     runner=manifest['components']['runner']; plugin=manifest['components']['plugin']
-    return f'Unsigned development preview for macOS ARM64 only. Not Developer ID signed or notarized. Explicit opt-in required.\n\nRunner {runner["version"]}: {runner["sourceRevision"]}\nPlugin {plugin["version"]}: {plugin["sourceRevision"]}\nBackend qualified source: {manifest["evidence"]["backendSourceRevision"]}\nRelease-set SHA256: {digest}\nDeployment profile: {manifest["deployment"]["profile"]}\nAPI origin: {manifest["deployment"]["apiOrigin"]}\nWeb app origin: {manifest["deployment"].get("webAppOrigin", "compiled cloud build configuration")}\nProtocol: {manifest["protocolVersion"]}\n\nLicense: existing Proprietary decision; no new license grant.\n\nInspect all assets and inventories before the separate operator publication checkpoint. Installation defaults to runner and plugin; --runner-only is supported. No login or organization selection is forced.\n'
+    notes=f'Unsigned development preview for macOS ARM64 only. Not Developer ID signed or notarized. Explicit opt-in required.\n\nRunner {runner["version"]}: {runner["sourceRevision"]}\nPlugin {plugin["version"]}: {plugin["sourceRevision"]}\nBackend qualified source: {manifest["evidence"]["backendSourceRevision"]}\nRelease-set SHA256: {digest}\nDeployment profile: {manifest["deployment"]["profile"]}\nAPI origin: {manifest["deployment"]["apiOrigin"]}\nWeb app origin: {manifest["deployment"].get("webAppOrigin", "compiled cloud build configuration")}\nProtocol: {manifest["protocolVersion"]}\n\nLicense: existing Proprietary decision; no new license grant.\n\nInspect all assets and inventories before the separate operator publication checkpoint. Installation defaults to runner and plugin; --runner-only is supported. No login or organization selection is forced.\n'
+
+    if legacy_names(manifest): return notes
+    notes=notes.replace('Unsigned development preview for macOS ARM64 only.', 'Loomex for macOS Apple silicon. These artifacts are unsigned development builds.')
+    url=f'https://github.com/{REPOSITORY}/releases/download/{manifest["releaseTag"]}/install.sh'
+    return notes+f'''## Install runner and Codex plugin\n\nA compatible backend must already be available at the API origin above. Provider CLIs and their account access are separate prerequisites.\n\n```sh\nloomex_installer="$(mktemp)" &&\ncurl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' {url} -o "$loomex_installer" &&\nLOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 /bin/bash "$loomex_installer" --allow-unsigned-development\n```\n\nReview the downloaded script before executing it if desired. The release-specific launcher pins the helper and paired manifest hashes; it never mixes component downloads from latest. Restart Codex after installation, then use `$loomex:loomex-connect` to sign in and choose an organization.\n'''
 
 def launcher_script(manifest,digest):
     base=f'https://github.com/{REPOSITORY}/releases/download/{manifest["releaseTag"]}'
     installer=manifest['installer']
+    flag=unsigned_flag(manifest)
+    classification='unsigned preview' if legacy_names(manifest) else 'unsigned distribution'
+    opt_in='preview' if legacy_names(manifest) else 'unsigned'
     return f'''#!/bin/bash
 # This release-specific transport launcher contains no lifecycle implementation.
 set -euo pipefail
 [[ "$(uname -s)-$(uname -m)" == Darwin-arm64 ]] || {{ echo "macOS ARM64 required" >&2; exit 1; }}
-[[ "${{LOOMEX_ALLOW_UNSAFE_DEV_INSTALL:-}}" == 1 ]] || {{ echo "Set LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 only after reviewing this unsigned preview" >&2; exit 1; }}
-preview=0
-for option in "$@"; do [[ "$option" != --allow-unsigned-preview ]] || preview=1; done
-[[ "$preview" == 1 ]] || {{ echo "--allow-unsigned-preview required" >&2; exit 1; }}
+[[ "${{LOOMEX_ALLOW_UNSAFE_DEV_INSTALL:-}}" == 1 ]] || {{ echo "Set LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 only after reviewing this {classification}" >&2; exit 1; }}
+{opt_in}=0
+for option in "$@"; do [[ "$option" != {flag} ]] || {opt_in}=1; done
+[[ "${opt_in}" == 1 ]] || {{ echo "{flag} required" >&2; exit 1; }}
 work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
 /usr/bin/curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' '{base}/release-set.json' --output "$work/release-set.json"
 [[ "$(/usr/bin/shasum -a 256 "$work/release-set.json" | /usr/bin/awk '{{print $1}}')" == '{digest}' ]] || {{ echo "release-set digest mismatch" >&2; exit 1; }}

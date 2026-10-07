@@ -19,6 +19,21 @@ backend configuration supported by those binaries. Installation does not sign yo
 into a provider or establish model access. Use Codex desktop or CLI to access the
 plugin; the release instructions also cover its registration requirements.
 
+The installer installs both components. For the current unsigned distribution,
+review the release prerequisites, then run:
+
+```sh
+loomex_installer="$(mktemp)" &&
+curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+  https://github.com/loomex-app/loomex-runner/releases/latest/download/install.sh \
+  -o "$loomex_installer" &&
+LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 /bin/bash "$loomex_installer" --allow-unsigned-development
+```
+
+The downloaded launcher pins one exact release manifest and installer. The paired
+packages remain hash-verified; unsigned builds require the explicit opt-in above.
+Restart Codex afterward. A compatible backend must already be running.
+
 ## Get started
 
 After successful installation, check the runner using its stable path:

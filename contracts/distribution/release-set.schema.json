@@ -169,7 +169,7 @@
       "const": "loomex.local-control/v2"
     },
     "releaseTag": {
-      "pattern": "^preview-runner-v[0-9]+\\.[0-9]+\\.[0-9]+-plugin-v[0-9]+\\.[0-9]+\\.[0-9]+$",
+      "pattern": "^(preview-)?runner-v[0-9]+\\.[0-9]+\\.[0-9]+-plugin-v[0-9]+\\.[0-9]+\\.[0-9]+$",
       "type": "string"
     },
     "schema": {

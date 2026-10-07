@@ -15,17 +15,23 @@ spec=importlib.util.spec_from_file_location('github_preview',Path(__file__).with
 release=importlib.util.module_from_spec(spec);spec.loader.exec_module(release)
 
 
-def local_fixture(root,offline_extra=None,offline=False,profile=None):
+def local_fixture(root,offline_extra=None,offline=False,profile=None,modern=False):
     spec=importlib.util.spec_from_file_location('release_set_tests',Path(__file__).with_name('test_release_set.py'))
     fixtures=importlib.util.module_from_spec(spec);spec.loader.exec_module(fixtures)
     installer=fixtures.put(root/'fixture-installer','fixture native installer',0o755)
     assets,manifest=fixtures.fixture(root,installer,profile)
+    if modern:
+        manifest['releaseTag']=manifest['releaseTag'].removeprefix('preview-')
+        for c in manifest['components'].values():c['releaseTag']=manifest['releaseTag']
+        for a in [manifest['installer'],manifest['evidence']['asset']]+[c['asset'] for c in manifest['components'].values()]:
+            a['url']=f"https://github.com/{release.REPO}/releases/download/{manifest['releaseTag']}/{a['file']}"
+        fixtures.put(assets/'release-set.json',manifest)
     digest=release.pack.sha(assets/'release-set.json')
-    fixtures.put(assets/'install-preview.sh',release.pack.launcher_script(manifest,digest),0o755)
+    fixtures.put(assets/release.pack.launcher_name(manifest),release.pack.launcher_script(manifest,digest),0o755)
     fixtures.put(assets/'RELEASE-NOTES.md',release.pack.release_notes(manifest,digest))
     if offline or offline_extra:
         offline=root/'offline';shutil.copytree(assets,offline);(offline/'RELEASE-NOTES.md').unlink()
-        fixtures.put(offline/'INSTALL.txt',f'Explicit unsigned preview only. Verify release-set.json against independently reviewed SHA256 {digest}.\nLOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 ./loomex-install-darwin-arm64 --offline "$PWD" --manifest-sha256 {digest} --allow-unsigned-preview\n')
+        fixtures.put(offline/'INSTALL.txt',release.pack.offline_instructions(manifest,digest))
         if offline_extra:fixtures.put(offline/offline_extra,'#!/bin/bash\necho unreviewed\n',0o755)
         fixtures.archive(offline,assets/f"{manifest['releaseTag']}-offline.tar.gz")
     checksum(assets)
@@ -39,6 +45,21 @@ class ApprovalBindingRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             assets,_,_=local_fixture(Path(d),offline=True)
             release.local_inventory(assets)
+
+    def test_current_launcher_online_offline_and_regular_release_identity(self):
+        with tempfile.TemporaryDirectory() as d:
+            assets,m,digest=local_fixture(Path(d),offline=True,modern=True)
+            release.local_inventory(assets)
+            self.assertTrue((assets/'install.sh').exists())
+            self.assertFalse((assets/'install-preview.sh').exists())
+            body=release.pack.release_notes(m,digest)
+            r={'id':123,'draft':True,'prerelease':False,'tag_name':m['releaseTag'],'body':body}
+            release.verify_release_identity(r,m['releaseTag'],f'Release-set SHA256: {digest}',expected_body=body)
+            r['prerelease']=True
+            with self.assertRaises(ValueError):release.verify_release_identity(r,m['releaseTag'],f'Release-set SHA256: {digest}',expected_body=body)
+            with (assets/'install.sh').open('a') as f:f.write('echo unreviewed\n')
+            checksum(assets)
+            with self.assertRaisesRegex(ValueError,'launcher'):release.local_inventory(assets)
 
     def test_local_development_inventory_and_profile_notes_are_bound(self):
         with tempfile.TemporaryDirectory() as d:

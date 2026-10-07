@@ -184,7 +184,7 @@ fn validate(s: &ReleaseSet) -> Result<()> {
     ensure!(s.platform == "darwin-arm64", "unsupported platform");
     ensure!(
         s.development_only,
-        "this installer supports explicitly unsigned preview sets only"
+        "this installer supports explicitly unsigned development sets only"
     );
     ensure!(
         s.protocol_version == "loomex.local-control/v2",
@@ -229,9 +229,14 @@ fn validate(s: &ReleaseSet) -> Result<()> {
     ensure!(
         s.release_tag
             == format!(
-                "preview-runner-v{}-plugin-v{}",
+                "runner-v{}-plugin-v{}",
                 s.components.runner.version, s.components.plugin.version
-            ),
+            )
+            || s.release_tag
+                == format!(
+                    "preview-runner-v{}-plugin-v{}",
+                    s.components.runner.version, s.components.plugin.version
+                ),
         "release tag/version pair mismatch"
     );
     ensure!(
@@ -880,7 +885,7 @@ fn main() -> Result<()> {
                 }
                 i += 2;
             }
-            "--allow-unsigned-preview" => {
+            "--allow-unsigned-development" | "--allow-unsigned-preview" => {
                 preview = true;
                 i += 1
             }
@@ -897,13 +902,13 @@ fn main() -> Result<()> {
                 i += 1
             }
             _ => bail!(
-                "usage: loomex-install (--manifest FILE | --offline DIR) --manifest-sha256 SHA256 --allow-unsigned-preview [--runner-only] [--runner-install-base DIR] [--plugin-install-base DIR]"
+                "usage: loomex-install (--manifest FILE | --offline DIR) --manifest-sha256 SHA256 --allow-unsigned-development [--runner-only] [--runner-install-base DIR] [--plugin-install-base DIR]"
             ),
         }
     }
     ensure!(
         preview && std::env::var("LOOMEX_ALLOW_UNSAFE_DEV_INSTALL").as_deref() == Ok("1"),
-        "unsigned preview requires --allow-unsigned-preview and LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1"
+        "unsigned distribution requires --allow-unsigned-development and LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1"
     );
     ensure!(
         std::env::consts::OS == "macos" && std::env::consts::ARCH == "aarch64",
@@ -1118,6 +1123,28 @@ mod tests {
         };
         assert!(validate(&s).is_err());
     }
+    #[test]
+    fn current_release_names_preserve_frozen_urls_and_pair_binding() {
+        let mut s = fixture();
+        s.release_tag = s.release_tag.trim_start_matches("preview-").to_owned();
+        for c in [&mut s.components.runner, &mut s.components.plugin] {
+            c.release_tag = s.release_tag.clone();
+            c.asset.url = format!(
+                "https://github.com/{REPOSITORY}/releases/download/{}/{}",
+                s.release_tag, c.asset.file
+            );
+        }
+        for a in [&mut s.installer, &mut s.evidence.asset] {
+            a.url = format!(
+                "https://github.com/{REPOSITORY}/releases/download/{}/{}",
+                s.release_tag, a.file
+            );
+        }
+        validate(&s).unwrap();
+        s.components.runner.release_tag = "runner-v9.9.9-plugin-v0.16.1".into();
+        assert!(validate(&s).is_err());
+    }
+
     #[test]
     fn deployment_profiles_are_discriminated_and_canonical() {
         let mut s = fixture();

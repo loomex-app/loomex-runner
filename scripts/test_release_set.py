@@ -121,6 +121,28 @@ class SchemaTests(unittest.TestCase):
             for value in ['file:///tmp/x','https://example.test/run','https://github.com/loomex-app/loomex-runner/releases/latest/download/runner.tar.gz']:
                 bad=copy.deepcopy(m);bad['components']['runner']['asset']['url']=value
                 with self.assertRaises(ValueError):pack.validate_manifest(bad)
+    def test_current_names_keep_exact_pair_and_hash_bindings(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d);assets,m=fixture(p,put(p/'installer','fixture',0o755))
+            m['releaseTag']=m['releaseTag'].removeprefix('preview-')
+            for c in m['components'].values():
+                c['releaseTag']=m['releaseTag']
+            for a in [m['installer'],m['evidence']['asset']]+[c['asset'] for c in m['components'].values()]:
+                a['url']=f"https://github.com/{pack.REPOSITORY}/releases/download/{m['releaseTag']}/{a['file']}"
+            pack.validate_manifest(m)
+            self.assertEqual(pack.launcher_name(m),'install.sh')
+            self.assertEqual(pack.unsigned_flag(m),'--allow-unsigned-development')
+            digest='a'*64;script=pack.launcher_script(m,digest)
+            self.assertIn(digest,script);self.assertNotIn('preview',script)
+            self.assertNotIn('/latest/',script)
+            self.assertEqual(subprocess.run(['/bin/bash','-n'],input=script,text=True).returncode,0)
+            notes=pack.release_notes(m,digest)
+            self.assertIn('/install.sh',notes);self.assertIn('curl --fail',notes)
+            self.assertIn('notarized',notes);self.assertNotIn('Unsigned development preview',notes)
+            self.assertNotIn('preview',pack.offline_instructions(m,digest))
+            bad=copy.deepcopy(m);bad['components']['runner']['releaseTag']='runner-v9.9.9-plugin-v0.16.2'
+            with self.assertRaises(ValueError):pack.validate_manifest(bad)
+
     def test_local_deployment_is_explicit_and_loopback_only(self):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d);_,m=fixture(p,put(p/'installer','fixture',0o755),'local-development')

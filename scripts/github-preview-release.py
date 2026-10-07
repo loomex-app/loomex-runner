@@ -28,12 +28,13 @@ def local_inventory(directory):
         pack.regular(path)
         items[path.name]={'sha256':pack.sha(path),'size':path.stat().st_size}
     manifest_digest=items['release-set.json']['sha256']
-    launcher=directory/'install-preview.sh'
+    launcher_file=pack.launcher_name(manifest)
+    launcher=directory/launcher_file
     if not launcher.is_file() or launcher.is_symlink() or launcher.read_bytes()!=pack.launcher_script(manifest,manifest_digest).encode(): raise ValueError('mandatory executable launcher differs from approved release-set transport')
     notes=directory/'RELEASE-NOTES.md'
     if not notes.is_file() or notes.is_symlink() or notes.read_bytes()!=pack.release_notes(manifest,manifest_digest).encode(): raise ValueError('mandatory release notes differ from approved source-derived guidance')
     for path in directory.iterdir():
-        if path.stat().st_mode & 0o111 and path.name not in {'install-preview.sh',manifest['installer']['file']}: raise ValueError('unreviewed executable release asset')
+        if path.stat().st_mode & 0o111 and path.name not in {launcher_file,manifest['installer']['file']}: raise ValueError('unreviewed executable release asset')
     expected=[manifest['installer'],manifest['evidence']['asset']]+[c['asset'] for c in manifest['components'].values()]
     for item in expected:
         if items.get(item['file']) != {'sha256':item['sha256'],'size':item['size']}: raise ValueError('asset inventory differs from release-set')
@@ -44,7 +45,7 @@ def local_inventory(directory):
         if name in values or name not in items or items[name]['sha256'] != digest: raise ValueError('checksum inventory invalid')
         values[name]=digest
     if set(values)!=set(items)-{'SHA256SUMS'}: raise ValueError('checksum inventory omits or adds assets')
-    allowed={e['file'] for e in expected}|{'release-set.json','SHA256SUMS','install-preview.sh','RELEASE-NOTES.md',f"{manifest['releaseTag']}-offline.tar.gz"}
+    allowed={e['file'] for e in expected}|{'release-set.json','SHA256SUMS',launcher_file,'RELEASE-NOTES.md',f"{manifest['releaseTag']}-offline.tar.gz"}
     if set(items)-allowed: raise ValueError('unreviewed asset in upload inventory')
     # Inspect outer inventories; never execute envelope programs during publication.
     component_inventories={}
@@ -73,14 +74,14 @@ def local_inventory(directory):
         offline=directory/f"{manifest['releaseTag']}-offline.tar.gz"
         if offline.exists():
             root=Path(temp)/'offline';pack.safe_extract(offline,root)
-            required={item['file'] for item in expected}|{'release-set.json','install-preview.sh','INSTALL.txt'}
+            required={item['file'] for item in expected}|{'release-set.json',launcher_file,'INSTALL.txt'}
             actual={p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file()}
             if actual!=required:raise ValueError('offline inventory adds or omits reviewed members')
             for name in required-{'INSTALL.txt'}:
                 if pack.sha(root/name)!=items[name]['sha256'] or (root/name).stat().st_size!=items[name]['size']:raise ValueError('offline reviewed member bytes differ')
-                expected_mode=0o755 if name in {'install-preview.sh',manifest['installer']['file']} else 0o644
+                expected_mode=0o755 if name in {launcher_file,manifest['installer']['file']} else 0o644
                 if (root/name).stat().st_mode & 0o777 != expected_mode:raise ValueError('offline executable/mode inventory differs')
-            instructions=f'Explicit unsigned preview only. Verify release-set.json against independently reviewed SHA256 {manifest_digest}.\nLOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 ./loomex-install-darwin-arm64 --offline "$PWD" --manifest-sha256 {manifest_digest} --allow-unsigned-preview\n'
+            instructions=pack.offline_instructions(manifest,manifest_digest)
             if (root/'INSTALL.txt').read_bytes()!=instructions.encode() or (root/'INSTALL.txt').stat().st_mode & 0o777 != 0o644:raise ValueError('offline instructions differ from approved transport')
             for item in expected:
                 if pack.sha(root/item['file'])!=item['sha256'] or (root/item['file']).stat().st_size!=item['size']:raise ValueError('offline asset binding mismatch')
@@ -124,7 +125,7 @@ def verify_release_identity(release,tag,marker,release_id=None,*,expected_body,d
     body=release.get('body')
     if not isinstance(body,str) or body!=expected_body:raise ValueError('remote release body differs from exact reviewed installation guidance')
     markers=[line for line in body.splitlines() if line.startswith('Release-set SHA256: ')] if isinstance(body,str) else []
-    if release.get('draft') is not draft or release.get('prerelease') is not True or release.get('tag_name')!=tag or markers!=[marker]:raise ValueError('remote release state/tag/approval marker differs')
+    if release.get('draft') is not draft or release.get('prerelease') is not tag.startswith('preview-') or release.get('tag_name')!=tag or markers!=[marker]:raise ValueError('remote release state/tag/approval marker differs')
     if immutable is not None and release.get('immutable') is not immutable:raise ValueError('immutable terminal release state not proved')
     return actual_id
 
@@ -147,7 +148,7 @@ def main():
         if a.action=='stage-draft':
             if release is not None:raise ValueError('release already exists; inspect exact draft then explicitly resume it')
             notes=directory/'RELEASE-NOTES.md'
-            command('gh','release','create',tag,'--repo',REPO,'--verify-tag','--draft','--prerelease','--latest=false','--title',f'Unsigned preview {tag}','--notes-file',str(notes))
+            command('gh','release','create',tag,'--repo',REPO,'--verify-tag','--draft',*(['--prerelease'] if pack.legacy_names(manifest) else []),'--latest=false','--title',f'Loomex runner {manifest["components"]["runner"]["version"]} / plugin {manifest["components"]["plugin"]["version"]}','--notes-file',str(notes))
             release=release_by_tag(tag)
         release_id=verify_release_identity(release,tag,marker,expected_body=expected_body)
         remote=verify_remote_assets(release,inventory,complete=a.action=='publish')
@@ -159,10 +160,10 @@ def main():
             verify_release_identity(release,tag,marker,release_id,expected_body=expected_body)
             verify_remote_assets(release,inventory,complete=True)
             print(json.dumps({'state':'draft-ready','releaseTag':tag,'releaseSetSha256':digest,'url':release['html_url'],'publicationRequiresSeparateExplicitApproval':True}));return
-        command('gh','release','edit',tag,'--repo',REPO,'--verify-tag','--draft=false','--prerelease','--latest=false')
+        command('gh','release','edit',tag,'--repo',REPO,'--verify-tag','--draft=false',*(['--prerelease','--latest=false'] if pack.legacy_names(manifest) else ['--prerelease=false','--latest']))
         published=release_by_tag(tag)
         verify_release_identity(published,tag,marker,release_id,expected_body=expected_body,draft=False,immutable=True)
         verify_remote_assets(published,inventory,complete=True)
-        print(json.dumps({'state':'published-immutable-preview','url':published['html_url'],'releaseSetSha256':digest}))
+        print(json.dumps({'state':'published-immutable-preview' if pack.legacy_names(manifest) else 'published-immutable-release','url':published['html_url'],'releaseSetSha256':digest}))
     except (ValueError,KeyError,OSError,subprocess.CalledProcessError) as error:p.exit(1,f'release action rejected: {error}\n')
 if __name__=='__main__':main()
