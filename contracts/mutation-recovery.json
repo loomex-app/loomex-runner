@@ -48,6 +48,16 @@
       "method": "workflow.operations.get",
       "identity": "idempotencyKey",
       "operation": "editor.start"
+    },
+    "persona.roles.create": {
+      "method": "personas.operations.get",
+      "identity": "idempotencyKey",
+      "operation": "role.create"
+    },
+    "personas.create": {
+      "method": "personas.operations.get",
+      "identity": "idempotencyKey",
+      "operation": "person.create"
     }
   }
 }

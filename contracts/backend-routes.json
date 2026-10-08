@@ -433,6 +433,18 @@
       "method": "POST",
       "pathTemplate": "v2/workflow-edit/start/",
       "source": "src/control.rs"
+    },
+    {
+      "id": "persona.persona.roles.create",
+      "method": "POST",
+      "pathTemplate": "v1/persona-roles/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "persona.personas.create",
+      "method": "POST",
+      "pathTemplate": "v1/personas/",
+      "source": "src/control.rs"
     }
   ],
   "daemonRouteIds": [
@@ -1062,6 +1074,20 @@
       "classification": "backend-proxy",
       "routeIds": [
         "editor.start"
+      ]
+    },
+    {
+      "method": "persona.roles.create",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "persona.persona.roles.create"
+      ]
+    },
+    {
+      "method": "personas.create",
+      "classification": "backend-proxy",
+      "routeIds": [
+        "persona.personas.create"
       ]
     }
   ]

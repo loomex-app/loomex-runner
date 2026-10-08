@@ -180,6 +180,10 @@ class CheckedArchiveTests(unittest.TestCase):
             subprocess.run([sys.executable,str(ROOT/'scripts/artifact.py'),'source-manifest','--source-root',str(repo),'--source-revision',revision,'--output',str(manifest)],check=True)
             source=root/'source';shutil.copytree(repo,source,ignore=shutil.ignore_patterns('.git'))
             payload=root/'payload';payload.mkdir();_,local=PreviewPackageTests().local_fixture(payload)
+            # This fixture validates an immutable HEAD archive. Its packaged
+            # contract must come from that same archive, even when working-tree
+            # contracts contain a newer additive change awaiting review.
+            shutil.copy(source/'contracts/compatibility-manifest.json',payload/'metadata/compatibility-manifest.json')
             (payload/'metadata/source-content-manifest.json').write_bytes(manifest.read_bytes())
             (payload/'metadata/local-development-origin.json').write_text(canonical({**local,'sourceRevision':revision}))
             script=(ROOT/'scripts/build-release.sh').read_text()

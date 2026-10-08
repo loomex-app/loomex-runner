@@ -213,6 +213,22 @@
     "PERSONA_MEMORY_CONTRACT_INVALID": {
       "recovery": "prepare_again",
       "outcome": "rejected"
+    },
+    "RUNNER_SCOPE_REQUIRED": {
+      "recovery": "explicit_scope_upgrade",
+      "outcome": "rejected"
+    },
+    "AUTHORIZATION_FAILED": {
+      "recovery": "refresh_authority",
+      "outcome": "rejected"
+    },
+    "VALIDATION_ERROR": {
+      "recovery": "correct_input",
+      "outcome": "rejected"
+    },
+    "IDEMPOTENCY_KEY_INVALID": {
+      "recovery": "correct_input",
+      "outcome": "rejected"
     }
   }
 }

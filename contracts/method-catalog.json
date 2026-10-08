@@ -10275,6 +10275,170 @@
       "appOnly": false
     },
     {
+      "name": "persona.roles.create",
+      "mutating": true,
+      "idempotent": true,
+      "appOnly": false,
+      "transportRetry": "never_after_send",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "organizationId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 255,
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "key": {
+            "type": "string",
+            "maxLength": 255
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 4096
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "disabled"
+            ]
+          },
+          "config": {
+            "type": "object",
+            "properties": {
+              "promptPolicy": {
+                "type": "object",
+                "properties": {
+                  "basePrompt": {
+                    "type": "string",
+                    "maxLength": 32768
+                  },
+                  "responsibility": {
+                    "type": "string",
+                    "maxLength": 32768
+                  },
+                  "boundaries": {
+                    "type": "string",
+                    "maxLength": 32768
+                  },
+                  "safetyRules": {
+                    "type": "string",
+                    "maxLength": 32768
+                  }
+                },
+                "required": [],
+                "additionalProperties": false
+              },
+              "skills": {
+                "type": "array",
+                "maxItems": 100,
+                "items": {
+                  "oneOf": [
+                    {
+                      "type": "string",
+                      "maxLength": 255,
+                      "minLength": 1,
+                      "pattern": "\\S"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "maxLength": 255,
+                          "minLength": 1,
+                          "pattern": "\\S"
+                        },
+                        "enabled": {
+                          "type": "boolean"
+                        },
+                        "priority": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 1000
+                        }
+                      },
+                      "required": [
+                        "id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  ]
+                }
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "organizationId",
+          "idempotencyKey",
+          "name"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "role": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "role"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    {
       "name": "persona.roles.list",
       "mutating": false,
       "idempotent": true,
@@ -10388,6 +10552,186 @@
             },
             "required": [
               "role"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "responseRef": {
+                "type": "string"
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "encoding": {
+                "const": "json"
+              },
+              "nextOffset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "checksumSha256": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "responseRef",
+              "sizeBytes",
+              "encoding",
+              "nextOffset",
+              "checksumSha256"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "personas.create",
+      "mutating": true,
+      "idempotent": true,
+      "appOnly": false,
+      "transportRetry": "never_after_send",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "organizationId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 255,
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "key": {
+            "type": "string",
+            "maxLength": 255
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 4096
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "active"
+            ]
+          },
+          "config": {
+            "type": "object",
+            "properties": {
+              "promptPolicy": {
+                "type": "object",
+                "properties": {
+                  "personalityPrompt": {
+                    "type": "string",
+                    "maxLength": 32768
+                  },
+                  "outputStyle": {
+                    "type": "string",
+                    "maxLength": 32768
+                  },
+                  "memoryUsageInstruction": {
+                    "type": "string",
+                    "maxLength": 32768
+                  }
+                },
+                "required": [],
+                "additionalProperties": false
+              },
+              "skills": {
+                "type": "array",
+                "maxItems": 100,
+                "items": {
+                  "oneOf": [
+                    {
+                      "type": "string",
+                      "maxLength": 255,
+                      "minLength": 1,
+                      "pattern": "\\S"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "maxLength": 255,
+                          "minLength": 1,
+                          "pattern": "\\S"
+                        },
+                        "enabled": {
+                          "type": "boolean"
+                        },
+                        "priority": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 1000
+                        }
+                      },
+                      "required": [
+                        "id"
+                      ],
+                      "additionalProperties": false
+                    }
+                  ]
+                }
+              },
+              "memoryPolicy": {
+                "type": "object",
+                "properties": {
+                  "maxItems": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 200
+                  },
+                  "writeMemory": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [],
+                "additionalProperties": false
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "roleId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "organizationId",
+          "idempotencyKey",
+          "name",
+          "roleId"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "person": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "person"
             ],
             "additionalProperties": false
           },
@@ -11327,7 +11671,9 @@
             "enum": [
               "chat_context.create",
               "memory.write",
-              "memory.update"
+              "memory.update",
+              "role.create",
+              "person.create"
             ]
           },
           "idempotencyKey": {
@@ -11351,7 +11697,9 @@
                 "enum": [
                   "chat_context.create",
                   "memory.write",
-                  "memory.update"
+                  "memory.update",
+                  "role.create",
+                  "person.create"
                 ]
               },
               "key": {
@@ -11377,7 +11725,9 @@
                 "enum": [
                   "chat_context.create",
                   "memory.write",
-                  "memory.update"
+                  "memory.update",
+                  "role.create",
+                  "person.create"
                 ]
               },
               "key": {
@@ -11408,7 +11758,9 @@
                 "enum": [
                   "chat_context.create",
                   "memory.write",
-                  "memory.update"
+                  "memory.update",
+                  "role.create",
+                  "person.create"
                 ]
               },
               "key": {
@@ -11494,7 +11846,8 @@
                 "runner.personas.read",
                 "runner.personas.chat",
                 "runner.personas.memory.read",
-                "runner.personas.memory.write"
+                "runner.personas.memory.write",
+                "runner.personas.manage"
               ]
             },
             "uniqueItems": true,
@@ -11804,6 +12157,8 @@
     "method:builder.start",
     "method:editor.start",
     "authoring.chat-native/v1",
-    "transfer.response-utf8/v1"
+    "transfer.response-utf8/v1",
+    "method:persona.roles.create",
+    "method:personas.create"
   ]
 }

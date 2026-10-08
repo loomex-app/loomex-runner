@@ -28,6 +28,50 @@
       "encoding": "json",
       "nextOffset": 0,
       "checksumSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "operation": "role.create",
+      "key": "10000000-0000-4000-8000-000000000001",
+      "status": "not_found"
+    },
+    {
+      "operation": "role.create",
+      "key": "10000000-0000-4000-8000-000000000001",
+      "status": "processing",
+      "requestDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "operation": "role.create",
+      "key": "10000000-0000-4000-8000-000000000001",
+      "status": "completed",
+      "requestDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "response": {
+        "role": {
+          "id": "10000000-0000-4000-8000-000000000002"
+        }
+      }
+    },
+    {
+      "operation": "person.create",
+      "key": "10000000-0000-4000-8000-000000000001",
+      "status": "not_found"
+    },
+    {
+      "operation": "person.create",
+      "key": "10000000-0000-4000-8000-000000000001",
+      "status": "processing",
+      "requestDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "operation": "person.create",
+      "key": "10000000-0000-4000-8000-000000000001",
+      "status": "completed",
+      "requestDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "response": {
+        "person": {
+          "id": "10000000-0000-4000-8000-000000000002"
+        }
+      }
     }
   ],
   "invalid": [

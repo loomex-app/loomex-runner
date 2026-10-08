@@ -525,46 +525,40 @@ impl Daemon {
                         verify_native_authoring_start(method, &response)?;
                         Some(response)
                     }
-                } else if matches!(
-                    method,
-                    "personas.chat_context.create"
-                        | "personas.memory.write"
-                        | "personas.memory.update"
-                ) {
+                } else if let Some(operation) = persona_mutation_operation(method) {
                     // A response loss or permission change never causes another
                     // write. Read the backend's exact owner-checked receipt even
                     // when a convenience result was cached locally.
-                    let operation = if method == "personas.chat_context.create" {
-                        "chat_context.create"
-                    } else if method == "personas.memory.write" {
-                        "memory.write"
-                    } else {
-                        "memory.update"
-                    };
                     let query =
                         json!({"operation":operation,"idempotencyKey":params["idempotencyKey"]});
                     let (verb, route, body) = backend_route("personas.operations.get", &query)?;
                     let receipt = self
-                        .backend(
+                        .native_authoring_backend(
                             scope.as_deref().context("ORGANIZATION_REQUIRED")?,
                             &verb,
                             &route,
                             body,
                             None,
+                            scoped_account.as_deref().context("ORGANIZATION_REQUIRED")?,
                         )
                         .await?;
+                    verify_persona_receipt(&query, &receipt)?;
                     ensure!(
                         receipt["operation"] == operation
                             && receipt["key"] == params["idempotencyKey"]
-                            && receipt["status"] == "completed",
+                            && receipt["status"] == "completed"
+                            && receipt["requestDigest"]
+                                .as_str()
+                                .is_some_and(lowercase_sha256)
+                            && receipt["response"].is_object(),
                         "NETWORK_AMBIGUOUS"
                     );
-                    Some(
-                        receipt
-                            .get("response")
-                            .cloned()
-                            .context("BACKEND_PROTOCOL_ERROR")?,
-                    )
+                    let response = receipt
+                        .get("response")
+                        .cloned()
+                        .context("BACKEND_PROTOCOL_ERROR")?;
+                    verify_persona_creation(method, &params, &response)?;
+                    Some(response)
                 } else {
                     record.get("result").cloned()
                 }
@@ -1152,12 +1146,7 @@ impl Daemon {
                 // that the owner route never ran. Keep the exact journal
                 // and require explicit same-key reconciliation, not retry.
                 if (method == "runs.continuation.requeue"
-                    || matches!(
-                        method,
-                        "personas.chat_context.create"
-                            | "personas.memory.write"
-                            | "personas.memory.update"
-                    ))
+                    || persona_mutation_operation(method).is_some())
                     && error.downcast_ref::<ApiError>().is_some_and(|api| {
                         matches!(
                             api.code.as_str(),
@@ -1171,6 +1160,10 @@ impl Daemon {
                 }
             })?
         };
+        verify_persona_creation(method, p, &result)?;
+        if method == "personas.operations.get" {
+            verify_persona_receipt(p, &result)?;
+        }
         if method == "runs.continuation.requeue" {
             ensure!(
                 result["executionId"] == p["runId"]
@@ -3632,7 +3625,70 @@ fn fenced_authoring_method(method: &str) -> bool {
             | "runs.wait"
             | "runs.events"
             | "runs.result"
+            | "persona.roles.create"
+            | "personas.create"
+            | "personas.operations.get"
     )
+}
+fn persona_mutation_operation(method: &str) -> Option<&'static str> {
+    match method {
+        "persona.roles.create" => Some("role.create"),
+        "personas.create" => Some("person.create"),
+        "personas.chat_context.create" => Some("chat_context.create"),
+        "personas.memory.write" => Some("memory.write"),
+        "personas.memory.update" => Some("memory.update"),
+        _ => None,
+    }
+}
+fn verify_persona_receipt(params: &Value, receipt: &Value) -> Result<()> {
+    ensure!(
+        receipt["operation"] == params["operation"] && receipt["key"] == params["idempotencyKey"],
+        "BACKEND_PROTOCOL_ERROR"
+    );
+    let catalog: Value = serde_json::from_str(include_str!("../contracts/method-catalog.json"))?;
+    let entry = catalog["methods"]
+        .as_array()
+        .context("INTERNAL")?
+        .iter()
+        .find(|entry| entry["name"] == "personas.operations.get")
+        .context("INTERNAL")?;
+    let schema = entry["outputSchema"]["oneOf"]
+        .as_array()
+        .context("INTERNAL")?
+        .iter()
+        .find(|schema| schema["properties"]["status"]["const"] == receipt["status"])
+        .context("BACKEND_PROTOCOL_ERROR")?;
+    validate_params(receipt, schema).map_err(|_| anyhow::anyhow!("BACKEND_PROTOCOL_ERROR"))?;
+    if receipt["status"] != "not_found" {
+        ensure!(
+            receipt["requestDigest"]
+                .as_str()
+                .is_some_and(lowercase_sha256),
+            "BACKEND_PROTOCOL_ERROR"
+        );
+    }
+    Ok(())
+}
+fn verify_persona_creation(method: &str, params: &Value, result: &Value) -> Result<()> {
+    let (entity, default_status) = match method {
+        "persona.roles.create" => ("role", "active"),
+        "personas.create" => ("person", "draft"),
+        _ => return Ok(()),
+    };
+    let created = &result[entity];
+    ensure!(
+        result.as_object().is_some_and(|fields| fields.len() == 1)
+            && created["id"]
+                .as_str()
+                .is_some_and(|id| Uuid::parse_str(id).is_ok())
+            && created["organizationId"] == params["organizationId"]
+            && created["name"].as_str() == params["name"].as_str().map(str::trim)
+            && created["status"].as_str()
+                == Some(params["status"].as_str().unwrap_or(default_status))
+            && (entity != "person" || created["roleId"] == params["roleId"]),
+        "BACKEND_PROTOCOL_ERROR"
+    );
+    Ok(())
 }
 pub(crate) fn validate_params(p: &Value, schema: &Value) -> Result<()> {
     let map = p.as_object().context("INVALID_REQUEST")?;
@@ -3646,6 +3702,17 @@ pub(crate) fn validate_params(p: &Value, schema: &Value) -> Result<()> {
         if s.is_null() {
             bail!("INVALID_REQUEST")
         };
+        if let Some(alternatives) = s["oneOf"].as_array() {
+            ensure!(
+                alternatives
+                    .iter()
+                    .filter(|alternative| { validate_schema_value(value, alternative).is_ok() })
+                    .count()
+                    == 1,
+                "INVALID_REQUEST"
+            );
+            continue;
+        }
         let type_matches = |kind: &str| match kind {
             "string" => value.is_string(),
             "object" => {
@@ -3661,7 +3728,9 @@ pub(crate) fn validate_params(p: &Value, schema: &Value) -> Result<()> {
                 items.len() >= s["minItems"].as_u64().unwrap_or(0) as usize
                     && items.len() <= s["maxItems"].as_u64().unwrap_or(u64::MAX) as usize
                     && items.iter().all(|item| {
-                        if item_schema["type"] == "object" {
+                        if item_schema.get("oneOf").is_some() {
+                            validate_schema_value(item, item_schema).is_ok()
+                        } else if item_schema["type"] == "object" {
                             validate_params(item, item_schema).is_ok()
                         } else if item_schema.is_null() {
                             true
@@ -3734,6 +3803,12 @@ pub(crate) fn validate_params(p: &Value, schema: &Value) -> Result<()> {
     }
     Ok(())
 }
+fn validate_schema_value(value: &Value, schema: &Value) -> Result<()> {
+    validate_params(
+        &json!({"value":value}),
+        &json!({"type":"object","properties":{"value":schema},"required":["value"],"additionalProperties":false}),
+    )
+}
 pub fn backend_route(method: &str, p: &Value) -> Result<(String, String, Option<Value>)> {
     let mut body = p.clone();
     for key in [
@@ -3756,10 +3831,7 @@ pub fn backend_route(method: &str, p: &Value) -> Result<(String, String, Option<
     if method == "workflow.operations.get"
         || matches!(method, "builder.start" | "editor.start")
         || method == "personas.operations.get"
-        || matches!(
-            method,
-            "personas.chat_context.create" | "personas.memory.write" | "personas.memory.update"
-        )
+        || persona_mutation_operation(method).is_some()
     {
         body["idempotencyKey"] = p
             .get("idempotencyKey")
@@ -3773,6 +3845,11 @@ pub fn backend_route(method: &str, p: &Value) -> Result<(String, String, Option<
         });
     }
     let (verb, route) = match method {
+        "persona.roles.create" => ("POST", "v1/persona-roles/".into()),
+        "personas.create" => {
+            body["roleId"] = p["roleId"].clone();
+            ("POST", "v1/personas/".into())
+        }
         "persona.roles.list" => ("GET", "v1/persona-roles/".into()),
         "persona.roles.get" => (
             "GET",
@@ -8989,6 +9066,148 @@ mod persona_contract_tests {
             .unwrap()["inputSchema"]
             .clone()
     }
+    fn creation_args(method: &str) -> Value {
+        let mut args = json!({
+            "organizationId":Uuid::new_v4(), "idempotencyKey":Uuid::new_v4(),
+            "name":"Example", "key":"example", "description":"Description",
+            "config":{"skills":["docs",{"id":"reference","enabled":false,"priority":1000}]}
+        });
+        if method == "persona.roles.create" {
+            args["status"] = json!("active");
+            args["config"]["promptPolicy"] = json!({"basePrompt":"Base","responsibility":"Responsibility","boundaries":"Boundaries","safetyRules":"Safety"});
+        } else {
+            args["roleId"] = json!(Uuid::new_v4());
+            args["status"] = json!("draft");
+            args["config"]["promptPolicy"] = json!({"personalityPrompt":"Personality","outputStyle":"Style","memoryUsageInstruction":"Memory"});
+            args["config"]["memoryPolicy"] = json!({"maxItems":50,"writeMemory":false});
+        }
+        args
+    }
+    fn creation_response(method: &str, args: &Value) -> Value {
+        let entity = if method == "persona.roles.create" {
+            "role"
+        } else {
+            "person"
+        };
+        let mut created = json!({"id":Uuid::new_v4(),"organizationId":args["organizationId"],"name":args["name"],"status":args["status"],"config":args["config"]});
+        if entity == "person" {
+            created["roleId"] = args["roleId"].clone();
+        }
+        json!({entity:created})
+    }
+    #[test]
+    fn persona_creation_routes_preserve_every_typed_field_and_exact_key() {
+        for method in ["persona.roles.create", "personas.create"] {
+            let args = creation_args(method);
+            assert!(validate_params(&args, &input(method)).is_ok());
+            assert!(account_scoped_method(method));
+            let (verb, route, body) = backend_route(method, &args).unwrap();
+            assert_eq!(verb, "POST");
+            assert_eq!(
+                route,
+                if method == "personas.create" {
+                    "v1/personas/"
+                } else {
+                    "v1/persona-roles/"
+                }
+            );
+            assert_eq!(body, Some(args));
+        }
+    }
+    #[test]
+    fn persona_creation_rejects_unknown_and_invalid_nested_configuration() {
+        for method in ["persona.roles.create", "personas.create"] {
+            let valid = creation_args(method);
+            for (pointer, value) in [
+                ("/organizationId", json!("invalid")),
+                ("/idempotencyKey", json!("invalid")),
+                ("/name", json!("   ")),
+                ("/name", json!("x".repeat(256))),
+                ("/description", json!("x".repeat(4097))),
+                ("/config", Value::Null),
+                ("/config/skills", json!([""])),
+                ("/config/skills", json!([" "])),
+                ("/config/skills", json!(["x".repeat(256)])),
+                ("/config/skills", json!([{"id":"docs","unknown":true}])),
+                ("/config/skills", json!([{"id":"docs","priority":-1}])),
+                ("/config/skills", json!([{"id":"docs","priority":1001}])),
+                ("/config/skills", json!([{"id":"docs","enabled":"true"}])),
+                ("/config/skills", json!(vec!["docs"; 101])),
+            ] {
+                let mut invalid = valid.clone();
+                *invalid.pointer_mut(pointer).unwrap() = value;
+                assert!(
+                    validate_params(&invalid, &input(method)).is_err(),
+                    "{method}: {pointer}"
+                );
+            }
+            for field in ["avatar", "provider", "model", "tools", "general"] {
+                let mut invalid = valid.clone();
+                invalid[field] = json!({});
+                assert!(validate_params(&invalid, &input(method)).is_err());
+                invalid = valid.clone();
+                invalid["config"][field] = json!({});
+                assert!(validate_params(&invalid, &input(method)).is_err());
+            }
+            let mut invalid = valid.clone();
+            invalid["config"]["promptPolicy"]["unknown"] = json!("value");
+            assert!(validate_params(&invalid, &input(method)).is_err());
+            let prompt = if method == "personas.create" {
+                "personalityPrompt"
+            } else {
+                "basePrompt"
+            };
+            invalid = valid.clone();
+            invalid["config"]["promptPolicy"][prompt] = json!("x".repeat(32769));
+            assert!(validate_params(&invalid, &input(method)).is_err());
+            let mut minimal = json!({"organizationId":valid["organizationId"],"name":"Minimal","idempotencyKey":valid["idempotencyKey"],"config":{}});
+            if method == "personas.create" {
+                minimal["roleId"] = valid["roleId"].clone();
+            }
+            assert!(validate_params(&minimal, &input(method)).is_ok());
+        }
+        for policy in [
+            json!({"maxItems":0}),
+            json!({"maxItems":201}),
+            json!({"writeMemory":"false"}),
+            json!({"scope":"org"}),
+        ] {
+            let mut args = creation_args("personas.create");
+            args["config"]["memoryPolicy"] = policy;
+            assert!(validate_params(&args, &input("personas.create")).is_err());
+        }
+        let upgrade = json!({"organizationId":Uuid::new_v4(),"idempotencyKey":Uuid::new_v4(),"requestedScopes":["runner.personas.manage"]});
+        assert!(validate_params(&upgrade, &input("auth.scope_upgrade")).is_ok());
+    }
+    #[test]
+    fn persona_creation_acknowledgement_requires_matching_resource_and_defaults() {
+        for method in ["persona.roles.create", "personas.create"] {
+            let args = creation_args(method);
+            let response = creation_response(method, &args);
+            assert!(verify_persona_creation(method, &args, &response).is_ok());
+            let entity = if method == "personas.create" {
+                "person"
+            } else {
+                "role"
+            };
+            for field in ["id", "organizationId", "name", "status"] {
+                let mut invalid = response.clone();
+                invalid[entity][field] = json!("wrong");
+                assert!(verify_persona_creation(method, &args, &invalid).is_err());
+            }
+            let mut invalid = response.clone();
+            invalid["private"] = json!("unrecognized response");
+            assert!(verify_persona_creation(method, &args, &invalid).is_err());
+            let mut defaults = args.clone();
+            defaults.as_object_mut().unwrap().remove("status");
+            assert!(verify_persona_creation(method, &defaults, &response).is_ok());
+            if entity == "person" {
+                invalid = response.clone();
+                invalid[entity]["roleId"] = json!(Uuid::new_v4());
+                assert!(verify_persona_creation(method, &args, &invalid).is_err());
+            }
+        }
+    }
     #[test]
     fn persona_memory_is_strict_and_routes_preserve_original_mutation_key() {
         let ids = json!({"personId":Uuid::new_v4(),"conversationId":Uuid::new_v4(),"chatId":Uuid::new_v4(),"arguments":{"content":"stable fact","type":"fact"},"idempotencyKey":Uuid::new_v4()});
@@ -9233,6 +9452,171 @@ mod persona_contract_tests {
     async fn response(mut stream: tokio::net::TcpStream, body: Value) {
         let bytes = body.to_string();
         stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",bytes.len(),bytes).as_bytes()).await.unwrap();
+    }
+    #[tokio::test]
+    async fn persona_creation_lost_response_reconciles_both_owner_checked_operations() {
+        for method in ["persona.roles.create", "personas.create"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api = Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+            let args = creation_args(method);
+            let org = args["organizationId"].as_str().unwrap();
+            let daemon = Daemon::new(
+                tmp.path().into(),
+                api.clone(),
+                Auth::test_enrolled(api, org, "runner"),
+            )
+            .unwrap();
+            // The explicit reviewed organization selects the credential even if
+            // a different organization is currently open in the host UI.
+            daemon.public.lock().await.active_organization = Some("other".into());
+            let copy = args.clone();
+            let expected = creation_response(method, &args);
+            let returned = expected.clone();
+            let server = tokio::spawn(async move {
+                let (stream, head, body) = request(&listener).await;
+                assert!(head.starts_with("POST "));
+                assert!(head.to_ascii_lowercase().contains(&format!(
+                    "idempotency-key: {}",
+                    copy["idempotencyKey"].as_str().unwrap()
+                )));
+                assert_eq!(body, copy);
+                drop(stream);
+                for _ in 0..2 {
+                    let (stream, head, body) = request(&listener).await;
+                    assert!(head.starts_with("GET "));
+                    assert!(head.contains(&format!(
+                        "/personas/operations/{}/{}/",
+                        persona_mutation_operation(method).unwrap(),
+                        copy["idempotencyKey"].as_str().unwrap()
+                    )));
+                    assert_eq!(body, json!({}));
+                    response(stream,json!({"data":{"operation":persona_mutation_operation(method).unwrap(),"key":copy["idempotencyKey"],"status":"completed","requestDigest":"a".repeat(64),"response":returned}})).await;
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            assert_eq!(
+                daemon
+                    .dispatch(method, args.clone())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "NETWORK_AMBIGUOUS"
+            );
+            assert_eq!(
+                daemon.dispatch(method, args.clone()).await.unwrap(),
+                expected
+            );
+            let mut changed = args.clone();
+            changed["name"] = json!("Changed");
+            assert_eq!(
+                daemon
+                    .dispatch(method, changed)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "IDEMPOTENCY_CONFLICT"
+            );
+            assert_eq!(daemon.dispatch(method, args).await.unwrap(), expected);
+            server.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn persona_creation_authority_errors_never_retry_the_write() {
+        for (method, code) in [
+            ("persona.roles.create", "RUNNER_SCOPE_REQUIRED"),
+            ("personas.create", "AUTHORIZATION_FAILED"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api = Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+            let args = creation_args(method);
+            let daemon = Daemon::new(
+                tmp.path().into(),
+                api.clone(),
+                Auth::test_enrolled(api, args["organizationId"].as_str().unwrap(), "runner"),
+            )
+            .unwrap();
+            let copy = args.clone();
+            let server = tokio::spawn(async move {
+                let (mut stream, head, _) = request(&listener).await;
+                assert!(head.starts_with("POST "));
+                let body = json!({"error":{"code":code,"message":"Denied"}}).to_string();
+                stream.write_all(format!("HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
+                let (stream, head, _) = request(&listener).await;
+                assert!(head.starts_with("GET "));
+                response(stream,json!({"data":{"operation":persona_mutation_operation(method).unwrap(),"key":copy["idempotencyKey"],"status":"not_found"}})).await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            // Preserve the backend's permission error; an explicit same-key
+            // retry remains a receipt read even after a known rejection.
+            let error = daemon.dispatch(method, args.clone()).await.unwrap_err();
+            assert_eq!(error.downcast_ref::<ApiError>().unwrap().code, code);
+            assert_eq!(
+                daemon.dispatch(method, args).await.unwrap_err().to_string(),
+                "NETWORK_AMBIGUOUS"
+            );
+            server.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn persona_creation_owner_drift_withholds_response_and_retains_pending_journal() {
+        for method in ["persona.roles.create", "personas.create"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api = Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+            let args = creation_args(method);
+            let org = args["organizationId"].as_str().unwrap().to_owned();
+            let auth = Auth::test_enrolled(api.clone(), &org, "runner");
+            let daemon = Daemon::new(tmp.path().into(), api, auth.clone()).unwrap();
+            let expected = creation_response(method, &args);
+            let server_org = org.clone();
+            let server = tokio::spawn(async move {
+                let (stream, head, _) = request(&listener).await;
+                assert!(head.starts_with("POST "));
+                auth.test_fingerprint_identity_drift(&server_org, None, Some("changed-runner"))
+                    .await
+                    .unwrap();
+                response(stream, json!({"data":expected})).await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            assert_eq!(
+                daemon
+                    .dispatch(method, args.clone())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "AUTH_IDENTITY_CHANGED"
+            );
+            let journal = state::json_digest(
+                &json!({"organizationId":org,"accountSubject":"runner","idempotencyKey":args["idempotencyKey"]}),
+            );
+            let record: Value = state::read_json(
+                &tmp.path()
+                    .join("operations")
+                    .join(format!("{journal}.json")),
+            )
+            .unwrap();
+            assert_eq!(record["status"], "pending");
+            assert!(record.get("result").is_none());
+            assert!(!tmp.path().join("responses").exists());
+            server.await.unwrap();
+        }
     }
     #[tokio::test]
     async fn persona_dispatch_pending_and_completed_replays_only_owner_checked_receipt_reads() {

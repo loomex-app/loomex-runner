@@ -50,10 +50,12 @@
     "method:interactions.respond",
     "method:organizations.list",
     "method:organizations.select",
+    "method:persona.roles.create",
     "method:persona.roles.get",
     "method:persona.roles.list",
     "method:personas.chat_context.create",
     "method:personas.chat_context.get",
+    "method:personas.create",
     "method:personas.get",
     "method:personas.list",
     "method:personas.memory.read",
@@ -121,11 +123,11 @@
   "catalogVersion": "0.3.9",
   "generatedFrom": {
     "backendRoutes": {
-      "digest": "sha256:e90600c3265c2b61324aa7aa0921c38052ff8f09492c443f9cc5b8168c1ba7b9",
+      "digest": "sha256:2036006aa7fabfe9706842117225af48669e785017c1de85474ea3945c7c8974",
       "path": "contracts/backend-routes.json"
     },
     "methodCatalog": {
-      "digest": "sha256:39bb63c8b865a48d56127e4971265c028e962c75bcb1499cca54552ece7c6b2c",
+      "digest": "sha256:70810be76ef03f422433e5ffceb9885768239c6f5b9d661f5d5a643505bf47ff",
       "path": "contracts/method-catalog.json"
     }
   },
@@ -240,7 +242,7 @@
     {
       "classification": "backend-auth",
       "idempotent": true,
-      "inputSchemaDigest": "sha256:f1b31f88f4a9841de21129be78b4e2a25ecef7857394048aa9eb0748c88346f3",
+      "inputSchemaDigest": "sha256:53341429b2acda20ccce27dc3a03d77dfe8c668698271aba07e7bc7daca96a22",
       "mutating": true,
       "name": "auth.scope_upgrade",
       "outputSchemaDigest": "sha256:3c3aca38d835f416a078513c8438115759293afe9aed23efa5982e4b35174a92",
@@ -587,6 +589,18 @@
     {
       "classification": "backend-proxy",
       "idempotent": true,
+      "inputSchemaDigest": "sha256:241f2d26364e70872e4eff5468511661a98e16c6fb74df0a08e81d286d34d644",
+      "mutating": true,
+      "name": "persona.roles.create",
+      "outputSchemaDigest": "sha256:c8a01c39a5834a4d88351a6668fbbe60756e85209828b435627072d2cef24b57",
+      "routeIds": [
+        "persona.persona.roles.create"
+      ],
+      "transportRetry": "never_after_send"
+    },
+    {
+      "classification": "backend-proxy",
+      "idempotent": true,
       "inputSchemaDigest": "sha256:2b10f7d73b1de2bb3aa0af967e740388127f3f363c46b00a1bf62e263ca3b66c",
       "mutating": false,
       "name": "persona.roles.get",
@@ -631,6 +645,18 @@
         "persona.personas.chat_context.get"
       ],
       "transportRetry": "before_response_once"
+    },
+    {
+      "classification": "backend-proxy",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:58246766f1c3e8fdddb6090849b12263acfcd991dfb1764a47183c8f7f99e3a3",
+      "mutating": true,
+      "name": "personas.create",
+      "outputSchemaDigest": "sha256:f0bf0f41b8d5b44ffb9c8590bb81cb9b16b838993e1018c10cf6a967dfdc5f9c",
+      "routeIds": [
+        "persona.personas.create"
+      ],
+      "transportRetry": "never_after_send"
     },
     {
       "classification": "backend-proxy",
@@ -707,10 +733,10 @@
     {
       "classification": "backend-proxy",
       "idempotent": true,
-      "inputSchemaDigest": "sha256:fd6417fc9b66346c4a093d7bd54e240e2b22ef38125b40c3f28d98ad51fafd44",
+      "inputSchemaDigest": "sha256:8b54568836b7d521dfd491211efbe601b99113b8c47490964f550cd0213fae28",
       "mutating": false,
       "name": "personas.operations.get",
-      "outputSchemaDigest": "sha256:2c8e8050ce60320f4d4f760b6adba7be94b61222f7013f5b727a5be95f5d0e5e",
+      "outputSchemaDigest": "sha256:5e390b805c6e3b706df406c8d91f8014f2da277a6c54add3b8cb25567e978ac3",
       "routeIds": [
         "persona.personas.operations.get"
       ],
@@ -1559,6 +1585,12 @@
       "source": "src/control.rs"
     },
     {
+      "id": "persona.persona.roles.create",
+      "method": "POST",
+      "pathTemplate": "v1/persona-roles/",
+      "source": "src/control.rs"
+    },
+    {
       "id": "persona.persona.roles.get",
       "method": "GET",
       "pathTemplate": "v1/persona-roles/{roleId}/",
@@ -1580,6 +1612,12 @@
       "id": "persona.personas.chat_context.get",
       "method": "POST",
       "pathTemplate": "v1/personas/{personId}/chat-context/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "persona.personas.create",
+      "method": "POST",
+      "pathTemplate": "v1/personas/",
       "source": "src/control.rs"
     },
     {
@@ -1657,14 +1695,14 @@
   ],
   "schemaVersion": "loomex.runner.compatibility-manifest/v1",
   "summary": {
-    "backendRouteCount": 71,
-    "capabilityCount": 117,
+    "backendRouteCount": 73,
+    "capabilityCount": 119,
     "methodClassifications": {
       "backend-auth": 7,
-      "backend-proxy": 53,
+      "backend-proxy": 55,
       "daemon-lifecycle": 1,
       "local-control": 36
     },
-    "methodCount": 97
+    "methodCount": 99
   }
 }

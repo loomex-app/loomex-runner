@@ -1357,9 +1357,9 @@ impl Auth {
             .ok_or_else(|| anyhow!("INVALID_REQUEST"))?;
         ensure!(
             !requested.is_empty()
-                && requested.iter().all(|scope| scope
-                    .as_str()
-                    .is_some_and(|scope| PERSONA_SCOPES.contains(&scope))),
+                && requested
+                    .iter()
+                    .all(|scope| scope.as_str().is_some_and(persona_scope)),
             "INVALID_REQUEST"
         );
         let _guard = self.auth_guard().await?;
@@ -1594,17 +1594,14 @@ impl Auth {
                 }
             }
             ensure!(
-                effective.iter().all(|scope| !scope
-                    .as_str()
-                    .is_some_and(|scope| PERSONA_SCOPES.contains(&scope))
-                    || normalized_grant.contains(scope)),
+                effective
+                    .iter()
+                    .all(|scope| !scope.as_str().is_some_and(persona_scope)
+                        || normalized_grant.contains(scope)),
                 "INVALID_API_RESPONSE"
             );
             let token_stale = normalized_grant.iter().any(|scope| {
-                scope
-                    .as_str()
-                    .is_some_and(|scope| PERSONA_SCOPES.contains(&scope))
-                    && !effective.contains(scope)
+                scope.as_str().is_some_and(persona_scope) && !effective.contains(scope)
             });
             if token_stale {
                 if attempt == 0 {
@@ -1938,6 +1935,11 @@ const PERSONA_SCOPES: [&str; 4] = [
     "runner.personas.memory.read",
     "runner.personas.memory.write",
 ];
+// Management is an explicit additive grant. Keep the original four-scope set
+// intact so discovery/chat clients do not acquire a new required permission.
+fn persona_scope(scope: &str) -> bool {
+    PERSONA_SCOPES.contains(&scope) || scope == "runner.personas.manage"
+}
 fn persona_credential_metadata(data: &Value, org: &str) -> Result<Value> {
     ensure!(
         data["organizationId"] == org
@@ -4228,6 +4230,98 @@ mod tests {
         }));
         auth.save(&state).await.unwrap();
         state
+    }
+    #[tokio::test]
+    async fn persona_manage_scope_is_explicit_and_retains_exact_grant_and_owner() {
+        assert_eq!(PERSONA_SCOPES.len(), 4);
+        assert!(!PERSONA_SCOPES.contains(&"runner.personas.manage"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let auth = Auth::test_enrolled(api, SCOPE_ORG, SCOPE_RUNNER);
+        let key = "10000000-0000-4000-8000-000000000005";
+        let scopes = json!(["runner.personas.manage"]);
+        let journal_key = format!("upgrade:{SCOPE_ORG}:{key}");
+        let mut state = pending_upgrade_fixture(&auth, key, &scopes).await;
+        state.persona_state.get_mut(&journal_key).unwrap()["phase"] = json!("grant_pending");
+        auth.save(&state).await.unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_request(&mut stream).await,
+                json!({"delegationId":SCOPE_DELEGATION,"requestedScopes":["runner.personas.manage"],"idempotencyKey":key})
+            );
+            respond(&mut stream,200,json!({"data":{"status":"denied","deviceId":SCOPE_DEVICE,"organizationId":SCOPE_ORG,"runnerId":SCOPE_RUNNER,"delegationId":SCOPE_DELEGATION,"requestedScopes":["runner.personas.manage"],"grantedScopes":["runner.personas.read"],"refreshRequired":false}})).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let denied = auth.scope_upgrade(SCOPE_ORG, &scopes, key).await.unwrap();
+        assert_eq!(denied["status"], "denied");
+        assert_eq!(
+            auth.scope_upgrade(SCOPE_ORG, &scopes, key).await.unwrap(),
+            denied
+        );
+        assert_eq!(
+            auth.scope_upgrade(
+                SCOPE_ORG,
+                &json!(["runner.personas.manage", "runner.personas.read"]),
+                key
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "IDEMPOTENCY_CONFLICT"
+        );
+        let mut changed = auth.required().await.unwrap();
+        changed.children.get_mut(SCOPE_ORG).unwrap().subject =
+            "10000000-0000-4000-8000-000000000009".into();
+        auth.save(&changed).await.unwrap();
+        assert_eq!(
+            auth.scope_upgrade(SCOPE_ORG, &scopes, key)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "AUTH_IDENTITY_CHANGED"
+        );
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn persona_manage_scope_finalization_accepts_only_current_verified_grant() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let auth = Auth::test_enrolled(api, SCOPE_ORG, SCOPE_RUNNER);
+        let key = "10000000-0000-4000-8000-000000000005";
+        let scopes = json!(["runner.personas.manage"]);
+        pending_upgrade_fixture(&auth, key, &scopes).await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert!(read_request(&mut stream).await.is_null());
+            let scopes = json!(["runner.personas.manage"]);
+            respond(
+                &mut stream,
+                200,
+                json!({"data":scope_self(scopes.clone(),scopes)}),
+            )
+            .await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let result = auth.scope_upgrade(SCOPE_ORG, &scopes, key).await.unwrap();
+        assert_eq!(result["status"], "verified");
+        assert_eq!(result["scopes"], scopes);
+        assert_eq!(
+            auth.scope_upgrade(SCOPE_ORG, &scopes, key).await.unwrap(),
+            result
+        );
+        assert!(!result.to_string().contains("Token") && !result.to_string().contains("secret"));
+        server.await.unwrap();
     }
     #[tokio::test]
     async fn persona_scope_self_recovers_lost_metadata_and_rejects_unverified_authority() {
