@@ -22,6 +22,7 @@ pub(super) async fn require_execution_authorization_with(
 
 struct LocalAuthority {
     workspace: PathBuf,
+    extras: Vec<PathBuf>,
     record: Value,
     identity: (String, String),
 }
@@ -68,6 +69,7 @@ async fn read_execution_authority(
         || record["installationId"] != identity.1
         || (record.get("accountSubject").is_some() && record["accountSubject"] != identity.0)
         || record["workspacePath"] != payload["workspacePath"]
+        || !crate::workspace_set::same_set(binding, payload)
         || binding["executionPolicy"] != "host_user/v1"
         || payload["executionPolicy"] != "host_user/v1"
         || !payload["providerConfiguration"].is_object()
@@ -81,15 +83,31 @@ async fn read_execution_authority(
     // The refresh/reconciliation above is complete before projecting ANY local
     // authority facts. Grant/canonical path validation uses that verified local
     // installation; it does not introduce another refresh-capable auth await.
-    let workspace = daemon.public.lock().await.require_grant(
-        Path::new(
-            payload["workspacePath"]
-                .as_str()
-                .context("WORKSPACE_DENIED")?,
-        ),
+    let mut workspace_binding = binding.clone();
+    workspace_binding["workspacePath"] = payload["workspacePath"].clone();
+    let identities = crate::workspace_set::require_set(
+        &*daemon.public.lock().await,
+        &workspace_binding,
         &journal.organization,
         &identity.1,
     )?;
+    if let Some(expected) = record.get("workspaceIdentities") {
+        anyhow::ensure!(&identities == expected, "WORKSPACE_DENIED");
+    }
+    if binding.get("workspaceSetContract").is_some() {
+        anyhow::ensure!(
+            binding["workspaceIdentities"] == identities,
+            "WORKSPACE_DENIED"
+        );
+    }
+    // Reject an unbound output root before any command or provider can launch.
+    if let Some(declarations) = payload["artifactOutputs"].as_array() {
+        for declaration in declarations {
+            crate::workspace_set::artifact_root(payload, declaration)?;
+        }
+    }
+    let workspace = PathBuf::from(identities[0]["path"].as_str().context("WORKSPACE_DENIED")?);
+    let extras = crate::workspace_set::bound_extras(payload)?;
     // Waiting for the grant projection can yield. The same preparation must
     // still be the actual committed record when this complete projection exits.
     let fresh_record: Value = state::read_json(
@@ -105,6 +123,7 @@ async fn read_execution_authority(
     );
     Ok(LocalAuthority {
         workspace,
+        extras,
         record,
         identity,
     })
@@ -139,12 +158,16 @@ impl AuthorizedJob {
     pub(super) fn workspace(&self) -> &Path {
         &self.authority.workspace
     }
+    pub(super) fn additional_workspaces(&self) -> &[PathBuf] {
+        &self.authority.extras
+    }
     pub(super) async fn revalidate(&self, daemon: &Daemon, journal: &Journal) -> Result<()> {
         let fresh = read_execution_authority(daemon, journal, self.providers.clone()).await?;
         anyhow::ensure!(
             fresh.record == self.authority.record
                 && fresh.identity == self.authority.identity
-                && fresh.workspace == self.authority.workspace,
+                && fresh.workspace == self.authority.workspace
+                && fresh.extras == self.authority.extras,
             "LOCAL_EXECUTION_AUTHORIZATION_REQUIRED"
         );
         Ok(())
@@ -189,6 +212,75 @@ pub(super) async fn authorize(daemon: &Daemon, journal: &Journal) -> Result<Auth
 #[cfg(test)]
 mod fingerprint_revalidation_tests {
     use super::*;
+    #[tokio::test]
+    async fn workspace_set_job_rejects_substitution_and_unbound_artifacts_before_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("a");
+        let extra = temp.path().join("b");
+        std::fs::create_dir(&primary).unwrap();
+        std::fs::create_dir(&extra).unwrap();
+        let primary = primary.canonicalize().unwrap();
+        let extra = extra.canonicalize().unwrap();
+        let api = crate::api::Api::for_test_origin("http://127.0.0.1:9").unwrap();
+        let daemon = Daemon::new(
+            temp.path().join("state"),
+            api.clone(),
+            crate::auth::Auth::test_enrolled(api, "org", "runner"),
+        )
+        .unwrap();
+        let install = daemon.auth.installation_id().await.unwrap();
+        {
+            let mut public = daemon.public.lock().await;
+            for root in [&primary, &extra] {
+                public
+                    .grants
+                    .push(crate::state::WorkspaceGrant::new(root, "org", &install, "key").unwrap());
+            }
+        }
+        let mut binding = json!({"workspacePath":primary,"workspaceSetContract":crate::workspace_set::CONTRACT,"additionalWorkspacePaths":[extra],"executionPolicy":"host_user/v1","providerConfiguration":{"requested":{},"installed":{}}});
+        let identities = crate::workspace_set::require_set(
+            &*daemon.public.lock().await,
+            &binding,
+            "org",
+            &install,
+        )
+        .unwrap();
+        binding["workspaceIdentities"] = identities.clone();
+        let prep = Uuid::new_v4();
+        let record = json!({"organizationId":"org","accountSubject":"runner","installationId":install,"workspacePath":primary,"workspaceIdentities":identities,"bindingDigest":"fixed-binding","providers":{},"binding":binding,"commitAuthorization":{"preparationId":prep,"bindingDigest":"fixed-binding"}});
+        state::write_json(
+            &daemon.dir.join("preparations").join(format!("{prep}.json")),
+            &record,
+        )
+        .unwrap();
+        let mut journal = crate::jobs::protocol_tests::journal();
+        journal.job["runnerId"] = json!("runner");
+        journal.job["payload"] = binding;
+        journal.job["payload"]["preparationId"] = json!(prep);
+        journal.job["payload"]["bindingDigest"] = json!("fixed-binding");
+        journal.job["payload"]["artifactOutputs"] =
+            json!([{"path":"result.txt","name":"Result","workspaceRoot":extra}]);
+        assert!(
+            read_execution_authority(&daemon, &journal, json!({}))
+                .await
+                .is_ok()
+        );
+        journal.job["payload"]["artifactOutputs"][0]["workspaceRoot"] = json!(temp.path());
+        assert!(
+            read_execution_authority(&daemon, &journal, json!({}))
+                .await
+                .is_err()
+        );
+        journal.job["payload"]["artifactOutputs"] = json!([]);
+        journal.job["payload"]["additionalWorkspacePaths"] = json!([temp.path()]);
+        assert!(
+            read_execution_authority(&daemon, &journal, json!({}))
+                .await
+                .is_err()
+        );
+        assert_eq!(daemon.managed_work(), 0);
+    }
+
     async fn refresh_request(socket: &mut tokio::net::TcpStream) -> Value {
         use tokio::io::AsyncReadExt;
         let mut bytes = Vec::new();

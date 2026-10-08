@@ -163,6 +163,60 @@
         }
       ],
       "additionalProperties": false
+    },
+    "workspaceSet": {
+      "type": "object",
+      "description": "Additional reviewed roots; omission preserves historical primary-only bindings. Not a filesystem sandbox.",
+      "required": [
+        "workspacePath",
+        "workspaceSetContract",
+        "additionalWorkspacePaths",
+        "workspaceIdentities"
+      ],
+      "properties": {
+        "workspacePath": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "workspaceSetContract": {
+          "const": "execution.workspace-set/v1"
+        },
+        "additionalWorkspacePaths": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^/"
+          },
+          "uniqueItems": true
+        },
+        "workspaceIdentities": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "path",
+              "device",
+              "inode"
+            ],
+            "properties": {
+              "path": {
+                "type": "string",
+                "pattern": "^/"
+              },
+              "device": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "inode": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        }
+      },
+      "additionalProperties": true
     }
   },
   "oneOf": [

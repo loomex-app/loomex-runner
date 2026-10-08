@@ -13,3 +13,4 @@ pub mod recovery;
 pub mod retention;
 pub mod state;
 pub mod workflow_patch;
+pub mod workspace_set;

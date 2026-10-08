@@ -172,7 +172,8 @@ impl Daemon {
                     .fingerprints
                     .fingerprint_provider(path.clone(), name)
                     .await?;
-                let memory = if name == "codex" {
+                // One fingerprint read; each advertised feature is qualified for this exact CLI.
+                let qualified_codex_cli = if name == "codex" {
                     let (qualified, native) = crate::jobs::persona_memory::qualify_fingerprint(
                         &self.fingerprints,
                         &fingerprint,
@@ -183,7 +184,7 @@ impl Daemon {
                 } else {
                     false
                 };
-                providers.insert(name.into(), json!({"path":path,"adapter":adapter,"checksumSha256":fingerprint.checksum,"sizeBytes":fingerprint.size,"modifiedNanos":fingerprint.modified_nanos,"executionPolicy":"host_user/v1","capabilities":{"ai.persona-memory/v1":memory}}));
+                providers.insert(name.into(), json!({"path":path,"adapter":adapter,"checksumSha256":fingerprint.checksum,"sizeBytes":fingerprint.size,"modifiedNanos":fingerprint.modified_nanos,"executionPolicy":"host_user/v1","capabilities":{"ai.persona-memory/v1":qualified_codex_cli,"execution.workspace-set/v1":name == "codex" && qualified_codex_cli}}));
                 files.push(fingerprint);
             }
         }
@@ -261,6 +262,24 @@ impl Daemon {
     pub async fn granted(&self, path: &Path, org: &str) -> Result<PathBuf> {
         let install = self.auth.installation_id().await?;
         self.public.lock().await.require_grant(path, org, &install)
+    }
+    async fn require_prepared_workspaces(&self, record: &Value, org: &str) -> Result<()> {
+        let install = self.auth.installation_id().await?;
+        let mut binding = record["binding"].clone();
+        // Legacy fixture/readers lack a projected primary inside binding.
+        binding["workspacePath"] = record["workspacePath"].clone();
+        let identities =
+            crate::workspace_set::require_set(&*self.public.lock().await, &binding, org, &install)?;
+        if let Some(expected) = record.get("workspaceIdentities") {
+            ensure!(&identities == expected, "WORKSPACE_DENIED");
+        }
+        if binding.get("workspaceSetContract").is_some() {
+            ensure!(
+                binding["workspaceIdentities"] == identities,
+                "WORKSPACE_DENIED"
+            );
+        }
+        Ok(())
     }
     fn drain_status(&self) -> Value {
         let work = self.managed_work();
@@ -1042,19 +1061,29 @@ impl Daemon {
             "workspaces.grant" => {
                 self.auth.credential(&org).await?;
                 let install = self.auth.installation_id().await?;
-                let grant = WorkspaceGrant::new(
+                let (primary, extras) = crate::workspace_set::canonical_set(
                     Path::new(required(p, "workspacePath")?),
-                    &org,
-                    &install,
-                    key.unwrap(),
+                    &p["additionalWorkspacePaths"],
                 )?;
+                let grants = std::iter::once(&primary)
+                    .chain(extras.iter())
+                    .map(|path| WorkspaceGrant::new(path, &org, &install, key.unwrap()))
+                    .collect::<Result<Vec<_>>>()?;
                 let mut public = self.public.lock().await;
-                public
-                    .grants
-                    .retain(|g| !(g.organization_id == org && g.path == grant.path));
-                public.grants.push(grant.clone());
-                public.save(&self.dir)?;
-                return Ok(json!({"workspace":grant,"executionPolicy":"host_user/v1"}));
+                let previous = public.grants.clone();
+                public.grants.retain(|g| {
+                    !(g.organization_id == org && grants.iter().any(|n| n.path == g.path))
+                });
+                public.grants.extend(grants.iter().cloned());
+                if let Err(error) = public.save(&self.dir) {
+                    public.grants = previous;
+                    return Err(error);
+                }
+                let mut result = json!({"workspace":grants[0],"executionPolicy":"host_user/v1"});
+                if !extras.is_empty() {
+                    result["additionalWorkspaces"] = json!(&grants[1..]);
+                }
+                return Ok(result);
             }
             "workspaces.revoke" => {
                 let path = PathBuf::from(required(p, "workspacePath")?);
@@ -1824,9 +1853,25 @@ impl Daemon {
         if self.execution.is_draining() {
             bail!("RUNNER_NOT_READY")
         }
-        let workspace = self
-            .granted(Path::new(required(p, "workspacePath")?), org)
-            .await?;
+        let (workspace, extras) = crate::workspace_set::canonical_set(
+            Path::new(required(p, "workspacePath")?),
+            &p["additionalWorkspacePaths"],
+        )?;
+        let mut workspace_binding = json!({"workspacePath":workspace});
+        if !extras.is_empty() {
+            workspace_binding["additionalWorkspacePaths"] = json!(extras);
+            workspace_binding["workspaceSetContract"] = json!(crate::workspace_set::CONTRACT);
+        }
+        let install_for_roots = self.auth.installation_id().await?;
+        let workspace_identities = crate::workspace_set::require_set(
+            &*self.public.lock().await,
+            &workspace_binding,
+            org,
+            &install_for_roots,
+        )?;
+        if !extras.is_empty() {
+            workspace_binding["workspaceIdentities"] = workspace_identities.clone();
+        }
         let (install, account) = self
             .fingerprints
             .measure(method, "credential", async {
@@ -1841,12 +1886,28 @@ impl Daemon {
             self.auth.current_child_identity(org).await? == (account.clone(), install.clone()),
             "AUTH_IDENTITY_CHANGED"
         );
-        self.granted(Path::new(required(p, "workspacePath")?), org)
-            .await?;
+        ensure!(
+            crate::workspace_set::require_set(
+                &*self.public.lock().await,
+                &workspace_binding,
+                org,
+                &install_for_roots
+            )? == workspace_identities,
+            "WORKSPACE_DENIED"
+        );
         let mut body = p.clone();
         let map = body.as_object_mut().unwrap();
         map.remove("idempotencyKey");
         map.insert("workspacePath".into(), json!(workspace));
+        map.remove("additionalWorkspacePaths");
+        if !extras.is_empty() {
+            map.insert("additionalWorkspacePaths".into(), json!(extras));
+            map.insert(
+                "workspaceSetContract".into(),
+                json!(crate::workspace_set::CONTRACT),
+            );
+            map.insert("workspaceIdentities".into(), workspace_identities.clone());
+        }
         map.insert("installationId".into(), json!(install));
         map.insert("executionPolicy".into(), json!("host_user/v1"));
         let user_config = map.remove("providerConfiguration").unwrap_or(json!({}));
@@ -1872,8 +1933,20 @@ impl Daemon {
             self.auth.current_child_identity(org).await? == (account.clone(), install.clone()),
             "AUTH_IDENTITY_CHANGED"
         );
-        self.granted(Path::new(required(p, "workspacePath")?), org)
-            .await?;
+        ensure!(
+            crate::workspace_set::require_set(
+                &*self.public.lock().await,
+                &workspace_binding,
+                org,
+                &install_for_roots
+            )? == workspace_identities,
+            "WORKSPACE_DENIED"
+        );
+        ensure!(
+            result["binding"]["workspacePath"] == workspace_binding["workspacePath"]
+                && crate::workspace_set::same_set(&result["binding"], &workspace_binding),
+            "BACKEND_PROTOCOL_ERROR"
+        );
         verify_persona_memory_binding(&result["binding"], &providers, true)?;
         let preparation = required(&result, "preparationId")?.to_owned();
         Uuid::parse_str(&preparation)?;
@@ -1899,7 +1972,7 @@ impl Daemon {
         let persisted = Instant::now();
         state::write_json(
             &record_path,
-            &json!({"operation":method,"organizationId":org,"accountSubject":account,"installationId":install,"workspacePath":workspace,"bindingDigest":sealed["bindingDigest"],"binding":sealed["binding"],"confirmationKey":confirmation,"providers":providers,"review":sealed}),
+            &json!({"operation":method,"organizationId":org,"accountSubject":account,"installationId":install,"workspacePath":workspace,"workspaceIdentities":workspace_identities,"bindingDigest":sealed["bindingDigest"],"binding":sealed["binding"],"confirmationKey":confirmation,"providers":providers,"review":sealed}),
         )?;
         self.fingerprints.record_stage(
             method,
@@ -2014,10 +2087,8 @@ impl Daemon {
             return Ok(stale("record_invalid", "prepare_again"));
         }
         if self
-            .public
-            .lock()
+            .require_prepared_workspaces(&record, org)
             .await
-            .require_grant(Path::new(workspace), org, &install)
             .is_err()
         {
             return Ok(stale("workspace_changed", "prepare_again"));
@@ -2040,7 +2111,7 @@ impl Daemon {
         {
             return Ok(stale("expired", "prepare_again"));
         }
-        self.granted(Path::new(workspace), org).await?;
+        self.require_prepared_workspaces(&record, org).await?;
         Ok(
             json!({"status":"valid","operation":operation,"preparation":Self::preparation_review_projection(&review)}),
         )
@@ -2990,8 +3061,7 @@ impl Daemon {
             // or uncertain operation cannot replace a consumed authorization.
             bail!("PRECONDITION_FAILED");
         }
-        self.granted(Path::new(required(&record, "workspacePath")?), org)
-            .await?;
+        self.require_prepared_workspaces(&record, org).await?;
         if record["providers"] != self.provider_snapshot().await? {
             bail!("PRECONDITION_FAILED")
         }
@@ -3012,8 +3082,7 @@ impl Daemon {
                 .is_none_or(|expiry| expiry > state::now()),
             "PRECONDITION_FAILED"
         );
-        self.granted(Path::new(required(&record, "workspacePath")?), org)
-            .await?;
+        self.require_prepared_workspaces(&record, org).await?;
         verify_persona_memory_binding(&record["binding"], &record["providers"], false)?;
         // The separate confirmation authorizes this exact preparation before the
         // backend can enqueue a job. A lost response never removes this grant.
@@ -4201,7 +4270,7 @@ fn provider_snapshot_with(
         if let Some(path) = resolve(adapter)? {
             let fingerprint = crate::fingerprint::synchronous(&path)?;
             let checksum = fingerprint.checksum;
-            providers.insert(name.into(),json!({"path":path,"adapter":adapter,"checksumSha256":checksum,"sizeBytes":fingerprint.size,"modifiedNanos":fingerprint.modified_nanos,"executionPolicy":"host_user/v1","capabilities":{"ai.persona-memory/v1":name == "codex" && crate::jobs::persona_memory::qualified_executable(&path)}}));
+            providers.insert(name.into(),json!({"path":path,"adapter":adapter,"checksumSha256":checksum,"sizeBytes":fingerprint.size,"modifiedNanos":fingerprint.modified_nanos,"executionPolicy":"host_user/v1","capabilities":{"ai.persona-memory/v1":name == "codex" && crate::jobs::persona_memory::qualified_executable(&path),"execution.workspace-set/v1":name == "codex" && crate::jobs::persona_memory::qualified_executable(&path)}}));
         }
     }
     Ok(Value::Object(providers))

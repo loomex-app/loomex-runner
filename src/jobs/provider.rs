@@ -561,6 +561,7 @@ pub(super) fn command_request(
     Ok(ExecutionRequest {
         job_id: id.into(),
         workspace: authorized.workspace().to_path_buf(),
+        additional_workspaces: authorized.additional_workspaces().to_vec(),
         cwd: payload["cwd"].as_str().map(PathBuf::from),
         argv,
         env,

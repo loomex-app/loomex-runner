@@ -255,17 +255,22 @@ pub(super) async fn materialize_terminal(
     if expected.contains(&result["exitCode"]) && result["cancelled"] != true {
         let mut artifacts = Vec::new();
         if let Some(declarations) = j.job["payload"]["artifactOutputs"].as_array() {
-            let workspace = daemon
-                .granted(
-                    Path::new(
-                        j.job["payload"]["workspacePath"]
-                            .as_str()
-                            .context("WORKSPACE_DENIED")?,
-                    ),
-                    &j.organization,
-                )
-                .await?;
             for (index, item) in declarations.iter().enumerate() {
+                let install = daemon.auth.installation_id().await?;
+                let identities = crate::workspace_set::require_set(
+                    &*daemon.public.lock().await,
+                    &j.job["payload"],
+                    &j.organization,
+                    &install,
+                )?;
+                if j.job["payload"].get("workspaceSetContract").is_some() {
+                    anyhow::ensure!(
+                        identities == j.job["payload"]["workspaceIdentities"],
+                        "WORKSPACE_DENIED"
+                    );
+                }
+                let selected = crate::workspace_set::artifact_root(&j.job["payload"], item)?;
+                let workspace = daemon.granted(&selected, &j.organization).await?;
                 let relative = Path::new(
                     item["path"]
                         .as_str()

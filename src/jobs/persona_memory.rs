@@ -535,6 +535,7 @@ mod tests {
             ],
             job_id: "test-memory".into(),
             workspace: tmp.path().into(),
+            additional_workspaces: Vec::new(),
             cwd: None,
             env: std::collections::BTreeMap::new(),
             output_dir: tmp.path().into(),

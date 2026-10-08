@@ -228,6 +228,7 @@ async fn public_status_codex_config_is_additive_and_keeps_final_prompt() {
     let mut request = ExecutionRequest {
         job_id: "public-config".into(),
         workspace: temp.path().into(),
+        additional_workspaces: Vec::new(),
         cwd: None,
         argv: original.clone(),
         env: Default::default(),

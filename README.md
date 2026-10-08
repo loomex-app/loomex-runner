@@ -91,3 +91,5 @@ and [distribution](docs/public-distribution.md) for deployment profiles,
 compatibility gates, and packaging. Low-level `loomex rpc METHOD JSON` calls use
 the [method catalog](contracts/method-catalog.json); ambiguous mutations must be
 reconciled with their original UUID idempotency key.
+
+Workspace selection supports a primary directory and explicitly selected additional directories when `execution.workspace-set/v1` is negotiated. See [reviewed workspace sets](docs/workspace-set.md) for binding, provider qualification and historical recovery rules.

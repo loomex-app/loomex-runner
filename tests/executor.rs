@@ -70,6 +70,7 @@ fn request(root: &Path, script: &str) -> ExecutionRequest {
     ExecutionRequest {
         job_id: "executor-test".into(),
         workspace: root.canonicalize().unwrap(),
+        additional_workspaces: Vec::new(),
         cwd: None,
         argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
         env: BTreeMap::new(),
@@ -731,4 +732,43 @@ async fn abort_during_blocking_identity_journal_preserves_owned_guardian_cleanup
     wait_for_group_stop(pgid).await;
     assert!(!root.path().join("should-not-exist").exists());
     release_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn multi_root_execution_can_use_bound_absolute_cwd_without_broadening_to_parent() {
+    let root = tempfile::tempdir().unwrap();
+    let extra = tempfile::tempdir().unwrap();
+    let mut req = request(root.path(), "pwd");
+    req.additional_workspaces = vec![extra.path().canonicalize().unwrap()];
+    req.cwd = Some(extra.path().canonicalize().unwrap());
+    let outcome = run(req, Arc::new(AtomicBool::new(false))).await.unwrap();
+    assert_eq!(
+        fs::read_to_string(outcome.stdout_path).unwrap().trim(),
+        extra.path().canonicalize().unwrap().to_str().unwrap()
+    );
+    let mut bad = request(root.path(), "true");
+    bad.additional_workspaces = vec![extra.path().canonicalize().unwrap()];
+    bad.cwd = Some(
+        extra
+            .path()
+            .canonicalize()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_owned(),
+    );
+    assert!(run(bad, Arc::new(AtomicBool::new(false))).await.is_err());
+
+    let sibling = root
+        .path()
+        .join("../")
+        .join(extra.path().file_name().unwrap());
+    let mut relative_escape = request(root.path(), "true");
+    relative_escape.additional_workspaces = vec![extra.path().canonicalize().unwrap()];
+    relative_escape.cwd = Some(sibling.strip_prefix(root.path()).unwrap().to_owned());
+    assert!(
+        run(relative_escape, Arc::new(AtomicBool::new(false)))
+            .await
+            .is_err()
+    );
 }

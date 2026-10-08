@@ -126,6 +126,7 @@ pub trait ExecutionObserver: Send + Sync {
 pub struct ExecutionRequest {
     pub job_id: String,
     pub workspace: PathBuf,
+    pub additional_workspaces: Vec<PathBuf>,
     pub cwd: Option<PathBuf>,
     pub argv: Vec<String>,
     pub env: BTreeMap<String, String>,
@@ -186,15 +187,27 @@ fn checked_cwd(request: &ExecutionRequest) -> Result<PathBuf> {
     if workspace != request.workspace || !workspace.is_dir() {
         bail!("workspace must be a canonical directory");
     }
+    for root in &request.additional_workspaces {
+        if root.canonicalize().ok().as_ref() != Some(root) || !root.is_dir() {
+            bail!("WORKSPACE_DENIED");
+        }
+    }
     let relative = request.cwd.as_deref().unwrap_or(Path::new("."));
-    if relative.is_absolute() {
+    if relative.is_absolute() && request.additional_workspaces.is_empty() {
         bail!("cwd must be relative to workspace");
     }
     let cwd = workspace
         .join(relative)
         .canonicalize()
         .context("canonical cwd")?;
-    if !cwd.starts_with(&workspace) || !cwd.is_dir() {
+    let within_reviewed_root = if relative.is_absolute() {
+        std::iter::once(&workspace)
+            .chain(request.additional_workspaces.iter())
+            .any(|root| cwd.starts_with(root))
+    } else {
+        cwd.starts_with(&workspace)
+    };
+    if !cwd.is_dir() || !within_reviewed_root {
         bail!("cwd escapes workspace or is not a directory");
     }
     Ok(cwd)

@@ -9,6 +9,7 @@
     "error.recovery/v1",
     "error.validation-issues/v1",
     "execution.host_user/v1",
+    "execution.workspace-set/v1",
     "follow.session.lifecycle/v1",
     "interactions.drafts/v1",
     "method:artifacts.download",
@@ -127,7 +128,7 @@
       "path": "contracts/backend-routes.json"
     },
     "methodCatalog": {
-      "digest": "sha256:70810be76ef03f422433e5ffceb9885768239c6f5b9d661f5d5a643505bf47ff",
+      "digest": "sha256:0bd2338b5efa2dae8fc9ff57bd2367175d7ea98106f8b39322a358903cb3f20b",
       "path": "contracts/method-catalog.json"
     }
   },
@@ -312,7 +313,7 @@
     {
       "classification": "backend-proxy",
       "idempotent": true,
-      "inputSchemaDigest": "sha256:5690241908f976d1af6daaa95ef1c3271a68474f449280e6367057458fd1c38b",
+      "inputSchemaDigest": "sha256:846ef1d4e7e3a90fa27e8aee5662cfe2568b66ce4fc04e515896e6e2c9204177",
       "mutating": true,
       "name": "builder.prepare",
       "outputSchemaDigest": "sha256:3318fe6e16c44fe1b3da3f7950d157888b60251fe6a9560474d18795bda4fa9c",
@@ -434,7 +435,7 @@
     {
       "classification": "backend-proxy",
       "idempotent": true,
-      "inputSchemaDigest": "sha256:8c96b4cdef341f5fc9db8d2fe631ed4daf8e16a5f82485ac6d59ce1c956e8e03",
+      "inputSchemaDigest": "sha256:d2077de3a7d422d13ed20722f3be85f9f159b8e7f3b018d61034d633ce0a7c22",
       "mutating": true,
       "name": "editor.prepare",
       "outputSchemaDigest": "sha256:3318fe6e16c44fe1b3da3f7950d157888b60251fe6a9560474d18795bda4fa9c",
@@ -1009,7 +1010,7 @@
     {
       "classification": "backend-proxy",
       "idempotent": true,
-      "inputSchemaDigest": "sha256:0e81946c8e8bc7310cbae4353e0e516dce7e0a573fe281ecf1f5609509defa05",
+      "inputSchemaDigest": "sha256:7eebd9755495352a7cf0b9e11c90360584f64c4489af1b4e788754c95446c871",
       "mutating": true,
       "name": "runs.prepare",
       "outputSchemaDigest": "sha256:3318fe6e16c44fe1b3da3f7950d157888b60251fe6a9560474d18795bda4fa9c",
@@ -1224,10 +1225,10 @@
     {
       "classification": "local-control",
       "idempotent": true,
-      "inputSchemaDigest": "sha256:f780a94ad9bf057a54a7014aae1f3494e7f490004fa16d61e7515d1be0766aaf",
+      "inputSchemaDigest": "sha256:3f7cc5917474f288e4449c38264af4374ca2fc9d69105482f3fffa70213ed34c",
       "mutating": true,
       "name": "workspaces.grant",
-      "outputSchemaDigest": "sha256:8cfb77ac0faa200e62a6481b11602766b636aac779582e1869652b37809b69f5",
+      "outputSchemaDigest": "sha256:59f395b0eb512f60f00a431e8c32ab140ba8210312969b61a165daa2e0b9666b",
       "routeIds": [],
       "transportRetry": "never_after_send"
     },
@@ -1696,7 +1697,7 @@
   "schemaVersion": "loomex.runner.compatibility-manifest/v1",
   "summary": {
     "backendRouteCount": 73,
-    "capabilityCount": 119,
+    "capabilityCount": 120,
     "methodClassifications": {
       "backend-auth": 7,
       "backend-proxy": 55,
