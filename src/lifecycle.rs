@@ -2582,34 +2582,25 @@ async fn reconcile_service_stop(paths: &Paths, operation: &mut Operation) -> Res
         // therefore a definitive unsent intent; Unconfirmed remains read-only.
         request_service_stop(paths, operation).await?;
     }
-    if stop.request == StopRequest::ObservedStopped
-        && stop.direction == StopDirection::ActivateCandidate
-        && matches!(
-            operation.checkpoint.as_deref(),
-            Some("stopped_service_start_failed" | "stopped_service_health_failed")
-        )
-    {
-        return restore_failed_candidate(paths, operation).await;
-    }
     if stop.request == StopRequest::ObservedStopped {
         let resources = operation
             .resources
-            .as_ref()
+            .clone()
             .context("activation resources missing")?;
         let (target, digest) = match stop.direction {
             StopDirection::ActivateCandidate => (
-                Some(&stop.package.target),
-                Some(&resources.staged_launch_agent_sha256),
+                Some(stop.package.target.clone()),
+                Some(resources.staged_launch_agent_sha256.clone()),
             ),
             StopDirection::RestorePrevious => (
-                operation.previous_target.as_ref(),
-                resources.launch_agent_backup_sha256.as_ref(),
+                operation.previous_target.clone(),
+                resources.launch_agent_backup_sha256.clone(),
             ),
         };
-        if current_target(paths)?.as_ref() == target
-            && regular_digest(&resources.launch_agent)?.as_ref() == digest
+        if current_target(paths)?.as_ref() == target.as_ref()
+            && regular_digest(&resources.launch_agent)?.as_ref() == digest.as_ref()
         {
-            if let Some(target) = target {
+            if let Some(target) = target.as_ref() {
                 let version = target
                     .file_name()
                     .and_then(|name| name.to_str())
@@ -2630,6 +2621,39 @@ async fn reconcile_service_stop(paths: &Paths, operation: &mut Operation) -> Res
                         restarted_service_identity_matches(paths, target).await,
                         "candidate recovery process identity is unconfirmed"
                     );
+                }
+                // A previous observation can fail while Keychain access is
+                // awaiting the user. Reobserve the exact loaded candidate
+                // before reverting it; the failure checkpoint is not current
+                // evidence. A drain left by an interrupted recovery can be
+                // released only with the existing owned/idle restart route;
+                // that route verifies authentication continuity after restart.
+                // Idle drain deliberately refuses ordinary authenticated reads.
+                let recorded_health_failure = stop.direction == StopDirection::ActivateCandidate
+                    && matches!(
+                        operation.checkpoint.as_deref(),
+                        Some("stopped_service_health_failed" | "candidate_drain_release_pending")
+                    );
+                if recorded_health_failure {
+                    ensure!(
+                        restarted_service_identity_matches(paths, target).await,
+                        "candidate recovery process identity is unconfirmed"
+                    );
+                    let status = daemon_status(paths).await?;
+                    if candidate_drain_can_be_released(&status, version) {
+                        ensure!(
+                            operation.auth_baseline.is_some(),
+                            "lifecycle auth baseline is unavailable"
+                        );
+                        release_service_drain(
+                            paths,
+                            operation,
+                            target,
+                            resources.staged_launch_agent_sha256.as_str(),
+                            "candidate_drain_release_pending",
+                        )
+                        .await?;
+                    }
                 }
                 let health = if stop.direction == StopDirection::RestorePrevious {
                     healthy_restored_previous(paths, version, operation.auth_baseline.as_ref())
@@ -2657,7 +2681,7 @@ async fn reconcile_service_stop(paths: &Paths, operation: &mut Operation) -> Res
                         )?;
                         return Ok(json!({"resumed":true,"operation":operation}));
                     }
-                } else if generic_loaded_candidate
+                } else if (generic_loaded_candidate || recorded_health_failure)
                     && operation.kind == OperationKind::Update
                     && operation.previous_target.is_some()
                 {
@@ -2676,6 +2700,14 @@ async fn reconcile_service_stop(paths: &Paths, operation: &mut Operation) -> Res
                     return restore_failed_candidate(paths, operation).await;
                 }
             }
+        }
+        if stop.direction == StopDirection::ActivateCandidate
+            && matches!(
+                operation.checkpoint.as_deref(),
+                Some("stopped_service_start_failed" | "stopped_service_health_failed")
+            )
+        {
+            return restore_failed_candidate(paths, operation).await;
         }
     }
     match observe_service_stop(paths, operation, false).await? {
@@ -6181,6 +6213,49 @@ mod tests {
         *TEST_RECOVERY_STATUS.lock().unwrap() =
             Some(json!({"version":"1.2.3","activeJobs":0,"draining":true}));
         historical
+    }
+
+    async fn recorded_health_failure_recovery(drained: bool) {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = StopTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let mut original = historical_failed_candidate_fixture(&paths).await;
+        original.checkpoint = Some("stopped_service_health_failed".into());
+        save_operation(&paths, &original).unwrap();
+        let AuthBaseline::Authenticated {
+            installation_id,
+            active_organization,
+        } = original.auth_baseline.clone().unwrap()
+        else {
+            panic!("fixture baseline")
+        };
+        *TEST_RECOVERY_STATUS.lock().unwrap() =
+            Some(json!({"version":"1.2.3","activeJobs":0,"draining":drained}));
+        if drained {
+            fs::write(paths.state_dir.join("drain.json"), b"{}").unwrap();
+        }
+        *TEST_AUTH_STATUS.lock().unwrap() = Some(json!({"authenticated":true,
+            "code":"AUTHENTICATED","installationId":installation_id,
+            "activeOrganization":active_organization,"loginPending":false}));
+        let result = resume(&paths).await.unwrap();
+        assert_eq!(result["operation"]["phase"], "completed");
+        assert_eq!(result["operation"]["id"], original.id.to_string());
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fs::read_link(paths.current()).unwrap(),
+            original.package.unwrap().target
+        );
+    }
+
+    #[tokio::test]
+    async fn recorded_health_failure_reobserves_recovered_candidate_without_rollback() {
+        recorded_health_failure_recovery(false).await;
+    }
+
+    #[tokio::test]
+    async fn recorded_health_failure_releases_only_owned_idle_candidate_drain() {
+        recorded_health_failure_recovery(true).await;
     }
 
     #[tokio::test]
