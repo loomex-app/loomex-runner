@@ -13,8 +13,9 @@ use tokio::{
 
 pub(super) const SCHEMA: &str = "ai.persona-memory/v1";
 // One disposable real invocation proved all four MCP tools and strict final JSON on
-// Codex CLI 0.157.0. The launcher and native binary identities are both pinned;
-// a different CLI or platform must qualify before required memory can commit.
+// Codex CLI 0.157.0. Direct native invocation checks the same pinned binary;
+// npm invocation additionally checks its launcher. A different CLI or platform
+// must qualify before required memory can commit.
 const QUALIFIED_LAUNCHER: &str = "61b0194f3bb6534439c8d26a3ed57d0805f84b884588b761795323eeb92fcf70";
 const QUALIFIED_NATIVE: &str = "ad0be20d04e2ba6146ecdb51d7f8b7b0fe15420a15dc9b0057518d858f1f3714";
 #[derive(Serialize, Deserialize)]
@@ -58,6 +59,12 @@ pub(crate) async fn qualify_fingerprint(
     if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         return Ok((false, None));
     }
+    // The supported installer binds the native executable directly. It has
+    // already been fingerprinted, and callers revalidate its filesystem
+    // identity before using this result. No npm package layout is required.
+    if launcher.checksum == QUALIFIED_NATIVE {
+        return Ok((true, None));
+    }
     let Some(root) = launcher.path().parent().and_then(Path::parent) else {
         return Ok((false, None));
     };
@@ -85,13 +92,18 @@ pub(crate) fn qualified_executable(path: &Path) -> bool {
     if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         return false;
     }
+    let Ok(fingerprint) = crate::fingerprint::synchronous(path) else {
+        return false;
+    };
+    if fingerprint.checksum == QUALIFIED_NATIVE {
+        return true;
+    }
     let Some(root) = path.parent().and_then(Path::parent) else {
         return false;
     };
     let native =
         root.join("node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex");
-    crate::fingerprint::synchronous(path)
-        .is_ok_and(|fingerprint| fingerprint.checksum == QUALIFIED_LAUNCHER)
+    (fingerprint.checksum == QUALIFIED_LAUNCHER)
         && crate::fingerprint::synchronous(&native)
             .is_ok_and(|fingerprint| fingerprint.checksum == QUALIFIED_NATIVE)
 }
@@ -310,6 +322,8 @@ async fn handle(
         let operation=wire["operation"].as_str().context("INVALID_REQUEST")?;validate_arguments(operation,&wire["arguments"])?;
         let call_id=wire["callId"].as_str().context("INVALID_REQUEST")?;Uuid::parse_str(call_id).context("INVALID_REQUEST")?;
         let _call_lock=lock_call(root,call_id).await?;
+        let lease_requests=journal.lock().map_err(|_|anyhow::anyhow!("PERSONA_MEMORY_NOT_ACTIVE"))?.lease_requests.clone();
+        let _lease_request=lease_requests.lock().await;
         let expected=snapshot(journal)?;live(&expected,cancel,gate)?;
         let id=expected.job["id"].as_str().context("BACKEND_PROTOCOL_ERROR")?;
         let mutation=["write","update"].contains(&operation);
@@ -653,6 +667,63 @@ mod tests {
         );
         backend.await.unwrap();
     }
+
+    #[tokio::test]
+    async fn memory_waits_for_inflight_renewal_then_uses_its_committed_fence() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let d = daemon(
+            temp.path(),
+            format!("http://{}", listener.local_addr().unwrap()),
+        );
+        let path = temp.path().join("job.json");
+        let records = Arc::new(Mutex::new(memory_journal()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let server =
+            MemoryServer::start(d.clone(), &path, records.clone(), cancel.clone()).unwrap();
+        let renewal = tokio::spawn(maintain_lease(
+            d,
+            path,
+            records.clone(),
+            cancel.clone(),
+            finished.clone(),
+            Arc::new(LeaseExpiryCancellation::new(cancel)),
+            Duration::ZERO,
+        ));
+        let (stream, head, body) = http_request(&listener).await;
+        assert!(head.contains("/renew/"));
+        assert_eq!(body["leaseVersion"], 7);
+        let key = Uuid::new_v4().to_string();
+        let memory = send(
+            &server,
+            "write",
+            json!({"content":"fact during renewal"}),
+            &key,
+        );
+        tokio::pin!(memory);
+        tokio::select! {
+            result = &mut memory => panic!("memory completed before renewal: {result}"),
+            early = tokio::time::timeout(Duration::from_millis(100), listener.accept()) => {
+                assert!(early.is_err(), "memory transmitted with the old in-flight lease");
+            }
+        }
+        finished.store(true, Ordering::SeqCst);
+        let mut renewed = snapshot(&records).unwrap().job;
+        renewed["leaseVersion"] = json!(8);
+        renewed["leasedUntilEpochMs"] = json!(2000000001000u64);
+        http_response(stream, json!({"job":renewed})).await;
+        let backend = async {
+            let (stream, head, body) = http_request(&listener).await;
+            assert!(head.contains("/memory-tools/write/"));
+            assert_eq!(body["leaseVersion"], 8);
+            assert_eq!(body["idempotencyKey"], key);
+            http_response(stream, json!({"result":{"candidateId":"one-candidate"}})).await;
+        };
+        let (result, ()) = tokio::join!(memory, backend);
+        assert_eq!(result["ok"], true);
+        renewal.await.unwrap();
+    }
     #[tokio::test]
     async fn canceled_inflight_memory_response_is_not_exposed_or_durably_accepted() {
         let temp = tempfile::tempdir().unwrap();
@@ -701,6 +772,34 @@ mod tests {
 #[cfg(test)]
 mod fingerprint_optional_qualification_tests {
     use super::*;
+    #[tokio::test]
+    async fn fingerprint_qualified_native_does_not_require_an_npm_launcher() {
+        if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("codex");
+        std::fs::write(&path, b"synthetic native").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let service = crate::fingerprint::FingerprintService::default();
+        let mut native = service
+            .fingerprint(std::fs::canonicalize(path).unwrap())
+            .await
+            .unwrap();
+        // Exercise selection by an already-verified identity; this fixture
+        // does not claim its synthetic bytes are a qualified provider.
+        native.checksum = QUALIFIED_NATIVE.into();
+        assert!(matches!(
+            qualify_fingerprint(&service, &native).await.unwrap(),
+            (true, None)
+        ));
+        native.checksum = "0".repeat(64);
+        assert!(matches!(
+            qualify_fingerprint(&service, &native).await.unwrap(),
+            (false, None)
+        ));
+    }
+
     #[tokio::test]
     async fn fingerprint_missing_optional_native_downgrades_only_memory_capability() {
         if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {

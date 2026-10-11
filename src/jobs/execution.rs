@@ -7,14 +7,14 @@ enum CancellationCause {
     LocalLeaseExpired,
 }
 
-struct LeaseExpiryCancellation {
+pub(super) struct LeaseExpiryCancellation {
     token: Arc<AtomicBool>,
     cause: AtomicBool,
     gate: Mutex<()>,
 }
 
 impl LeaseExpiryCancellation {
-    fn new(token: Arc<AtomicBool>) -> Self {
+    pub(super) fn new(token: Arc<AtomicBool>) -> Self {
         Self {
             token,
             cause: AtomicBool::new(false),
@@ -280,7 +280,7 @@ pub(super) async fn execute_job(
     terminal
 }
 
-async fn maintain_lease(
+pub(super) async fn maintain_lease(
     daemon: Arc<Daemon>,
     path: PathBuf,
     journal: Arc<Mutex<Journal>>,
@@ -291,6 +291,13 @@ async fn maintain_lease(
 ) {
     while !finished.load(Ordering::SeqCst) {
         tokio::time::sleep(cadence).await;
+        if finished.load(Ordering::SeqCst) {
+            break;
+        }
+        let Ok(gate) = journal.lock().map(|record| record.lease_requests.clone()) else {
+            break;
+        };
+        let _request = gate.lock().await;
         if finished.load(Ordering::SeqCst) {
             break;
         }

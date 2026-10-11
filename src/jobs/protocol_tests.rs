@@ -57,6 +57,7 @@ pub(super) fn journal() -> Journal {
         acknowledged_at: None,
         delivery_diagnostic: None,
         first_failure_diagnostic: None,
+        lease_requests: Default::default(),
         event_sender: Default::default(),
         durable_writer: Default::default(),
         stdout_pending: None,

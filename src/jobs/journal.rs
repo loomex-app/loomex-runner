@@ -103,6 +103,11 @@ pub(super) struct Journal {
     /// a later terminal submission fails for a different reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) first_failure_diagnostic: Option<DeliveryDiagnostic>,
+    // Renewal rotates the fence. Memory calls hold this job-local gate from
+    // their fresh snapshot through acknowledgment; renewal holds it through
+    // durable publication. It carries no authority and is not persisted.
+    #[serde(skip)]
+    pub(super) lease_requests: Arc<tokio::sync::Mutex<()>>,
     #[serde(skip)]
     pub(super) event_sender: Arc<tokio::sync::Mutex<()>>,
     #[serde(skip)]

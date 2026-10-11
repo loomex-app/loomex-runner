@@ -20,6 +20,21 @@ Job memory uses the exact `ai.persona-memory/v1` required marker. Each live job 
 
 The provider's final JSON schema and the independently disabled public-status gate are unchanged. Invocation-only Codex MCP configuration preserves the user's prompt and global configuration. See [Codex configuration reference](https://developers.openai.com/codex/config-reference) for `mcp_servers.<id>.default_tools_approval_mode`; only the generated private server receives `auto` approval. Memory content remains untrusted data.
 
-Capability advertisement requires the qualified macOS arm64 Codex launcher and native executable digests. Missing or changed binaries, other platforms and other providers remain unsupported for required memory. Live disposable qualification evidence, including exact model/executable identities and fixed synthetic tool calls, lives in `planning/personas-2026-10-02/runner/` in the parent workspace. That fixture proves native transport behavior only; backend policy and receipt behavior are covered separately by source tests. It does not prove a real workflow, installation, live grant upgrade or other provider support.
+Capability advertisement requires the qualified macOS arm64 Codex 0.157.0 native executable digest. Direct native invocation, including the installer's explicit provider binding, checks that binary. Invocation through its npm launcher additionally checks the qualified launcher digest and the native binary it loads. Missing or changed binaries, other platforms and other providers remain unsupported for required memory. Both paths retain fresh filesystem identity checks. Live disposable qualification evidence, including exact model/executable identities and fixed synthetic tool calls, lives in `planning/personas-2026-10-02/runner/` in the parent workspace. That fixture proves native transport behavior only; backend policy and receipt behavior are covered separately by source tests. It does not prove a real workflow, installation, live grant upgrade or other provider support.
 
 Canonical inputs are `contracts/method-catalog.json`, `contracts/backend-routes.json`, and the mutation/error recovery contracts. The generated compatibility manifest must match those bytes. Backend contracts are documented in the parent backend repository's `docs/ai-persona-chat-contract.md` and `docs/ai-persona-job-memory-contract.md`.
+
+### Renewal and receipt consistency
+
+Each job's existing in-memory journal owns an ephemeral lease-request gate.
+Persona calls acquire it before reading their fence; renewal retains it through
+publication of the durable renewed journal. Credential waits therefore cannot
+race a local renewal. The existing 30-second memory-handler deadline includes
+queue time; cancellation and expired ownership still reject results. Different
+jobs have independent gates. Restart creates no execution authority from the
+gate, and uncertain writes reconcile their original call/key without replay.
+
+The backend authorizes the current lease for each call but binds durable memory
+receipts to the stable owner, organization, job, session, node and preparation.
+Healthy renewal must not make an accepted receipt inaccessible. Manual memory
+candidates require the backend's explicit review, not content validation.

@@ -389,7 +389,7 @@ pub(super) async fn session(daemon: Arc<Daemon>, org: String) -> Result<()> {
                     acknowledged_at: None,
         delivery_diagnostic: None,
         first_failure_diagnostic: None,
-                    event_sender:Default::default(),durable_writer:Default::default(),
+                    lease_requests:Default::default(),event_sender:Default::default(),durable_writer:Default::default(),
                     stdout_pending: None,
                     stderr_pending: None,
                     progress_buffer: Vec::new(),
