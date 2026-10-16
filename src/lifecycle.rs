@@ -3413,6 +3413,104 @@ const REFUSAL_CONTROLLER_MANIFEST_SHA256: &str =
     "29fa7e75eaffba163f3a106eab19ef1da2800cc94ca40880017c5c85cb9d2f07";
 const REFUSAL_CANDIDATE_MANIFEST_SHA256: &str =
     "6eac15418a6fcef070007ee793b3a1a7bb52ee2398d29ba456f2cb03a4d9c3c2";
+// Audited legacy source protocol: request_service_stop verifies the candidate
+// contract before dispatch, and main routes ordinary resume directly to it.
+// These hashes qualify implementation behavior, independent of product versions.
+const REFUSAL_LIFECYCLE_SOURCE_SHA256: &str =
+    "b4eab7f64b80bdd3293ee2151174c745173b8ddbc9468ff17e23e2bb10b504b0";
+const REFUSAL_MAIN_SOURCE_SHA256: &str =
+    "1c13d6e0387785ff6e4e37f7f608507997f6bff70c335803a7e0cd4b9b095328";
+
+fn audited_refusal_source_protocol(previous: &Path, manifest_digest: &str) -> Result<()> {
+    // This metadata is already bound to the retained package's immutable owned
+    // inventory by verify_stop_binding. It is local release provenance, not an
+    // independently signed attestation that arbitrary source built a binary.
+    let path = previous.join("metadata/source-content-manifest.json");
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)?;
+    let before = file.metadata()?;
+    const LIMIT: u64 = 4 * 1024 * 1024;
+    ensure!(
+        before.is_file() && before.uid() == unsafe { libc::geteuid() } && before.len() <= LIMIT,
+        "unsafe refusal controller source provenance"
+    );
+    let mut bytes = Vec::new();
+    (&mut file).take(LIMIT + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= LIMIT
+            && same_file_identity(&before, &file.metadata()?)
+            && same_file_identity(&before, &fs::symlink_metadata(&path)?),
+        "refusal controller source provenance changed"
+    );
+    let value: Value = serde_json::from_slice(&bytes)?;
+    let mut canonical = serde_json::to_vec(&value)?;
+    canonical.push(b'\n');
+    ensure!(
+        canonical == bytes
+            && value.as_object().is_some_and(|object| object.len() == 3)
+            && value["schema"] == "app.loomex.source-content/v1"
+            && value["sourceRevision"]
+                .as_str()
+                .is_some_and(|revision| revision.len() == 40
+                    && revision
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))),
+        "unsupported refusal controller source provenance"
+    );
+    let files = value["files"]
+        .as_array()
+        .context("refusal controller source files missing")?;
+    let mut paths = std::collections::BTreeSet::new();
+    let mut last_path = None;
+    for entry in files {
+        let path = entry["path"]
+            .as_str()
+            .context("refusal source path missing")?;
+        ensure!(
+            !path.is_empty()
+                && Path::new(path)
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(_)))
+                && !path
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == "..")
+                && paths.insert(path)
+                && last_path.is_none_or(|last| last < path)
+                && entry.as_object().is_some_and(|object| object.len() == 6)
+                && entry["tracked"] == true
+                && entry["size"].as_u64().is_some()
+                && entry["sha256"].as_str().is_some_and(valid_digest)
+                && ((entry["type"] == "file"
+                    && matches!(entry["mode"].as_str(), Some("100644" | "100755")))
+                    || (entry["type"] == "symlink" && entry["mode"] == "120000")),
+            "unsupported refusal source entry"
+        );
+        last_path = Some(path);
+    }
+    for (path, digest) in [
+        ("src/lifecycle.rs", REFUSAL_LIFECYCLE_SOURCE_SHA256),
+        ("src/main.rs", REFUSAL_MAIN_SOURCE_SHA256),
+        ("contracts/compatibility-manifest.json", manifest_digest),
+    ] {
+        ensure!(
+            files.iter().any(|entry| entry["path"] == path
+                && entry["type"] == "file"
+                && entry["sha256"] == digest),
+            "refusal controller source protocol is not audited"
+        );
+    }
+    ensure!(
+        manifest_digest
+            != state::digest(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/contracts/compatibility-manifest.json"
+            ))),
+        "refusal controller contract did not differ"
+    );
+    Ok(())
+}
 
 fn read_refusal_evidence(path: &Path) -> Result<(PreparedStopRefusalEvidence, String)> {
     let mut file = OpenOptions::new()
@@ -3558,12 +3656,12 @@ fn verify_refusal_evidence(
     ensure!(
         evidence.controller_cli_sha256 == cli_digest
             && evidence.controller_manifest_sha256 == manifest_digest
-            && known_refusal_controller(
+            && (known_refusal_controller(
                 prior_version,
                 &stop.package.version,
                 &cli_digest,
                 &manifest_digest
-            ),
+            ) || audited_refusal_source_protocol(previous, &manifest_digest).is_ok()),
         "prepared-stop refusal controller is not the reviewed pre-dispatch implementation"
     );
     Ok(())
@@ -3611,8 +3709,9 @@ async fn require_reviewed_stop_fresh(paths: &Paths, operation: &Operation) -> Re
     verify_stop_binding(paths, operation, stop, false)
 }
 
-/// Explicit authorization for the narrow, locally reviewed 0.4.8 pre-dispatch
-/// compatibility refusal. Neither Prepared nor a journal digest proves unsentness.
+/// Explicit authorization for a locally reviewed pre-dispatch compatibility
+/// refusal. Neither Prepared nor a journal digest proves unsentness; controller
+/// behavior must match a frozen incident or the audited source protocol.
 /// The evidence has a same-user observation trust boundary, not signed audit authority.
 pub async fn resume_reviewed_unsent_stop(
     paths: &Paths,
@@ -3689,6 +3788,27 @@ pub async fn resume(paths: &Paths) -> Result<Value> {
             );
         }
         if operation.package.is_some() && operation.resources.is_some() {
+            // Refuse an old controller before it captures any process-bearing
+            // stop or writes a checkpoint. The candidate's controller can then
+            // resume this exact pending operation with its own product contract.
+            if operation.kind == OperationKind::Update
+                && operation.phase == "pending_active_work"
+                && operation.service_stops.is_empty()
+            {
+                let package = operation
+                    .package
+                    .as_ref()
+                    .context("activation package missing")?;
+                verify_owned_version(paths, &package.target)?;
+                if let Err(error) = validate_rollback_target(&package.target, &package.version) {
+                    if error.to_string() == "LIFECYCLE_ROLLBACK_COMPATIBILITY_MISMATCH" {
+                        return Ok(json!({"resumed":false,"pending":true,"operation":operation,
+                            "reason":"candidate_controller_required","error":"LIFECYCLE_ROLLBACK_COMPATIBILITY_MISMATCH",
+                            "nextAction":"use_candidate_lifecycle_controller"}));
+                    }
+                    return Err(error);
+                }
+            }
             match reconcile_activation(paths, &mut operation).await {
                 Ok(value) => return Ok(value),
                 Err(error) => {
@@ -6820,6 +6940,315 @@ mod tests {
             evidence_path,
             regular_digest(&paths.operation()).unwrap().unwrap(),
         )
+    }
+
+    fn write_owned_fixture_value(paths: &Paths, target: &Path, relative: &str, value: &Value) {
+        let path = target.join(relative);
+        let mut bytes = serde_json::to_vec(value).unwrap();
+        bytes.push(b'\n');
+        fs::write(&path, &bytes).unwrap();
+        let inventory_path = paths.state_dir.join("owned-versions.json");
+        let mut inventory: Value = state::read_json(&inventory_path).unwrap();
+        let files = inventory["inventories"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["path"] == json!(target))
+            .unwrap()["files"]
+            .as_array_mut()
+            .unwrap();
+        files.retain(|entry| entry["path"] != relative);
+        files.push(
+            json!({"path":relative,"sha256":state::digest(&bytes),"size":bytes.len(),
+            "mode":fs::metadata(&path).unwrap().permissions().mode() & 0o777}),
+        );
+        files.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
+        state::write_json(&inventory_path, &inventory).unwrap();
+    }
+
+    fn forward_pending_refusal_fixture(paths: &Paths) -> Operation {
+        let mut before = previous_drained_recovery_fixture(paths);
+        let previous = paths.versions().join("1.2.3");
+        let candidate = paths.versions().join("1.2.4");
+        fs::remove_file(paths.current()).unwrap();
+        std::os::unix::fs::symlink(&previous, paths.current()).unwrap();
+        before.package.as_mut().unwrap().version = "1.2.4".into();
+        before.package.as_mut().unwrap().target = candidate;
+        before.previous_target = Some(previous.clone());
+        before.schema = OPERATION_SCHEMA.into();
+        before.auth_baseline = Some(AuthBaseline::SignedOut {
+            installation_id: None,
+        });
+        before.phase = "pending_active_work".into();
+        before.checkpoint = Some("daemon_has_active_work".into());
+        fs::write(
+            &before.resources.as_ref().unwrap().staged_launch_agent,
+            b"candidate-plist",
+        )
+        .unwrap();
+        write_owned_fixture_value(
+            paths,
+            &previous,
+            "metadata/compatibility-manifest.json",
+            &json!({"contract":"old-controller"}),
+        );
+        let old_manifest =
+            streaming_file_digest(&previous.join("metadata/compatibility-manifest.json"))
+                .unwrap()
+                .0;
+        let source = json!({"schema":"app.loomex.source-content/v1","sourceRevision":"a43d3e2dd10c1ac5229ff5872c5f6015e714ae07","files":[
+            {"path":"contracts/compatibility-manifest.json","type":"file","tracked":true,"mode":"100644","size":1,"sha256":old_manifest},
+            {"path":"src/lifecycle.rs","type":"file","tracked":true,"mode":"100644","size":417123,"sha256":"b4eab7f64b80bdd3293ee2151174c745173b8ddbc9468ff17e23e2bb10b504b0"},
+            {"path":"src/main.rs","type":"file","tracked":true,"mode":"100644","size":26992,"sha256":"1c13d6e0387785ff6e4e37f7f608507997f6bff70c335803a7e0cd4b9b095328"},
+        ]});
+        write_owned_fixture_value(
+            paths,
+            &previous,
+            "metadata/source-content-manifest.json",
+            &source,
+        );
+        save_operation(paths, &before).unwrap();
+        *TEST_RECOVERY_STATUS.lock().unwrap() =
+            Some(json!({"version":"1.2.3","activeJobs":0,"draining":true}));
+        *TEST_AUTH_STATUS.lock().unwrap() =
+            Some(json!({"code":"AUTH_REQUIRED","authenticated":false,"loginPending":false}));
+        before
+    }
+
+    async fn forward_refusal_evidence(paths: &Paths) -> (Operation, PathBuf, String) {
+        let before = forward_pending_refusal_fixture(paths);
+        let mut refused = before.clone();
+        prepare_service_stop(paths, &mut refused, StopDirection::ActivateCandidate)
+            .await
+            .unwrap();
+        set_checkpoint(
+            paths,
+            &mut refused,
+            "recovery_required",
+            "observed state could not be reconciled safely",
+        )
+        .unwrap();
+        let previous = before.previous_target.as_ref().unwrap().clone();
+        let evidence = PreparedStopRefusalEvidence {
+            schema: REFUSAL_EVIDENCE_SCHEMA.into(),
+            before_operation: before,
+            refused_operation: refused.clone(),
+            controller_cli_sha256: streaming_file_digest(&previous.join("bin/loomex"))
+                .unwrap()
+                .0,
+            controller_manifest_sha256: streaming_file_digest(
+                &previous.join("metadata/compatibility-manifest.json"),
+            )
+            .unwrap()
+            .0,
+            failure_code: "LIFECYCLE_ROLLBACK_COMPATIBILITY_MISMATCH".into(),
+        };
+        let path = paths.state_dir.join("forward-refusal.json");
+        state::write_json(&path, &evidence).unwrap();
+        let digest = regular_digest(&paths.operation()).unwrap().unwrap();
+        (refused, path, digest)
+    }
+
+    #[tokio::test]
+    async fn reviewed_stop_audited_source_protocol_recovers_forward_123_to_124() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = StopTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let (original, evidence, digest) = forward_refusal_evidence(&paths).await;
+        let result = resume_reviewed_unsent_stop(&paths, original.id, &digest, &evidence).await;
+        assert!(
+            result.is_ok(),
+            "audited forward refusal should recover exact operation: {result:?}"
+        );
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1);
+        let saved: Operation = state::read_json(&paths.operation()).unwrap();
+        assert_eq!(saved.id, original.id);
+        assert_eq!(saved.package, original.package);
+        assert_eq!(saved.service_stops.len(), 1);
+        assert_eq!(
+            saved.service_stops[0].process,
+            original.service_stops[0].process
+        );
+        assert_eq!(resume(&paths).await.unwrap()["pending"], true);
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reviewed_stop_source_protocol_rejects_unknown_or_malformed_provenance_without_writes()
+    {
+        let _serial = TEST_SERIAL.lock().await;
+        for case in [
+            "lifecycle",
+            "main",
+            "contract",
+            "missing_entry",
+            "duplicate",
+            "schema",
+            "revision",
+            "untracked",
+            "unknown_field",
+            "path",
+            "type",
+            "missing_manifest",
+            "same_contract",
+        ] {
+            let _scope = StopTestScope::start();
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let (original, evidence, _digest) = forward_refusal_evidence(&paths).await;
+            let previous = original.previous_target.as_ref().unwrap();
+            let source_path = previous.join("metadata/source-content-manifest.json");
+            let mut source: Value = state::read_json(&source_path).unwrap();
+            match case {
+                "lifecycle" => source["files"][1]["sha256"] = json!("b".repeat(64)),
+                "main" => source["files"][2]["sha256"] = json!("b".repeat(64)),
+                "contract" => source["files"][0]["sha256"] = json!("b".repeat(64)),
+                "missing_entry" => {
+                    source["files"].as_array_mut().unwrap().pop();
+                }
+                "duplicate" => {
+                    let duplicate = source["files"][1].clone();
+                    source["files"].as_array_mut().unwrap().push(duplicate);
+                }
+                "schema" => source["schema"] = json!("unknown"),
+                "revision" => source["sourceRevision"] = json!("unknown"),
+                "untracked" => source["files"][1]["tracked"] = json!(false),
+                "unknown_field" => source["extra"] = json!(true),
+                "path" => source["files"][1]["path"] = json!("../src/lifecycle.rs"),
+                "type" => source["files"][1]["type"] = json!("symlink"),
+                "missing_manifest" => {
+                    fs::remove_file(&source_path).unwrap();
+                }
+                "same_contract" => {
+                    source["files"][0]["sha256"] = json!(state::digest(include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/contracts/compatibility-manifest.json"
+                    ))))
+                }
+                _ => unreachable!(),
+            }
+            if case != "missing_manifest" {
+                write_owned_fixture_value(
+                    &paths,
+                    previous,
+                    "metadata/source-content-manifest.json",
+                    &source,
+                );
+                // The intentionally changed inventory is itself part of the
+                // captured refusal. Bind fresh evidence to isolate provenance.
+                let mut refusal: PreparedStopRefusalEvidence = state::read_json(&evidence).unwrap();
+                let mut current = original.clone();
+                current.service_stops[0].inventory_digest =
+                    regular_digest(&paths.state_dir.join("owned-versions.json"))
+                        .unwrap()
+                        .unwrap();
+                save_operation(&paths, &current).unwrap();
+                refusal.refused_operation = current.clone();
+                state::write_json(&evidence, &refusal).unwrap();
+            }
+            let before = fs::read(paths.operation()).unwrap();
+            let actual_digest = regular_digest(&paths.operation()).unwrap().unwrap();
+            if case == "same_contract" {
+                let current_contract = state::digest(include_bytes!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/contracts/compatibility-manifest.json"
+                )));
+                assert!(audited_refusal_source_protocol(previous, &current_contract).is_err());
+            } else {
+                assert!(
+                    resume_reviewed_unsent_stop(&paths, original.id, &actual_digest, &evidence)
+                        .await
+                        .is_err(),
+                    "{case}"
+                );
+            }
+            assert_eq!(fs::read(paths.operation()).unwrap(), before, "{case}");
+            assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 0, "{case}");
+            assert_eq!(TEST_RESTART_COUNT.load(Ordering::SeqCst), 0, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_activation_wrong_controller_refuses_before_prepared_stop_and_keeps_journal() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = StopTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let operation = forward_pending_refusal_fixture(&paths);
+        write_owned_fixture_value(
+            &paths,
+            &operation.package.as_ref().unwrap().target,
+            "metadata/compatibility-manifest.json",
+            &json!({"contract":"newer-than-controller"}),
+        );
+        let before = fs::read(paths.operation()).unwrap();
+        let result = resume(&paths).await.unwrap();
+        assert_eq!(result["reason"], "candidate_controller_required");
+        assert_eq!(fs::read(paths.operation()).unwrap(), before);
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 0);
+        assert_eq!(TEST_RESTART_COUNT.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_activation_preflight_rejects_changed_unowned_and_fifo_candidate_without_writes()
+     {
+        let _serial = TEST_SERIAL.lock().await;
+        for case in ["changed", "unowned", "fifo"] {
+            let _scope = StopTestScope::start();
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let operation = forward_pending_refusal_fixture(&paths);
+            let candidate = &operation.package.as_ref().unwrap().target;
+            let metadata = candidate.join("metadata/project.json");
+            let mut fifo_keeper = None;
+            match case {
+                "changed" => fs::write(&metadata, b"changed").unwrap(),
+                "unowned" => {
+                    let file = paths.state_dir.join("owned-versions.json");
+                    let mut owned: Value = state::read_json(&file).unwrap();
+                    owned["inventories"]
+                        .as_array_mut()
+                        .unwrap()
+                        .retain(|entry| entry["path"] != json!(candidate));
+                    state::write_json(&file, &owned).unwrap();
+                }
+                "fifo" => {
+                    fs::remove_file(&metadata).unwrap();
+                    let name = std::ffi::CString::new(metadata.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                    // Keep a finite writer alive so a regressed blocking read
+                    // fails the timing assertion instead of hanging the suite.
+                    let (ready, started) = std::sync::mpsc::channel();
+                    let (release, finished) = std::sync::mpsc::channel();
+                    let thread = std::thread::spawn(move || {
+                        let _file = OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .custom_flags(libc::O_NONBLOCK)
+                            .open(metadata)
+                            .unwrap();
+                        ready.send(()).unwrap();
+                        let _ = finished.recv_timeout(Duration::from_millis(500));
+                    });
+                    started.recv().unwrap();
+                    fifo_keeper = Some((release, thread));
+                }
+                _ => unreachable!(),
+            }
+            let before = fs::read(paths.operation()).unwrap();
+            let started = std::time::Instant::now();
+            assert!(resume(&paths).await.is_err(), "{case}");
+            let elapsed = started.elapsed();
+            if let Some((release, thread)) = fifo_keeper {
+                let _ = release.send(());
+                thread.join().unwrap();
+            }
+            assert!(elapsed < Duration::from_millis(250), "{case}: {elapsed:?}");
+            assert_eq!(fs::read(paths.operation()).unwrap(), before, "{case}");
+            assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 0, "{case}");
+            assert_eq!(TEST_RESTART_COUNT.load(Ordering::SeqCst), 0, "{case}");
+        }
     }
 
     #[tokio::test]

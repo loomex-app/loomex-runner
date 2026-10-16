@@ -214,13 +214,22 @@ does not identify its cause.
 
 ### Explicit recovery of the observed pre-dispatch compatibility refusal
 
+An ordinary resume of a pending update checks the candidate's product contract
+before draining or preparing a service stop. A controller with a different
+compiled contract returns `candidate_controller_required` and leaves the exact
+journal bytes unchanged. Use the staged candidate's `bin/loomex lifecycle resume
+--json`, or its release-bound bootstrap with the original release and
+configuration. This does not broaden ordinary rollback compatibility. Older
+controllers without this preflight may already have captured a protected stop;
+that history requires the explicit route below.
+
 Ordinary `lifecycle resume` remains observation-only for a historical process-bearing
 `Prepared` stop. `Prepared`, an unchanged process, idle counters, or a journal hash
 alone cannot prove that a previous `launchctl` child was never started. Unknown,
 accepted and unconfirmed requests remain protected.
 
-The qualified lifecycle owner has one explicit recovery for the reviewed 0.4.8
-controller / 0.5.0 candidate compatibility refusal:
+The qualified lifecycle owner has one explicit recovery for reviewed
+pre-dispatch compatibility refusals:
 
 ```text
 loomex lifecycle resume --expected-operation UUID --dispatch-reviewed-unsent-stop \
@@ -252,6 +261,24 @@ The owner revalidates immutable owned package bytes, actual prior CLI hash
 `87c6e905950251e1777b3c3d2d4d47d692c9a5b089188ca1df8b4498e8fef69e`, prior compiled
 manifest `29fa7e75eaffba163f3a106eab19ef1da2800cc94ca40880017c5c85cb9d2f07`, and candidate/controller
 manifest `6eac15418a6fcef070007ee793b3a1a7bb52ee2398d29ba456f2cb03a4d9c3c2`.
+That historical incident remains accepted exactly as before. A version-independent
+alternative qualifies the retained controller's audited source protocol through
+its inventory-bound `metadata/source-content-manifest.json`. It requires source
+schema v1, a canonical immutable source revision, unique sorted safe paths, and
+tracked regular-source entries with these exact audited fingerprints:
+
+- `src/lifecycle.rs`: `b4eab7f64b80bdd3293ee2151174c745173b8ddbc9468ff17e23e2bb10b504b0`
+- `src/main.rs`: `1c13d6e0387785ff6e4e37f7f608507997f6bff70c335803a7e0cd4b9b095328`
+
+The same source manifest must bind the retained controller's actual compatibility
+manifest, which must differ from the candidate contract. Captured controller CLI
+and manifest hashes still have to match the exact retained owned bytes. The
+audited implementation establishes that this categorical refusal occurs before
+stop dispatch; a source manifest by itself is not a signed binary attestation.
+Unknown, missing, malformed or changed source provenance never permits dispatch.
+The candidate package and its original release/configuration remain unchanged;
+a newer qualified CLI may act only as the recovery controller.
+
 It then requires fresh exact prior-version drained zero managed work, the recorded
 loaded PID, UID, executable and birth time, unchanged pointer, configuration,
 receipt, inventory and drain, under the existing lifecycle writer lock. These
