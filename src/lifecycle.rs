@@ -7883,6 +7883,9 @@ mod tests {
             let body = json!({"data":{"accessToken":"lmxr_fixture_access","refreshToken":"lmxrr_fixture_refresh","expiresInSeconds":3600}}).to_string();
             stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
         });
+        // Measure the complete refresh interval, including setup after the
+        // backend entered its delayed response; that setup is not zero time.
+        let started = tokio::time::Instant::now();
         let worker_auth = auth.clone();
         let refresh = tokio::spawn(async move { worker_auth.credential(&org).await });
         awaiting_response.await.unwrap();
@@ -7895,7 +7898,6 @@ mod tests {
             Duration::ZERO,
             Some(auth.clone()),
         );
-        let started = tokio::time::Instant::now();
         let result = healthy_candidate(&paths, "0.4.2", Some(&baseline)).await;
         refresh.await.unwrap().unwrap();
         backend.await.unwrap();

@@ -26,7 +26,11 @@ mod uninstall_state;
 
 fn main() {
     if let Err(error) = entry() {
-        eprintln!("{error:#}");
+        if json_output_requested() {
+            eprintln!("Loomex bootstrap operation did not complete.");
+        } else {
+            eprintln!("{error:#}");
+        }
         std::process::exit(1);
     }
 }
@@ -52,11 +56,17 @@ struct Arguments {
     settled_abandonment: Option<Uuid>,
     authorize_keychain_transition: bool,
     expected_old_journal_sha256: Option<String>,
+    replace_pre_adoption_candidate: bool,
+    expected_recovery_intent_sha256: Option<String>,
+    recovery_uninstall: bool,
+    expected_release_path: Option<PathBuf>,
+    json: bool,
+    activation: std::sync::Arc<std::sync::Mutex<ActivationFacts>>,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: loomex-lifecycle-bootstrap install RELEASE [--public-key FILE | --allow-unsigned-development (--development-api-origin LOOPBACK_URL | --preview-api-origin HTTPS_URL)] [--authorize-keychain-transition] [--settled-abandonment UUID] [--provider-executable PROVIDER=/absolute/path] [--install-base DIR --state-dir DIR --launch-agents-dir DIR]\n       loomex-lifecycle-bootstrap uninstall [--install-base DIR --state-dir DIR --launch-agents-dir DIR]\n       loomex-lifecycle-bootstrap preflight RELEASE [install options]\n       loomex-lifecycle-bootstrap recover-uninstall RELEASE --expected-old-journal-sha256 SHA256 [release verification and path options]"
+        "usage: loomex-lifecycle-bootstrap install RELEASE [--public-key FILE | --allow-unsigned-development (--development-api-origin LOOPBACK_URL | --preview-api-origin HTTPS_URL)] [--authorize-keychain-transition] [--settled-abandonment UUID] [--provider-executable PROVIDER=/absolute/path] [--install-base DIR --state-dir DIR --launch-agents-dir DIR]\n       loomex-lifecycle-bootstrap uninstall [--install-base DIR --state-dir DIR --launch-agents-dir DIR]\n       loomex-lifecycle-bootstrap preflight RELEASE [install options]\n       loomex-lifecycle-bootstrap recover-uninstall RELEASE --expected-old-journal-sha256 SHA256 [--replace-pre-adoption-candidate --expected-recovery-intent-sha256 SHA256] [--json] [release verification and path options]\n       recovery inspection: preflight RELEASE --recovery-uninstall --expected-old-journal-sha256 SHA256 [--expected-release-path STABLE_RELEASE] [replacement options]"
     );
     std::process::exit(2)
 }
@@ -87,10 +97,34 @@ fn parse() -> (String, Arguments) {
                 );
             }
             "--expected-old-journal-sha256" => {
-                if command != "recover-uninstall" || parsed.expected_old_journal_sha256.is_some() {
+                if !matches!(command.as_str(), "recover-uninstall" | "preflight")
+                    || parsed.expected_old_journal_sha256.is_some()
+                {
                     usage();
                 }
                 parsed.expected_old_journal_sha256 = Some(
+                    values
+                        .next()
+                        .unwrap_or_else(|| usage())
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            "--json" => parsed.json = true,
+            "--recovery-uninstall" if command == "preflight" => parsed.recovery_uninstall = true,
+            "--expected-release-path" if command == "preflight" => {
+                parsed.expected_release_path =
+                    Some(PathBuf::from(values.next().unwrap_or_else(|| usage())));
+            }
+            "--replace-pre-adoption-candidate"
+                if matches!(command.as_str(), "recover-uninstall" | "preflight") =>
+            {
+                parsed.replace_pre_adoption_candidate = true;
+            }
+            "--expected-recovery-intent-sha256"
+                if matches!(command.as_str(), "recover-uninstall" | "preflight") =>
+            {
+                parsed.expected_recovery_intent_sha256 = Some(
                     values
                         .next()
                         .unwrap_or_else(|| usage())
@@ -157,7 +191,18 @@ fn parse() -> (String, Arguments) {
             _ => usage(),
         }
     }
+    if !valid_recovery_arguments(&command, &parsed) {
+        usage();
+    }
     (command, parsed)
+}
+
+fn valid_recovery_arguments(command: &str, args: &Arguments) -> bool {
+    args.replace_pre_adoption_candidate == args.expected_recovery_intent_sha256.is_some()
+        && (!args.recovery_uninstall || args.expected_old_journal_sha256.is_some())
+        && (command != "preflight"
+            || !args.replace_pre_adoption_candidate
+            || args.recovery_uninstall)
 }
 
 fn paths(args: &Arguments) -> Result<lifecycle::Paths> {
@@ -901,15 +946,15 @@ fn inventory(root: &Path, expected: &[Value]) -> Result<()> {
 async fn extract(release: &Path, manifest: &Value, stage: &Path) -> Result<PathBuf> {
     fs::create_dir(stage)?;
     let archive = release.join(manifest["payload"]["file"].as_str().unwrap());
-    let status = tokio::process::Command::new("/usr/bin/tar")
+    let output = tokio::process::Command::new("/usr/bin/tar")
         .args(["-xzf"])
         .arg(archive)
         .arg("-C")
         .arg(stage)
         .stdin(Stdio::null())
-        .status()
+        .output()
         .await?;
-    if !status.success() {
+    if !output.status.success() {
         bail!("release extraction failed")
     }
     let expected = manifest["payload"]["files"]
@@ -1055,7 +1100,7 @@ fn atomic_write_owned(path: &Path, bytes: &[u8]) -> Result<()> {
 async fn install(args: Arguments) -> Result<()> {
     let release = fs::canonicalize(args.release.as_ref().context("release is required")?)?;
     let manifest = read_manifest(&release)?;
-    verify_release(&release, &manifest, &args).await?;
+    bootstrap_preflight::verify_artifact(&release, &manifest, &args).await?;
     if args.preview_api_origin.is_some() {
         validate_preview_identity(
             &manifest,
@@ -1122,7 +1167,17 @@ async fn install(args: Arguments) -> Result<()> {
     )
     .await?
     {
-        println!("{}", serde_json::to_string(&receipt)?);
+        if let Some(id) = receipt["operationId"]
+            .as_str()
+            .and_then(|v| Uuid::parse_str(v).ok())
+        {
+            select_activation(&args, id);
+        }
+        if args.json {
+            emit_activation(&args, "completed", "ACTIVATION_COMPLETED", "none")?;
+        } else {
+            println!("{}", serde_json::to_string(&receipt)?);
+        }
         return Ok(());
     }
     let successor_envelope = bootstrap_journal.exists()
@@ -1151,21 +1206,29 @@ async fn install(args: Arguments) -> Result<()> {
             bail!("LIFECYCLE_OPERATION_CONFIGURATION_MISMATCH")
         }
     }
-    let preflight = lifecycle::preflight_package_locked(
+    let package = lifecycle::PackageIdentity {
+        version: version.into(),
+        target: target.clone(),
+        manifest_sha256: manifest_digest.clone(),
+    };
+    select_install_activation(&args, &paths, &package);
+    if args.activation.lock().unwrap().operation_id.is_some() {
+        dispatch_activation(&args, true);
+    }
+    let preflight_result = lifecycle::preflight_package_locked(
         &paths,
         lifecycle::OperationKind::Update,
-        lifecycle::PackageIdentity {
-            version: version.into(),
-            target: target.clone(),
-            manifest_sha256: manifest_digest.clone(),
-        },
+        package.clone(),
     )
-    .await?;
+    .await;
+    select_install_activation(&args, &paths, &package);
+    let preflight = preflight_result?;
+    dispatch_activation(&args, false);
     if preflight["pending"] == true {
         // The matching native transaction retained the staged package and
         // rollback/update intent.  It has not activated, so do not write a
         // receipt or report installation success.
-        println!("{}", pending_update_message(&preflight));
+        report_pending_activation(&paths, &args, &preflight)?;
         return Ok(());
     }
     if preflight["reconciled"] == true {
@@ -1182,7 +1245,11 @@ async fn install(args: Arguments) -> Result<()> {
             &json!({"schema":"app.loomex.runner.install-receipt/v2","version":version,"versionPath":target,"launchAgent":paths.launch_agents_dir.join("app.loomex.runner.plist"),"bootstrapSha256":state::digest(&fs::read(bootstrap)?),"developmentOnly":manifest["developmentOnly"],"developmentApiOrigin":origin,"providerExecutables":providers}),
         )?;
         remove_regular(&bootstrap_journal)?;
-        println!("Installed and activated Loomex runner {version}");
+        if args.json {
+            emit_activation(&args, "completed", "ACTIVATION_COMPLETED", "none")?;
+        } else {
+            println!("Installed and activated Loomex runner {version}");
+        }
         return Ok(());
     }
     fs::create_dir_all(paths.install_base.join("versions"))?;
@@ -1247,16 +1314,20 @@ async fn install(args: Arguments) -> Result<()> {
     .await;
     let result = async {
         let staged_plist = staged_plist?;
-        let activation = lifecycle::activate_locked(
+        dispatch_activation(&args,true);
+        let activation_result = lifecycle::activate_locked(
             &paths,
             target.clone(),
             version.into(),
             manifest_digest,
             staged_plist,
-        )
-        .await?;
+        ).await;
+        select_install_activation(&args,&paths,&package);
+        if args.activation.lock().unwrap().operation_id.is_none() {dispatch_activation(&args,false);}
+        let activation=activation_result?;
+        dispatch_activation(&args,false);
         if activation["pending"] == true {
-            println!("{}", pending_update_message(&activation));
+            report_pending_activation(&paths, &args, &activation)?;
             return Ok::<bool, anyhow::Error>(false);
         }
         let bootstrap = target.join("bin/loomex-lifecycle-bootstrap");
@@ -1270,7 +1341,11 @@ async fn install(args: Arguments) -> Result<()> {
     }.await;
     let _ = fs::remove_dir_all(&stage);
     if result? {
-        println!("Installed and activated Loomex runner {version}");
+        if args.json {
+            emit_activation(&args, "completed", "ACTIVATION_COMPLETED", "none")?;
+        } else {
+            println!("Installed and activated Loomex runner {version}");
+        }
     }
     Ok(())
 }
@@ -1304,20 +1379,296 @@ fn remove_regular(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn json_output_requested() -> bool {
+    std::env::args_os().any(|v| v == "--json")
+}
+#[derive(Default, Clone)]
+struct ActivationFacts {
+    operation_id: Option<Uuid>,
+    dispatch_uncertain: bool,
+}
+fn select_activation(args: &Arguments, id: Uuid) {
+    args.activation.lock().unwrap().operation_id = Some(id);
+}
+fn dispatch_activation(args: &Arguments, uncertain: bool) {
+    args.activation.lock().unwrap().dispatch_uncertain = uncertain;
+}
+fn select_install_activation(
+    args: &Arguments,
+    paths: &lifecycle::Paths,
+    package: &lifecycle::PackageIdentity,
+) {
+    if let Ok(operation) =
+        state::read_json::<lifecycle::Operation>(&paths.state_dir.join("lifecycle-operation.json"))
+    {
+        if operation.package.as_ref() == Some(package)
+            && operation.kind == lifecycle::OperationKind::Update
+            && lifecycle::operation_is_terminal(&operation).is_ok()
+        {
+            select_activation(args, operation.id);
+        }
+    }
+}
+fn activation_record(facts: &ActivationFacts, outcome: &str, reason: &str, next: &str) -> Value {
+    json!({"schema":"app.loomex.runner.bootstrap-activation/v1","outcome":outcome,"operationId":facts.operation_id.map(|id|id.to_string()),"reasonCode":reason,"nextAction":next})
+}
+fn emit_activation(args: &Arguments, outcome: &str, reason: &str, next: &str) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string(&activation_record(
+            &args.activation.lock().unwrap(),
+            outcome,
+            reason,
+            next
+        ))?
+    );
+    Ok(())
+}
+fn activation_error_record(
+    facts: &ActivationFacts,
+    error: &anyhow::Error,
+    recovery: bool,
+) -> Value {
+    if error.downcast_ref::<PendingActivation>().is_some() {
+        return activation_record(
+            facts,
+            "pending",
+            "ACTIVE_WORK_PENDING",
+            "resume_bootstrap_uninstall",
+        );
+    }
+    if error
+        .downcast_ref::<OriginalUninstallOwnerRequired>()
+        .is_some()
+    {
+        return activation_record(
+            facts,
+            "blocked",
+            "RECOVERY_BLOCKED",
+            "resume_original_uninstall_owner",
+        );
+    }
+    if error.downcast_ref::<ManagedWorkBlocked>().is_some() {
+        return activation_record(
+            facts,
+            "blocked",
+            "MANAGED_WORK_UNRESOLVED",
+            "reconcile_managed_work",
+        );
+    }
+    let uncertain =
+        facts.dispatch_uncertain && error.downcast_ref::<DefinitiveActivationBlock>().is_none();
+    activation_record(
+        facts,
+        if uncertain { "unconfirmed" } else { "blocked" },
+        match (recovery, uncertain) {
+            (true, true) => "RECOVERY_UNCONFIRMED",
+            (true, false) => "RECOVERY_BLOCKED",
+            (false, true) => "ACTIVATION_UNCONFIRMED",
+            (false, false) => "ACTIVATION_BLOCKED",
+        },
+        "inspect_lifecycle_status",
+    )
+}
+#[derive(Debug)]
+struct DefinitiveActivationBlock;
+impl std::fmt::Display for DefinitiveActivationBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "native request was definitively refused before an uncertain outcome"
+        )
+    }
+}
+impl std::error::Error for DefinitiveActivationBlock {}
+
+#[derive(Debug)]
+struct OriginalUninstallOwnerRequired;
+impl std::fmt::Display for OriginalUninstallOwnerRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "current uninstall checkpoint requires its original receipt-bound owner; resume that helper with uninstall and its original path options, without recovery or JSON flags"
+        )
+    }
+}
+impl std::error::Error for OriginalUninstallOwnerRequired {}
+
+#[derive(Debug)]
+struct ManagedWorkBlocked;
+impl std::fmt::Display for ManagedWorkBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "managed work or delivery evidence remains unresolved; reconcile it before uninstall"
+        )
+    }
+}
+impl std::error::Error for ManagedWorkBlocked {}
+
+fn report_pending_activation(
+    _paths: &lifecycle::Paths,
+    args: &Arguments,
+    value: &Value,
+) -> Result<()> {
+    if args.json {
+        emit_activation(
+            args,
+            "pending",
+            if value["reason"] == "service_stop" {
+                "SERVICE_STOP_PENDING"
+            } else {
+                "ACTIVE_WORK_PENDING"
+            },
+            "resume_native_operation",
+        )
+    } else {
+        println!("{}", pending_update_message(value));
+        Ok(())
+    }
+}
+#[derive(Debug)]
+struct PendingActivation;
+impl std::fmt::Display for PendingActivation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "uninstall deferred while active work remains")
+    }
+}
+impl std::error::Error for PendingActivation {}
+
 async fn run() -> Result<()> {
     let (command, args) = parse();
-    match command.as_str() {
+    let structured = args.json && command != "preflight";
+    let activation = args.activation.clone();
+    let recovery = command == "recover-uninstall";
+    let result = match command.as_str() {
         "install" => install(args).await,
         "uninstall" => uninstall(args).await,
         "recover-uninstall" => bootstrap_uninstall::run(args, true).await,
         "preflight" => bootstrap_preflight::run(args).await,
         _ => usage(),
+    };
+    if structured {
+        let facts = activation.lock().unwrap().clone();
+        let report = match &result {
+            Ok(()) if command != "install" => Some(activation_record(
+                &facts,
+                "completed",
+                if recovery {
+                    "RECOVERY_COMPLETED"
+                } else {
+                    "UNINSTALL_COMPLETED"
+                },
+                if recovery {
+                    "install_candidate"
+                } else {
+                    "none"
+                },
+            )),
+            Err(error) => Some(activation_error_record(&facts, error, recovery)),
+            _ => None,
+        };
+        if let Some(report) = report {
+            println!("{}", serde_json::to_string(&report)?);
+        }
+        if result
+            .as_ref()
+            .is_err_and(|e| e.downcast_ref::<PendingActivation>().is_some())
+        {
+            return Ok(());
+        }
     }
+    result
 }
 
 #[cfg(test)]
 mod pending_stop_tests {
     use super::*;
+    #[test]
+    fn replacement_flags_must_be_paired_and_scoped_to_recovery() {
+        let mut args = Arguments {
+            replace_pre_adoption_candidate: true,
+            ..Arguments::default()
+        };
+        assert!(!valid_recovery_arguments("recover-uninstall", &args));
+        args.expected_recovery_intent_sha256 = Some("a".repeat(64));
+        assert!(valid_recovery_arguments("recover-uninstall", &args));
+        assert!(!valid_recovery_arguments("preflight", &args));
+        args.recovery_uninstall = true;
+        assert!(!valid_recovery_arguments("preflight", &args));
+        args.expected_old_journal_sha256 = Some("b".repeat(64));
+        assert!(valid_recovery_arguments("preflight", &args));
+        args.replace_pre_adoption_candidate = false;
+        assert!(!valid_recovery_arguments("preflight", &args));
+    }
+    #[tokio::test]
+    async fn rejected_install_does_not_report_unrelated_prior_operation_or_uncertain_dispatch() {
+        let root = tempfile::tempdir().unwrap();
+        let state_dir = root.path().join("state");
+        fs::create_dir(&state_dir).unwrap();
+        let operation =
+            lifecycle::Operation::new(lifecycle::OperationKind::Install, "completed", None);
+        state::write_json(&state_dir.join("lifecycle-operation.json"), &operation).unwrap();
+        let args = Arguments {
+            release: Some(root.path().join("missing-candidate")),
+            state_dir: Some(state_dir),
+            json: true,
+            ..Default::default()
+        };
+        let activation = args.activation.clone();
+        let error = install(args).await.unwrap_err();
+        let report = activation_error_record(&activation.lock().unwrap(), &error, false);
+        assert_eq!(report["outcome"], "blocked");
+        assert!(report["operationId"].is_null());
+        assert_eq!(report["reasonCode"], "ACTIVATION_BLOCKED");
+        let uncertain = ActivationFacts {
+            operation_id: Some(Uuid::new_v4()),
+            dispatch_uncertain: true,
+        };
+        assert_eq!(
+            activation_error_record(&uncertain, &anyhow::anyhow!("observation lost"), true)["outcome"],
+            "unconfirmed"
+        );
+    }
+    #[test]
+    fn activation_json_contains_only_fixed_public_outcome_fields() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = lifecycle::Paths {
+            install_base: root.path().join("install"),
+            state_dir: root.path().join("state"),
+            launch_agents_dir: root.path().join("agents"),
+        };
+        fs::create_dir(&paths.state_dir).unwrap();
+        let mut operation = lifecycle::Operation::new(
+            lifecycle::OperationKind::Install,
+            "completed",
+            Some("PRIVATE ERROR TEXT".into()),
+        );
+        operation.checkpoint = None;
+        state::write_json(
+            &paths.state_dir.join("lifecycle-operation.json"),
+            &operation,
+        )
+        .unwrap();
+        let facts = ActivationFacts {
+            operation_id: Some(operation.id),
+            dispatch_uncertain: false,
+        };
+        let output = activation_record(
+            &facts,
+            "pending",
+            "SERVICE_STOP_PENDING",
+            "resume_native_operation",
+        );
+        assert_eq!(
+            output["schema"],
+            "app.loomex.runner.bootstrap-activation/v1"
+        );
+        assert_eq!(output["outcome"], "pending");
+        assert_eq!(output["operationId"], operation.id.to_string());
+        assert_eq!(output.as_object().unwrap().len(), 5);
+        assert!(!output.to_string().contains("PRIVATE ERROR TEXT"));
+    }
     #[test]
     fn pending_stop_copy_distinguishes_service_observation_from_active_work() {
         assert!(

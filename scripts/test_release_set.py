@@ -44,16 +44,40 @@ def fixture(root,installer,profile=None):
             source_name='metadata/source-content-manifest.json';source_root=payload
             put(envelope/'loomex-lifecycle-bootstrap',r'''#!/bin/bash
 set -euo pipefail
-[[ "$1" == preflight ]]
+mode="$1";shift
+if [[ "$mode" == recover-uninstall ]]; then
+ echo recover >> "$FIXTURE_STATE/recovery.log"
+ if [[ "${FIXTURE_RECOVERY_RESULT:-}" != "" ]]; then echo "$FIXTURE_RECOVERY_RESULT";exit 1;fi
+ if [[ "${FIXTURE_RECOVERY_PENDING:-}" == 1 ]]; then
+  echo '{"schema":"app.loomex.runner.bootstrap-activation/v1","outcome":"pending","operationId":"fixture-recovery","reasonCode":"SERVICE_STOP_PENDING","nextAction":"resume_bootstrap_uninstall"}'
+ else
+  /bin/rm -f "$FIXTURE_STATE/old-journal"
+  echo '{"schema":"app.loomex.runner.bootstrap-activation/v1","outcome":"completed","operationId":null,"reasonCode":"RECOVERY_COMPLETED","nextAction":"install_candidate"}'
+ fi
+ exit 0
+fi
+[[ "$mode" == preflight ]]
 echo runner >> "$FIXTURE_STATE/preflights.log"
 if [[ "${FIXTURE_RUNNER_PREFLIGHT_FAIL:-}" == 1 ]]; then echo 'SECRET runner detail' >&2; exit 40; fi
-echo '{"schema":"app.loomex.runner.install-preflight/v1","artifact":{"eligible":true},"activation":{"eligible":true}}'
+recovery=false; old=""
+while (($#)); do case "$1" in --recovery-uninstall) recovery=true;shift;; --expected-old-journal-sha256) old="$2";shift 2;; *) shift;; esac;done
+status=none; owner=bootstrap_uninstall
+if [[ "${FIXTURE_NATIVE_PENDING:-}" == 1 ]]; then status=pending;owner=native;fi
+if [[ -f "$FIXTURE_STATE/old-journal" ]]; then
+ [[ "$recovery" == true && "$old" == "$(/bin/cat "$FIXTURE_STATE/old-journal")" ]] || exit 46
+ status=pending
+fi
+echo '{"schema":"app.loomex.runner.install-preflight/v1","artifact":{"eligible":true},"activation":{"eligible":true},"recoveryEligibility":{"eligible":true,"readOnly":true},"recoveryOwnership":{"status":"'"$status"'","owner":"'"$owner"'"}}'
 ''',0o755)
             side=envelope/'loomex-lifecycle-bootstrap';bootstrap={'file':side.name,'sha256':pack.sha(side),'size':side.stat().st_size}
             put(envelope/'scripts/install.sh',r'''#!/bin/bash
 set -euo pipefail
 release="$1"; shift
 echo "$*" >> "$FIXTURE_STATE/runner-args.log"
+if [[ "${FIXTURE_ACTIVATION:-}" != "" ]]; then
+  echo "${FIXTURE_ACTIVATION}"
+  exit "${FIXTURE_ACTIVATION_EXIT:-0}"
+fi
 base=""
 while (($#)); do case "$1" in --install-base) base="$2";shift 2;; --preview-api-origin|--development-api-origin) shift 2;; *) shift;; esac; done
 [[ -n "$base" ]]
@@ -68,6 +92,7 @@ echo '{"version":"0.5.2","protocol":"loomex.local-control/v2","draining":false,"
 STATUS
   /bin/chmod 0755 "$base/current/bin/loomex"
 fi
+echo '{"schema":"app.loomex.runner.bootstrap-activation/v1","outcome":"completed","operationId":null,"reasonCode":"ACTIVATION_COMPLETED","nextAction":"none"}'
 ''',0o755)
         else:
             put(envelope/'source-content.json',provenance)
@@ -79,12 +104,16 @@ fi
 set -euo pipefail
 shift
 [[ "$1" == preflight ]]; shift
-base=""; release=""
-while (($#)); do case "$1" in --install-base) base="$2";shift 2;; --release) release="$2";shift 2;; *) shift;; esac; done
+base=""; release=""; expected=""
+while (($#)); do case "$1" in --install-base) base="$2";shift 2;; --release) release="$2";shift 2;; --expected-release-path) expected="$2";shift 2;; *) shift;; esac; done
 echo plugin >> "$FIXTURE_STATE/preflights.log"
 if [[ "${FIXTURE_PLUGIN_PREFLIGHT_FAIL:-}" == 1 ]]; then echo 'SECRET plugin detail' >&2; exit 41; fi
-if [[ -f "$base/pending" ]]; then [[ "$(/bin/cat "$base/pending")" == "$release" ]] || exit 44; fi
-echo '{"schema":"app.loomex.plugin.install-preflight/v1","artifact":{"eligible":true},"activation":{"eligible":true}}'
+restore=false
+if [[ -f "$base/pending" ]]; then
+ [[ "$(/bin/cat "$base/pending")" == "${expected:-$release}" ]] || exit 44
+ [[ -z "$expected" ]] || restore=true
+fi
+echo '{"schema":"app.loomex.plugin.install-preflight/v1","artifact":{"eligible":true},"activation":{"eligible":true},"pendingRecovery":{"cacheRestoreRequired":'"$restore"'}}'
 ''',0o755);manager=put(envelope/'lifecycle.mjs','// compiled fixture owner\n')
             bootstrap={role:{'file':p.relative_to(envelope).as_posix(),'sha256':pack.sha(p),'size':p.stat().st_size,'mode':p.stat().st_mode&0o777} for role,p in [('runtime',runtime),('manager',manager)]}
             put(envelope/'scripts/install.sh',r'''#!/bin/bash
@@ -515,6 +544,129 @@ esac
         result=self.invoke(['--preflight-only']);self.assertEqual(result.returncode,0,result.stderr)
         self.assertEqual((self.plugin/'pending').read_bytes(),pending)
         self.assertEqual(before,{str(p.relative_to(cache)):(p.read_bytes(),p.stat().st_mtime_ns) for p in cache.rglob('*') if p.is_file()})
+
+    def test_verified_native_pending_preserves_operation_and_skips_health_plugin(self):
+        self.env['FIXTURE_ACTIVATION']=json.dumps({'schema':'app.loomex.runner.bootstrap-activation/v1','outcome':'pending','reasonCode':'ACTIVE_WORK_PENDING','operationId':'fixture-operation','nextAction':'resume_native_operation'})
+        self.env['FIXTURE_HEALTH_FAIL']='1'
+        result=self.invoke();self.assertEqual(result.returncode,3,result.stderr)
+        report=json.loads(result.stdout);self.assertEqual(report['schema'],'app.loomex.paired-install-result/v2')
+        self.assertEqual(report['outcome'],'pending');self.assertEqual(report['operationId'],'fixture-operation')
+        self.assertEqual(report['nextAction'],'resume_native_operation');self.assertFalse(self.plugin.exists())
+        self.assertEqual(report['completion']['plugin'],'not-attempted')
+
+    def test_missing_pending_cache_restores_original_path_only_on_install(self):
+        for missing in ['compatibility.json','plugin/manifest.json','plugin','ALL']:
+            with self.subTest(missing=missing):
+                self.env['FIXTURE_PLUGIN_FAIL']='1';self.assertNotEqual(self.invoke().returncode,0)
+                original=(self.plugin/'pending').read_text();cache=Path(original.strip()).parent
+                if missing=='ALL':shutil.rmtree(cache)
+                elif (cache/missing).is_dir():shutil.rmtree(cache/missing)
+                else:(cache/missing).unlink()
+                self.env.pop('FIXTURE_PLUGIN_FAIL')
+                before={str(p):p.read_bytes() for p in cache.rglob('*') if p.is_file()} if cache.exists() else {}
+                result=self.invoke(['--preflight-only']);self.assertEqual(result.returncode,3,result.stderr)
+                self.assertEqual(json.loads(result.stdout)['nextAction'],'cache_restore_required')
+                self.assertEqual(before,{str(p):p.read_bytes() for p in cache.rglob('*') if p.is_file()} if cache.exists() else {})
+                result=self.invoke();self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual((self.plugin/'installed').read_text(),original)
+                (self.plugin/'installed').unlink()
+
+    def test_native_prose_or_unconfirmed_json_never_claims_pending(self):
+        for result in ['SECRET native pending prose',json.dumps({'schema':'app.loomex.runner.bootstrap-activation/v1','outcome':'unconfirmed','operationId':None,'reasonCode':'ACTIVATION_UNCONFIRMED','nextAction':'inspect_lifecycle_status'})]:
+            self.env['FIXTURE_ACTIVATION']=result
+            response=self.invoke();self.assertEqual(response.returncode,1)
+            report=json.loads(response.stderr);self.assertEqual(report['outcome'],'unconfirmed')
+            self.assertFalse(self.plugin.exists());self.assertNotIn('SECRET',response.stderr)
+
+    def test_native_unresolved_work_preserves_blocked_and_skips_plugin(self):
+        self.env['FIXTURE_ACTIVATION']=json.dumps({'schema':'app.loomex.runner.bootstrap-activation/v1','outcome':'blocked','operationId':'fixture-operation','reasonCode':'MANAGED_WORK_UNRESOLVED','nextAction':'reconcile_managed_work'})
+        self.env['FIXTURE_ACTIVATION_EXIT']='1'
+        self.env['FIXTURE_HEALTH_FAIL']='1'
+        result=self.invoke();self.assertEqual(result.returncode,1)
+        report=json.loads(result.stderr)
+        self.assertEqual(report['outcome'],'blocked')
+        self.assertEqual(report['reasonCode'],'MANAGED_WORK_UNRESOLVED')
+        self.assertEqual(report['operationId'],'fixture-operation')
+        self.assertEqual(report['nextAction'],'reconcile_managed_work')
+        self.assertEqual(report['phase'],'runner-activation')
+        self.assertEqual(report['completion']['plugin'],'not-attempted')
+        self.assertFalse(self.plugin.exists());self.assert_no_owner()
+
+    def test_cache_symlink_or_unexpected_entries_are_preserved(self):
+        self.env['FIXTURE_PLUGIN_FAIL']='1';self.assertEqual(self.invoke().returncode,1)
+        cache=Path((self.plugin/'pending').read_text().strip()).parent
+        self.env.pop('FIXTURE_PLUGIN_FAIL')
+        for name,kind in [('unexpected-file','file'),('unexpected-dir','dir'),('unexpected-link','symlink')]:
+            path=cache/name
+            if kind=='file':path.write_text('keep')
+            elif kind=='dir':path.mkdir()
+            else:path.symlink_to(self.root/'absent')
+            result=self.invoke();self.assertEqual(result.returncode,1)
+            self.assertTrue(path.exists() or path.is_symlink());self.assertFalse((self.plugin/'installed').exists())
+            if kind=='dir':path.rmdir()
+            else:path.unlink()
+
+    def recovery_flags(self):return ['--recover-uninstall','--expected-old-journal-sha256','a'*64]
+
+    def test_recovery_requires_explicit_binding_and_ordinary_install_never_cleans(self):
+        put(self.state/'old-journal','a'*64)
+        for flags in [[],['--recover-uninstall'],['--expected-old-journal-sha256','a'*64],['--recover-uninstall','--expected-old-journal-sha256','b'*64]]:
+            result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout)
+            self.assertFalse((self.state/'recovery.log').exists());self.assertFalse((self.root/'cache').exists());self.assert_no_owner()
+
+    def test_recovery_preflights_all_owners_and_host_before_cleanup(self):
+        put(self.state/'old-journal','a'*64)
+        self.env['FIXTURE_PLUGIN_PREFLIGHT_FAIL']='1';result=self.invoke(self.recovery_flags())
+        self.assertEqual(result.returncode,1);self.assertFalse((self.state/'recovery.log').exists())
+        self.assertFalse((self.root/'cache').exists());self.env.pop('FIXTURE_PLUGIN_PREFLIGHT_FAIL')
+        self.fake_codex(collision=True);result=self.invoke(self.recovery_flags())
+        self.assertEqual(result.returncode,1);self.assertFalse((self.state/'recovery.log').exists())
+        self.assertFalse((self.root/'cache').exists())
+
+    def test_cleanup_completion_retry_uses_fresh_install_without_repeating_cleanup(self):
+        put(self.state/'old-journal','a'*64)
+        self.env['FIXTURE_ACTIVATION']='SECRET arbitrary failure';self.env['FIXTURE_ACTIVATION_EXIT']='1'
+        result=self.invoke(self.recovery_flags());self.assertEqual(result.returncode,1)
+        self.assertFalse((self.state/'old-journal').exists());self.assertFalse(self.plugin.exists())
+        self.env.pop('FIXTURE_ACTIVATION');self.env.pop('FIXTURE_ACTIVATION_EXIT')
+        result=self.invoke(self.recovery_flags());self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual((self.state/'recovery.log').read_text().splitlines(),['recover'])
+        self.assertTrue((self.plugin/'installed').exists())
+
+    def test_recovery_retry_resumes_replacement_native_operation_without_uninstall(self):
+        self.env['FIXTURE_NATIVE_PENDING']='1'
+        result=self.invoke(self.recovery_flags());self.assertEqual(result.returncode,0,result.stderr)
+        self.assertFalse((self.state/'recovery.log').exists())
+        self.assertTrue((self.runner/'installed').exists());self.assertTrue((self.plugin/'installed').exists())
+
+    def test_recovery_owner_change_preserves_original_owner_refusal_after_preflight(self):
+        put(self.state/'old-journal','a'*64)
+        self.env['FIXTURE_RECOVERY_RESULT']=json.dumps({'schema':'app.loomex.runner.bootstrap-activation/v1','outcome':'blocked','operationId':'fixture-recovery','reasonCode':'RECOVERY_BLOCKED','nextAction':'resume_original_uninstall_owner'})
+        result=self.invoke(self.recovery_flags());self.assertEqual(result.returncode,1)
+        report=json.loads(result.stderr)
+        self.assertEqual(report['outcome'],'blocked')
+        self.assertEqual(report['reasonCode'],'RECOVERY_BLOCKED')
+        self.assertEqual(report['operationId'],'fixture-recovery')
+        self.assertEqual(report['nextAction'],'resume_original_uninstall_owner')
+        self.assertEqual(report['phase'],'runner-recovery')
+        self.assertEqual((self.state/'preflights.log').read_text().splitlines(),['runner','plugin'])
+        self.assertEqual((self.state/'recovery.log').read_text().splitlines(),['recover'])
+        self.assertTrue((self.state/'old-journal').exists());self.assert_no_owner()
+        self.assertFalse(self.plugin.exists());self.assertFalse((self.state/'runner-args.log').exists())
+
+    def test_pending_cleanup_retains_operation_without_pair_activation(self):
+        put(self.state/'old-journal','a'*64);self.env['FIXTURE_RECOVERY_PENDING']='1'
+        result=self.invoke(self.recovery_flags());self.assertEqual(result.returncode,3,result.stderr)
+        report=json.loads(result.stdout);self.assertEqual(report['operationId'],'fixture-recovery')
+        self.assertEqual(report['nextAction'],'resume_bootstrap_uninstall');self.assert_no_owner()
+        self.assertTrue((self.state/'old-journal').exists());self.assertFalse(self.plugin.exists())
+
+    def test_cache_conflicts_are_preserved_and_refused(self):
+        self.env['FIXTURE_PLUGIN_FAIL']='1';self.assertEqual(self.invoke().returncode,1)
+        cache=Path((self.plugin/'pending').read_text().strip()).parent
+        path=cache/'compatibility.json';path.write_text('conflict')
+        self.env.pop('FIXTURE_PLUGIN_FAIL');result=self.invoke();self.assertEqual(result.returncode,1)
+        self.assertEqual(path.read_text(),'conflict');self.assertFalse((self.plugin/'installed').exists())
 
     def test_offline_success_runner_only(self):
         result=self.invoke(['--runner-only']);self.assertEqual(result.returncode,0,result.stderr)

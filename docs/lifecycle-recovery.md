@@ -2,124 +2,154 @@
 
 Updates, clean removal, and recovery are separate operations. Use the verified
 release's supported tools; do not delete receipts, native credentials, drain
-markers, or journals to make an installer proceed.
+markers, caches or journals to make an installer proceed.
 
 ## Inspect before changing anything
 
 `loomex lifecycle status --json` works without a running daemon. It reports
 bootstrap, native, and historical ownership together. An unfinished uninstall
-takes precedence over a historical completed update. `actionRequired: true`
-means the indicated owner must finish before another installation transaction.
+takes precedence over a historical completed update. Its controlling operation,
+phase, journal digest and supported next action determine recovery.
 
-A completed update can still require metadata recovery. Resume its exact
+The paired installer has two read-only modes. `--verify-only` checks artifact
+integrity. `--preflight-only` also checks installed owners and host registration
+prerequisites. Neither drains work, authorizes Keychain access, signs in, enrolls
+an organization, approves execution or changes installed state. An ineligible
+result includes only validated recovery categories and references; an arbitrary
+owner error is never copied into the public result.
+
+Preflight is an observation, not activation authority. Every mutating owner
+repeats its checks under its existing locks. Unknown ownership or an unresolved
+outcome remains a blocker.
+
+## Ordinary update and deferred activation
+
+Run the reviewed release-specific installer with its sealed release-set digest.
+It checks both selected component owners before activation. Healthy partial
+installation is preserved: plugin or registration failure does not roll back a
+healthy runner. Retry the same release set and component installation bases.
+
+The paired CLI result uses `app.loomex.paired-install-result/v2`. Exit 0 means
+completion, exit 3 means a verified pending lifecycle operation, and exit 1 means
+blocked or unconfirmed. A known active-work or service-stop pause is not a new
+health failure. Inspect the exact operation, finish the indicated native resume,
+then retry the same pair. Do not cancel managed work to force an update.
+
+A completed update can still require metadata recovery. Resume its existing
 operation rather than deleting `pending-update.json`. Recovery verifies the
-installed inventory, receipt and LaunchAgent/provider configuration, records
-the original marker bytes and digests in the existing lifecycle journal, then
-retires only that matching marker. Interrupted retirement retains its owner;
-unknown markers and competing legacy operations remain protected.
+installed inventory, receipt and LaunchAgent/provider configuration and retires
+only the matching marker. Unknown markers and competing operations stay protected.
 
-The native release bootstrap supports `preflight RELEASE` with the same release
-trust, backend-origin, and installation-path options as `install`. It verifies
-artifacts and installation eligibility without draining, authorizing native
-credential access, or writing an operation. The paired installer has two
-distinct read-only modes: `--verify-only` checks artifact integrity, while
-`--preflight-only` also checks both installed owners and host registration
-prerequisites. Neither is approval to activate a release.
+## Exact artifact-cache restoration
 
-Preflight is an observation. Every mutating owner repeats its checks under the
-existing lifecycle lock. A partial pair is reported as such; a plugin or Codex
-registration failure never silently rolls back a healthy runner. Retry the
-same verified release set, bases, and component operation identities.
+Pending operations can refer to their original stable release-cache paths.
+Read-only preflight reports `cache_restore_required` if those prerequisites are
+missing; it never repairs them. Installation can restore missing known bytes
+from the same fully verified release set while retaining those exact paths.
+It does not replace component journals, issue authority, or silently overwrite
+conflicting content. Unexpected files, symlinks and corrupted surviving files
+remain refusals. A newly downloaded release is not permission to substitute a
+different pending package.
 
-## Current uninstall
+## Current uninstall and stopped retries
 
-Run the installed release's `scripts/uninstall.sh`, retaining any explicitly
-selected installation/state/LaunchAgent paths. The native owner records one
-operation and drain identity, verifies idle managed work, records stop intent,
-and verifies service/process/singleton state. A stopped retry does not require
-the dead control socket. Uncertain stop dispatch is observed, never blindly
-replayed.
+Run the installed release's `scripts/uninstall.sh`, retaining explicitly selected
+installation/state/LaunchAgent paths. The native owner records the operation,
+drain identity, service-stop evidence, remote revocation and local cleanup stages.
+
+If the service has exited before the first idle acknowledgement, recovery must
+verify the recorded installation and native identity, service/process absence,
+singleton ownership and managed-work evidence. Socket absence alone proves
+nothing. The same operation can then continue through stopped maintenance; it
+must not start a daemon or relaunch a command merely to obtain an acknowledgement.
+Unresolved children, deliveries, schedules and uncertain outcomes block cleanup.
 
 Credential maintenance runs in the verified daemon executable without starting
-a service or execution worker. Its destination comes from the validated receipt,
-not the shell environment. It confirms remote revocation and checkpoints that
-fact before removing the native credential item. Missing local credentials
-alone do not prove revocation. A never-signed-in installation is classified as
-not requiring revocation only after a matching native absence observation.
+a socket server or worker. Its destination comes from the validated receipt,
+not ambient shell variables. Remote revocation confirmation, protected-state
+clearing and native item removal are separate outcomes. Missing local credentials
+alone do not prove remote revocation. Outstanding native I/O keeps its ownership
+even when the observer stops waiting.
 
-Native work retains ownership even when the observer's bounded deadline expires.
-Wait for and reconcile that same operation; do not start another cleanup.
-Ordinary logout does not bypass an acknowledged idle lifecycle drain. Read-only
-authentication observations remain available.
+Payload removal uses exact inventories and quarantine checkpoints. Partial
+removal is resumed against the surviving verified subset. Unknown files,
+backend records, user workspaces and provider CLI authentication are preserved.
+Stable non-secret singleton and credential-owner lock inodes are retained;
+unlinking a live lock could permit concurrent owners. Plugin files and host
+registration have separate outcomes; only the exact Loomex registration may be
+removed through supported Codex operations.
 
-Payload removal uses exact inventories and quarantine checkpoints. Resolved
-owned local state is inspected before stopping and again before deletion.
-Disposable browsing cards are not execution authority. Pending mutations,
-deliveries, schedules, and uncertain job evidence prevent destructive cleanup.
-Database inspection includes WAL contents through a private temporary snapshot;
-it does not change the original database or discard WAL-only records.
+## Recover a historical interrupted uninstall
 
-Unknown files, backend workflows/runs, user workspaces and provider CLI login
-stores are preserved. Stable non-secret singleton/credential-owner lock inodes
-are retained deliberately; unlinking a live lock can permit concurrent owners.
-Plugin file removal and Codex marketplace/plugin registration removal are
-separate outcomes; remove only the exact Loomex registration through supported
-Codex controls.
-
-## Recover an older prepared uninstall
-
-Older tools execute their installed bootstrap. Downloading a newer shell alone
-does not repair that executable. Use a newly verified recovery release:
+Ordinary installation never implicitly completes an uninstall. After reviewing
+the exact controlling journal and the intended clean-reinstall operation, use
+the verified paired installer with:
 
 ```sh
-bash /path/to/new-release/scripts/uninstall.sh recover-uninstall /path/to/new-release \
-  --expected-old-journal-sha256 <digest-from-reviewed-status> \
+LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 /path/to/verified/loomex-install-darwin-arm64 \
+  --offline /path/to/verified/release-set \
+  --manifest-sha256 REVIEWED_RELEASE_SET_SHA256 \
+  --allow-unsigned-development \
+  --recover-uninstall \
+  --expected-old-journal-sha256 REVIEWED_ORIGINAL_JOURNAL_SHA256
+```
+
+Retain the original explicit installation bases. The helper verifies artifacts,
+plugin/host prerequisites and recovery eligibility, retains the exact stable
+release cache, and delegates to the new release's existing native recovery owner.
+It observes cleanup, rechecks both owners, then installs the same pair. A retry
+resumes the matching pending operation. If cleanup completed before interruption,
+it observes fresh installation eligibility instead of starting another uninstall.
+Journal absence is never reported as historical revocation confirmation.
+
+The release-bound recovery route also supports an eligible current-format
+`prepared` journal left by an older controller: it verifies the exact original
+journal digest and preserves its operation, drain key, fence and old helper.
+It must not execute the older helper with unsupported new arguments. Other
+current-format phases continue through their recorded supported owner; an
+ineligible adoption must provide an explicit refusal before changing state.
+
+The native recovery entrypoint remains available independently:
+
+```sh
+LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 \
+  bash /path/to/new-release/scripts/uninstall.sh recover-uninstall /path/to/new-release \
+  --expected-old-journal-sha256 REVIEWED_ORIGINAL_JOURNAL_SHA256 \
   --allow-unsigned-development
 ```
 
-Development artifacts additionally require the existing
-`LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1` opt-in. Retain explicit installation path
-options. Production releases instead require the verified manifest public key.
-Do not substitute a new release, digest, or path on an ambiguous retry.
+Recovery verifies the original receipt, helper, inventories, historical native
+identity and new candidate before committing adoption. The installed helper is
+never overwritten. Unsupported historical state, absent identity evidence and
+signing downgrades refuse recovery. An old `revoked` label without bound remote
+confirmation is not sufficient evidence.
 
-Recovery independently verifies its package, original receipt/helper/inventories,
-historical protected-installation baseline, and current native identity. It
-preserves original bytes and writes a private versioned refusal fence before
-side effects, so older controllers cannot resume a competing operation.
-It never overwrites the old helper or its expected digest.
+For a recovery already pinned to a rejected candidate by an older implementation,
+use the explicit `--replace-pre-adoption-candidate` option together with
+`--expected-recovery-intent-sha256 REVIEWED_EXISTING_INTENT_SHA256` and the original
+journal digest. This is permitted only before mutating credential maintenance,
+with the historical journal unchanged. It retains the original operation, old
+intent evidence and old-controller fence. Uncertain or later-stage work cannot
+be reset this way. Never edit the saved intent or substitute a digest on an
+ambiguous retry.
 
-Recovery refuses when the original installation cannot be bound, when retained
-cleanup proof is incomplete, when a competing owner is known, or when a signing
-transition is unsupported. In particular an old `revoked` label without bound
-confirmation is not sufficient evidence. Keep the original journal and use
-permission-checked operator reconciliation; do not invent revocation evidence.
+## Signing, concurrency and qualification
 
-## Signing and concurrency boundary
+Development releases use the approved persistent self-signed identity on all
+three native executables. That preserves designated requirements; it is not
+Developer ID signing, notarization or Apple trust. Signed-to-ad-hoc and
+different-signer upgrades remain refused. The supported ad-hoc-to-stable transition
+requires explicit foreground native authorization and a noninteractive recheck;
+`--authorize-keychain-transition` is never added automatically. A successful
+read probe is not proof of deletion or remote revocation.
 
-Public development releases use the explicitly approved persistent self-signed
-identity on all three native binaries. This preserves designated requirements;
-it is not Developer ID signing, notarization or Apple trust. A matching available
-self-signed identity need not appear in `security find-identity -v`'s trusted
-list. Missing or different identities fail qualification. Private keys are never
-distributed to users and published historical artifacts are never re-signed.
+One installed runner per macOS user is supported. Current binaries share
+user-global credential exclusion, including across custom state paths. Older
+binaries that ignore that lock cannot be fenced by it; known competing owners
+must be stopped through their supported lifecycle before recovery proceeds.
 
-Signed-to-ad-hoc and different-signer upgrades remain refused. The existing
-ad-hoc-to-stable transition requires explicit foreground native authorization
-and a noninteractive recheck. An authorization probe is not proof of remote
-revocation or native deletion capability.
-
-One installed runner per macOS user is supported. Updated credential owners
-share user-global exclusion, independently of a custom state path. Unmodified
-legacy processes using alternate state directories do not honor that exclusion
-and are unsupported concurrently; a process inventory is observation, not a
-guarantee against their later startup. Close known competing tools before
-recovery. Same-user malicious processes remain within the documented local
-trust boundary.
-
-## Qualification boundary
-
-Fixture tests, actual packaged executables, and an observed installed journey
-are separate evidence. Destructive faults and native authorization transitions
-must use a disposable user/test environment and dedicated backend identity.
-Record exact release hashes and operation outcomes. Installation, remote
-publication and recovery on another machine require their own authorization.
+Fixture, packaged and actual native journeys are separate evidence. Destructive
+Keychain, historical uninstall, restart and reinstall tests require a disposable
+user/test machine and dedicated backend identity. The original incident's native
+rejection cause remains unknown. Publication, installation and other-machine
+recovery are separate authorized actions.

@@ -1,8 +1,9 @@
 //! Read-only release and installation eligibility inspection. No lifecycle lock,
 //! credential access, daemon request, or installed-state mutation belongs here.
 use super::*;
+use std::os::unix::fs::DirBuilderExt;
 
-struct Scratch(PathBuf);
+pub(super) struct Scratch(pub(super) PathBuf);
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
@@ -52,7 +53,7 @@ fn transition_eligibility(
     }
 }
 
-fn development_signing(payload: &Path) -> Result<Option<String>> {
+pub(super) fn development_signing(payload: &Path) -> Result<Option<String>> {
     let candidate = payload.join("bin/loomex-runner");
     let candidate_requirement = signing_requirement(&candidate)?;
     let metadata = payload.join("metadata/development-signing.json");
@@ -263,7 +264,7 @@ fn installed_eligibility(
     Ok(result)
 }
 
-fn verify_envelope(release: &Path, payload: &Path, manifest: &Value) -> Result<()> {
+pub(super) fn verify_envelope(release: &Path, payload: &Path, manifest: &Value) -> Result<()> {
     if manifest["bootstrap"]["file"] != "loomex-lifecycle-bootstrap" {
         bail!("release bootstrap binding is invalid")
     }
@@ -283,7 +284,11 @@ fn verify_envelope(release: &Path, payload: &Path, manifest: &Value) -> Result<(
 
 // Capture subprocess diagnostics so stdout remains one machine-readable report
 // and malformed artifacts cannot expose arbitrary command output.
-async fn verify_artifact(release: &Path, manifest: &Value, args: &Arguments) -> Result<()> {
+pub(super) async fn verify_artifact(
+    release: &Path,
+    manifest: &Value,
+    args: &Arguments,
+) -> Result<()> {
     let development = manifest["developmentOnly"]
         .as_bool()
         .context("release class is invalid")?;
@@ -332,8 +337,12 @@ async fn verify_artifact(release: &Path, manifest: &Value, args: &Arguments) -> 
     Ok(())
 }
 
-async fn extract_artifact(release: &Path, manifest: &Value, stage: &Path) -> Result<PathBuf> {
-    fs::create_dir(stage)?;
+pub(super) async fn extract_artifact(
+    release: &Path,
+    manifest: &Value,
+    stage: &Path,
+) -> Result<PathBuf> {
+    fs::DirBuilder::new().mode(0o700).create(stage)?;
     let output = tokio::process::Command::new("/usr/bin/tar")
         .arg("-xzf")
         .arg(release.join("payload.tar.gz"))
@@ -356,6 +365,8 @@ async fn extract_artifact(release: &Path, manifest: &Value, stage: &Path) -> Res
 }
 
 async fn inspect(args: &Arguments, report: &mut Value) -> Result<()> {
+    let paths = paths(args)?;
+    report["recoveryOwnership"] = bootstrap_uninstall::recovery_ownership(&paths);
     let release = fs::canonicalize(args.release.as_ref().context("release is required")?)?;
     let manifest = read_manifest(&release)?;
     verify_artifact(&release, &manifest, args).await?;
@@ -372,7 +383,6 @@ async fn inspect(args: &Arguments, report: &mut Value) -> Result<()> {
             env!("CARGO_PKG_VERSION"),
         )?;
     }
-    let paths = paths(args)?;
     let scratch =
         Scratch(std::env::temp_dir().join(format!("loomex-install-preflight-{}", Uuid::new_v4())));
     let payload = extract_artifact(&release, &manifest, &scratch.0).await?;
@@ -403,6 +413,22 @@ async fn inspect(args: &Arguments, report: &mut Value) -> Result<()> {
         (None, None)
     };
     report["artifact"] = json!({"eligible":true,"version":version,"manifestSha256":state::digest(&fs::read(release.join("manifest.json"))?)});
+    if args.recovery_uninstall {
+        let pending =
+            bootstrap_uninstall::recovery_preflight(&paths, args, &release, &manifest, &payload)
+                .await?;
+        if pending {
+            publish_recovery_eligibility(
+                report,
+                args.expected_release_path
+                    .as_deref()
+                    .is_some_and(|p| p != release),
+            )?;
+            return Ok(());
+        }
+        ensure_no_pending_uninstall(&report["recoveryOwnership"])?;
+        report["recoveryEligibility"] = json!({"eligible":true,"readOnly":true});
+    }
     let signing = if manifest["developmentOnly"] == true {
         installed_signing(&payload, &paths, args, requirement.as_deref())?
     } else {
@@ -427,6 +453,13 @@ async fn inspect(args: &Arguments, report: &mut Value) -> Result<()> {
     report["credentialPrerequisite"]["foregroundUserActionRequired"] = json!(signing != "eligible");
     report["credentialPrerequisite"]["transitionAuthorizedForInstall"] =
         json!(signing != "eligible" && args.authorize_keychain_transition);
+    report["cacheRestoreRequired"] = json!(
+        args.expected_release_path
+            .as_deref()
+            .is_some_and(|p| p != release)
+            && pending["ready"] == true
+            && report["recoveryOwnership"]["status"] == "pending"
+    );
     report["pendingRecovery"] = pending;
     report["upgradeEligibility"] = json!({"eligible":blockers.is_empty(),"conditional":signing != "eligible", "blockers":blockers,"signingTransition":signing});
     report["activation"] = report["upgradeEligibility"].clone();
@@ -434,9 +467,35 @@ async fn inspect(args: &Arguments, report: &mut Value) -> Result<()> {
     Ok(())
 }
 
+fn publish_recovery_eligibility(report: &mut Value, cache_restore_required: bool) -> Result<()> {
+    // Candidate/historical binding checks cannot override an authoritative
+    // ownership refusal. Keep the bounded diagnostic facts unchanged.
+    if report["recoveryOwnership"]["status"] != "pending" {
+        report["recoveryEligibility"] = json!({"eligible":false,"readOnly":true});
+        report["activation"] = json!({"eligible":false,"recovery":true});
+        report["eligible"] = json!(false);
+        report["cacheRestoreRequired"] = json!(false);
+        bail!("recovery ownership is unconfirmed");
+    }
+    report["recoveryEligibility"] = json!({"eligible":true,"readOnly":true});
+    report["activation"] = json!({"eligible":true,"recovery":true});
+    report["eligible"] = json!(true);
+    report["cacheRestoreRequired"] = json!(cache_restore_required);
+    Ok(())
+}
+
+fn ensure_no_pending_uninstall(ownership: &Value) -> Result<()> {
+    if ownership["status"] == "blocked" || ownership["owner"] == "bootstrap_uninstall" {
+        bail!("recovery ownership is unconfirmed");
+    }
+    Ok(())
+}
+
 pub(super) async fn run(args: super::Arguments) -> Result<()> {
     let mut report = json!({
         "schema":"app.loomex.runner.install-preflight/v1", "readOnly":true,"eligible":false,
+        "recoveryOwnership":{"status":"blocked","operationId":null,"phase":null,"journalSha256":null,"nextAction":"inspect_protected_ownership","reasonCode":"OWNERSHIP_UNCONFIRMED"},
+        "recoveryEligibility":{"eligible":false,"readOnly":true},"cacheRestoreRequired":false,
         "artifact":{"eligible":false}, "activation":{"eligible":false},
         "upgradeEligibility":{"eligible":false},"pendingRecovery":{"status":"not_checked"},
         "credentialPrerequisite":{"status":"not_verified","nativeAccessVerified":false,"accessAttempted":false},
@@ -462,6 +521,55 @@ pub(super) async fn run(args: super::Arguments) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn ownership_is_reported_before_missing_candidate_validation_without_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(root.path()).unwrap();
+        let paths = lifecycle::Paths {
+            install_base: base.join("install"),
+            state_dir: base.join("state"),
+            launch_agents_dir: base.join("agents"),
+        };
+        fs::create_dir(&paths.state_dir).unwrap();
+        let target = paths.install_base.join("versions/1.2.3");
+        let journal = json!({"schema":"app.loomex.runner.bootstrap-uninstall/v1","phase":"prepared","receipt":{"version":"1.2.3","versionPath":target},"paths":[target],"inventories":[{"path":target,"files":[{"path":"bin/loomex-runner","sha256":"a".repeat(64),"size":1,"mode":448}]}],"helper":paths.state_dir.join("bootstrap-uninstall-helper"),"helperSha256":"a".repeat(64)});
+        let path = paths.state_dir.join("bootstrap-uninstall.json");
+        state::write_json(&path, &journal).unwrap();
+        let before = fs::read(&path).unwrap();
+        let args = Arguments {
+            release: Some(root.path().join("missing-release")),
+            install_base: Some(paths.install_base.clone()),
+            state_dir: Some(paths.state_dir.clone()),
+            launch_agents_dir: Some(paths.launch_agents_dir.clone()),
+            ..Default::default()
+        };
+        let mut report = json!({});
+        assert!(inspect(&args, &mut report).await.is_err());
+        assert_eq!(
+            report["recoveryOwnership"]["nextAction"],
+            "recover_uninstall"
+        );
+        assert_eq!(
+            report["recoveryOwnership"]["journalSha256"],
+            state::digest(&before)
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!paths.state_dir.join("lifecycle.lock").exists());
+        assert_eq!(fs::read_dir(&paths.state_dir).unwrap().count(), 1);
+    }
+    #[test]
+    fn blocked_ownership_never_publishes_recovery_or_activation_eligibility() {
+        let ownership = json!({"status":"blocked","owner":"bootstrap_uninstall","operationId":Uuid::new_v4(),"phase":"prepared","journalSha256":"a".repeat(64),"nextAction":"inspect_protected_ownership","reasonCode":"OWNERSHIP_UNCONFIRMED"});
+        let mut report = json!({"artifact":{"eligible":true},"recoveryOwnership":ownership,
+            "eligible":false,"activation":{"eligible":false},"recoveryEligibility":{"eligible":false,"readOnly":true},"cacheRestoreRequired":false});
+        assert!(publish_recovery_eligibility(&mut report, true).is_err());
+        assert_eq!(report["recoveryOwnership"], ownership);
+        assert_eq!(report["artifact"]["eligible"], true);
+        assert_eq!(report["eligible"], false);
+        assert_eq!(report["activation"]["eligible"], false);
+        assert_eq!(report["recoveryEligibility"]["eligible"], false);
+        assert_eq!(report["cacheRestoreRequired"], false);
+    }
     #[test]
     fn version_cannot_escape_version_namespace() {
         for version in ["1.2.3", "0.0.1"] {

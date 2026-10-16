@@ -259,7 +259,8 @@ fn public_identity(status: &Value) -> Result<Value> {
 fn record_native_identity(journal: &mut Value, native: Value) -> Result<bool> {
     if journal["expectedIdentity"].is_null() {
         ensure!(
-            native.is_null() && journal["recovery"].is_null(),
+            native.is_null()
+                && (journal["recovery"].is_null() || journal["recovery"]["adoptedCurrent"] == true),
             "native credential item differs from verified fresh signed-out state"
         );
         journal["nativeAbsenceVerified"] = json!(true);
@@ -278,6 +279,23 @@ fn record_native_identity(journal: &mut Value, native: Value) -> Result<bool> {
     );
     journal["expectedIdentity"] = native;
     Ok(false)
+}
+
+fn validated_current_identity(journal: &Value) -> Result<Value> {
+    let identity = &journal["expectedIdentity"];
+    if identity.is_null() {
+        return Ok(Value::Null);
+    }
+    Uuid::parse_str(
+        identity["installationId"]
+            .as_str()
+            .context("current uninstall identity missing")?,
+    )?;
+    ensure!(
+        identity.as_object().is_some_and(|v| v.len() == 2) && identity["deviceId"].is_null(),
+        "current uninstall identity invalid"
+    );
+    Ok(identity.clone())
 }
 
 fn prior_identity(paths: &lifecycle::Paths) -> Result<Value> {
@@ -306,6 +324,9 @@ fn prior_identity(paths: &lifecycle::Paths) -> Result<Value> {
     Ok(json!({"installationId":installation,"deviceId":null}))
 }
 fn reject_unresolved_work(paths: &lifecycle::Paths) -> Result<()> {
+    reject_unresolved_work_evidence(paths).map_err(|error| error.context(ManagedWorkBlocked))
+}
+fn reject_unresolved_work_evidence(paths: &lifecycle::Paths) -> Result<()> {
     let root = paths.state_dir.join("jobs");
     if !root.try_exists()? {
         return Ok(());
@@ -341,7 +362,8 @@ fn reject_unresolved_work(paths: &lifecycle::Paths) -> Result<()> {
 
 fn qualify_before_effects(paths: &lifecycle::Paths) -> Result<()> {
     reject_unresolved_work(paths)?;
-    uninstall_state::inventory_resolved_state(&paths.state_dir)?;
+    uninstall_state::inventory_resolved_state(&paths.state_dir)
+        .map_err(|error| error.context(ManagedWorkBlocked))?;
     Ok(())
 }
 
@@ -484,6 +506,7 @@ async fn invoke_maintenance(
     guard: &File,
     identity_only: bool,
     delete_credential: bool,
+    args: &Arguments,
 ) -> Result<Value> {
     let binary = PathBuf::from(
         journal["maintenanceBinary"]
@@ -526,6 +549,7 @@ async fn invoke_maintenance(
         });
     }
     let mut process = child.spawn()?;
+    dispatch_activation(args, true);
     let output = observe_maintenance(&mut process, std::time::Duration::from_secs(35)).await?;
     if !output.status.success() {
         return Err(maintenance_failure(&output.stderr));
@@ -701,7 +725,18 @@ fn maintenance_failure(stderr: &[u8]) -> anyhow::Error {
     if let Some(removed) = value["protectedStoreRemoved"].as_bool() {
         projected["protectedStoreRemoved"] = json!(removed);
     }
-    anyhow::anyhow!("{projected}")
+    let error = anyhow::anyhow!("{projected}");
+    if matches!(
+        envelope["outcome"].as_str(),
+        Some("not_dispatched" | "rejected")
+    ) {
+        // Context keeps the public JSON display intact while retaining a typed
+        // authoritative refusal marker for the activation outcome encoder.
+        return Err::<(), _>(DefinitiveActivationBlock)
+            .context(error)
+            .unwrap_err();
+    }
+    error
 }
 
 fn immutable_copy(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -780,7 +815,24 @@ pub(super) async fn run(args: Arguments, recover: bool) -> Result<()> {
     let mut journal: Value;
     if journal_path.exists() {
         journal = serde_json::from_slice(&regular_bytes(&journal_path)?)?;
-        if journal["schema"] == OLD_SCHEMA {
+        if recover && journal["schema"] == SCHEMA && journal["recovery"].is_null() {
+            if journal["phase"] != "prepared" {
+                return Err(OriginalUninstallOwnerRequired.into());
+            }
+            ensure!(
+                args.expected_old_journal_sha256.as_deref()
+                    == Some(digest_file(&journal_path)?.as_str()),
+                "reviewed current uninstall journal digest mismatch"
+            );
+            validate_journal(&paths, &journal)?;
+            select_activation(
+                &args,
+                Uuid::parse_str(journal["operationId"].as_str().unwrap())?,
+            );
+        }
+        if journal["schema"] == OLD_SCHEMA
+            || (recover && journal["schema"] == SCHEMA && journal["recovery"].is_null())
+        {
             ensure!(
                 recover,
                 "old uninstall requires explicit recover-uninstall RELEASE --expected-old-journal-sha256 SHA256"
@@ -824,8 +876,20 @@ pub(super) async fn run(args: Arguments, recover: bool) -> Result<()> {
         journal = json!({"schema":SCHEMA,"phase":"prepared","operationId":Uuid::new_v4(),"drainKey":Uuid::new_v4(),"receipt":receipt,"receiptSha256":state::json_digest(&receipt),"receiptFileSha256":digest_file(&receipt_path)?,"paths":owned["paths"],"inventories":owned["inventories"],"helper":helper,"helperSha256":digest_file(&bootstrap)?,"expectedIdentity":identity,"maintenanceBinary":target.join("bin/loomex-runner"),"maintenanceSha256":digest_file(&target.join("bin/loomex-runner"))?,"cleanup":{"moved":[],"deletingStarted":[]}});
         journal["fenceJournalSha256"] = json!(state::json_digest(&journal));
         save(&paths, &journal)?;
+        select_activation(
+            &args,
+            Uuid::parse_str(journal["operationId"].as_str().unwrap())?,
+        );
+        fault("AFTER_PREPARED")?;
     }
     validate_journal(&paths, &journal)?;
+    select_activation(
+        &args,
+        Uuid::parse_str(journal["operationId"].as_str().unwrap())?,
+    );
+    if journal["stopEvidence"]["request"] == "unconfirmed" {
+        dispatch_activation(&args, true);
+    }
     if !journal["recovery"].is_null() {
         ensure!(
             recover
@@ -839,7 +903,7 @@ pub(super) async fn run(args: Arguments, recover: bool) -> Result<()> {
                 .context("uninstall recovery release required")?,
         )?;
         let manifest = read_manifest(&release)?;
-        verify_release(&release, &manifest, &args).await?;
+        bootstrap_preflight::verify_artifact(&release, &manifest, &args).await?;
         ensure!(
             release.to_string_lossy().as_ref()
                 == journal["recovery"]["releasePath"].as_str().unwrap_or("")
@@ -862,17 +926,14 @@ pub(super) async fn run(args: Arguments, recover: bool) -> Result<()> {
                 && digest_file(&original)? == journal["recovery"]["oldJournalSha256"],
             "original uninstall evidence changed"
         );
+        validate_adopted_replacement(&paths, &args, &journal)?;
         let intent = PathBuf::from(
             journal["recovery"]["releaseIntent"]
                 .as_str()
                 .context("recovery release intent missing")?,
         );
         ensure!(
-            intent
-                == paths.state_dir.join(format!(
-                    "bootstrap-uninstall-recovery-release-{}.json",
-                    journal["recovery"]["oldJournalSha256"].as_str().unwrap()
-                ))
+            recovery_intent_path_matches(&paths, &journal, &intent)
                 && digest_file(&intent)? == journal["recovery"]["releaseIntentSha256"],
             "uninstall recovery release intent changed"
         );
@@ -909,6 +970,21 @@ pub(super) async fn run(args: Arguments, recover: bool) -> Result<()> {
         id,
         journal["fenceJournalSha256"].as_str().unwrap(),
     )?;
+    let mut stopped_guard = None;
+    if journal["phase"] == "prepared" && !synthetic && label_observation(&paths).await?.is_none() {
+        // This is fresh absence admission, never an invented idle/drain proof.
+        // The receipt, owned payload and native identity remain bound while the
+        // singleton excludes both a daemon and another maintenance process.
+        let guard = verify_stopped(&paths, &journal, false).await?;
+        qualify_before_effects(&paths)?;
+        let agent_sha = digest_file(&paths.launch_agents_dir.join("app.loomex.runner.plist"))?;
+        let native = invoke_maintenance(&paths, &journal, &guard, true, false, &args).await?;
+        dispatch_activation(&args, false);
+        fault("BEFORE_PREPARED_STOPPED")?;
+        checkpoint_prepared_stopped(&paths, &mut journal, native, agent_sha)?;
+        fault("AFTER_PREPARED_STOPPED")?;
+        stopped_guard = Some(guard);
+    }
     let admission_phase = journal["phase"].as_str().unwrap().to_owned();
     require_initial_admission(&admission_phase,async {
         qualify_before_effects(&paths)?;
@@ -921,18 +997,23 @@ pub(super) async fn run(args: Arguments, recover: bool) -> Result<()> {
                     "uninstall drain identity mismatch"
                 );
             } else {
+                dispatch_activation(&args,true);
                 let result = control::client(
                     &paths.state_dir,
                     "daemon.drain",
                     json!({"idempotencyKey":journal["drainKey"]}),
                 )
                 .await?;
+                dispatch_activation(&args,false);
                 ensure!(
                     result.get("error").is_none() && result["result"]["draining"] == true,
                     "uninstall drain rejected"
                 );
             }
             let status = control::client(&paths.state_dir, "status.get", json!({})).await?;
+            if status.get("error").is_none() && status["result"]["activeJobs"].as_u64().is_some_and(|v| v > 0) {
+                return Err(PendingActivation.into());
+            }
             ensure!(
                 status.get("error").is_none()
                     && status["result"]["activeJobs"] == 0
@@ -997,6 +1078,7 @@ pub(super) async fn run(args: Arguments, recover: bool) -> Result<()> {
         // refusal restores prepared; an uncertain request is observation-only.
         journal["stopEvidence"]["request"] = json!("unconfirmed");
         save(&paths, &journal)?;
+        dispatch_activation(&args, true);
         if dispatch {
             let uid = unsafe { libc::geteuid() };
             let mut command = tokio::process::Command::new("/bin/launchctl");
@@ -1012,6 +1094,7 @@ pub(super) async fn run(args: Arguments, recover: bool) -> Result<()> {
                 Err(error) => {
                     journal["stopEvidence"]["request"] = json!("prepared");
                     save(&paths, &journal)?;
+                    dispatch_activation(&args, false);
                     return Err(error.into());
                 }
             };
@@ -1023,7 +1106,11 @@ pub(super) async fn run(args: Arguments, recover: bool) -> Result<()> {
     }
     // Stopped retries and uncertain stop requests observe fresh OS/singleton
     // facts without contacting the socket or repeating an uncertain bootout.
-    let guard = verify_stopped(&paths, &journal, synthetic).await?;
+    let guard = match stopped_guard {
+        Some(guard) => guard,
+        None => verify_stopped(&paths, &journal, synthetic).await?,
+    };
+    dispatch_activation(&args, false);
     if journal["phase"] == "stop_intent" {
         journal["phase"] = json!("stopped");
         save(&paths, &journal)?;
@@ -1035,11 +1122,14 @@ pub(super) async fn run(args: Arguments, recover: bool) -> Result<()> {
             save(&paths, &journal)?;
         }
         if !synthetic {
-            let native = invoke_maintenance(&paths, &journal, &guard, true, false).await?;
+            let native = invoke_maintenance(&paths, &journal, &guard, true, false, &args).await?;
+            dispatch_activation(&args, false);
             let absent = record_native_identity(&mut journal, native)?;
             save(&paths, &journal)?;
             if !absent {
-                let result = invoke_maintenance(&paths, &journal, &guard, false, false).await?;
+                let result =
+                    invoke_maintenance(&paths, &journal, &guard, false, false, &args).await?;
+                dispatch_activation(&args, false);
                 ensure!(
                     result["identity"]["installationId"]
                         == journal["expectedIdentity"]["installationId"]
@@ -1065,7 +1155,8 @@ pub(super) async fn run(args: Arguments, recover: bool) -> Result<()> {
     }
     if journal["phase"] == "revoked" && journal["protectedStoreRemoved"] != true {
         if !synthetic {
-            let result = invoke_maintenance(&paths, &journal, &guard, false, true).await?;
+            let result = invoke_maintenance(&paths, &journal, &guard, false, true, &args).await?;
+            dispatch_activation(&args, false);
             ensure!(
                 result["remoteRevocation"] == journal["remoteRevocation"]
                     && result["protectedStoreRemoved"] == true,
@@ -1079,16 +1170,539 @@ pub(super) async fn run(args: Arguments, recover: bool) -> Result<()> {
     cleanup(&paths, &mut journal, &guard, synthetic).await
 }
 
+struct RecoveryScratch(PathBuf);
+impl Drop for RecoveryScratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+fn valid_sha(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+fn recovery_stage_path_matches(paths: &lifecycle::Paths, journal: &Value, stage: &Path) -> bool {
+    let Some(old) = journal["recovery"]["oldJournalSha256"]
+        .as_str()
+        .filter(|v| valid_sha(v))
+    else {
+        return false;
+    };
+    let Some(manifest) = journal["recovery"]["releaseManifestSha256"]
+        .as_str()
+        .filter(|v| valid_sha(v))
+    else {
+        return false;
+    };
+    stage == paths.state_dir.join(format!("uninstall-recovery-{old}"))
+        || stage
+            == paths
+                .state_dir
+                .join(format!("uninstall-recovery-{old}-{manifest}"))
+}
+fn recovery_intent_path_matches(paths: &lifecycle::Paths, journal: &Value, intent: &Path) -> bool {
+    let Some(old) = journal["recovery"]["oldJournalSha256"]
+        .as_str()
+        .filter(|v| valid_sha(v))
+    else {
+        return false;
+    };
+    let Some(manifest) = journal["recovery"]["releaseManifestSha256"]
+        .as_str()
+        .filter(|v| valid_sha(v))
+    else {
+        return false;
+    };
+    intent
+        == paths
+            .state_dir
+            .join(format!("bootstrap-uninstall-recovery-release-{old}.json"))
+        || intent
+            == paths.state_dir.join(format!(
+                "bootstrap-uninstall-recovery-replacement-{old}-{manifest}.json"
+            ))
+}
+fn validate_replacement(
+    paths: &lifecycle::Paths,
+    args: &Arguments,
+    old: &Value,
+    old_digest: &str,
+    id: Uuid,
+    intent: &Path,
+) -> Result<()> {
+    ensure!(
+        old["schema"] == OLD_SCHEMA
+            && old["phase"] == "prepared"
+            && digest_file(&paths.state_dir.join("bootstrap-uninstall.json"))? == old_digest,
+        "candidate replacement requires unchanged historical prepared journal"
+    );
+    ensure!(
+        args.replace_pre_adoption_candidate
+            && args.expected_recovery_intent_sha256.as_deref()
+                == Some(digest_file(intent)?.as_str()),
+        "reviewed recovery intent digest mismatch"
+    );
+    let operation: lifecycle::Operation =
+        state::read_json(&paths.state_dir.join("lifecycle-operation.json"))?;
+    ensure!(
+        operation.id == id
+            && operation
+                .uninstall_fence
+                .as_ref()
+                .is_some_and(|f| f.journal_sha256 == old_digest),
+        "candidate replacement fence changed"
+    );
+    // A retained request can mean a child is still doing native IO. Neither a
+    // missing socket nor a v1 journal proves that such work never dispatched.
+    ensure!(
+        !paths
+            .state_dir
+            .join(format!("uninstall-maintenance-{id}.json"))
+            .try_exists()?,
+        "candidate replacement maintenance history is uncertain"
+    );
+    let previous: Value = serde_json::from_slice(&regular_bytes(intent)?)?;
+    ensure!(
+        previous["schema"] == "app.loomex.runner.uninstall-recovery-release/v1"
+            && previous["operationId"] == id.to_string()
+            && previous["oldJournalSha256"] == old_digest
+            && previous["stage"]
+                == paths
+                    .state_dir
+                    .join(format!("uninstall-recovery-{old_digest}"))
+                    .to_string_lossy()
+                    .as_ref()
+            && previous["manifestSha256"].as_str().is_some_and(valid_sha)
+            && previous["releasePath"]
+                .as_str()
+                .is_some_and(|p| Path::new(p).is_absolute()),
+        "candidate replacement original intent invalid"
+    );
+    qualify_before_effects(paths)?;
+    Ok(())
+}
+
+fn recovery_release_selection(
+    paths: &lifecycle::Paths,
+    args: &Arguments,
+    id: Uuid,
+    old_digest: &str,
+    manifest_sha: &str,
+    release: &Path,
+) -> (PathBuf, Value) {
+    let replacing = args.replace_pre_adoption_candidate;
+    let stage = paths.state_dir.join(if replacing {
+        format!("uninstall-recovery-{old_digest}-{manifest_sha}")
+    } else {
+        format!("uninstall-recovery-{old_digest}")
+    });
+    let intent = paths.state_dir.join(if replacing {
+        format!("bootstrap-uninstall-recovery-replacement-{old_digest}-{manifest_sha}.json")
+    } else {
+        format!("bootstrap-uninstall-recovery-release-{old_digest}.json")
+    });
+    let mut value = json!({"schema":"app.loomex.runner.uninstall-recovery-release/v1","operationId":id,"oldJournalSha256":old_digest,"releasePath":release,"manifestSha256":manifest_sha,"stage":stage});
+    if replacing {
+        value["supersededIntent"] = json!(paths.state_dir.join(format!(
+            "bootstrap-uninstall-recovery-release-{old_digest}.json"
+        )));
+        value["supersededIntentSha256"] = json!(args.expected_recovery_intent_sha256);
+    }
+    (intent, value)
+}
+fn validate_retained_selection(intent: &Path, expected: &Value) -> Result<()> {
+    if intent.try_exists()? {
+        ensure!(
+            regular_bytes(intent)? == serde_json::to_vec(expected)?,
+            "retained recovery candidate binding differs; explicit reviewed replacement is required"
+        );
+    }
+    Ok(())
+}
+
+fn validate_adopted_replacement(
+    paths: &lifecycle::Paths,
+    args: &Arguments,
+    journal: &Value,
+) -> Result<()> {
+    if !args.replace_pre_adoption_candidate {
+        return Ok(());
+    }
+    let old = journal["recovery"]["oldJournalSha256"]
+        .as_str()
+        .context("replacement historical binding missing")?;
+    let original = paths
+        .state_dir
+        .join(format!("bootstrap-uninstall-recovery-release-{old}.json"));
+    ensure!(
+        args.expected_recovery_intent_sha256.as_deref() == Some(digest_file(&original)?.as_str()),
+        "replacement original intent digest changed"
+    );
+    let selected = PathBuf::from(
+        journal["recovery"]["releaseIntent"]
+            .as_str()
+            .context("replacement selected intent missing")?,
+    );
+    ensure!(
+        selected != original && recovery_intent_path_matches(paths, journal, &selected),
+        "replacement was not adopted by this operation"
+    );
+    let value: Value = serde_json::from_slice(&regular_bytes(&selected)?)?;
+    ensure!(
+        value["supersededIntent"].as_str() == Some(original.to_string_lossy().as_ref())
+            && value["supersededIntentSha256"].as_str()
+                == args.expected_recovery_intent_sha256.as_deref()
+            && value["operationId"] == journal["operationId"],
+        "replacement selection evidence changed"
+    );
+    Ok(())
+}
+
+pub(super) fn recovery_ownership(paths: &lifecycle::Paths) -> Value {
+    let inspect = || -> Result<Value> {
+        let snapshot = lifecycle::status(paths).unwrap_or_else(|_| json!({"ownershipValid":false}));
+        let ownership_valid = snapshot["ownershipValid"] == true;
+        let operation_id = snapshot["operation"]["id"]
+            .as_str()
+            .and_then(|v| Uuid::parse_str(v).ok())
+            .map(|v| v.to_string());
+        for name in [
+            "bootstrap-uninstall.json",
+            "bootstrap-uninstall-terminal.json",
+        ] {
+            let path = paths.state_dir.join(name);
+            if !path.try_exists()? {
+                continue;
+            }
+            let journal: Value = serde_json::from_slice(&regular_bytes(&path)?)?;
+            let old = journal["schema"] == OLD_SCHEMA;
+            let digest = digest_file(&path)?;
+            let intent = paths.state_dir.join(format!(
+                "bootstrap-uninstall-recovery-release-{digest}.json"
+            ));
+            let intent_digest = if old && intent.try_exists()? {
+                Some(digest_file(&intent)?)
+            } else {
+                None
+            };
+            let phase = journal["phase"]
+                .as_str()
+                .filter(|v| {
+                    matches!(
+                        *v,
+                        "prepared"
+                            | "idle_verified"
+                            | "stop_intent"
+                            | "stopped"
+                            | "revoked"
+                            | "cleanup"
+                            | "terminal"
+                    )
+                })
+                .unwrap_or("unknown");
+            let original_owner =
+                journal["schema"] == SCHEMA && journal["recovery"].is_null() && phase != "prepared";
+            let prepared_current =
+                journal["schema"] == SCHEMA && journal["recovery"].is_null() && phase == "prepared";
+            return Ok(
+                json!({"status":if ownership_valid {"pending"} else {"blocked"},"owner":"bootstrap_uninstall","operationId":journal["operationId"].as_str().and_then(|v| Uuid::parse_str(v).ok()).map(|v| v.to_string()).or(operation_id),
+                "phase":phase,"journalSha256":digest,"recoveryIntentSha256":intent_digest,
+                "nextAction":if !ownership_valid {"inspect_protected_ownership"} else if original_owner {"resume_original_uninstall_owner"} else if old || prepared_current {"recover_uninstall"} else {"resume_bootstrap_uninstall"},
+                "reasonCode":if !ownership_valid {"OWNERSHIP_UNCONFIRMED"} else if old {"HISTORICAL_UNINSTALL_PENDING"} else {"UNINSTALL_PENDING"}}),
+            );
+        }
+        ensure!(ownership_valid, "invalid lifecycle ownership");
+        let record = snapshot["ownership"]
+            .as_array()
+            .and_then(|v| v.iter().find(|v| v["pending"] == true));
+        Ok(match record {
+            Some(record) => {
+                json!({"status":"pending","owner":record["owner"],"operationId":operation_id,"phase":record["phase"],"journalSha256":record["sha256"],"nextAction":snapshot["nextAction"],"reasonCode":"LIFECYCLE_OPERATION_PENDING"})
+            }
+            None => {
+                json!({"status":"none","operationId":null,"phase":null,"journalSha256":null,"nextAction":"none","reasonCode":"NO_PENDING_RECOVERY"})
+            }
+        })
+    };
+    inspect().unwrap_or_else(|_| json!({"status":"blocked","operationId":null,"phase":null,"journalSha256":null,"nextAction":"inspect_protected_ownership","reasonCode":"OWNERSHIP_UNCONFIRMED"}))
+}
+
+// Read-only candidate/historical binding admission. A successful preflight is
+// never native authorization; the mutator repeats every check under its lock.
+pub(super) async fn recovery_preflight(
+    paths: &lifecycle::Paths,
+    args: &Arguments,
+    release: &Path,
+    manifest: &Value,
+    payload: &Path,
+) -> Result<bool> {
+    let journal_path = paths.state_dir.join("bootstrap-uninstall.json");
+    let terminal_path = paths.state_dir.join("bootstrap-uninstall-terminal.json");
+    let path = if journal_path.try_exists()? {
+        journal_path
+    } else if terminal_path.try_exists()? {
+        terminal_path
+    } else {
+        return Ok(false);
+    };
+    let journal: Value = serde_json::from_slice(&regular_bytes(&path)?)?;
+    let expected_path = args.expected_release_path.as_deref().unwrap_or(release);
+    ensure!(
+        expected_path.is_absolute(),
+        "recovery release path must be absolute"
+    );
+    let release_sha = digest_file(&release.join("manifest.json"))?;
+    ensure!(
+        digest_file(&std::env::current_exe()?)? == manifest["bootstrap"]["sha256"],
+        "recovery requires release-bound bootstrap"
+    );
+    if journal["schema"] == OLD_SCHEMA
+        || (journal["schema"] == SCHEMA && journal["recovery"].is_null())
+    {
+        let current_v2 = journal["schema"] == SCHEMA;
+        if current_v2 && journal["phase"] != "prepared" {
+            return Err(OriginalUninstallOwnerRequired.into());
+        }
+        let digest = digest_file(&path)?;
+        ensure!(
+            args.expected_old_journal_sha256.as_deref() == Some(digest.as_str())
+                && journal["phase"] == "prepared",
+            "historical recovery journal binding mismatch"
+        );
+        lifecycle::require_terminal_before_uninstall(paths)?;
+        validate_owned_installation(paths, &journal["receipt"], &journal_owned(&journal), false)?;
+        validate_helper(paths, &journal)?;
+        ensure!(
+            serde_json::from_slice::<Value>(&regular_bytes(
+                &paths.state_dir.join("install-receipt.json")
+            )?)? == journal["receipt"],
+            "old uninstall receipt changed"
+        );
+        if current_v2 {
+            validate_journal(paths, &journal)?;
+            validated_current_identity(&journal)?;
+        } else {
+            prior_identity(paths)?;
+        }
+        qualify_before_effects(paths)?;
+        let intent = paths.state_dir.join(format!(
+            "bootstrap-uninstall-recovery-release-{digest}.json"
+        ));
+        if args.replace_pre_adoption_candidate {
+            let operation: lifecycle::Operation =
+                state::read_json(&paths.state_dir.join("lifecycle-operation.json"))?;
+            validate_replacement(paths, args, &journal, &digest, operation.id, &intent)?;
+        }
+        let operation: Option<lifecycle::Operation> = if paths
+            .state_dir
+            .join("lifecycle-operation.json")
+            .try_exists()?
+        {
+            Some(state::read_json(
+                &paths.state_dir.join("lifecycle-operation.json"),
+            )?)
+        } else {
+            None
+        };
+        let selected_id = if current_v2 {
+            Uuid::parse_str(
+                journal["operationId"]
+                    .as_str()
+                    .context("current uninstall operation missing")?,
+            )?
+        } else {
+            operation
+                .as_ref()
+                .filter(|op| op.uninstall_fence.is_some())
+                .map(|op| op.id)
+                .unwrap_or(Uuid::nil())
+        };
+        ensure!(
+            !paths
+                .state_dir
+                .join(format!("uninstall-maintenance-{selected_id}.json"))
+                .try_exists()?,
+            "prepared adoption maintenance history is uncertain"
+        );
+        let (selected_intent, expected) = recovery_release_selection(
+            paths,
+            args,
+            selected_id,
+            &digest,
+            &release_sha,
+            expected_path,
+        );
+        validate_retained_selection(&selected_intent, &expected)?;
+        validate_recovery_candidate(args, &journal, manifest, payload).await?;
+    } else {
+        validate_adopted_replacement(paths, args, &journal)?;
+        if journal["phase"] != "terminal" {
+            validate_journal(paths, &journal)?;
+        }
+        ensure!(
+            journal["schema"] == SCHEMA
+                && args.expected_old_journal_sha256.as_deref()
+                    == journal["recovery"]["oldJournalSha256"].as_str()
+                && journal["recovery"]["releasePath"].as_str()
+                    == Some(expected_path.to_string_lossy().as_ref())
+                && journal["recovery"]["releaseManifestSha256"] == release_sha,
+            "recovery candidate historical binding mismatch"
+        );
+        let original = paths.state_dir.join(format!(
+            "bootstrap-uninstall-original-{}.json",
+            args.expected_old_journal_sha256.as_deref().unwrap_or("")
+        ));
+        ensure!(
+            digest_file(&original)?.as_str()
+                == args.expected_old_journal_sha256.as_deref().unwrap_or(""),
+            "historical recovery evidence changed"
+        );
+        let intent = PathBuf::from(
+            journal["recovery"]["releaseIntent"]
+                .as_str()
+                .context("recovery intent missing")?,
+        );
+        ensure!(
+            recovery_intent_path_matches(paths, &journal, &intent)
+                && digest_file(&intent)? == journal["recovery"]["releaseIntentSha256"],
+            "recovery intent changed"
+        );
+    }
+    Ok(true)
+}
+
+async fn validate_recovery_candidate(
+    args: &Arguments,
+    old: &Value,
+    manifest: &Value,
+    payload: &Path,
+) -> Result<()> {
+    let version = manifest["version"]
+        .as_str()
+        .context("recovery version missing")?;
+    let numeric = |v: &str| -> Result<Vec<u64>> {
+        let parts = v
+            .split('.')
+            .map(|s| s.parse::<u64>().context("invalid recovery version"))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(parts.len() == 3, "invalid recovery version");
+        Ok(parts)
+    };
+    ensure!(
+        numeric(version)?
+            >= numeric(
+                old["receipt"]["version"]
+                    .as_str()
+                    .context("old version missing")?
+            )?,
+        "uninstall recovery release downgrade refused"
+    );
+    let project: Value =
+        serde_json::from_slice(&regular_bytes(&payload.join("metadata/project.json"))?)?;
+    ensure!(
+        project["project"] == "loomex-runner"
+            && project["version"] == version
+            && project["platform"] == "darwin-arm64",
+        "recovery project metadata mismatch"
+    );
+    if args.preview_api_origin.is_some() {
+        validate_preview_identity(
+            manifest,
+            option_env!("LOOMEX_PREVIEW_SOURCE_REVISION"),
+            env!("CARGO_PKG_VERSION"),
+        )?;
+    }
+    let candidate = payload.join("bin/loomex-runner");
+    let previous = PathBuf::from(
+        old["receipt"]["versionPath"]
+            .as_str()
+            .context("old target missing")?,
+    )
+    .join("bin/loomex-runner");
+    let candidate_requirement = if manifest["developmentOnly"] == true {
+        bootstrap_preflight::development_signing(payload)?
+    } else {
+        for name in ["loomex", "loomex-lifecycle-bootstrap"] {
+            signing_requirement(&payload.join("bin").join(name))?;
+        }
+        signing_requirement(&candidate)?
+    };
+    if manifest["developmentOnly"] == true {
+        let candidate_origin =
+            development_origin(payload, manifest, args, option_env!("LOOMEX_API_ORIGIN"))?;
+        ensure!(
+            candidate_origin.as_deref() == old["receipt"]["developmentApiOrigin"].as_str(),
+            "recovery origin differs from owned receipt"
+        );
+    } else {
+        ensure!(
+            old["receipt"]["developmentApiOrigin"].is_null(),
+            "production recovery origin mismatch"
+        );
+    }
+    let previous_requirement = signing_requirement(&previous)?;
+    signing_transition(
+        previous_requirement.as_deref(),
+        candidate_requirement.as_deref(),
+        digest_file(&previous)? == digest_file(&candidate)?,
+        args.authorize_keychain_transition,
+    )?;
+    // Both inspections are non-authorizing. Foreground native authorization
+    // runs only after the mutator has adopted the qualified candidate binding.
+    Ok(())
+}
+
+fn checkpoint_prepared_stopped(
+    paths: &lifecycle::Paths,
+    journal: &mut Value,
+    native: Value,
+    agent_sha: String,
+) -> Result<()> {
+    ensure!(
+        journal["phase"] == "prepared",
+        "stopped admission requires prepared journal"
+    );
+    qualify_before_effects(paths)?;
+    record_native_identity(journal, native)?;
+    journal["phase"] = json!("stopped");
+    journal["stopEvidence"] = json!({"launchAgentSha256":agent_sha,"admission":"service_absence_verified","request":"not_dispatched"});
+    save(paths, journal)
+}
+
+// Candidate qualification belongs before any durable binding. Keeping this
+// boundary explicit also makes failure ordering testable without native IO.
+async fn adopt_recovery_binding<F>(
+    paths: &lifecycle::Paths,
+    id: Uuid,
+    old_digest: &str,
+    intent: &Path,
+    release_intent: &Value,
+    qualification: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    qualification.await?;
+    lifecycle::begin_uninstall_fence_locked(paths, id, old_digest)?;
+    immutable_copy(intent, &serde_json::to_vec(release_intent)?)?;
+    Ok(())
+}
+
 async fn recover_old(paths: &lifecycle::Paths, args: &Arguments, old: Value) -> Result<Value> {
     let old_path = paths.state_dir.join("bootstrap-uninstall.json");
     let bytes = regular_bytes(&old_path)?;
     let old_digest = state::digest(&bytes);
     ensure!(
+        serde_json::from_slice::<Value>(&bytes)? == old,
+        "historical uninstall journal changed"
+    );
+    ensure!(
         args.expected_old_journal_sha256.as_deref() == Some(old_digest.as_str()),
         "reviewed old uninstall journal digest mismatch"
     );
     ensure!(
-        old["schema"] == OLD_SCHEMA
+        (old["schema"] == OLD_SCHEMA || (old["schema"] == SCHEMA && old["recovery"].is_null()))
             && matches!(old["phase"].as_str(), Some("prepared" | "revoked")),
         "unsupported old uninstall state"
     );
@@ -1106,10 +1720,18 @@ async fn recover_old(paths: &lifecycle::Paths, args: &Arguments, old: Value) -> 
         "old uninstall receipt changed"
     );
     qualify_before_effects(paths)?;
-    let identity = prior_identity(paths)?;
+    let current_v2 = old["schema"] == SCHEMA;
+    if current_v2 {
+        validate_journal(paths, &old)?;
+    }
+    let identity = if current_v2 {
+        validated_current_identity(&old)?
+    } else {
+        prior_identity(paths)?
+    };
     let release = fs::canonicalize(args.release.as_ref().context("recovery release required")?)?;
     let manifest = read_manifest(&release)?;
-    verify_release(&release, &manifest, args).await?;
+    bootstrap_preflight::verify_artifact(&release, &manifest, args).await?;
     ensure!(
         digest_file(&std::env::current_exe()?)? == manifest["bootstrap"]["sha256"],
         "recovery must run the release-bound bootstrap"
@@ -1135,20 +1757,67 @@ async fn recover_old(paths: &lifecycle::Paths, args: &Arguments, old: Value) -> 
         } else {
             None
         };
-    let id = operation
-        .as_ref()
-        .filter(|op| op.uninstall_fence.is_some())
-        .map(|op| op.id)
-        .unwrap_or_else(Uuid::new_v4);
-    lifecycle::begin_uninstall_fence_locked(paths, id, &old_digest)?;
-    let stage = paths
-        .state_dir
-        .join(format!("uninstall-recovery-{old_digest}"));
-    let intent = paths.state_dir.join(format!(
+    let id = if current_v2 {
+        Uuid::parse_str(
+            old["operationId"]
+                .as_str()
+                .context("current uninstall operation missing")?,
+        )?
+    } else {
+        operation
+            .as_ref()
+            .filter(|op| op.uninstall_fence.is_some())
+            .map(|op| op.id)
+            .unwrap_or_else(Uuid::new_v4)
+    };
+    select_activation(args, id);
+    let fence_digest = if current_v2 {
+        old["fenceJournalSha256"]
+            .as_str()
+            .context("current uninstall fence missing")?
+            .to_owned()
+    } else {
+        old_digest.clone()
+    };
+    ensure!(
+        !paths
+            .state_dir
+            .join(format!("uninstall-maintenance-{id}.json"))
+            .try_exists()?,
+        "prepared adoption maintenance history is uncertain"
+    );
+    // Validate in disposable scratch, including every package binding and the
+    // installed-to-candidate signer transition, before publishing any intent.
+    let scratch = RecoveryScratch(
+        std::env::temp_dir().join(format!("loomex-uninstall-qualification-{}", Uuid::new_v4())),
+    );
+    let original_intent = paths.state_dir.join(format!(
         "bootstrap-uninstall-recovery-release-{old_digest}.json"
     ));
-    let release_intent = json!({"schema":"app.loomex.runner.uninstall-recovery-release/v1","operationId":id,"oldJournalSha256":old_digest,"releasePath":release,"manifestSha256":digest_file(&release.join("manifest.json"))?,"stage":stage});
-    immutable_copy(&intent, &serde_json::to_vec(&release_intent)?)?;
+    let manifest_sha = digest_file(&release.join("manifest.json"))?;
+    let replacement = args.replace_pre_adoption_candidate;
+    let (intent, release_intent) =
+        recovery_release_selection(paths, args, id, &old_digest, &manifest_sha, &release);
+    let stage = PathBuf::from(release_intent["stage"].as_str().unwrap());
+    validate_retained_selection(&intent, &release_intent)?;
+    if replacement {
+        validate_replacement(paths, args, &old, &old_digest, id, &original_intent)?;
+    }
+    adopt_recovery_binding(paths, id, &fence_digest, &intent, &release_intent, async {
+        let payload =
+            bootstrap_preflight::extract_artifact(&release, &manifest, &scratch.0).await?;
+        bootstrap_preflight::verify_envelope(&release, &payload, &manifest)?;
+        validate_recovery_candidate(args, &old, &manifest, &payload).await?;
+        ensure!(
+            digest_file(&old_path)? == old_digest,
+            "historical uninstall journal changed during qualification"
+        );
+        if replacement {
+            validate_replacement(paths, args, &old, &old_digest, id, &original_intent)?;
+        }
+        Ok(())
+    })
+    .await?;
     if stage.exists() {
         inventory(
             &stage,
@@ -1157,30 +1826,19 @@ async fn recover_old(paths: &lifecycle::Paths, args: &Arguments, old: Value) -> 
                 .context("release inventory missing")?,
         )?;
     } else {
-        // Publish a fully verified tree with one rename. Interrupted extraction
-        // stays in private scratch and cannot become a partially valid stable
-        // maintenance payload or block the next exact recovery attempt.
-        let scratch = paths.state_dir.join(format!(
+        // Scratch may be on a different filesystem: copy into a private owned
+        // stage, reverify, then publish with one same-filesystem rename.
+        let publishing = RecoveryScratch(paths.state_dir.join(format!(
             ".uninstall-recovery-stage-{}-{}",
             id,
             Uuid::new_v4()
-        ));
-        extract(&release, &manifest, &scratch).await?;
-        fs::rename(&scratch, &stage)?;
+        )));
+        bootstrap_preflight::extract_artifact(&release, &manifest, &publishing.0).await?;
+        fs::rename(&publishing.0, &stage)?;
         File::open(&paths.state_dir)?.sync_all()?;
     }
-    let previous =
-        PathBuf::from(old["receipt"]["versionPath"].as_str().unwrap()).join("bin/loomex-runner");
     let candidate = stage.join("bin/loomex-runner");
-    let previous_requirement = signing_requirement(&previous)?;
-    let candidate_requirement = signing_requirement(&candidate)?;
-    let transition = signing_transition(
-        previous_requirement.as_deref(),
-        candidate_requirement.as_deref(),
-        digest_file(&previous)? == digest_file(&candidate)?,
-        args.authorize_keychain_transition,
-    )?;
-    if transition == SigningTransition::ForegroundAuthorizationRequired {
+    if args.authorize_keychain_transition {
         credential_probe(&candidate, true).await?;
     }
     // Preserve the original journal bytes and helper unchanged. The private
@@ -1190,7 +1848,13 @@ async fn recover_old(paths: &lifecycle::Paths, args: &Arguments, old: Value) -> 
         .join(format!("bootstrap-uninstall-original-{old_digest}.json"));
     immutable_copy(&original, &bytes)?;
     let drain = paths.state_dir.join("drain.json");
-    let drain_key = if drain.exists() {
+    let drain_key = if current_v2 {
+        Uuid::parse_str(
+            old["drainKey"]
+                .as_str()
+                .context("current uninstall drain missing")?,
+        )?
+    } else if drain.exists() {
         let marker: Value = serde_json::from_slice(&regular_bytes(&drain)?)?;
         Uuid::parse_str(
             marker["idempotencyKey"]
@@ -1205,20 +1869,21 @@ async fn recover_old(paths: &lifecycle::Paths, args: &Arguments, old: Value) -> 
     value["phase"] = json!("prepared");
     value["operationId"] = json!(id);
     value["drainKey"] = json!(drain_key);
-    value["fenceJournalSha256"] = json!(old_digest);
+    value["fenceJournalSha256"] = json!(fence_digest);
     value["expectedIdentity"] = identity;
     value["receiptSha256"] = json!(state::json_digest(&value["receipt"]));
     value["receiptFileSha256"] = json!(digest_file(&receipt_path)?);
     value["maintenanceBinary"] = json!(candidate);
     value["maintenanceSha256"] = json!(digest_file(&candidate)?);
     value["cleanup"] = json!({"moved":[],"deletingStarted":[]});
-    value["recovery"] = json!({"originalJournal":original,"oldJournalSha256":old_digest,"releasePath":release,"releaseManifestSha256":digest_file(&release.join("manifest.json"))?,"payloadPath":stage,"files":manifest["payload"]["files"],"releaseIntent":intent,"releaseIntentSha256":digest_file(&intent)?});
+    value["recovery"] = json!({"adoptedCurrent":current_v2,"originalJournal":original,"oldJournalSha256":old_digest,"releasePath":release,"releaseManifestSha256":digest_file(&release.join("manifest.json"))?,"payloadPath":stage,"files":manifest["payload"]["files"],"releaseIntent":intent,"releaseIntentSha256":digest_file(&intent)?});
     value["stopEvidence"] = json!({"launchAgentSha256":digest_file(&paths.launch_agents_dir.join("app.loomex.runner.plist"))?});
-    if label_observation(paths).await?.is_none() {
+    if !current_v2 && label_observation(paths).await?.is_none() {
         value["phase"] = json!("stop_intent");
         value["recovery"]["adoptedStopped"] = json!(true);
     }
     save(paths, &value)?;
+    fault("AFTER_RECOVERY_ADOPTION")?;
     Ok(value)
 }
 
@@ -1320,11 +1985,7 @@ async fn cleanup(
                 .context("recovery payload missing")?,
         );
         ensure!(
-            stage
-                == paths.state_dir.join(format!(
-                    "uninstall-recovery-{}",
-                    journal["recovery"]["oldJournalSha256"].as_str().unwrap()
-                )),
+            recovery_stage_path_matches(paths, journal, &stage),
             "unsafe recovery payload path"
         );
         if stage.exists() {
@@ -1397,15 +2058,20 @@ async fn cleanup(
     fault("AFTER_HELPER_UNLINK")?;
     remove_terminal_fence(paths, journal)?;
     remove_regular(&marker)?;
-    println!(
-        "Removed inventoried runner files and resolved state. Stable lock metadata and unowned files were preserved."
-    );
+    if !json_output_requested() {
+        println!(
+            "Removed inventoried runner files and resolved state. Stable lock metadata and unowned files were preserved."
+        );
+    }
     Ok(())
 }
 
 async fn finish_terminal(paths: &lifecycle::Paths, args: &Arguments, recover: bool) -> Result<()> {
     let marker = paths.state_dir.join("bootstrap-uninstall-terminal.json");
     let terminal: Value = serde_json::from_slice(&regular_bytes(&marker)?)?;
+    if recover && terminal["recovery"].is_null() {
+        return Err(OriginalUninstallOwnerRequired.into());
+    }
     ensure!(
         terminal["schema"] == SCHEMA
             && terminal["phase"] == "terminal"
@@ -1436,7 +2102,7 @@ async fn finish_terminal(paths: &lifecycle::Paths, args: &Arguments, recover: bo
                 .context("terminal recovery release missing")?,
         )?;
         let manifest = read_manifest(&release)?;
-        verify_release(&release, &manifest, args).await?;
+        bootstrap_preflight::verify_artifact(&release, &manifest, args).await?;
         ensure!(
             digest_file(&std::env::current_exe()?)? == manifest["bootstrap"]["sha256"]
                 && digest_file(&release.join("manifest.json"))?
@@ -1444,6 +2110,11 @@ async fn finish_terminal(paths: &lifecycle::Paths, args: &Arguments, recover: bo
             "terminal recovery release changed"
         );
     }
+    validate_adopted_replacement(paths, args, &terminal)?;
+    select_activation(
+        args,
+        Uuid::parse_str(terminal["operationId"].as_str().unwrap())?,
+    );
     let synthetic = std::env::var_os("LOOMEX_INSTALL_TEST_MODE").is_some();
     let _guard = verify_stopped(paths, &terminal, synthetic).await?;
     let helper = paths.state_dir.join("bootstrap-uninstall-helper");
@@ -1453,7 +2124,9 @@ async fn finish_terminal(paths: &lifecycle::Paths, args: &Arguments, recover: bo
     }
     remove_terminal_fence(paths, &terminal)?;
     remove_regular(&marker)?;
-    println!("Loomex runner is already uninstalled.");
+    if !args.json {
+        println!("Loomex runner is already uninstalled.");
+    }
     Ok(())
 }
 
@@ -1712,6 +2385,590 @@ mod tests {
             target,
             quarantine,
         }
+    }
+    fn historical_fixture() -> Fixture {
+        let mut fixture = fixture();
+        fs::rename(&fixture.quarantine, &fixture.target).unwrap();
+        fs::write(fixture.target.join("bin/deleted"), b"deleted").unwrap();
+        fs::set_permissions(
+            fixture.target.join("bin/deleted"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        fixture.journal["schema"] = json!(OLD_SCHEMA);
+        fixture.journal["phase"] = json!("prepared");
+        let mut operation =
+            lifecycle::Operation::new(lifecycle::OperationKind::Install, "completed", None);
+        operation.auth_baseline = Some(lifecycle::AuthBaseline::SignedOut {
+            installation_id: Some(Uuid::new_v4()),
+        });
+        operation.previous_target = Some(fixture.target.clone());
+        state::write_json(
+            &fixture.paths.state_dir.join("lifecycle-operation.json"),
+            &operation,
+        )
+        .unwrap();
+        save(&fixture.paths, &fixture.journal).unwrap();
+        fixture
+    }
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn current_prepared_v2_recovery_routes_modern_controller_and_preserves_existing_fence() {
+        const CHILD: &str = "LOOMEX_TEST_CURRENT_V2_RECOVERY_ROOT";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            let paths = lifecycle::Paths {
+                install_base: root.join("install"),
+                state_dir: root.join("state"),
+                launch_agents_dir: root.join("agents"),
+            };
+            let expected = std::env::var("LOOMEX_TEST_EXPECTED_CURRENT_SHA").unwrap();
+            let args = Arguments {
+                release: Some(root.join("release")),
+                allow_unsigned_development: true,
+                development_api_origin: Some("http://127.0.0.1:9".into()),
+                expected_old_journal_sha256: Some(expected),
+                install_base: Some(paths.install_base.clone()),
+                state_dir: Some(paths.state_dir.clone()),
+                launch_agents_dir: Some(paths.launch_agents_dir.clone()),
+                json: true,
+                ..Default::default()
+            };
+            let adoption_expected = std::env::var_os("LOOMEX_TEST_ADOPTION_EXPECTED").is_some();
+            let release = root.join("release");
+            let manifest = read_manifest(&release).unwrap();
+            let readonly = recovery_preflight(
+                &paths,
+                &args,
+                &release,
+                &manifest,
+                &root.join("candidate-payload"),
+            )
+            .await;
+            assert_eq!(readonly.is_ok(), adoption_expected, "{readonly:?}");
+            let activation = args.activation.clone();
+            let error = run(args, true).await.unwrap_err();
+            assert!(!root.join("old-helper-dispatched").exists());
+            let current: Value =
+                state::read_json(&paths.state_dir.join("bootstrap-uninstall.json")).unwrap();
+            let facts = activation.lock().unwrap().clone();
+            let output = activation_error_record(&facts, &error, true);
+            assert_eq!(output["outcome"], "blocked");
+            if std::env::var_os("LOOMEX_TEST_ADOPTION_EXPECTED").is_some() {
+                assert!(
+                    error.to_string().contains("AFTER_RECOVERY_ADOPTION"),
+                    "{error:#}"
+                );
+                assert_eq!(current["recovery"]["adoptedCurrent"], true);
+                assert_eq!(output["operationId"], current["operationId"]);
+            } else {
+                assert!(error.to_string().contains("digest mismatch"), "{error:#}");
+                assert!(current["recovery"].is_null());
+            }
+            return;
+        }
+        let mut fixture = historical_fixture();
+        let base = fixture.paths.state_dir.parent().unwrap().to_path_buf();
+        fs::write(
+            fixture
+                .paths
+                .launch_agents_dir
+                .join("app.loomex.runner.plist"),
+            b"owned fixture service configuration",
+        )
+        .unwrap();
+        let helper = fixture.paths.state_dir.join("bootstrap-uninstall-helper");
+        let helper_bytes =
+            b"#!/bin/sh\nprintf dispatched > \"$LOOMEX_TEST_OLD_HELPER_MARKER\"\nexit 64\n";
+        fs::write(&helper, helper_bytes).unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        fs::copy(&executable, fixture.target.join("bin/loomex-runner")).unwrap();
+        let runner = fixture.target.join("bin/loomex-runner");
+        let runner_meta = fs::metadata(&runner).unwrap();
+        let mut files = fixture.journal["inventories"][0]["files"]
+            .as_array()
+            .unwrap()
+            .clone();
+        files.push(json!({"path":"bin/loomex-runner","sha256":digest_file(&runner).unwrap(),"size":runner_meta.len(),"mode":runner_meta.mode() & 0o777}));
+        fixture.journal["inventories"][0]["files"] = json!(files);
+        fixture.journal["receipt"]["bootstrapSha256"] = json!(state::digest(helper_bytes));
+        fixture.journal["receipt"]["developmentOnly"] = json!(true);
+        fixture.journal["receipt"]["developmentApiOrigin"] = json!("http://127.0.0.1:9/");
+        fixture.journal["helperSha256"] = json!(state::digest(helper_bytes));
+        fixture.journal["receiptSha256"] = json!(state::json_digest(&fixture.journal["receipt"]));
+        state::write_json(
+            &fixture.paths.state_dir.join("install-receipt.json"),
+            &fixture.journal["receipt"],
+        )
+        .unwrap();
+        fixture.journal["receiptFileSha256"] =
+            json!(digest_file(&fixture.paths.state_dir.join("install-receipt.json")).unwrap());
+        state::write_json(
+            &fixture.paths.state_dir.join("owned-versions.json"),
+            &journal_owned(&fixture.journal),
+        )
+        .unwrap();
+        fixture.journal["schema"] = json!(SCHEMA);
+        fixture.journal["expectedIdentity"] =
+            json!({"installationId":Uuid::new_v4(),"deviceId":null});
+        fixture.journal["cleanup"] = json!({"moved":[],"deletingStarted":[]});
+        fixture.journal["fenceJournalSha256"] = json!("f".repeat(64));
+        save(&fixture.paths, &fixture.journal).unwrap();
+        let id = Uuid::parse_str(fixture.journal["operationId"].as_str().unwrap()).unwrap();
+        lifecycle::begin_uninstall_fence_locked(&fixture.paths, id, &"f".repeat(64)).unwrap();
+        let fence_before =
+            fs::read(fixture.paths.state_dir.join("lifecycle-operation.json")).unwrap();
+        let original = fs::read(fixture.paths.state_dir.join("bootstrap-uninstall.json")).unwrap();
+        let digest = state::digest(&original);
+        assert_ne!(digest, "f".repeat(64));
+        let payload = base.join("candidate-payload");
+        fs::create_dir_all(payload.join("bin")).unwrap();
+        fs::create_dir_all(payload.join("metadata")).unwrap();
+        for name in ["loomex", "loomex-runner", "loomex-lifecycle-bootstrap"] {
+            fs::hard_link(&executable, payload.join("bin").join(name)).unwrap();
+        }
+        state::write_json(&payload.join("metadata/project.json"),&json!({"project":"loomex-runner","version":env!("CARGO_PKG_VERSION"),"platform":"darwin-arm64"})).unwrap();
+        let source = json!({"schema":"app.loomex.source-content/v1","sourceRevision":"test-original-source","files":[]});
+        let mut source_bytes = serde_json::to_vec(&source).unwrap();
+        source_bytes.push(b'\n');
+        fs::write(
+            payload.join("metadata/source-content-manifest.json"),
+            source_bytes,
+        )
+        .unwrap();
+        let mut candidate_files = Vec::new();
+        for name in [
+            "bin/loomex",
+            "bin/loomex-runner",
+            "bin/loomex-lifecycle-bootstrap",
+            "metadata/project.json",
+            "metadata/source-content-manifest.json",
+        ] {
+            let path = payload.join(name);
+            let metadata = fs::metadata(&path).unwrap();
+            candidate_files.push(json!({"path":name,"sha256":digest_file(&path).unwrap(),"size":metadata.len(),"mode":metadata.mode() & 0o777}));
+        }
+        candidate_files.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+        let release = base.join("release");
+        fs::create_dir(&release).unwrap();
+        assert!(
+            std::process::Command::new("/usr/bin/tar")
+                .arg("-czf")
+                .arg(release.join("payload.tar.gz"))
+                .arg("-C")
+                .arg(&payload)
+                .args(["bin", "metadata"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::hard_link(&executable, release.join("loomex-lifecycle-bootstrap")).unwrap();
+        let manifest = json!({"schema":"app.loomex.release/v1","project":"loomex-runner","platform":"darwin-arm64","version":env!("CARGO_PKG_VERSION"),"developmentOnly":true,"sourceRevision":"test-original-source","sourceContent":{"file":"metadata/source-content-manifest.json","sha256":digest_file(&payload.join("metadata/source-content-manifest.json")).unwrap()},"payload":{"file":"payload.tar.gz","sha256":digest_file(&release.join("payload.tar.gz")).unwrap(),"files":candidate_files},"bootstrap":{"file":"loomex-lifecycle-bootstrap","sha256":digest_file(&executable).unwrap(),"size":fs::metadata(&executable).unwrap().len()}});
+        let mut manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        manifest_bytes.push(b'\n');
+        fs::write(release.join("manifest.json"), manifest_bytes).unwrap();
+        let child = |expected: &str, adoption: bool| {
+            let mut command = std::process::Command::new(&executable);
+            command.args(["--exact","bootstrap_uninstall::tests::current_prepared_v2_recovery_routes_modern_controller_and_preserves_existing_fence","--nocapture"])
+                .env(CHILD,&base).env("LOOMEX_TEST_EXPECTED_CURRENT_SHA",expected).env("LOOMEX_TEST_OLD_HELPER_MARKER",base.join("old-helper-dispatched"))
+                .env("LOOMEX_ALLOW_UNSAFE_DEV_INSTALL","1").env("LOOMEX_TEST_UNINSTALL_FAIL_AFTER_RECOVERY_ADOPTION","1").env_remove("LOOMEX_INSTALL_TEST_MODE");
+            if adoption {
+                command.env("LOOMEX_TEST_ADOPTION_EXPECTED", "1");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        child(&"0".repeat(64), false);
+        assert_eq!(
+            fs::read(fixture.paths.state_dir.join("bootstrap-uninstall.json")).unwrap(),
+            original
+        );
+        child(&digest, true);
+        let adopted: Value =
+            state::read_json(&fixture.paths.state_dir.join("bootstrap-uninstall.json")).unwrap();
+        assert_eq!(adopted["operationId"], id.to_string());
+        assert_eq!(adopted["fenceJournalSha256"], "f".repeat(64));
+        assert_eq!(adopted["drainKey"], fixture.journal["drainKey"]);
+        assert_eq!(
+            fs::read(fixture.paths.state_dir.join("lifecycle-operation.json")).unwrap(),
+            fence_before
+        );
+        assert_eq!(fs::read(&helper).unwrap(), helper_bytes);
+        assert_eq!(
+            fs::read(
+                fixture
+                    .paths
+                    .state_dir
+                    .join(format!("bootstrap-uninstall-original-{digest}.json"))
+            )
+            .unwrap(),
+            original
+        );
+        assert!(!base.join("old-helper-dispatched").exists());
+        let mut retry = Arguments {
+            expected_old_journal_sha256: Some(digest.clone()),
+            ..Default::default()
+        };
+        assert!(
+            recovery_preflight(&fixture.paths, &retry, &release, &manifest, &payload)
+                .await
+                .unwrap()
+        );
+        retry.expected_release_path = Some(base.join("relocated-identical-release"));
+        assert!(
+            recovery_preflight(&fixture.paths, &retry, &release, &manifest, &payload)
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn unresolved_current_work_reports_known_blocked_operation_before_old_helper_dispatch() {
+        let mut fixture = historical_fixture();
+        fixture.journal["schema"] = json!(SCHEMA);
+        fixture.journal["expectedIdentity"] =
+            json!({"installationId":Uuid::new_v4(),"deviceId":null});
+        save(&fixture.paths, &fixture.journal).unwrap();
+        let job = fixture
+            .paths
+            .state_dir
+            .join("jobs")
+            .join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&job).unwrap();
+        state::write_json(&job.join("journal.json"), &json!({"phase":"running"})).unwrap();
+        let args = Arguments {
+            install_base: Some(fixture.paths.install_base.clone()),
+            state_dir: Some(fixture.paths.state_dir.clone()),
+            launch_agents_dir: Some(fixture.paths.launch_agents_dir.clone()),
+            json: true,
+            ..Default::default()
+        };
+        let activation = args.activation.clone();
+        let error = run(args, false).await.unwrap_err();
+        let report = activation_error_record(&activation.lock().unwrap(), &error, false);
+        assert_eq!(report["outcome"], "blocked");
+        assert_eq!(report["reasonCode"], "MANAGED_WORK_UNRESOLVED");
+        assert_eq!(report["operationId"], fixture.journal["operationId"]);
+        assert!(job.join("journal.json").exists());
+        assert!(!fixture.paths.state_dir.join("drain.json").exists());
+    }
+    #[tokio::test]
+    async fn terminal_cleanup_retains_command_operation_identity_after_journals_are_removed() {
+        const CHILD: &str = "LOOMEX_TEST_TERMINAL_IDENTITY_ROOT";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            let args = Arguments {
+                install_base: Some(root.join("install")),
+                state_dir: Some(root.join("state")),
+                launch_agents_dir: Some(root.join("agents")),
+                json: true,
+                ..Default::default()
+            };
+            let activation = args.activation.clone();
+            run(args, false).await.unwrap();
+            let report = activation_record(
+                &activation.lock().unwrap(),
+                "completed",
+                "UNINSTALL_COMPLETED",
+                "none",
+            );
+            assert_eq!(
+                report["operationId"],
+                std::env::var("LOOMEX_TEST_TERMINAL_OPERATION").unwrap()
+            );
+            assert!(
+                !root
+                    .join("state/bootstrap-uninstall-terminal.json")
+                    .exists()
+            );
+            assert!(!root.join("state/lifecycle-operation.json").exists());
+            return;
+        }
+        let fixture = fixture();
+        let mut terminal = fixture.journal.clone();
+        terminal["phase"] = json!("terminal");
+        state::write_json(
+            &fixture
+                .paths
+                .state_dir
+                .join("bootstrap-uninstall-terminal.json"),
+            &terminal,
+        )
+        .unwrap();
+        for name in [
+            "bootstrap-uninstall.json",
+            "install-receipt.json",
+            "owned-versions.json",
+        ] {
+            fs::remove_file(fixture.paths.state_dir.join(name)).unwrap();
+        }
+        fs::remove_file(fixture.paths.install_base.join("current")).unwrap();
+        let id = Uuid::parse_str(terminal["operationId"].as_str().unwrap()).unwrap();
+        lifecycle::begin_uninstall_fence_locked(
+            &fixture.paths,
+            id,
+            terminal["fenceJournalSha256"].as_str().unwrap(),
+        )
+        .unwrap();
+        let output=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","bootstrap_uninstall::tests::terminal_cleanup_retains_command_operation_identity_after_journals_are_removed","--nocapture"])
+            .env(CHILD,fixture.paths.state_dir.parent().unwrap()).env("LOOMEX_TEST_TERMINAL_OPERATION",id.to_string()).env("LOOMEX_INSTALL_TEST_MODE","1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    #[tokio::test]
+    async fn nonprepared_current_owner_refuses_release_adoption_with_original_owner_action() {
+        let mut fixture = historical_fixture();
+        fixture.journal["schema"] = json!(SCHEMA);
+        fixture.journal["phase"] = json!("idle_verified");
+        save(&fixture.paths, &fixture.journal).unwrap();
+        let args = Arguments {
+            install_base: Some(fixture.paths.install_base.clone()),
+            state_dir: Some(fixture.paths.state_dir.clone()),
+            launch_agents_dir: Some(fixture.paths.launch_agents_dir.clone()),
+            expected_old_journal_sha256: Some(
+                digest_file(&fixture.paths.state_dir.join("bootstrap-uninstall.json")).unwrap(),
+            ),
+            json: true,
+            ..Default::default()
+        };
+        let activation = args.activation.clone();
+        let before =
+            regular_bytes(&fixture.paths.state_dir.join("bootstrap-uninstall.json")).unwrap();
+        let error = run(args, true).await.unwrap_err();
+        let report = activation_error_record(&activation.lock().unwrap(), &error, true);
+        assert_eq!(report["outcome"], "blocked");
+        assert_eq!(report["nextAction"], "resume_original_uninstall_owner");
+        assert_eq!(
+            recovery_ownership(&fixture.paths)["nextAction"],
+            "resume_original_uninstall_owner"
+        );
+        assert_eq!(
+            regular_bytes(&fixture.paths.state_dir.join("bootstrap-uninstall.json")).unwrap(),
+            before
+        );
+    }
+    #[test]
+    fn selected_replacement_intent_rejects_same_candidate_relocated_before_adoption() {
+        let fixture = historical_fixture();
+        let args = Arguments {
+            replace_pre_adoption_candidate: true,
+            expected_recovery_intent_sha256: Some("c".repeat(64)),
+            ..Default::default()
+        };
+        let id = Uuid::new_v4();
+        let old = "a".repeat(64);
+        let manifest = "b".repeat(64);
+        let (intent, a) = recovery_release_selection(
+            &fixture.paths,
+            &args,
+            id,
+            &old,
+            &manifest,
+            Path::new("/release-a"),
+        );
+        immutable_copy(&intent, &serde_json::to_vec(&a).unwrap()).unwrap();
+        let (_, b) = recovery_release_selection(
+            &fixture.paths,
+            &args,
+            id,
+            &old,
+            &manifest,
+            Path::new("/release-b"),
+        );
+        assert!(validate_retained_selection(&intent, &a).is_ok());
+        assert!(validate_retained_selection(&intent, &b).is_err());
+        assert_eq!(
+            regular_bytes(&intent).unwrap(),
+            serde_json::to_vec(&a).unwrap()
+        );
+    }
+    #[tokio::test]
+    async fn explicit_candidate_replacement_preserves_original_intent_and_same_fence() {
+        let fixture = historical_fixture();
+        let old_path = fixture.paths.state_dir.join("bootstrap-uninstall.json");
+        let old_bytes = fs::read(&old_path).unwrap();
+        let old_sha = state::digest(&old_bytes);
+        let id = Uuid::new_v4();
+        lifecycle::begin_uninstall_fence_locked(&fixture.paths, id, &old_sha).unwrap();
+        let fence_before =
+            fs::read(fixture.paths.state_dir.join("lifecycle-operation.json")).unwrap();
+        let intent = fixture.paths.state_dir.join(format!(
+            "bootstrap-uninstall-recovery-release-{old_sha}.json"
+        ));
+        let original = json!({"schema":"app.loomex.runner.uninstall-recovery-release/v1","operationId":id,"oldJournalSha256":old_sha,"releasePath":"/original-release","manifestSha256":"a".repeat(64),"stage":fixture.paths.state_dir.join(format!("uninstall-recovery-{old_sha}"))});
+        immutable_copy(&intent, &serde_json::to_vec(&original).unwrap()).unwrap();
+        let original_bytes = fs::read(&intent).unwrap();
+        let mut args = Arguments {
+            replace_pre_adoption_candidate: true,
+            expected_old_journal_sha256: Some(old_sha.clone()),
+            expected_recovery_intent_sha256: Some(state::digest(&original_bytes)),
+            ..Default::default()
+        };
+        validate_replacement(
+            &fixture.paths,
+            &args,
+            &fixture.journal,
+            &old_sha,
+            id,
+            &intent,
+        )
+        .unwrap();
+        args.expected_recovery_intent_sha256 = Some("b".repeat(64));
+        assert!(
+            validate_replacement(
+                &fixture.paths,
+                &args,
+                &fixture.journal,
+                &old_sha,
+                id,
+                &intent
+            )
+            .is_err()
+        );
+        args.expected_recovery_intent_sha256 = Some(state::digest(&original_bytes));
+        let selected = fixture.paths.state_dir.join("replacement-qualified.json");
+        adopt_recovery_binding(
+            &fixture.paths,
+            id,
+            &old_sha,
+            &selected,
+            &json!({"candidate":"corrected"}),
+            async { Ok(()) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(fs::read(&intent).unwrap(), original_bytes);
+        assert_eq!(fs::read(&old_path).unwrap(), old_bytes);
+        assert_eq!(
+            fs::read(fixture.paths.state_dir.join("lifecycle-operation.json")).unwrap(),
+            fence_before
+        );
+        fs::write(
+            fixture
+                .paths
+                .state_dir
+                .join(format!("uninstall-maintenance-{id}.json")),
+            b"uncertain dispatch",
+        )
+        .unwrap();
+        assert!(
+            validate_replacement(
+                &fixture.paths,
+                &args,
+                &fixture.journal,
+                &old_sha,
+                id,
+                &intent
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn stopped_prepared_identity_or_unresolved_work_never_advances_checkpoint() {
+        let fixture = fixture();
+        let mut journal = fixture.journal.clone();
+        journal["phase"] = json!("prepared");
+        journal["expectedIdentity"] = json!({"installationId":Uuid::new_v4(),"deviceId":null});
+        let before = fs::read(fixture.paths.state_dir.join("bootstrap-uninstall.json")).unwrap();
+        assert!(
+            checkpoint_prepared_stopped(
+                &fixture.paths,
+                &mut journal,
+                json!({"installationId":Uuid::new_v4(),"deviceId":null}),
+                "a".repeat(64)
+            )
+            .is_err()
+        );
+        assert_eq!(journal["phase"], "prepared");
+        let job = fixture
+            .paths
+            .state_dir
+            .join("jobs")
+            .join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&job).unwrap();
+        state::write_json(&job.join("journal.json"), &json!({"phase":"running"})).unwrap();
+        let native = journal["expectedIdentity"].clone();
+        assert!(
+            checkpoint_prepared_stopped(&fixture.paths, &mut journal, native, "a".repeat(64))
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(fixture.paths.state_dir.join("bootstrap-uninstall.json")).unwrap(),
+            before
+        );
+    }
+    #[test]
+    fn recovery_ownership_keeps_journal_digest_when_candidate_or_owner_is_ineligible() {
+        let fixture = historical_fixture();
+        let ownership = recovery_ownership(&fixture.paths);
+        assert_eq!(ownership["status"], "pending");
+        assert_eq!(ownership["nextAction"], "recover_uninstall");
+        assert_eq!(
+            ownership["journalSha256"],
+            digest_file(&fixture.paths.state_dir.join("bootstrap-uninstall.json")).unwrap()
+        );
+        fs::write(
+            fixture.paths.state_dir.join("lifecycle-operation.json"),
+            b"malformed",
+        )
+        .unwrap();
+        let blocked = recovery_ownership(&fixture.paths);
+        assert_eq!(blocked["status"], "blocked");
+        assert_eq!(blocked["nextAction"], "inspect_protected_ownership");
+        assert_eq!(blocked["journalSha256"], ownership["journalSha256"]);
+    }
+    #[tokio::test]
+    async fn rejected_recovery_candidate_does_not_pin_fence_or_intent() {
+        let fixture = fixture();
+        let intent = fixture.paths.state_dir.join("candidate-intent.json");
+        let result = adopt_recovery_binding(
+            &fixture.paths,
+            Uuid::new_v4(),
+            &"b".repeat(64),
+            &intent,
+            &json!({"candidate":"incompatible"}),
+            async { signing_transition(Some("old"), Some("different"), false, false).map(|_| ()) },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            !intent.exists(),
+            "rejected candidate pinned immutable release intent"
+        );
+        assert!(
+            !fixture
+                .paths
+                .state_dir
+                .join("lifecycle-operation.json")
+                .exists(),
+            "rejected candidate pinned lifecycle fence"
+        );
+    }
+    #[tokio::test]
+    async fn stopped_prepared_retry_does_not_need_a_live_admission_socket() {
+        let fixture = fixture();
+        let mut journal = fixture.journal.clone();
+        journal["phase"] = json!("prepared");
+        journal["expectedIdentity"] = json!({"installationId":Uuid::new_v4(),"deviceId":null});
+        let native = journal["expectedIdentity"].clone();
+        checkpoint_prepared_stopped(&fixture.paths, &mut journal, native, "a".repeat(64)).unwrap();
+        require_initial_admission(journal["phase"].as_str().unwrap(), async {
+            Err(anyhow::anyhow!("dead admission socket contacted"))
+        })
+        .await
+        .unwrap();
+        assert_eq!(journal["phase"], "stopped");
+        assert!(journal["stopEvidence"]["pid"].is_null());
+        assert!(!fixture.paths.state_dir.join("drain.json").exists());
     }
     #[tokio::test]
     async fn interrupted_quarantine_cleanup_resumes_subset_and_retains_same_lock_inode() {

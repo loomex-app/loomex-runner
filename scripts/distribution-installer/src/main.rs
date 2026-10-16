@@ -606,13 +606,41 @@ fn run_owner(script: &Path, release: &Path, args: &[String]) -> Result<()> {
     Ok(())
 }
 // Keep owner output private: it can contain paths, account details or arbitrary errors.
-fn owner_preflight(cmd: &mut Command, schema: &str) -> Result<Value> {
-    let value = command_json(cmd)?;
+fn owner_preflight(cmd: &mut Command, schema: &str, completion: &mut Completion) -> Result<Value> {
+    // Preflight owners return typed rejection JSON with nonzero exit status.
+    // Never expose arbitrary stdout/stderr or interpret prose as authority.
+    let out = cmd.output()?;
+    let value: Value = serde_json::from_slice(&out.stdout).context("unsupported owner response")?;
     ensure!(
-        value["schema"] == schema
+        value["schema"] == schema,
+        "unsupported owner preflight schema"
+    );
+    if schema == "app.loomex.runner.install-preflight/v1" {
+        let observation = &value["recoveryOwnership"];
+        if let Some(id) = observation["operationId"]
+            .as_str()
+            .filter(|id| valid_operation_id(id))
+        {
+            completion.operation_id = Some(id.into());
+        }
+        if let Some(next) = observation["nextAction"].as_str().filter(|next| {
+            matches!(
+                *next,
+                "recover_uninstall"
+                    | "resume_bootstrap_uninstall"
+                    | "resume_native_operation"
+                    | "resume_original_uninstall_owner"
+                    | "inspect_protected_ownership"
+            )
+        }) {
+            completion.next_action = next.into();
+        }
+    }
+    ensure!(
+        out.status.success()
             && value["artifact"]["eligible"] == true
             && value["activation"]["eligible"] == true,
-        "unsupported or ineligible owner preflight response"
+        "ineligible owner preflight response"
     );
     Ok(value)
 }
@@ -622,18 +650,19 @@ fn preflight_owners(
     runner_args: &[String],
     plugin_args: &[String],
     completion: &mut Completion,
-) -> Result<()> {
+) -> Result<(Value, Option<Value>)> {
     completion.phase = "runner-preflight";
-    owner_preflight(
+    let native = owner_preflight(
         Command::new(runner.join("loomex-lifecycle-bootstrap"))
             .arg("preflight")
             .arg(runner)
             .args(runner_args),
         "app.loomex.runner.install-preflight/v1",
+        completion,
     )?;
-    if let Some(plugin) = plugin {
+    let plugin = if let Some(plugin) = plugin {
         completion.phase = "plugin-preflight";
-        owner_preflight(
+        Some(owner_preflight(
             Command::new(plugin.join("lifecycle-runtime/node"))
                 .arg(plugin.join("lifecycle.mjs"))
                 .arg("preflight")
@@ -641,41 +670,53 @@ fn preflight_owners(
                 .arg(plugin)
                 .args(plugin_args),
             "app.loomex.plugin.install-preflight/v1",
-        )?;
-    }
-    // Never relay the owners' extensible fields or errors through the transport.
-    Ok(())
+            completion,
+        )?)
+    } else {
+        None
+    };
+    Ok((native, plugin))
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Completion {
     schema: &'static str,
     phase: &'static str,
+    outcome: &'static str,
+    operation_id: Option<String>,
+    next_action: String,
+    reason_code: String,
     runner: &'static str,
     plugin: &'static str,
     host_registration: &'static str,
+    guidance: Option<String>,
 }
 impl Default for Completion {
     fn default() -> Self {
         Self {
-            schema: "app.loomex.paired-install-result/v1",
+            schema: "app.loomex.paired-install-result/v2",
             phase: "artifact-verification",
+            outcome: "blocked",
+            operation_id: None,
+            next_action: "inspect_lifecycle_status".into(),
+            reason_code: "PAIRED_INSTALL_REJECTED".into(),
             runner: "not-attempted",
             plugin: "not-attempted",
             host_registration: "not-attempted",
+            guidance: None,
         }
     }
 }
-fn failure_report(completion: &Completion) -> Value {
-    let message = match completion.phase {
+fn failure_report(c: &Completion) -> Value {
+    let message = match c.phase {
         "runner-preflight" => {
             "Runner installed eligibility was rejected by the native lifecycle owner. Inspect its preflight result and retry this exact release set."
         }
         "plugin-preflight" => {
             "Plugin installed eligibility was rejected by the plugin lifecycle owner. Inspect its preflight result and retry this exact release set."
         }
-        "runner-activation" | "runner-health" => {
-            "Runner activation or health is unconfirmed. Resolve the native lifecycle owner before retrying this exact release set."
+        "runner-activation" | "runner-health" | "runner-recovery" => {
+            "Runner activation or recovery is unconfirmed. Resolve the native lifecycle owner before retrying this exact release set."
         }
         "plugin-activation" => {
             "Plugin installation is incomplete; the healthy runner remains installed. Retry this exact release set to resume the plugin owner."
@@ -696,7 +737,101 @@ fn failure_report(completion: &Completion) -> Value {
             "Release-set verification failed. Review the exact artifacts and invocation before retrying."
         }
     };
-    serde_json::json!({"schema":completion.schema,"ok":false,"category":"PAIRED_INSTALL_REJECTED","phase":completion.phase,"completion":completion,"message":message})
+    serde_json::json!({"schema":c.schema,"ok":false,"outcome":c.outcome,"operationId":c.operation_id,"nextAction":c.next_action,"reasonCode":c.reason_code,"category":"PAIRED_INSTALL_REJECTED","phase":c.phase,"completion":c,"message":message})
+}
+fn valid_operation_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+}
+fn native_activation(cmd: &mut Command, completion: &mut Completion) -> Result<bool> {
+    let out = cmd.output()?;
+    let v: Value =
+        serde_json::from_slice(&out.stdout).context("unsupported native activation response")?;
+    ensure!(
+        v["schema"] == "app.loomex.runner.bootstrap-activation/v1",
+        "unsupported native activation schema"
+    );
+    let outcome = v["outcome"].as_str().context("native outcome missing")?;
+    let reason = v["reasonCode"].as_str().context("native reason missing")?;
+    let next = v["nextAction"]
+        .as_str()
+        .context("native next action missing")?;
+    ensure!(
+        matches!(
+            reason,
+            "ACTIVATION_COMPLETED"
+                | "RECOVERY_COMPLETED"
+                | "ACTIVE_WORK_PENDING"
+                | "SERVICE_STOP_PENDING"
+                | "MANAGED_WORK_UNRESOLVED"
+                | "ACTIVATION_BLOCKED"
+                | "ACTIVATION_UNCONFIRMED"
+                | "RECOVERY_BLOCKED"
+                | "RECOVERY_UNCONFIRMED"
+        ),
+        "unknown native reason"
+    );
+    ensure!(
+        matches!(
+            next,
+            "none"
+                | "install_candidate"
+                | "resume_native_operation"
+                | "resume_bootstrap_uninstall"
+                | "recover_uninstall"
+                | "inspect_lifecycle_status"
+                | "reconcile_managed_work"
+                | "resume_original_uninstall_owner"
+        ),
+        "unknown native next action"
+    );
+    completion.operation_id = match &v["operationId"] {
+        Value::Null => None,
+        Value::String(id) if valid_operation_id(id) => Some(id.clone()),
+        _ => bail!("unsupported native operation identity"),
+    };
+    completion.reason_code = reason.into();
+    completion.next_action = next.into();
+    match outcome {
+        "completed" => {
+            ensure!(out.status.success(), "native completion exit differs");
+            Ok(true)
+        }
+        "pending" => {
+            ensure!(
+                out.status.success() || out.status.code() == Some(3),
+                "native pending exit differs"
+            );
+            ensure!(
+                completion.operation_id.is_some()
+                    && matches!(
+                        next,
+                        "resume_native_operation"
+                            | "resume_bootstrap_uninstall"
+                            | "recover_uninstall"
+                    ),
+                "unverified native pending"
+            );
+            completion.outcome = "pending";
+            completion.runner = "pending";
+            Ok(false)
+        }
+        "blocked" => {
+            completion.outcome = "blocked";
+            bail!("native activation blocked")
+        }
+        "unconfirmed" => {
+            completion.outcome = "unconfirmed";
+            bail!("native activation unconfirmed")
+        }
+        _ => bail!("unsupported native outcome"),
+    }
+}
+fn result_report(c: &Completion) -> Value {
+    serde_json::json!({"schema":c.schema,"ok":c.outcome == "completed","outcome":c.outcome,"operationId":c.operation_id,"nextAction":c.next_action,"reasonCode":c.reason_code,"phase":c.phase,"completion":c})
 }
 // Resolve existing aliases component by component while retaining normalized
 // missing suffixes. This reads metadata only and never creates an install root.
@@ -825,16 +960,16 @@ fn validate_install_namespaces(runner: &Path, plugin: &Path, runner_state: &Path
 // Existing complete cache bytes may carry a pending owner's exact release-path binding.
 // Reading it must not repair, chmod, create, or remove any entry.
 fn preflight_root<'a>(stage: &'a Path, cache: &'a Path) -> Result<&'a Path> {
-    if !cache.exists() {
-        return Ok(stage);
-    }
     for ancestor in cache.ancestors() {
-        if ancestor.exists() {
+        if fs::symlink_metadata(ancestor).is_ok() {
             ensure!(
                 !fs::symlink_metadata(ancestor)?.file_type().is_symlink(),
                 "artifact cache ancestor symlink forbidden"
             );
         }
+    }
+    if !cache.exists() {
+        return Ok(stage);
     }
     let expected = directory_inventory(stage)?;
     let actual = cache_inventory(cache)?;
@@ -888,6 +1023,14 @@ fn directory_inventory_impl(
             );
             if m.is_dir() {
                 if !(ignore_incoming && p == base.join(".incoming")) {
+                    out.push((
+                        p.strip_prefix(base)?
+                            .to_str()
+                            .context("cache path encoding")?
+                            .into(),
+                        "directory".into(),
+                        0,
+                    ));
                     walk(&p, base, out, ignore_incoming)?;
                 }
             } else {
@@ -1105,6 +1248,10 @@ fn install(completion: &mut Completion) -> Result<()> {
     let mut verify_only = false;
     let mut preflight_only = false;
     let mut authorize_keychain_transition = false;
+    let mut recover_uninstall = false;
+    let mut old_journal_sha = None;
+    let mut replace_candidate = false;
+    let mut recovery_intent_sha = None;
     let mut bases = Vec::new();
     let mut cache = None;
     let mut i = 0;
@@ -1115,13 +1262,17 @@ fn install(completion: &mut Completion) -> Result<()> {
             | "--manifest-sha256"
             | "--runner-install-base"
             | "--plugin-install-base"
-            | "--cache-dir" => {
+            | "--cache-dir"
+            | "--expected-old-journal-sha256"
+            | "--expected-recovery-intent-sha256" => {
                 let value = args.get(i + 1).context("missing option value")?.clone();
                 match args[i].as_str() {
                     "--manifest" => manifest = Some(value),
                     "--offline" => offline = Some(value),
                     "--manifest-sha256" => expected = Some(value),
                     "--cache-dir" => cache = Some(PathBuf::from(value)),
+                    "--expected-old-journal-sha256" => old_journal_sha = Some(value),
+                    "--expected-recovery-intent-sha256" => recovery_intent_sha = Some(value),
                     key => bases.push((key.to_owned(), value)),
                 }
                 i += 2;
@@ -1132,6 +1283,14 @@ fn install(completion: &mut Completion) -> Result<()> {
             }
             "--authorize-keychain-transition" => {
                 authorize_keychain_transition = true;
+                i += 1;
+            }
+            "--recover-uninstall" => {
+                recover_uninstall = true;
+                i += 1;
+            }
+            "--replace-pre-adoption-candidate" => {
+                replace_candidate = true;
                 i += 1;
             }
             "--preflight-only" => {
@@ -1169,6 +1328,21 @@ fn install(completion: &mut Completion) -> Result<()> {
     );
     let expected = expected.context("an independently reviewed --manifest-sha256 is required")?;
     ensure!(hex_string(&expected, 64), "invalid manifest digest");
+    ensure!(
+        recover_uninstall == old_journal_sha.is_some(),
+        "recovery requires explicit old journal digest"
+    );
+    if let Some(sha) = &old_journal_sha {
+        ensure!(hex_string(sha, 64), "invalid old journal digest");
+    }
+    ensure!(
+        replace_candidate == recovery_intent_sha.is_some()
+            && (!replace_candidate || recover_uninstall),
+        "replacement requires explicit recovery binding"
+    );
+    if let Some(sha) = &recovery_intent_sha {
+        ensure!(hex_string(sha, 64), "invalid recovery intent digest");
+    }
     let offline = offline.map(PathBuf::from);
     let manifest = manifest
         .map(PathBuf::from)
@@ -1222,7 +1396,7 @@ fn install(completion: &mut Completion) -> Result<()> {
     if verify_only {
         println!(
             "{}",
-            serde_json::json!({"schema":"app.loomex.paired-install-result/v1","ok":true,"mode":"verify-only","artifactIntegrity":true,"installedEligibilityVerified":false})
+            serde_json::json!({"schema":"app.loomex.paired-install-result/v2","ok":true,"outcome":"completed","operationId":null,"nextAction":"none","reasonCode":"ARTIFACT_VERIFIED","mode":"verify-only","artifactIntegrity":true,"installedEligibilityVerified":false})
         );
         return Ok(());
     }
@@ -1283,13 +1457,64 @@ fn install(completion: &mut Completion) -> Result<()> {
         plugin_base.to_string_lossy().into_owned(),
     ]);
     let root = preflight_root(stage.path(), &cache)?;
-    preflight_owners(
+    let incomplete_cache = root == stage.path();
+    let mut preflight_runner_args = runner_args.clone();
+    let mut preflight_plugin_args = plugin_args.clone();
+    if incomplete_cache {
+        preflight_runner_args.extend([
+            "--expected-release-path".into(),
+            cache.join("runner").to_string_lossy().into_owned(),
+        ]);
+        preflight_plugin_args.extend([
+            "--expected-release-path".into(),
+            cache.join("plugin").to_string_lossy().into_owned(),
+        ]);
+    }
+    let mut recovery_args = runner_args.clone();
+    if recover_uninstall {
+        recovery_args.extend([
+            "--expected-old-journal-sha256".into(),
+            old_journal_sha.unwrap(),
+        ]);
+        if replace_candidate {
+            recovery_args.extend([
+                "--replace-pre-adoption-candidate".into(),
+                "--expected-recovery-intent-sha256".into(),
+                recovery_intent_sha.unwrap(),
+            ]);
+        }
+        preflight_runner_args = recovery_args.clone();
+        preflight_runner_args.push("--recovery-uninstall".into());
+        if incomplete_cache {
+            preflight_runner_args.extend([
+                "--expected-release-path".into(),
+                cache.join("runner").to_string_lossy().into_owned(),
+            ]);
+        }
+    }
+    let (native, plugin_preflight) = preflight_owners(
         &root.join("runner"),
         (!runner_only).then(|| root.join("plugin")).as_deref(),
-        &runner_args,
-        &plugin_args,
+        &preflight_runner_args,
+        &preflight_plugin_args,
         completion,
     )?;
+    if recover_uninstall {
+        ensure!(
+            native["recoveryEligibility"]["eligible"] == true
+                && matches!(
+                    native["recoveryOwnership"]["status"].as_str(),
+                    Some("none" | "pending")
+                ),
+            "native recovery ownership not verified"
+        );
+    }
+    let restore_required = incomplete_cache
+        && (native["pendingRecovery"]["cacheRestoreRequired"] == true
+            || native["cacheRestoreRequired"] == true
+            || plugin_preflight
+                .as_ref()
+                .is_some_and(|v| v["pendingRecovery"]["cacheRestoreRequired"] == true));
     let codex = find_codex();
     let has_codex = codex.is_some();
     completion.phase = "host-preflight";
@@ -1297,9 +1522,26 @@ fn install(completion: &mut Completion) -> Result<()> {
         check_marketplace(codex.as_deref().unwrap(), &plugin_base)?;
     }
     if preflight_only {
+        completion.outcome = if restore_required {
+            "pending"
+        } else {
+            "completed"
+        };
+        completion.next_action = if restore_required {
+            "cache_restore_required"
+        } else {
+            "none"
+        }
+        .into();
+        completion.reason_code = if restore_required {
+            "CACHE_RESTORE_REQUIRED"
+        } else {
+            "PREFLIGHT_COMPLETED"
+        }
+        .into();
         println!(
             "{}",
-            serde_json::json!({"schema":"app.loomex.paired-install-result/v1","ok":true,"mode":"preflight-only","artifactIntegrity":true,"installedEligibilityVerified":true,"runnerOnly":runner_only,"hostRegistrationVerified":false})
+            serde_json::json!({"schema":completion.schema,"ok":!restore_required,"outcome":completion.outcome,"operationId":completion.operation_id,"nextAction":completion.next_action,"reasonCode":completion.reason_code,"mode":"preflight-only","artifactIntegrity":true,"installedEligibilityVerified":true,"runnerOnly":runner_only,"hostRegistrationVerified":false})
         );
         return Ok(());
     }
@@ -1307,20 +1549,75 @@ fn install(completion: &mut Completion) -> Result<()> {
     persist_cache(stage.path(), &cache)?;
     let runner = cache.join("runner");
     let plugin = cache.join("plugin");
+    if recover_uninstall
+        && native["recoveryOwnership"]["status"] == "pending"
+        && native["recoveryOwnership"]["owner"] == "bootstrap_uninstall"
+    {
+        ensure!(
+            native["recoveryEligibility"]["eligible"] == true,
+            "native recovery eligibility missing"
+        );
+        completion.phase = "runner-recovery";
+        completion.outcome = "unconfirmed";
+        completion.reason_code = "RECOVERY_UNCONFIRMED".into();
+        completion.next_action = "inspect_lifecycle_status".into();
+        completion.runner = "unconfirmed";
+        if !native_activation(
+            Command::new(runner.join("loomex-lifecycle-bootstrap"))
+                .arg("recover-uninstall")
+                .arg(&runner)
+                .args(&recovery_args)
+                .arg("--json"),
+            completion,
+        )? {
+            println!("{}", result_report(completion));
+            return Ok(());
+        }
+        // Cleanup completion is owner authority. Re-check both owners and host before installing the pair.
+        preflight_owners(
+            &runner,
+            (!runner_only).then_some(plugin.as_path()),
+            &runner_args,
+            &plugin_args,
+            completion,
+        )?;
+        completion.phase = "host-preflight";
+        if !runner_only && has_codex {
+            check_marketplace(codex.as_deref().unwrap(), &plugin_base)?;
+        }
+    }
     completion.phase = "runner-activation";
+    completion.outcome = "unconfirmed";
+    completion.reason_code = "ACTIVATION_UNCONFIRMED".into();
+    completion.next_action = "inspect_lifecycle_status".into();
     completion.runner = "unconfirmed";
-    run_owner(&runner.join("scripts/install.sh"), &runner, &runner_args)?;
+    if !native_activation(
+        Command::new("/bin/bash")
+            .arg(runner.join("scripts/install.sh"))
+            .arg(&runner)
+            .args(&runner_args)
+            .arg("--json")
+            .env("LOOMEX_ALLOW_UNSAFE_DEV_INSTALL", "1"),
+        completion,
+    )? {
+        println!("{}", result_report(completion));
+        return Ok(());
+    }
     completion.phase = "runner-health";
+    completion.reason_code = "RUNNER_HEALTH_UNCONFIRMED".into();
+    completion.next_action = "inspect_lifecycle_status".into();
     runner_health(&runner_base, &s.components.runner.version)?;
     completion.runner = "healthy";
     let installed = !runner_only;
     if installed {
         completion.phase = "plugin-activation";
+        completion.reason_code = "PLUGIN_ACTIVATION_UNCONFIRMED".into();
         completion.plugin = "unconfirmed";
         run_owner(&plugin.join("scripts/install.sh"), &plugin, &plugin_args)?;
         completion.plugin = "installed";
         if has_codex {
             completion.phase = "host-registration";
+            completion.reason_code = "HOST_REGISTRATION_UNCONFIRMED".into();
             completion.host_registration = "unconfirmed";
             register_plugin(
                 codex.as_deref().unwrap(),
@@ -1332,21 +1629,24 @@ fn install(completion: &mut Completion) -> Result<()> {
             completion.host_registration = "manual-action-required";
         }
     }
-    if installed && has_codex {
-        println!(
-            "Runner and Loomex plugin installed and read back through Codex. Restart Codex to load the plugin."
-        );
+    completion.guidance = Some(if installed && has_codex {
+        "Runner and Loomex plugin installed and read back through Codex. Restart Codex to load the plugin.".into()
     } else if runner_only {
-        println!("Runner lifecycle owner completed (--runner-only).");
+        "Runner lifecycle owner completed (--runner-only).".into()
     } else {
-        println!(
+        format!(
             "Runner and plugin files installed. Codex CLI is unavailable; the healthy runner is preserved. In Codex desktop open Plugins, import the local marketplace at {} and install Loomex from loomex-private. If the GUI cannot import a local marketplace, install the supported Codex CLI, then retry this exact release set. Verified prerequisites retained at {}. No settings/cache edits are required.",
             plugin_base.display(),
             cache.display()
-        );
-    }
+        )
+    });
 
     completion.phase = "complete";
+    completion.outcome = "completed";
+    completion.next_action = "none".into();
+    completion.reason_code = "PAIRED_INSTALL_COMPLETED".into();
+    completion.operation_id = None;
+    println!("{}", result_report(completion));
     Ok(())
 }
 
@@ -1355,6 +1655,9 @@ fn main() {
     if install(&mut completion).is_err() {
         eprintln!("{}", failure_report(&completion));
         std::process::exit(1);
+    }
+    if completion.outcome == "pending" {
+        std::process::exit(3);
     }
 }
 
@@ -1624,10 +1927,31 @@ mod tests {
                 .arg("fixture")
                 .arg(output);
             assert_eq!(
-                owner_preflight(&mut cmd, "fixture").is_ok(),
+                owner_preflight(&mut cmd, "fixture", &mut Completion::default()).is_ok(),
                 output.contains(r#""activation":{"eligible":true}"#)
             );
         }
+    }
+    #[test]
+    fn typed_nonzero_preflight_retains_only_bounded_recovery_identity() {
+        let mut completion = Completion::default();
+        let output = r#"{"schema":"app.loomex.runner.install-preflight/v1","artifact":{"eligible":true},"activation":{"eligible":false},"recoveryOwnership":{"operationId":"fixture-operation","nextAction":"recover_uninstall","secret":"SECRET"}}"#;
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "printf '%s' \"$1\"; exit 1", "fixture", output]);
+        assert!(
+            owner_preflight(
+                &mut cmd,
+                "app.loomex.runner.install-preflight/v1",
+                &mut completion
+            )
+            .is_err()
+        );
+        assert_eq!(
+            completion.operation_id.as_deref(),
+            Some("fixture-operation")
+        );
+        assert_eq!(completion.next_action, "recover_uninstall");
+        assert!(!failure_report(&completion).to_string().contains("SECRET"));
     }
     #[test]
     fn symlink_archive_rejected() {
