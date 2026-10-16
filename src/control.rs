@@ -3460,16 +3460,13 @@ impl Daemon {
                 .flatten()
                 .take(32)
                 .filter_map(|issue| {
-                    let code = issue["code"].as_str()?;
-                    let path = issue["path"].as_str()?;
-                    if code.len() > 80
-                        || path.len() > 256
-                        || !code.bytes().all(|c| c.is_ascii_uppercase() || c == b'_')
-                        || path.chars().any(char::is_control)
-                    {
-                        return None;
+                    // Older validator projections omitted the optional copy.
+                    // Retain their code/path with the existing safe fallback.
+                    let mut normalized = Value::Object(issue.as_object()?.clone());
+                    if normalized.get("message").is_none() {
+                        normalized["message"] = json!("Workflow definition field is invalid.");
                     }
-                    Some(json!({"code":code,"path":path,"message":"Workflow definition field is invalid."}))
+                    crate::api::safe_authoring_issue(&normalized)
                 })
                 .collect::<Vec<_>>();
             return Err(ApiError {
@@ -6311,7 +6308,7 @@ mod conformance {
                 reply_http(stream, 200, json!({"selectedVersion":{"workflowId":workflow,"status":"draft","revision":5,"definitionChecksum":checksum,"definition":{"nodes":[{"key":"n","config":{"prompt":"old"}}],"transitions":[]},"notes":"Keep this draft guidance"}})).await;
                 let (stream, head) = receive_http(&listener).await;
                 assert!(head.contains("/v1/workflows/validate/"));
-                reply_http(stream, 200, json!({"valid":false,"issues":[{"code":"NODE_INVALID","path":"nodes[0].config"}],"errors":["invalid"]})).await;
+                reply_http(stream, 200, json!({"valid":false,"issues":[null, 42, {"code":"NODE_INVALID","path":"nodes[0].config"}],"errors":["invalid"]})).await;
                 assert!(
                     tokio::time::timeout(Duration::from_millis(100), listener.accept())
                         .await

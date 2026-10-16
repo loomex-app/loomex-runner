@@ -203,3 +203,17 @@ readable. Unknown phases are rejected and retained for investigation.
 Graceful daemon shutdown closes admission, joins organization workers and
 recovery tasks, then removes the control socket. It does not imply cancellation
 of active work or transfer ownership to another daemon.
+
+### Authoring diagnostic details
+
+The canonical local-control schema defines `authoringIssue` with required code,
+path and safe message, plus optional categorical `reasonCode` and parser
+`location` (one-based line/column, zero-based character offset). The API error
+projection and scoped patch validator share one bounded diagnostic projector;
+unknown payload fields never cross that boundary. Older patch validation
+responses without message copy retain the existing fixed safe fallback.
+
+Workflow JSON parsing, semantic validation, rejected-candidate receipts and
+repair budgets belong to the backend. The runner forwards these contracts and
+never adds a parallel parser or provider-output repair engine. The plugin pin
+must be updated alongside changes to these optional diagnostic fields.

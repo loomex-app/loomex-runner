@@ -141,6 +141,51 @@ fn safe_validation_data(payload: &Value) -> Option<Value> {
     (!issues.is_empty()).then(|| json!({"validationIssueVersion":"v1","validationIssues":issues}))
 }
 
+/// Project only the versioned canonical diagnostic fields, never raw candidate content.
+pub(crate) fn safe_authoring_issue(issue: &Value) -> Option<Value> {
+    let code = issue.get("code")?.as_str()?;
+    let path = issue.get("path")?.as_str()?;
+    let message = issue.get("message")?.as_str()?;
+    if code.is_empty()
+        || code.len() > 120
+        || path.is_empty()
+        || path.len() > 512
+        || message.is_empty()
+        || message.len() > MAX_AUTHORING_ERROR_MESSAGE_BYTES
+        || code.chars().any(char::is_control)
+        || path.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let mut projected = json!({"code":code,"path":path,"message":message});
+    if let Some(reason) = issue.get("reasonCode") {
+        let reason = reason.as_str()?;
+        if reason.is_empty()
+            || reason.len() > 120
+            || !reason
+                .bytes()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
+        {
+            return None;
+        }
+        projected["reasonCode"] = json!(reason);
+    }
+    if let Some(location) = issue.get("location") {
+        let fields = location.as_object()?;
+        if fields.len() != 3 {
+            return None;
+        }
+        for field in ["line", "column", "offset"] {
+            let value = fields.get(field)?.as_u64()?;
+            if value > 9_007_199_254_740_991 || (field != "offset" && value == 0) {
+                return None;
+            }
+        }
+        projected["location"] = location.clone();
+    }
+    Some(projected)
+}
+
 /// Creation-time definition failures are user-correctable authoring feedback,
 /// rather than execution-policy advice.  The backend deliberately supplies a
 /// single canonical message for these codes; preserve only that bounded field
@@ -168,21 +213,7 @@ fn safe_authoring_error_data(code: &str, payload: &Value) -> Option<Value> {
         }
         let projected = issues
             .iter()
-            .filter_map(|issue| {
-                let code = issue.get("code")?.as_str()?;
-                let path = issue.get("path")?.as_str()?;
-                let message = issue.get("message")?.as_str()?;
-                if code.is_empty()
-                    || code.len() > 120
-                    || path.is_empty()
-                    || path.len() > 512
-                    || message.is_empty()
-                    || message.len() > MAX_AUTHORING_ERROR_MESSAGE_BYTES
-                {
-                    return None;
-                }
-                Some(json!({"code":code,"path":path,"message":message}))
-            })
+            .filter_map(safe_authoring_issue)
             .collect::<Vec<_>>();
         return (projected.len() == issues.len())
             .then(|| json!({"authoringIssueVersion":"v1","authoringIssues":projected}));
@@ -1150,5 +1181,35 @@ mod tests {
                 }]
             }))
         );
+    }
+    #[test]
+    fn workflow_authoring_issues_retain_safe_optional_diagnostics() {
+        let issue = json!({"code":"WORKFLOW_DEFINITION_JSON_INVALID", "path":"$.definitionJson",
+            "message":"Definition JSON has invalid syntax", "reasonCode":"JSON_SYNTAX_INVALID",
+            "location":{"line":2,"column":3,"offset":17}, "candidate":"must-not-cross"});
+        let error = parse_envelope(
+            422,
+            json!({"error":{"code":"WORKFLOW_AUTHORING_INVALID",
+            "details":{"authoringIssueVersion":"v1","authoringIssues":[issue]}}}),
+        )
+        .unwrap_err();
+        let mut expected = issue;
+        expected.as_object_mut().unwrap().remove("candidate");
+        assert_eq!(error.data.unwrap()["authoringIssues"][0], expected);
+        for invalid in [
+            json!({"line":0,"column":1,"offset":0}),
+            json!({"line":1,"column":1,"offset":-1}),
+            json!({"line":1,"column":1,"offset":0,"raw":"private"}),
+        ] {
+            let mut issue = expected.clone();
+            issue["location"] = invalid;
+            let error = parse_envelope(
+                422,
+                json!({"error":{"code":"WORKFLOW_AUTHORING_INVALID",
+                "details":{"authoringIssueVersion":"v1","authoringIssues":[issue]}}}),
+            )
+            .unwrap_err();
+            assert!(error.data.is_none());
+        }
     }
 }
