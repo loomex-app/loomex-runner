@@ -8,12 +8,56 @@ use loomex_runner::{
 use std::sync::Arc;
 fn main() {
     if let Err(error) = entry() {
-        let (code, retryable, _) = control::public_error(&error);
-        eprintln!("{}", state::safe_error(&code, retryable));
+        eprintln!("{}", control::public_error_record(&error));
         std::process::exit(1)
     }
 }
 fn entry() -> Result<()> {
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|a| a == "--maintenance-offline-logout")
+    {
+        let dir = std::env::args_os()
+            .nth(2)
+            .ok_or_else(|| anyhow::anyhow!("INVALID_REQUEST"))?;
+        if std::env::args_os().nth(3).is_some() {
+            anyhow::bail!("INVALID_REQUEST")
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        let result = runtime.block_on(loomex_runner::maintenance::run_offline_logout(
+            std::path::Path::new(&dir),
+        ));
+        // Maintenance may have a native worker after the observer's deadline.
+        // Keep this process and its ownership guards until that IO completes.
+        drop(runtime);
+        println!("{}", result?);
+        return Ok(());
+    }
+    if let Some(mode) = std::env::args().nth(1).filter(|value| {
+        matches!(
+            value.as_str(),
+            "--maintenance-logout" | "--maintenance-identity"
+        )
+    }) {
+        let context = std::env::args_os()
+            .nth(2)
+            .ok_or_else(|| anyhow::anyhow!("INVALID_REQUEST"))?;
+        if std::env::args_os().nth(3).is_some() {
+            anyhow::bail!("INVALID_REQUEST")
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        let result = runtime.block_on(loomex_runner::maintenance::run(
+            std::path::Path::new(&context),
+            mode == "--maintenance-identity",
+        ));
+        drop(runtime);
+        println!("{}", result?);
+        return Ok(());
+    }
     if let Some(argument) = std::env::args().nth(1) {
         if matches!(
             argument.as_str(),
@@ -77,6 +121,9 @@ fn entry() -> Result<()> {
     if std::env::args().nth(1).is_some_and(|a| a == "--version") {
         println!("loomex-runner {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+    if std::env::args_os().nth(1).is_some() {
+        anyhow::bail!("INVALID_REQUEST");
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

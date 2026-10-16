@@ -121,6 +121,8 @@ const LEGACY_CHECKPOINTS: &[&str] = &[
     "observed state could not be reconciled safely",
     "legacy_journal_retained",
 ];
+const PENDING_UPDATE_RETIREMENT_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v9";
+const UNINSTALL_FENCE_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v8";
 const LOCK_NAME: &str = "lifecycle.lock";
 const OPERATION_NAME: &str = "lifecycle-operation.json";
 const NATIVE_EXECUTABLES: &[&str] = &["/bin/launchctl"];
@@ -165,6 +167,37 @@ pub struct Operation {
     pub prune: Option<PruneIntent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewed_unsent_stop: Option<ReviewedUnsentStop>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uninstall_fence: Option<UninstallFence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_update_retirement: Option<PendingUpdateRetirement>,
+}
+
+/// Exact legacy marker evidence retained in its native transaction before unlink.
+/// A private schema prevents older controllers from discarding partial retirement.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PendingUpdateRetirement {
+    previous_schema: String,
+    marker_snapshot: String,
+    marker_sha256: String,
+    receipt_sha256: String,
+    receipt_value_sha256: String,
+    receipt_before_sha256: String,
+    inventory_sha256: String,
+    launch_agent_sha256: String,
+    retired: bool,
+}
+
+/// A new owner retains the exact prior operation before taking bootstrap ownership.
+/// The unknown schema makes older lifecycle writers refuse before any effects.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UninstallFence {
+    pub journal_sha256: String,
+    pub original_operation: Option<Box<Operation>>,
+    pub original_operation_sha256: Option<String>,
+    pub original_operation_snapshot: Option<String>,
 }
 
 // An owner-reviewed local refusal is provenance, not an external audit proof.
@@ -288,10 +321,118 @@ impl Operation {
             auth_baseline: None,
             prune: None,
             reviewed_unsent_stop: None,
+            uninstall_fence: None,
+            pending_update_retirement: None,
         }
     }
 
     fn validate(&self) -> Result<()> {
+        if self.schema == PENDING_UPDATE_RETIREMENT_SCHEMA {
+            let retirement = self
+                .pending_update_retirement
+                .as_ref()
+                .context("invalid pending update retirement")?;
+            let package = self
+                .package
+                .as_ref()
+                .context("pending update retirement package missing")?;
+            ensure!(
+                self.kind == OperationKind::Update
+                    && self.phase == "completed"
+                    && self.uninstall_fence.is_none()
+                    && self.resources.is_some()
+                    && self.abandonment.is_none()
+                    && self.prune.is_none()
+                    && matches!(
+                        retirement.previous_schema.as_str(),
+                        OPERATION_SCHEMA
+                            | LEGACY_OPERATION_SCHEMA
+                            | PRE_AUTH_OPERATION_SCHEMA
+                            | REVIEWED_STOP_OPERATION_SCHEMA
+                    )
+                    && [
+                        &retirement.marker_sha256,
+                        &retirement.receipt_sha256,
+                        &retirement.receipt_value_sha256,
+                        &retirement.receipt_before_sha256,
+                        &retirement.inventory_sha256,
+                        &retirement.launch_agent_sha256
+                    ]
+                    .iter()
+                    .all(|digest| valid_digest(digest)),
+                "invalid pending update retirement binding"
+            );
+            let marker: Value = serde_json::from_str(&retirement.marker_snapshot)?;
+            ensure!(
+                state::digest(retirement.marker_snapshot.as_bytes()) == retirement.marker_sha256
+                    && marker["schema"] == "app.loomex.runner.pending-update/v1"
+                    && marker["version"] == package.version
+                    && marker["path"] == json!(package.target)
+                    && marker["manifestSha256"] == package.manifest_sha256
+                    && marker["providerExecutables"].is_object()
+                    && marker
+                        .get("operationId")
+                        .is_none_or(|id| *id == self.id.to_string()),
+                "invalid pending update retirement evidence"
+            );
+            let mut previous = self.clone();
+            previous.schema = retirement.previous_schema.clone();
+            previous.pending_update_retirement = None;
+            previous.validate()?;
+            return Ok(());
+        }
+        ensure!(
+            self.pending_update_retirement.is_none(),
+            "pending update retirement schema mismatch"
+        );
+        if self.schema == UNINSTALL_FENCE_SCHEMA {
+            let fence = self
+                .uninstall_fence
+                .as_ref()
+                .context("invalid uninstall fence")?;
+            ensure!(
+                self.kind == OperationKind::Uninstall
+                    && self.phase == "bootstrap_owned"
+                    && self.package.is_none()
+                    && self.previous_target.is_none()
+                    && self.resources.is_none()
+                    && self.service_stops.is_empty()
+                    && self.abandonment.is_none()
+                    && self.auth_baseline.is_none()
+                    && self.prune.is_none()
+                    && self.reviewed_unsent_stop.is_none()
+                    && self.checkpoint.is_none()
+                    && valid_digest(&fence.journal_sha256),
+                "invalid uninstall fence"
+            );
+            match (
+                &fence.original_operation,
+                &fence.original_operation_sha256,
+                &fence.original_operation_snapshot,
+            ) {
+                (Some(operation), Some(digest), Some(snapshot)) => {
+                    ensure!(
+                        operation.uninstall_fence.is_none(),
+                        "nested uninstall fence"
+                    );
+                    operation.validate()?;
+                    ensure!(
+                        terminal(&operation.phase)
+                            && valid_digest(digest)
+                            && state::digest(snapshot.as_bytes()) == *digest
+                            && serde_json::from_str::<Operation>(snapshot)? == **operation,
+                        "invalid uninstall prior operation"
+                    );
+                }
+                (None, None, None) => {}
+                _ => bail!("invalid uninstall prior operation"),
+            }
+            return Ok(());
+        }
+        ensure!(
+            self.uninstall_fence.is_none(),
+            "uninstall fence schema mismatch"
+        );
         if !matches!(
             self.schema.as_str(),
             OPERATION_SCHEMA
@@ -748,12 +889,15 @@ impl Drop for LifecycleLock {
 }
 
 fn read_optional<T: for<'a> Deserialize<'a>>(path: &Path) -> Result<Option<T>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    if fs::symlink_metadata(path)?.file_type().is_symlink() {
-        bail!("unsafe lifecycle state")
-    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "unsafe lifecycle state"
+    );
     Ok(Some(state::read_json(path)?))
 }
 
@@ -2267,16 +2411,88 @@ fn terminal(phase: &str) -> bool {
 /// discard.
 pub fn operation_is_terminal(operation: &Operation) -> Result<bool> {
     operation.validate()?;
-    Ok(terminal(&operation.phase))
+    Ok(terminal(&operation.phase)
+        && operation
+            .pending_update_retirement
+            .as_ref()
+            .is_none_or(|retirement| retirement.retired))
 }
 
 /// Must run under LifecycleLock before uninstall writes, drain or logout.
 pub fn require_terminal_before_uninstall(paths: &Paths) -> Result<()> {
+    let snapshot = ownership_snapshot(paths);
+    for journal in &snapshot {
+        ensure!(journal["valid"] == true, "LIFECYCLE_OWNERSHIP_INVALID");
+        if journal["pending"] == true
+            && journal["owner"] != "bootstrap_uninstall"
+            && journal["owner"] != "native"
+            && journal["owner"] != "drain"
+        {
+            bail!("LIFECYCLE_OPERATION_PENDING");
+        }
+    }
     if let Some(operation) = read_optional::<Operation>(&paths.operation())? {
         operation.validate()?;
-        ensure!(terminal(&operation.phase), "LIFECYCLE_OPERATION_PENDING");
+        if let Some(fence) = &operation.uninstall_fence {
+            let journal_path = paths.state_dir.join("bootstrap-uninstall.json");
+            let journal: Value = state::read_json(&journal_path)?;
+            ensure!(
+                (journal["operationId"] == operation.id.to_string()
+                    && journal["fenceJournalSha256"] == fence.journal_sha256)
+                    || (journal["schema"] == "app.loomex.runner.bootstrap-uninstall/v1"
+                        && regular_digest(&journal_path)?.as_deref()
+                            == Some(&fence.journal_sha256)),
+                "LIFECYCLE_UNINSTALL_FENCE_MISMATCH"
+            );
+        } else {
+            ensure!(
+                operation_is_terminal(&operation)?,
+                "LIFECYCLE_OPERATION_PENDING"
+            );
+        }
     }
     Ok(())
+}
+
+/// Caller holds LifecycleLock. Preserve the prior terminal operation atomically
+/// in a journal schema unsupported by older lifecycle owners.
+pub fn begin_uninstall_fence_locked(paths: &Paths, id: Uuid, journal_sha256: &str) -> Result<()> {
+    ensure!(
+        valid_digest(journal_sha256),
+        "invalid uninstall journal digest"
+    );
+    let existing = read_optional::<Operation>(&paths.operation())?;
+    if let Some(operation) = &existing {
+        operation.validate()?;
+        if let Some(fence) = &operation.uninstall_fence {
+            ensure!(
+                operation.id == id && fence.journal_sha256 == journal_sha256,
+                "LIFECYCLE_UNINSTALL_FENCE_MISMATCH"
+            );
+            return Ok(());
+        }
+        ensure!(
+            operation_is_terminal(operation)?,
+            "LIFECYCLE_OPERATION_PENDING"
+        );
+    }
+    let snapshot = existing
+        .as_ref()
+        .map(|_| fs::read_to_string(paths.operation()))
+        .transpose()?;
+    let digest = snapshot
+        .as_ref()
+        .map(|value| state::digest(value.as_bytes()));
+    let mut operation = Operation::new(OperationKind::Uninstall, "bootstrap_owned", None);
+    operation.schema = UNINSTALL_FENCE_SCHEMA.into();
+    operation.id = id;
+    operation.uninstall_fence = Some(UninstallFence {
+        journal_sha256: journal_sha256.into(),
+        original_operation: existing.map(Box::new),
+        original_operation_sha256: digest,
+        original_operation_snapshot: snapshot,
+    });
+    save_operation(paths, &operation)
 }
 
 /// Reconcile an interrupted install before a bootstrap stages another package
@@ -2298,6 +2514,7 @@ pub async fn preflight_package_locked(
     kind: OperationKind,
     package: PackageIdentity,
 ) -> Result<Value> {
+    require_bootstrap_ownership_clear(paths, Some(&package))?;
     if let Some(value) = reconcile_matching_operation(paths, kind, &package).await? {
         if value["pending"] == true {
             return Ok(
@@ -3149,6 +3366,14 @@ async fn activate_as_locked(
         target: target.clone(),
         manifest_sha256: manifest_sha256.clone(),
     };
+    require_bootstrap_ownership_clear(
+        paths,
+        if kind == OperationKind::Rollback {
+            None
+        } else {
+            Some(&package)
+        },
+    )?;
     // A terminal journal still owns its operation-specific staging files.
     // Release those exact files before this writer replaces the journal with a
     // new transaction; if this cleanup is interrupted the terminal journal
@@ -3293,31 +3518,816 @@ async fn activate_as_locked(
     }
 }
 
-fn legacy(path: &Path) -> Result<Option<Value>> {
-    read_optional(path)
+/// Observe only durable local state; no daemon, launchd or credential access.
+/// Every record is validated independently so malformed ownership is visible
+/// and blocks writers without concealing the other owners.
+fn ownership_snapshot(paths: &Paths) -> Vec<Value> {
+    let operation = read_optional::<Operation>(&paths.operation())
+        .ok()
+        .flatten();
+    let authoritative = operation.as_ref().and_then(|operation| {
+        operation
+            .uninstall_fence
+            .as_ref()
+            .and_then(|fence| fence.original_operation.as_deref())
+            .or(Some(operation))
+    });
+    let mut records = Vec::new();
+    for (name, owner) in [
+        (OPERATION_NAME, "native"),
+        ("bootstrap-install.json", "bootstrap_install"),
+        ("bootstrap-uninstall.json", "bootstrap_uninstall"),
+        ("bootstrap-uninstall-terminal.json", "bootstrap_uninstall"),
+        ("install-operation.json", "legacy_install"),
+        ("uninstall-operation.json", "legacy_uninstall"),
+        ("receipt-repair.json", "receipt_repair"),
+        ("pending-update.json", "pending_update"),
+        ("drain.json", "drain"),
+    ] {
+        let path = paths.state_dir.join(name);
+        let observation = (|| -> Result<Option<Value>> {
+            let Some(value) = read_optional::<Value>(&path)? else {
+                return Ok(None);
+            };
+            ensure!(value.is_object(), "invalid ownership record");
+            let digest = regular_digest(&path)?.context("ownership record disappeared")?;
+            let (phase, pending, next_action) = match owner {
+                "native" => {
+                    let operation: Operation = serde_json::from_value(value.clone())?;
+                    operation.validate()?;
+                    let pending = !operation_is_terminal(&operation)?;
+                    (
+                        operation.phase,
+                        pending,
+                        if operation.uninstall_fence.is_some() {
+                            "resume_bootstrap_uninstall"
+                        } else {
+                            "resume_native_operation"
+                        },
+                    )
+                }
+                "bootstrap_install" => {
+                    let configuration = if value["schema"]
+                        == "app.loomex.runner.bootstrap-install/v2"
+                    {
+                        ensure!(
+                            value["phase"] == "aborted"
+                                && value["operationId"]
+                                    .as_str()
+                                    .and_then(|v| Uuid::parse_str(v).ok())
+                                    .is_some(),
+                            "invalid bootstrap install ownership"
+                        );
+                        ensure!(
+                            value["configurationDigest"]
+                                .as_str()
+                                .is_some_and(valid_digest)
+                                && bootstrap_configuration_digest(&value["configuration"])?
+                                    == value["configurationDigest"],
+                            "invalid bootstrap install configuration"
+                        );
+                        if value.get("successorConfiguration").is_none() {
+                            records.push(json!({"journal":name,"owner":owner,"phase":"aborted","pending":false,"valid":true,"sha256":digest,"nextAction":"none"}));
+                            return Ok(None);
+                        }
+                        ensure!(
+                            value["successorConfigurationDigest"]
+                                .as_str()
+                                .is_some_and(valid_digest)
+                                && bootstrap_configuration_digest(
+                                    &value["successorConfiguration"]
+                                )? == value["successorConfigurationDigest"],
+                            "invalid bootstrap successor configuration"
+                        );
+                        &value["successorConfiguration"]
+                    } else {
+                        &value
+                    };
+                    ensure!(
+                        configuration["schema"] == "app.loomex.runner.bootstrap-install/v1",
+                        "unsupported bootstrap install ownership"
+                    );
+                    let package = configuration_package(configuration)?;
+                    ensure!(
+                        package.target == paths.versions().join(&package.version),
+                        "invalid bootstrap target ownership"
+                    );
+                    let finished = authoritative.is_some_and(|op| {
+                        op.validate().is_ok()
+                            && op.phase == "completed"
+                            && matches!(
+                                op.kind,
+                                OperationKind::Install
+                                    | OperationKind::Update
+                                    | OperationKind::Rollback
+                            )
+                            && op.package.as_ref() == Some(&package)
+                    });
+                    (
+                        if finished {
+                            "completed".into()
+                        } else {
+                            "prepared".into()
+                        },
+                        !finished,
+                        "retry_exact_bootstrap_install",
+                    )
+                }
+                "bootstrap_uninstall" => {
+                    ensure!(
+                        matches!(
+                            value["schema"].as_str(),
+                            Some(
+                                "app.loomex.runner.bootstrap-uninstall/v1"
+                                    | "app.loomex.runner.bootstrap-uninstall/v2"
+                            )
+                        ),
+                        "unsupported bootstrap uninstall ownership"
+                    );
+                    let phase = value["phase"]
+                        .as_str()
+                        .context("missing bootstrap uninstall phase")?;
+                    ensure!(
+                        matches!(
+                            phase,
+                            "prepared"
+                                | "idle_verified"
+                                | "stop_intent"
+                                | "stopped"
+                                | "revoked"
+                                | "cleanup"
+                                | "terminal"
+                        ),
+                        "invalid bootstrap uninstall phase"
+                    );
+                    if value["schema"] == "app.loomex.runner.bootstrap-uninstall/v1" {
+                        ensure!(
+                            matches!(phase, "prepared" | "revoked" | "terminal"),
+                            "invalid legacy bootstrap uninstall phase"
+                        );
+                    } else {
+                        for field in ["operationId", "drainKey"] {
+                            ensure!(
+                                value[field]
+                                    .as_str()
+                                    .and_then(|v| Uuid::parse_str(v).ok())
+                                    .is_some(),
+                                "invalid bootstrap uninstall identity"
+                            );
+                        }
+                        ensure!(
+                            value["fenceJournalSha256"]
+                                .as_str()
+                                .is_some_and(valid_digest)
+                                && value["receiptSha256"] == state::json_digest(&value["receipt"]),
+                            "invalid bootstrap uninstall immutable binding"
+                        );
+                    }
+                    ensure!(
+                        value["receipt"].is_object()
+                            && value["paths"].is_array()
+                            && value["inventories"].is_array()
+                            && value["helper"]
+                                == paths
+                                    .state_dir
+                                    .join("bootstrap-uninstall-helper")
+                                    .to_string_lossy()
+                                    .as_ref()
+                            && value["helperSha256"].as_str().is_some_and(valid_digest),
+                        "invalid bootstrap uninstall inventory"
+                    );
+                    ensure!(
+                        value["paths"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .all(|v| v.as_str().is_some_and(|p| {
+                                let p = Path::new(p);
+                                p.is_absolute()
+                                    && p.parent() == Some(paths.versions().as_path())
+                                    && p.components().all(|part| {
+                                        !matches!(part, Component::ParentDir | Component::CurDir)
+                                    })
+                            })),
+                        "invalid uninstall target ownership"
+                    );
+                    let owned_paths = value["paths"].as_array().unwrap();
+                    let inventories = value["inventories"].as_array().unwrap();
+                    ensure!(
+                        !owned_paths.is_empty()
+                            && owned_paths.len() == inventories.len()
+                            && owned_paths
+                                .iter()
+                                .collect::<std::collections::HashSet<_>>()
+                                .len()
+                                == owned_paths.len()
+                            && owned_paths
+                                .iter()
+                                .any(|path| *path == value["receipt"]["versionPath"])
+                            && value["receipt"]["version"]
+                                .as_str()
+                                .is_some_and(|version| value["receipt"]["versionPath"]
+                                    == paths.versions().join(version).to_string_lossy().as_ref()),
+                        "invalid bootstrap uninstall receipt binding"
+                    );
+                    for path in owned_paths {
+                        let matching: Vec<_> = inventories
+                            .iter()
+                            .filter(|inventory| inventory["path"] == *path)
+                            .collect();
+                        ensure!(
+                            matching.len() == 1,
+                            "ambiguous bootstrap uninstall inventory"
+                        );
+                        let files = matching[0]["files"]
+                            .as_array()
+                            .context("missing uninstall files")?;
+                        let mut names = std::collections::HashSet::new();
+                        ensure!(!files.is_empty(), "empty uninstall file inventory");
+                        for file in files {
+                            let name = file["path"]
+                                .as_str()
+                                .context("invalid uninstall file path")?;
+                            ensure!(
+                                !name.is_empty()
+                                    && Path::new(name)
+                                        .components()
+                                        .all(|part| matches!(part, Component::Normal(_)))
+                                    && names.insert(name)
+                                    && file["sha256"].as_str().is_some_and(valid_digest)
+                                    && file["size"].as_u64().is_some()
+                                    && file["mode"].as_u64().is_some_and(|mode| mode <= 0o777),
+                                "invalid uninstall file inventory"
+                            );
+                        }
+                    }
+                    ensure!(
+                        (name == "bootstrap-uninstall-terminal.json") == (phase == "terminal"),
+                        "invalid uninstall terminal ownership"
+                    );
+                    // A terminal marker still owns helper cleanup until removed.
+                    (phase.into(), true, "resume_bootstrap_uninstall")
+                }
+                "legacy_install" | "legacy_uninstall" => {
+                    let expected = if owner == "legacy_install" {
+                        "app.loomex.runner.install-operation/v1"
+                    } else {
+                        "app.loomex.runner.uninstall-operation/v1"
+                    };
+                    ensure!(
+                        value["schema"] == expected
+                            && value["phase"]
+                                .as_str()
+                                .is_some_and(|p| !p.is_empty() && p.len() <= 128),
+                        "invalid legacy lifecycle ownership"
+                    );
+                    (
+                        value["phase"].as_str().unwrap().into(),
+                        true,
+                        "protected_legacy_repair",
+                    )
+                }
+                "receipt_repair" => {
+                    ensure!(
+                        value["schema"] == "loomex.receipt-repair/v1"
+                            && matches!(value["phase"].as_str(), Some("pending" | "completed"))
+                            && value["expectedDigest"].as_str().is_some_and(valid_digest)
+                            && value["version"].as_str().is_some_and(prune_version_name)
+                            && value["target"]
+                                == paths
+                                    .versions()
+                                    .join(value["version"].as_str().unwrap_or(""))
+                                    .to_string_lossy()
+                                    .as_ref(),
+                        "invalid receipt repair ownership"
+                    );
+                    (
+                        value["phase"].as_str().unwrap().into(),
+                        value["phase"] != "completed",
+                        "repair_receipt",
+                    )
+                }
+                "pending_update" => {
+                    pending_update_package(paths, &value)?;
+                    ("pending".into(), true, "inspect_pending_update")
+                }
+                "drain" => {
+                    ensure!(
+                        value["requestedAt"].as_u64().is_some()
+                            && value["idempotencyKey"]
+                                .as_str()
+                                .and_then(|v| Uuid::parse_str(v).ok())
+                                .is_some(),
+                        "invalid drain ownership"
+                    );
+                    ("draining".into(), true, "inspect_drain_owner")
+                }
+                _ => ("pending".into(), true, "resume_native_operation"),
+            };
+            Ok(Some(
+                json!({"journal":name,"owner":owner,"phase":phase,"pending":pending,"valid":true,"sha256":digest,"nextAction":if pending { next_action } else { "none" },"operationId":value.get("operationId").or(value.get("id")),"bindingSha256":value.get("fenceJournalSha256")}),
+            ))
+        })();
+        match observation {
+            Ok(Some(record)) => records.push(record),
+            Ok(None) => {}
+            Err(_) => records.push(json!({"journal":name,"owner":owner,"phase":"unknown","pending":true,"valid":false,"blocker":"LIFECYCLE_OWNERSHIP_INVALID","nextAction":"inspect_protected_ownership"})),
+        }
+    }
+    if let (Ok(Some(mut journal)), Ok(Some(mut marker))) = (
+        read_optional::<Value>(&paths.state_dir.join("bootstrap-uninstall.json")),
+        read_optional::<Value>(&paths.state_dir.join("bootstrap-uninstall-terminal.json")),
+    ) {
+        journal.as_object_mut().map(|value| value.remove("phase"));
+        marker.as_object_mut().map(|value| value.remove("phase"));
+        if journal != marker {
+            records.push(json!({"journal":"bootstrap-uninstall-terminal.json","owner":"bootstrap_uninstall",
+                "phase":"unknown","pending":true,"valid":false,"blocker":"LIFECYCLE_OWNERSHIP_AMBIGUOUS",
+                "nextAction":"inspect_protected_ownership"}));
+        }
+    }
+    if let Some(operation) = &operation {
+        if operation.uninstall_fence.is_some()
+            && !records.iter().any(|record| {
+                record["owner"] == "bootstrap_uninstall"
+                    && record["valid"] == true
+                    && ((record["operationId"] == operation.id.to_string()
+                        && record["bindingSha256"]
+                            == operation.uninstall_fence.as_ref().unwrap().journal_sha256)
+                        || record["sha256"]
+                            == operation.uninstall_fence.as_ref().unwrap().journal_sha256)
+            })
+        {
+            records.push(
+                json!({"journal":OPERATION_NAME,"owner":"native","phase":"unknown",
+                "pending":true,"valid":false,"blocker":"LIFECYCLE_UNINSTALL_FENCE_MISMATCH",
+                "nextAction":"inspect_protected_ownership"}),
+            );
+        }
+    }
+    if records
+        .iter()
+        .any(|record| record["owner"] == "bootstrap_install" && record["pending"] == true)
+        && records
+            .iter()
+            .any(|record| record["owner"] == "bootstrap_uninstall" && record["pending"] == true)
+    {
+        records.push(
+            json!({"journal":"bootstrap-ownership","owner":"unknown","phase":"unknown",
+            "pending":true,"valid":false,"blocker":"LIFECYCLE_OWNERSHIP_AMBIGUOUS",
+            "nextAction":"inspect_protected_ownership"}),
+        );
+    }
+    records
+}
+
+fn pending_update_package(paths: &Paths, value: &Value) -> Result<PackageIdentity> {
+    ensure!(
+        value["schema"] == "app.loomex.runner.pending-update/v1",
+        "invalid pending update schema"
+    );
+    let package = PackageIdentity {
+        version: value["version"]
+            .as_str()
+            .context("pending update version missing")?
+            .into(),
+        target: PathBuf::from(
+            value["path"]
+                .as_str()
+                .context("pending update target missing")?,
+        ),
+        manifest_sha256: value["manifestSha256"]
+            .as_str()
+            .context("pending update manifest missing")?
+            .into(),
+    };
+    ensure!(
+        prune_version_name(&package.version)
+            && package.target == paths.versions().join(&package.version)
+            && valid_digest(&package.manifest_sha256),
+        "invalid pending update package"
+    );
+    if let Some(id) = value.get("operationId") {
+        ensure!(
+            id.as_str()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .is_some(),
+            "invalid pending update operation identity"
+        );
+    }
+    let providers = value["providerExecutables"]
+        .as_object()
+        .context("pending update provider configuration missing")?;
+    ensure!(
+        providers.iter().all(|(name, path)| matches!(
+            name.as_str(),
+            "codex" | "claude" | "gemini" | "antigravity"
+        ) && path
+            .as_str()
+            .is_some_and(|path| Path::new(path).is_absolute())),
+        "invalid pending update provider configuration"
+    );
+    Ok(package)
+}
+
+fn matching_pending_update_owner(
+    paths: &Paths,
+    candidate: Option<&PackageIdentity>,
+) -> Result<bool> {
+    let marker: Value = state::read_json(&paths.state_dir.join("pending-update.json"))?;
+    let package = pending_update_package(paths, &marker)?;
+    let Some(candidate) = candidate.filter(|candidate| **candidate == package) else {
+        return Ok(false);
+    };
+    let Some(operation) = read_optional::<Operation>(&paths.operation())? else {
+        return Ok(false);
+    };
+    operation.validate()?;
+    if operation.kind != OperationKind::Update
+        || operation.package.as_ref() != Some(candidate)
+        || operation.resources.is_none()
+        || (marker.get("operationId").is_some()
+            && marker["operationId"] != operation.id.to_string())
+    {
+        return Ok(false);
+    }
+    if operation.phase == "completed" && current_target(paths)?.as_ref() != Some(&package.target) {
+        return Ok(false);
+    }
+    if let Some(journal) = read_optional::<Value>(&paths.state_dir.join("bootstrap-install.json"))?
+    {
+        let configuration = if journal["schema"] == "app.loomex.runner.bootstrap-install/v2" {
+            &journal["successorConfiguration"]
+        } else {
+            &journal
+        };
+        if configuration["providerExecutables"] != marker["providerExecutables"] {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn require_receipt_repair_owner(paths: &Paths) -> Result<()> {
+    let Some(intent) = read_optional::<Value>(&paths.state_dir.join("receipt-repair.json"))? else {
+        return Ok(());
+    };
+    if intent["phase"] != "pending" {
+        return Ok(());
+    }
+    let target = PathBuf::from(
+        intent["target"]
+            .as_str()
+            .context("LIFECYCLE_RECEIPT_REPAIR_MISMATCH")?,
+    );
+    let version = intent["version"]
+        .as_str()
+        .context("LIFECYCLE_RECEIPT_REPAIR_MISMATCH")?;
+    ensure!(
+        intent["schema"] == "loomex.receipt-repair/v1"
+            && target == paths.versions().join(version)
+            && current_target(paths)?.as_ref() == Some(&target),
+        "LIFECYCLE_RECEIPT_REPAIR_MISMATCH"
+    );
+    ensure!(
+        read_optional::<Value>(&paths.state_dir.join("install-receipt.json"))?.is_some(),
+        "LIFECYCLE_RECEIPT_REPAIR_MISMATCH"
+    );
+    if let Some(operation) = read_optional::<Operation>(&paths.operation())? {
+        operation.validate()?;
+        ensure!(
+            operation.phase == "completed"
+                && matches!(
+                    operation.kind,
+                    OperationKind::Install | OperationKind::Update | OperationKind::Rollback
+                )
+                && operation
+                    .package
+                    .as_ref()
+                    .is_some_and(|package| package.target == target && package.version == version),
+            "LIFECYCLE_RECEIPT_REPAIR_PENDING"
+        );
+    }
+    Ok(())
+}
+
+/// Finish only the exact marker captured by a completed native Update. This is
+/// metadata recovery: service state, provider credentials and jobs are untouched.
+async fn retire_pending_update_locked(paths: &Paths, operation: &mut Operation) -> Result<bool> {
+    operation.validate()?;
+    let marker_path = paths.state_dir.join("pending-update.json");
+    let marker = read_optional::<Value>(&marker_path)?;
+    if operation
+        .pending_update_retirement
+        .as_ref()
+        .is_some_and(|retirement| retirement.retired)
+    {
+        ensure!(marker.is_none(), "LIFECYCLE_PENDING_UPDATE_PROTECTED");
+        return Ok(false);
+    }
+    if marker.is_none() && operation.pending_update_retirement.is_none() {
+        return Ok(false);
+    }
+    let package = operation
+        .package
+        .as_ref()
+        .context("LIFECYCLE_PENDING_UPDATE_PROTECTED")?
+        .clone();
+    let resources = operation
+        .resources
+        .as_ref()
+        .context("LIFECYCLE_PENDING_UPDATE_PROTECTED")?;
+    ensure!(
+        operation.kind == OperationKind::Update
+            && operation.phase == "completed"
+            && operation.abandonment.is_none()
+            && current_target(paths)?.as_ref() == Some(&package.target)
+            && resources.launch_agent == launch_agent(paths)
+            && regular_digest(&resources.launch_agent)?.as_deref()
+                == Some(&resources.staged_launch_agent_sha256),
+        "LIFECYCLE_PENDING_UPDATE_PROTECTED"
+    );
+    verify_all_owned_versions(paths)?;
+    let observed = observe_receipt_configuration(paths).await?;
+    let receipt_path = paths.state_dir.join("install-receipt.json");
+    let receipt: Value =
+        read_optional(&receipt_path)?.context("LIFECYCLE_PENDING_UPDATE_RECEIPT_REQUIRED")?;
+    let expected = expected_install_receipt(paths, &receipt, &observed)?;
+    let receipt_digest =
+        regular_digest(&receipt_path)?.context("LIFECYCLE_PENDING_UPDATE_RECEIPT_REQUIRED")?;
+    let inventory_digest = regular_digest(&paths.state_dir.join("owned-versions.json"))?
+        .context("owned inventory missing")?;
+    let plist_digest = regular_digest(&resources.launch_agent)?.context("LaunchAgent missing")?;
+    if let Some(retirement) = &operation.pending_update_retirement {
+        let original: Value = serde_json::from_str(&retirement.marker_snapshot)?;
+        ensure!(
+            pending_update_package(paths, &original)? == package
+                && observed.provider_executables.as_ref() == Some(&original["providerExecutables"])
+                && inventory_digest == retirement.inventory_sha256
+                && plist_digest == retirement.launch_agent_sha256
+                && state::json_digest(&expected) == retirement.receipt_value_sha256
+                && (receipt_digest == retirement.receipt_before_sha256
+                    || receipt_digest == retirement.receipt_sha256),
+            "LIFECYCLE_PENDING_UPDATE_RETIREMENT_MISMATCH"
+        );
+        if marker.is_some() {
+            ensure!(
+                regular_digest(&marker_path)?.as_deref() == Some(&retirement.marker_sha256),
+                "LIFECYCLE_PENDING_UPDATE_RETIREMENT_MISMATCH"
+            );
+        }
+    } else {
+        ensure!(
+            matching_pending_update_owner(paths, Some(&package))?,
+            "LIFECYCLE_PENDING_UPDATE_PROTECTED"
+        );
+        let marker = marker.as_ref().unwrap();
+        ensure!(
+            observed.provider_executables.as_ref() == Some(&marker["providerExecutables"]),
+            "LIFECYCLE_PENDING_UPDATE_CONFIGURATION_MISMATCH"
+        );
+        // A foreign pending receipt intent is never replaced by retirement.
+        if let Some(intent) = read_optional::<Value>(&paths.state_dir.join("receipt-repair.json"))?
+        {
+            ensure!(
+                intent["phase"] != "pending"
+                    || (intent["target"] == json!(package.target)
+                        && intent["version"] == package.version
+                        && intent["expectedDigest"] == state::json_digest(&expected)),
+                "LIFECYCLE_RECEIPT_REPAIR_MISMATCH"
+            );
+        }
+        let marker_snapshot = fs::read_to_string(&marker_path)?;
+        ensure!(
+            serde_json::from_str::<Value>(&marker_snapshot)? == *marker,
+            "LIFECYCLE_PENDING_UPDATE_RETIREMENT_MISMATCH"
+        );
+        let previous_schema = operation.schema.clone();
+        operation.pending_update_retirement = Some(PendingUpdateRetirement {
+            previous_schema,
+            marker_sha256: state::digest(marker_snapshot.as_bytes()),
+            marker_snapshot,
+            // A semantically current receipt keeps its exact original bytes.
+            // Reconciliation serializes only a receipt that actually changes.
+            receipt_sha256: if receipt == expected {
+                receipt_digest.clone()
+            } else {
+                state::json_digest(&expected)
+            },
+            receipt_value_sha256: state::json_digest(&expected),
+            receipt_before_sha256: receipt_digest,
+            inventory_sha256: inventory_digest,
+            launch_agent_sha256: plist_digest,
+            retired: false,
+        });
+        operation.schema = PENDING_UPDATE_RETIREMENT_SCHEMA.into();
+        operation.updated_at = state::now();
+        save_operation(paths, operation)?;
+    }
+    #[cfg(test)]
+    recovery_fault("after_pending_update_retirement_intent")?;
+    reconcile_install_receipt(paths, &observed)?;
+    let retirement = operation.pending_update_retirement.as_ref().unwrap();
+    ensure!(
+        regular_digest(&receipt_path)?.as_deref() == Some(&retirement.receipt_sha256)
+            && regular_digest(&paths.state_dir.join("owned-versions.json"))?.as_deref()
+                == Some(&retirement.inventory_sha256)
+            && regular_digest(&launch_agent(paths))?.as_deref()
+                == Some(&retirement.launch_agent_sha256),
+        "LIFECYCLE_PENDING_UPDATE_RETIREMENT_MISMATCH"
+    );
+    #[cfg(test)]
+    recovery_fault("after_pending_update_retirement_metadata")?;
+    if regular_digest(&marker_path)?.is_some() {
+        ensure!(
+            regular_digest(&marker_path)?.as_deref() == Some(&retirement.marker_sha256),
+            "LIFECYCLE_PENDING_UPDATE_RETIREMENT_MISMATCH"
+        );
+        remove_regular_and_sync(&marker_path)?;
+    }
+    #[cfg(test)]
+    recovery_fault("after_pending_update_retirement_unlink")?;
+    operation
+        .pending_update_retirement
+        .as_mut()
+        .unwrap()
+        .retired = true;
+    operation.updated_at = state::now();
+    save_operation(paths, operation)?;
+    Ok(true)
+}
+
+/// Shared read-only bootstrap exclusion, called while LifecycleLock is held.
+/// An install may continue only its exact release identity; all other writers
+/// must leave an unfinished bootstrap transaction with its original owner.
+pub fn require_bootstrap_ownership_clear(
+    paths: &Paths,
+    candidate: Option<&PackageIdentity>,
+) -> Result<()> {
+    require_ownership_clear(paths, candidate, OwnershipAccess::Package)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OwnershipAccess {
+    Package,
+    Resume,
+    ReceiptRepair,
+    BootstrapAbandonment,
+}
+
+// Each exception names the existing owner that will validate and finish its
+// own intent; it never permits another writer to supersede protected state.
+fn require_ownership_clear(
+    paths: &Paths,
+    candidate: Option<&PackageIdentity>,
+    access: OwnershipAccess,
+) -> Result<()> {
+    for record in ownership_snapshot(paths) {
+        ensure!(record["valid"] == true, "LIFECYCLE_OWNERSHIP_INVALID");
+        if record["pending"] != true {
+            continue;
+        }
+        match record["owner"].as_str() {
+            Some("native")
+                if read_optional::<Operation>(&paths.operation())?.is_some_and(|operation| {
+                    operation
+                        .pending_update_retirement
+                        .as_ref()
+                        .is_some_and(|retirement| !retirement.retired)
+                }) =>
+            {
+                ensure!(
+                    matches!(
+                        access,
+                        OwnershipAccess::Resume | OwnershipAccess::ReceiptRepair
+                    ),
+                    "LIFECYCLE_PENDING_UPDATE_RETIREMENT_PENDING"
+                );
+            }
+            Some("bootstrap_install") => {
+                let journal: Value =
+                    state::read_json(&paths.state_dir.join("bootstrap-install.json"))?;
+                let configuration = if journal["schema"] == "app.loomex.runner.bootstrap-install/v2"
+                {
+                    &journal["successorConfiguration"]
+                } else {
+                    &journal
+                };
+                ensure!(
+                    access == OwnershipAccess::BootstrapAbandonment
+                        || candidate == Some(&configuration_package(configuration)?),
+                    "LIFECYCLE_BOOTSTRAP_INSTALL_PENDING"
+                );
+            }
+            Some("bootstrap_uninstall") => bail!("LIFECYCLE_BOOTSTRAP_UNINSTALL_PENDING"),
+            Some("pending_update") => ensure!(
+                matching_pending_update_owner(paths, candidate)?,
+                "LIFECYCLE_PENDING_UPDATE_PROTECTED"
+            ),
+            Some("receipt_repair") => {
+                ensure!(
+                    matches!(
+                        access,
+                        OwnershipAccess::Resume | OwnershipAccess::ReceiptRepair
+                    ),
+                    "LIFECYCLE_RECEIPT_REPAIR_PENDING"
+                );
+                require_receipt_repair_owner(paths)?;
+            }
+            Some("legacy_install" | "legacy_uninstall") => {
+                ensure!(
+                    access == OwnershipAccess::Resume,
+                    "LIFECYCLE_LEGACY_OPERATION_PENDING"
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// A verified release caller may ask readiness before staging. This never
+/// reconciles a journal, changes a service, or reads credentials.
+pub fn package_preflight(
+    paths: &Paths,
+    kind: OperationKind,
+    package: &PackageIdentity,
+) -> Result<Value> {
+    ensure!(
+        package.target == paths.versions().join(&package.version)
+            && !package.version.is_empty()
+            && Path::new(&package.version).components().count() == 1
+            && valid_digest(&package.manifest_sha256),
+        "invalid lifecycle package identity"
+    );
+    let mut blockers = Vec::new();
+    if let Err(error) = require_bootstrap_ownership_clear(paths, Some(package)) {
+        blockers.push(error.to_string());
+    }
+    if let Ok(Some(operation)) = read_optional::<Operation>(&paths.operation()) {
+        if operation.validate().is_err() {
+            blockers.push("LIFECYCLE_OWNERSHIP_INVALID".into());
+        } else if !terminal(&operation.phase)
+            && (operation.kind != kind || operation.package.as_ref() != Some(package))
+        {
+            blockers.push("LIFECYCLE_OPERATION_PENDING".into());
+        }
+    }
+    blockers.sort();
+    blockers.dedup();
+    Ok(
+        json!({"schema":"app.loomex.runner.package-preflight/v1","ready":blockers.is_empty(),"blockers":blockers,"package":package,"ownership":ownership_snapshot(paths)}),
+    )
 }
 
 pub fn status(paths: &Paths) -> Result<Value> {
-    let operation = read_optional::<Operation>(&paths.operation())?;
-    if let Some(op) = &operation {
-        op.validate()?;
-    }
+    let records = ownership_snapshot(paths);
+    let operation = read_optional::<Operation>(&paths.operation())
+        .ok()
+        .flatten()
+        .filter(|op| op.validate().is_ok());
     let current = match fs::read_link(paths.current()) {
         Ok(target) => Some(target.to_string_lossy().into_owned()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    let legacy_install = legacy(&paths.state_dir.join("install-operation.json"))?.is_some();
-    let legacy_uninstall = legacy(&paths.state_dir.join("uninstall-operation.json"))?.is_some();
-    let native_pending = operation
-        .as_ref()
-        .is_some_and(|op| !matches!(op.phase.as_str(), "completed" | "rolled_back"));
+    let pending = |owner: &str| {
+        records
+            .iter()
+            .any(|record| record["owner"] == owner && record["pending"] == true)
+    };
+    let bootstrap_uninstall = pending("bootstrap_uninstall");
+    let next_action = if records.iter().any(|record| record["valid"] != true) {
+        "inspect_protected_ownership"
+    } else if bootstrap_uninstall {
+        "resume_bootstrap_uninstall"
+    } else if pending("bootstrap_install") {
+        "retry_exact_bootstrap_install"
+    } else if pending("native")
+        || (pending("pending_update")
+            && operation.as_ref().is_some_and(|operation| {
+                matching_pending_update_owner(paths, operation.package.as_ref()).unwrap_or(false)
+            }))
+    {
+        "resume_native_operation"
+    } else if pending("legacy_install") || pending("legacy_uninstall") {
+        "protected_legacy_repair"
+    } else if pending("receipt_repair") {
+        "repair_receipt"
+    } else if pending("pending_update") {
+        "inspect_pending_update"
+    } else if pending("drain") {
+        "inspect_drain_owner"
+    } else {
+        "none"
+    };
     Ok(json!({
-        "schema":"app.loomex.runner.lifecycle-status/v1",
-        "current":current,
-        "operation":operation,
-        "legacyJournal":{"install":legacy_install,"uninstall":legacy_uninstall},
-        "actionRequired": native_pending || legacy_install || legacy_uninstall,
+        "schema":"app.loomex.runner.lifecycle-status/v1", "current":current,"operation":operation,
+        "legacyJournal":{"install":pending("legacy_install"),"uninstall":pending("legacy_uninstall")},
+        "bootstrapJournal":{"install":pending("bootstrap_install"),"uninstall":bootstrap_uninstall},
+        "pendingUpdate":pending("pending_update"),"draining":pending("drain"),
+        "ownership":records,"actionRequired":records.iter().any(|record| record["pending"] == true),
+        "ownershipValid":records.iter().all(|record| record["valid"] == true),"nextAction":next_action,
     }))
 }
 
@@ -3367,6 +4377,12 @@ pub fn remove_operation_resources_after_uninstall(paths: &Paths) -> Result<()> {
         return Ok(());
     };
     operation.validate()?;
+    if let Some(fence) = &operation.uninstall_fence {
+        if let Some(original) = &fence.original_operation {
+            return remove_operation_resources(paths, original);
+        }
+        return Ok(());
+    }
     remove_operation_resources(paths, &operation)
 }
 
@@ -3726,6 +4742,7 @@ pub async fn resume_reviewed_unsent_stop(
         "reviewed stop journal digest changed"
     );
     let mut operation: Operation = state::read_json(&paths.operation())?;
+    require_bootstrap_ownership_clear(paths, operation.package.as_ref())?;
     ensure!(
         operation.id == expected_operation,
         "reviewed stop operation changed"
@@ -3763,8 +4780,82 @@ pub async fn resume_reviewed_unsent_stop(
 
 pub async fn resume(paths: &Paths) -> Result<Value> {
     let _lock = LifecycleLock::acquire(paths)?;
+    let snapshot = status(paths)?;
+    ensure!(
+        snapshot["ownershipValid"] == true,
+        "LIFECYCLE_OWNERSHIP_INVALID"
+    );
+    if snapshot["bootstrapJournal"]["uninstall"] == true {
+        return Ok(json!({"resumed":false,"pending":true,"actionRequired":true,
+            "reason":"bootstrap uninstall owns lifecycle recovery","nextAction":"resume_bootstrap_uninstall",
+            "ownership":snapshot["ownership"]}));
+    }
+    let operation = read_optional::<Operation>(&paths.operation())?;
+    let candidate = operation
+        .as_ref()
+        .filter(|op| {
+            !terminal(&op.phase)
+                || op.abandonment.is_some()
+                || (op.phase == "completed"
+                    && matches!(
+                        op.kind,
+                        OperationKind::Install | OperationKind::Update | OperationKind::Rollback
+                    ))
+        })
+        .and_then(|op| op.package.as_ref());
+    let receipt_pending = snapshot["ownership"].as_array().is_some_and(|records| {
+        records
+            .iter()
+            .any(|record| record["owner"] == "receipt_repair" && record["pending"] == true)
+    });
+    if let Err(error) = require_ownership_clear(paths, candidate, OwnershipAccess::Resume) {
+        if error.to_string() == "LIFECYCLE_BOOTSTRAP_INSTALL_PENDING" {
+            return Ok(json!({"resumed":false,"pending":true,"actionRequired":true,
+                "reason":"bootstrap install owns lifecycle recovery","nextAction":"retry_exact_bootstrap_install",
+                "ownership":snapshot["ownership"]}));
+        }
+        return Err(error);
+    }
+    if let Some(mut operation) = operation {
+        if operation.phase == "completed"
+            && operation.kind == OperationKind::Update
+            && (paths.state_dir.join("pending-update.json").exists()
+                || operation
+                    .pending_update_retirement
+                    .as_ref()
+                    .is_some_and(|retirement| !retirement.retired))
+        {
+            if snapshot["legacyJournal"]["install"] == true
+                || snapshot["legacyJournal"]["uninstall"] == true
+            {
+                return Ok(json!({"resumed":false,"actionRequired":true,
+                    "reason":"legacy journal is protected for native repair","operation":operation,
+                    "legacyJournal":snapshot["legacyJournal"]}));
+            }
+            let retired = retire_pending_update_locked(paths, &mut operation).await?;
+            return Ok(
+                json!({"resumed":retired,"pendingUpdateRetired":retired,"reason":"operation is terminal","operation":operation}),
+            );
+        }
+    }
+    if receipt_pending {
+        return Ok(json!({"resumed":false,"pending":true,"actionRequired":true,
+            "reason":"receipt repair owns lifecycle recovery","nextAction":"repair_receipt",
+            "ownership":snapshot["ownership"]}));
+    }
     if let Some(mut operation) = read_optional::<Operation>(&paths.operation())? {
         operation.validate()?;
+        if !terminal(&operation.phase)
+            && (operation.kind != OperationKind::Repair
+                || operation.package.is_some()
+                || operation.resources.is_some())
+            && (snapshot["legacyJournal"]["install"] == true
+                || snapshot["legacyJournal"]["uninstall"] == true)
+        {
+            return Ok(json!({"resumed":false,"actionRequired":true,
+                "reason":"legacy journal is protected for native repair","operation":operation,
+                "legacyJournal":snapshot["legacyJournal"]}));
+        }
         if operation.kind == OperationKind::Prune {
             return reconcile_prune(paths, &mut operation).await;
         }
@@ -3954,7 +5045,7 @@ fn prune_quarantine(paths: &Paths, operation: &Operation, target: &Path) -> Resu
         .join(version))
 }
 
-fn prune_quarantine_inventory(
+pub fn prune_quarantine_inventory(
     root: &Path,
     expected: &[Value],
     allow_missing: bool,
@@ -4047,7 +5138,7 @@ fn prune_quarantine_inventory(
     Ok((present_files, sorted_dirs))
 }
 
-fn prune_remove_quarantine_exact(root: &Path, expected: &[Value]) -> Result<()> {
+pub fn prune_remove_quarantine_exact(root: &Path, expected: &[Value]) -> Result<()> {
     let (files, dirs) = prune_quarantine_inventory(root, expected, true)?;
     for relative in files {
         fs::remove_file(root.join(relative))?;
@@ -4068,7 +5159,7 @@ fn sync_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn prune_in_use(targets: &[PathBuf]) -> Result<()> {
+pub async fn prune_in_use(targets: &[PathBuf]) -> Result<()> {
     #[cfg(test)]
     if lifecycle_test_mode() {
         let references = TEST_PRUNE_IN_USE.lock().unwrap();
@@ -4303,6 +5394,7 @@ pub async fn prune(paths: &Paths, remove: &[String], retain: &[String]) -> Resul
         "INVALID_REQUEST"
     );
     let _lock = LifecycleLock::acquire(paths)?;
+    require_bootstrap_ownership_clear(paths, None)?;
     if let Some(mut existing) = read_optional::<Operation>(&paths.operation())? {
         existing.validate()?;
         ensure!(terminal(&existing.phase), "LIFECYCLE_OPERATION_PENDING");
@@ -4310,13 +5402,6 @@ pub async fn prune(paths: &Paths, remove: &[String], retain: &[String]) -> Resul
             reconcile_prune(paths, &mut existing).await?;
         }
     }
-    ensure!(
-        !paths.state_dir.join("bootstrap-install.json").exists()
-            && !paths.state_dir.join("bootstrap-uninstall.json").exists()
-            && !paths.state_dir.join("install-operation.json").exists()
-            && !paths.state_dir.join("uninstall-operation.json").exists(),
-        "LIFECYCLE_OPERATION_PENDING"
-    );
     if let Some(repair) = read_optional::<Value>(&paths.state_dir.join("receipt-repair.json"))? {
         ensure!(
             repair["schema"] == "loomex.receipt-repair/v1" && repair["phase"] == "completed",
@@ -4785,6 +5870,11 @@ pub async fn reconcile_bootstrap_abandonment_locked(
     configuration: &Value,
     settled_abandonment: Option<Uuid>,
 ) -> Result<Option<Value>> {
+    require_ownership_clear(
+        paths,
+        Some(&configuration_package(configuration)?),
+        OwnershipAccess::BootstrapAbandonment,
+    )?;
     let operation = read_optional::<Operation>(&paths.operation())?;
     if let Some(mut operation) = operation {
         operation.validate()?;
@@ -4878,8 +5968,13 @@ pub async fn rollback_with_expected(
 ) -> Result<Value> {
     {
         let _lock = LifecycleLock::acquire(paths)?;
+        // A bootstrap uninstall always takes precedence over historical operations.
+        if status(paths)?["bootstrapJournal"]["uninstall"] == true {
+            bail!("LIFECYCLE_BOOTSTRAP_UNINSTALL_PENDING");
+        }
         if let Some(mut operation) = read_optional::<Operation>(&paths.operation())? {
             operation.validate()?;
+            require_bootstrap_ownership_clear(paths, operation.package.as_ref())?;
             if operation.abandonment.is_some() || !terminal(&operation.phase) {
                 ensure!(
                     expected_operation == Some(operation.id),
@@ -5057,7 +6152,9 @@ pub async fn repair(paths: &Paths) -> Result<Value> {
     // crash between native activation and receipt replacement.
     let stable = matches!(
         reconciliation["reason"].as_str(),
-        Some("no pending lifecycle operation") | Some("operation is terminal")
+        Some("no pending lifecycle operation")
+            | Some("operation is terminal")
+            | Some("receipt repair owns lifecycle recovery")
     );
     if reconciliation["resumed"] != true && !stable {
         return Ok(json!({
@@ -5067,6 +6164,12 @@ pub async fn repair(paths: &Paths) -> Result<Value> {
         }));
     }
     let _lock = LifecycleLock::acquire(paths)?;
+    let operation = read_optional::<Operation>(&paths.operation())?;
+    let candidate = operation
+        .as_ref()
+        .filter(|operation| operation.phase == "completed")
+        .and_then(|operation| operation.package.as_ref());
+    require_ownership_clear(paths, candidate, OwnershipAccess::ReceiptRepair)?;
     // Resume releases its lock. Recheck under this lock before touching receipt
     // metadata in case another lifecycle operation began in between.
     if let Some(operation) = read_optional::<Operation>(&paths.operation())? {
@@ -5078,17 +6181,22 @@ pub async fn repair(paths: &Paths) -> Result<Value> {
         }
     }
     let temporary = paths.state_dir.join(format!("{OPERATION_NAME}.new"));
-    let removed_temporary = if temporary.exists() {
-        if fs::symlink_metadata(&temporary)?.file_type().is_symlink() {
-            bail!("unsafe lifecycle temporary")
+    let removed_temporary = match fs::symlink_metadata(&temporary) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                "unsafe lifecycle temporary"
+            );
+            true
         }
-        fs::remove_file(&temporary)?;
-        true
-    } else {
-        false
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
     };
     let observed = observe_receipt_identity(paths).await?;
     let receipt = reconcile_install_receipt(paths, &observed)?;
+    if removed_temporary {
+        remove_regular_and_sync(&temporary)?;
+    }
     Ok(
         json!({"repaired":true,"removedTemporary":removed_temporary,"receipt":receipt,"reconciliation":reconciliation}),
     )
@@ -5102,18 +6210,38 @@ struct ReceiptObservation {
     target: PathBuf,
     version: String,
     plist_digest: String,
+    provider_executables: Option<Value>,
+    development_api_origin: Option<Value>,
 }
 
 async fn observe_receipt_identity(paths: &Paths) -> Result<ReceiptObservation> {
+    let observed = observe_receipt_configuration(paths).await?;
+    ensure!(
+        daemon_status(paths).await?["version"] == observed.version,
+        "LIFECYCLE_IDENTITY_CONFLICT"
+    );
+    Ok(observed)
+}
+
+async fn observe_receipt_configuration(paths: &Paths) -> Result<ReceiptObservation> {
     let target = current_target(paths)?.context("LIFECYCLE_IDENTITY_CONFLICT")?;
     verify_owned_version(paths, &target)?;
     let plist = launch_agent(paths);
     checked_regular(&plist)?;
-    let output = tokio::process::Command::new("/usr/bin/plutil")
-        .args(["-convert", "json", "-o", "-"])
-        .arg(&plist)
-        .output()
-        .await?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::process::Command::new("/usr/bin/plutil")
+            .args(["-convert", "json", "-o", "-"])
+            .arg(&plist)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("LIFECYCLE_IDENTITY_CONFLICT")??;
+    ensure!(
+        output.stdout.len() <= 65536 && output.stderr.len() <= 65536,
+        "LIFECYCLE_IDENTITY_CONFLICT"
+    );
     if !output.status.success() {
         bail!("LIFECYCLE_IDENTITY_CONFLICT")
     }
@@ -5127,30 +6255,49 @@ async fn observe_receipt_identity(paths: &Paths) -> Result<ReceiptObservation> {
     {
         bail!("LIFECYCLE_IDENTITY_CONFLICT")
     }
-    let status = daemon_status(paths).await?;
     let version = target
         .file_name()
         .and_then(|v| v.to_str())
         .context("LIFECYCLE_IDENTITY_CONFLICT")?
         .to_owned();
-    if status["version"] != version {
-        bail!("LIFECYCLE_IDENTITY_CONFLICT")
+    let mut providers = serde_json::Map::new();
+    for (provider, key) in [
+        ("codex", "LOOMEX_CODEX_EXECUTABLE"),
+        ("claude", "LOOMEX_CLAUDE_EXECUTABLE"),
+        ("gemini", "LOOMEX_GEMINI_EXECUTABLE"),
+        ("antigravity", "LOOMEX_ANTIGRAVITY_EXECUTABLE"),
+    ] {
+        if let Some(path) = value["EnvironmentVariables"].get(key) {
+            ensure!(
+                path.as_str()
+                    .is_some_and(|path| Path::new(path).is_absolute()),
+                "LIFECYCLE_IDENTITY_CONFLICT"
+            );
+            providers.insert(provider.into(), path.clone());
+        }
     }
     Ok(ReceiptObservation {
         target,
         version,
         plist_digest: state::digest(&fs::read(plist)?),
+        provider_executables: Some(Value::Object(providers)),
+        development_api_origin: Some(
+            value["EnvironmentVariables"]
+                .get("LOOMEX_DEV_API_ORIGIN")
+                .cloned()
+                .unwrap_or(Value::Null),
+        ),
     })
 }
 
-fn reconcile_install_receipt(paths: &Paths, observed: &ReceiptObservation) -> Result<Value> {
-    let receipt_path = paths.state_dir.join("install-receipt.json");
-    let Some(receipt) = read_optional::<Value>(&receipt_path)? else {
-        return Ok(json!({"reconciled":false,"reason":"receipt is absent"}));
-    };
+fn expected_install_receipt(
+    paths: &Paths,
+    receipt: &Value,
+    observed: &ReceiptObservation,
+) -> Result<Value> {
     let target = match current_target(paths)? {
         Some(target) => target,
-        None => return Ok(json!({"reconciled":false,"reason":"current target is absent"})),
+        None => bail!("LIFECYCLE_IDENTITY_CONFLICT"),
     };
     verify_owned_version(paths, &target)?;
     let version = target
@@ -5174,7 +6321,20 @@ fn reconcile_install_receipt(paths: &Paths, observed: &ReceiptObservation) -> Re
     if !(development_origin.is_null() || development_origin.is_string()) {
         bail!("install receipt has invalid development origin")
     }
-    let providers = receipt["providerExecutables"]
+    let mut provider_value = receipt["providerExecutables"].clone();
+    if let Some(marker) = read_optional::<Value>(&paths.state_dir.join("pending-update.json"))? {
+        let package = pending_update_package(paths, &marker)?;
+        ensure!(
+            package.target == target
+                && package.version == version
+                && matching_pending_update_owner(paths, Some(&package))?
+                && observed.provider_executables.as_ref() == Some(&marker["providerExecutables"])
+                && observed.development_api_origin.as_ref() == Some(development_origin),
+            "LIFECYCLE_PENDING_UPDATE_CONFIGURATION_MISMATCH"
+        );
+        provider_value = marker["providerExecutables"].clone();
+    }
+    let providers = provider_value
         .as_object()
         .context("install receipt has invalid provider executables")?;
     for (provider, executable) in providers {
@@ -5190,7 +6350,7 @@ fn reconcile_install_receipt(paths: &Paths, observed: &ReceiptObservation) -> Re
     }
     let bootstrap = target.join("bin/loomex-lifecycle-bootstrap");
     checked_regular(&bootstrap)?;
-    let expected = json!({
+    Ok(json!({
         "schema":"app.loomex.runner.install-receipt/v2",
         "version":version,
         "versionPath":target,
@@ -5199,7 +6359,28 @@ fn reconcile_install_receipt(paths: &Paths, observed: &ReceiptObservation) -> Re
         "developmentOnly":development_only,
         "developmentApiOrigin":development_origin,
         "providerExecutables":providers,
-    });
+    }))
+}
+
+fn reconcile_install_receipt(paths: &Paths, observed: &ReceiptObservation) -> Result<Value> {
+    let receipt_path = paths.state_dir.join("install-receipt.json");
+    let Some(receipt) = read_optional::<Value>(&receipt_path)? else {
+        return Ok(json!({"reconciled":false,"reason":"receipt is absent"}));
+    };
+    let expected = expected_install_receipt(paths, &receipt, observed)?;
+    let target = observed.target.clone();
+    let version = observed.version.as_str();
+    if let Some(intent) = read_optional::<Value>(&paths.state_dir.join("receipt-repair.json"))? {
+        if intent["phase"] == "pending" {
+            ensure!(
+                intent["schema"] == "loomex.receipt-repair/v1"
+                    && intent["target"] == json!(target)
+                    && intent["version"] == version
+                    && intent["expectedDigest"] == state::json_digest(&expected),
+                "LIFECYCLE_RECEIPT_REPAIR_MISMATCH"
+            );
+        }
+    }
     if receipt == expected {
         let intent_path = paths.state_dir.join("receipt-repair.json");
         if let Some(mut intent) = read_optional::<Value>(&intent_path)? {
@@ -5234,8 +6415,10 @@ pub fn readable(value: &Value) -> String {
     let current = value["current"].as_str().unwrap_or("none");
     let action = value["actionRequired"].as_bool().unwrap_or(false);
     let pending_active_work = value["operation"]["phase"] == "pending_active_work";
+    let next_action = value["nextAction"].as_str().unwrap_or("none");
+    let uninstall_pending = value["bootstrapJournal"]["uninstall"] == true;
     format!(
-        "Loomex lifecycle\ncurrent: {current}\naction required: {action}\npending active work: {pending_active_work}"
+        "Loomex lifecycle\ncurrent: {current}\naction required: {action}\npending active work: {pending_active_work}\nbootstrap uninstall pending: {uninstall_pending}\nnext action: {next_action}"
     )
 }
 
@@ -5243,6 +6426,642 @@ pub fn readable(value: &Value) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    fn bootstrap_uninstall_ownership_fixture(paths: &Paths) -> Value {
+        json!({"schema":"app.loomex.runner.bootstrap-uninstall/v1","phase":"prepared",
+            "receipt":{"version":"1.2.3","versionPath":paths.versions().join("1.2.3")},
+            "paths":[paths.versions().join("1.2.3")],"inventories":[{"path":paths.versions().join("1.2.3"),"files":[{"path":"bin/loomex-runner","sha256":"a".repeat(64),"size":1,"mode":448}]}],
+            "helper":paths.state_dir.join("bootstrap-uninstall-helper"),"helperSha256":"a".repeat(64)})
+    }
+
+    #[tokio::test]
+    async fn bootstrap_uninstall_overrides_historical_terminal_update_offline() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let operation = Operation::new(OperationKind::Update, "completed", None);
+        save_operation(&paths, &operation).unwrap();
+        let journal = bootstrap_uninstall_ownership_fixture(&paths);
+        state::write_json(&paths.state_dir.join("bootstrap-uninstall.json"), &journal).unwrap();
+        let original = fs::read(paths.operation()).unwrap();
+        let snapshot = status(&paths).unwrap();
+        assert_eq!(snapshot["operation"]["phase"], "completed");
+        assert_eq!(snapshot["actionRequired"], true);
+        assert_eq!(snapshot["ownershipValid"], true);
+        assert_eq!(snapshot["nextAction"], "resume_bootstrap_uninstall");
+        assert_eq!(
+            resume(&paths).await.unwrap()["nextAction"],
+            "resume_bootstrap_uninstall"
+        );
+        assert_eq!(repair(&paths).await.unwrap()["repaired"], false);
+        assert_eq!(fs::read(paths.operation()).unwrap(), original);
+        assert!(!paths.state_dir.join("receipt-repair.json").exists());
+        assert!(require_bootstrap_ownership_clear(&paths, None).is_err());
+        let package = PackageIdentity {
+            version: "1.2.4".into(),
+            target: paths.versions().join("1.2.4"),
+            manifest_sha256: "b".repeat(64),
+        };
+        assert_eq!(
+            package_preflight(&paths, OperationKind::Update, &package).unwrap()["ready"],
+            false
+        );
+        assert_eq!(
+            preflight_package_locked(&paths, OperationKind::Update, package)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "LIFECYCLE_BOOTSTRAP_UNINSTALL_PENDING"
+        );
+        assert_eq!(
+            rollback_with_expected(&paths, "1.2.3", None)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "LIFECYCLE_BOOTSTRAP_UNINSTALL_PENDING"
+        );
+        assert_eq!(
+            prune(&paths, &["1.2.3".into()], &["1.2.4".into()])
+                .await
+                .unwrap_err()
+                .to_string(),
+            "LIFECYCLE_BOOTSTRAP_UNINSTALL_PENDING"
+        );
+        require_terminal_before_uninstall(&paths).unwrap();
+        assert_eq!(fs::read(paths.operation()).unwrap(), original);
+    }
+
+    #[test]
+    fn ownership_snapshot_reports_terminal_helper_cleanup_and_drain_offline() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let mut journal = bootstrap_uninstall_ownership_fixture(&paths);
+        journal["phase"] = json!("terminal");
+        state::write_json(
+            &paths.state_dir.join("bootstrap-uninstall-terminal.json"),
+            &journal,
+        )
+        .unwrap();
+        state::write_json(
+            &paths.state_dir.join("drain.json"),
+            &json!({"requestedAt":1,"idempotencyKey":Uuid::new_v4()}),
+        )
+        .unwrap();
+        state::write_json(
+            &paths.state_dir.join("pending-update.json"),
+            &json!({"schema":"app.loomex.runner.pending-update/v1","version":"1.2.3","path":paths.versions().join("1.2.3"),"manifestSha256":"a".repeat(64),"providerExecutables":{}}),
+        )
+        .unwrap();
+        let snapshot = status(&paths).unwrap();
+        assert_eq!(snapshot["draining"], true);
+        assert_eq!(snapshot["pendingUpdate"], true);
+        assert_eq!(snapshot["bootstrapJournal"]["uninstall"], true);
+        assert_eq!(snapshot["nextAction"], "resume_bootstrap_uninstall");
+    }
+
+    #[test]
+    fn malformed_or_unsafe_bootstrap_ownership_fails_closed() {
+        for malformed in [
+            json!({"schema":"unknown","phase":"completed"}),
+            json!({"schema":"app.loomex.runner.bootstrap-uninstall/v1","phase":"prepared"}),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            state::write_json(
+                &paths.state_dir.join("bootstrap-uninstall.json"),
+                &malformed,
+            )
+            .unwrap();
+            let snapshot = status(&paths).unwrap();
+            assert_eq!(snapshot["actionRequired"], true);
+            assert_eq!(snapshot["ownershipValid"], false);
+            assert!(require_bootstrap_ownership_clear(&paths, None).is_err());
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        symlink(
+            paths.state_dir.join("absent"),
+            paths.state_dir.join("bootstrap-install.json"),
+        )
+        .unwrap();
+        assert_eq!(status(&paths).unwrap()["ownershipValid"], false);
+        assert!(require_terminal_before_uninstall(&paths).is_err());
+    }
+
+    fn pending_update_retirement_fixture(paths: &Paths) -> (Operation, Vec<u8>) {
+        make_compatible_target(paths);
+        add_owned_bootstrap(paths, "1.2.3");
+        let target = paths.versions().join("1.2.3");
+        let daemon = target.join("bin/loomex-runner");
+        fs::write(&daemon, b"fixture daemon").unwrap();
+        fs::set_permissions(&daemon, fs::Permissions::from_mode(0o700)).unwrap();
+        let inventory_path = paths.state_dir.join("owned-versions.json");
+        let mut inventory: Value = state::read_json(&inventory_path).unwrap();
+        inventory["inventories"][0]["files"].as_array_mut().unwrap().push(json!({"path":"bin/loomex-runner","sha256":state::digest(b"fixture daemon"),"size":14,"mode":448}));
+        inventory["inventories"][0]["files"]
+            .as_array_mut()
+            .unwrap()
+            .sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+        state::write_json(&inventory_path, &inventory).unwrap();
+        symlink(&target, paths.current()).unwrap();
+        let plist = format!(
+            "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>app.loomex.runner</string><key>ProgramArguments</key><array><string>{}</string></array><key>EnvironmentVariables</key><dict><key>LOOMEX_STATE_DIR</key><string>{}</string></dict></dict></plist>",
+            target.join("bin/loomex-runner").display(),
+            paths.state_dir.display()
+        );
+        fs::write(launch_agent(paths), plist.as_bytes()).unwrap();
+        let package = PackageIdentity {
+            version: "1.2.3".into(),
+            target: target.clone(),
+            manifest_sha256: "a".repeat(64),
+        };
+        let mut operation = Operation::new(OperationKind::Update, "completed", None);
+        operation.schema = PRE_AUTH_OPERATION_SCHEMA.into();
+        operation.package = Some(package.clone());
+        operation.resources = Some(OperationResources {
+            launch_agent: launch_agent(paths),
+            staged_launch_agent: paths.state_dir.join("retirement-staged.plist"),
+            staged_launch_agent_sha256: state::digest(plist.as_bytes()),
+            launch_agent_backup: paths.state_dir.join("retirement-backup.plist"),
+            launch_agent_backup_sha256: None,
+            owned_versions: vec![target.clone()],
+        });
+        fs::write(
+            &operation.resources.as_ref().unwrap().staged_launch_agent,
+            plist.as_bytes(),
+        )
+        .unwrap();
+        save_operation(paths, &operation).unwrap();
+        state::write_json(&paths.state_dir.join("install-receipt.json"), &json!({"schema":"app.loomex.runner.install-receipt/v2","version":package.version,"versionPath":package.target,"launchAgent":launch_agent(paths),"bootstrapSha256":state::digest(b"bootstrap"),"developmentOnly":false,"developmentApiOrigin":null,"providerExecutables":{}})).unwrap();
+        let marker = json!({"schema":"app.loomex.runner.pending-update/v1","version":package.version,"path":package.target,"manifestSha256":package.manifest_sha256,"providerExecutables":{}});
+        let raw = format!("{}\n", serde_json::to_string_pretty(&marker).unwrap()).into_bytes();
+        fs::write(paths.state_dir.join("pending-update.json"), &raw).unwrap();
+        (operation, raw)
+    }
+
+    #[tokio::test]
+    async fn completed_matching_pending_update_retires_marker_and_unblocks_next_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let (operation, raw_marker) = pending_update_retirement_fixture(&paths);
+        let next = PackageIdentity {
+            version: "1.2.4".into(),
+            target: paths.versions().join("1.2.4"),
+            manifest_sha256: "b".repeat(64),
+        };
+        assert_eq!(status(&paths).unwrap()["actionRequired"], true);
+        assert_eq!(
+            package_preflight(&paths, OperationKind::Update, &next).unwrap()["ready"],
+            false
+        );
+        assert!(require_terminal_before_uninstall(&paths).is_err());
+        let result = resume(&paths).await.unwrap();
+        assert_eq!(result["operation"]["id"], operation.id.to_string());
+        assert!(
+            !paths.state_dir.join("pending-update.json").exists(),
+            "matching terminal owner must retire its marker"
+        );
+        let retired: Operation = state::read_json(&paths.operation()).unwrap();
+        let evidence = retired.pending_update_retirement.as_ref().unwrap();
+        assert_eq!(retired.schema, PENDING_UPDATE_RETIREMENT_SCHEMA);
+        assert!(evidence.retired);
+        assert_eq!(evidence.marker_snapshot.as_bytes(), raw_marker);
+        assert_eq!(evidence.marker_sha256, state::digest(&raw_marker));
+        assert_eq!(status(&paths).unwrap()["actionRequired"], false);
+        assert_eq!(
+            package_preflight(&paths, OperationKind::Update, &next).unwrap()["ready"],
+            true
+        );
+        require_terminal_before_uninstall(&paths).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_update_retirement_preserves_pretty_current_receipt_through_recovery() {
+        let _serial = TEST_SERIAL.lock().await;
+        for fault in [
+            None,
+            Some("after_pending_update_retirement_intent"),
+            Some("after_pending_update_retirement_metadata"),
+            Some("after_pending_update_retirement_unlink"),
+        ] {
+            let _scope = StopTestScope::start();
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let (operation, _) = pending_update_retirement_fixture(&paths);
+            let receipt_path = paths.state_dir.join("install-receipt.json");
+            let receipt: Value = state::read_json(&receipt_path).unwrap();
+            let exact =
+                format!("{}\n", serde_json::to_string_pretty(&receipt).unwrap()).into_bytes();
+            fs::write(&receipt_path, &exact).unwrap();
+            if let Some(fault) = fault {
+                *TEST_RECOVERY_FAULT.lock().unwrap() = Some(fault);
+                assert!(resume(&paths).await.is_err(), "{fault}");
+                *TEST_RECOVERY_FAULT.lock().unwrap() = None;
+            }
+            let result = resume(&paths).await.unwrap();
+            assert_eq!(result["operation"]["id"], operation.id.to_string());
+            assert_eq!(result["pendingUpdateRetired"], true);
+            assert_eq!(fs::read(&receipt_path).unwrap(), exact);
+            let completed: Operation = state::read_json(&paths.operation()).unwrap();
+            assert_eq!(
+                completed.pending_update_retirement.unwrap().receipt_sha256,
+                state::digest(&exact)
+            );
+            assert!(!paths.state_dir.join("pending-update.json").exists());
+            assert_eq!(status(&paths).unwrap()["actionRequired"], false);
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_update_retirement_preserves_legacy_owners_before_and_after_intent() {
+        let _serial = TEST_SERIAL.lock().await;
+        for legacy in ["install", "uninstall"] {
+            for interrupted in [false, true] {
+                let _scope = StopTestScope::start();
+                let temp = tempfile::tempdir().unwrap();
+                let paths = paths(temp.path());
+                pending_update_retirement_fixture(&paths);
+                if interrupted {
+                    *TEST_RECOVERY_FAULT.lock().unwrap() =
+                        Some("after_pending_update_retirement_intent");
+                    assert!(resume(&paths).await.is_err());
+                    *TEST_RECOVERY_FAULT.lock().unwrap() = None;
+                }
+                let legacy_path = paths.state_dir.join(format!("{legacy}-operation.json"));
+                state::write_json(&legacy_path, &json!({"schema":format!("app.loomex.runner.{legacy}-operation/v1"),"phase":"owned"})).unwrap();
+                let watched = [
+                    paths.operation(),
+                    paths.state_dir.join("pending-update.json"),
+                    paths.state_dir.join("install-receipt.json"),
+                    legacy_path,
+                ];
+                let before: Vec<_> = watched.iter().map(|path| fs::read(path).unwrap()).collect();
+                let result = resume(&paths).await.unwrap();
+                assert_eq!(result["resumed"], false, "{legacy}/{interrupted}");
+                assert_eq!(
+                    result["reason"],
+                    "legacy journal is protected for native repair"
+                );
+                for (path, original) in watched.iter().zip(before) {
+                    assert_eq!(fs::read(path).unwrap(), original, "{}", path.display());
+                }
+                assert_eq!(status(&paths).unwrap()["actionRequired"], true);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_update_retirement_recovers_each_metadata_boundary_without_lost_evidence() {
+        let _serial = TEST_SERIAL.lock().await;
+        for fault in [
+            "after_pending_update_retirement_intent",
+            "after_pending_update_retirement_metadata",
+            "after_pending_update_retirement_unlink",
+        ] {
+            let _scope = StopTestScope::start();
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let (operation, original) = pending_update_retirement_fixture(&paths);
+            *TEST_RECOVERY_FAULT.lock().unwrap() = Some(fault);
+            assert!(resume(&paths).await.is_err(), "{fault}");
+            let interrupted: Operation = state::read_json(&paths.operation()).unwrap();
+            let evidence = interrupted.pending_update_retirement.as_ref().unwrap();
+            assert!(!evidence.retired);
+            assert_eq!(evidence.marker_snapshot.as_bytes(), original);
+            assert_eq!(evidence.marker_sha256, state::digest(&original));
+            assert!(!operation_is_terminal(&interrupted).unwrap());
+            assert_eq!(status(&paths).unwrap()["actionRequired"], true);
+            let next = PackageIdentity {
+                version: "1.2.4".into(),
+                target: paths.versions().join("1.2.4"),
+                manifest_sha256: "b".repeat(64),
+            };
+            assert_eq!(
+                package_preflight(&paths, OperationKind::Update, &next).unwrap()["ready"],
+                false
+            );
+            assert!(require_terminal_before_uninstall(&paths).is_err());
+            let mut disguised = interrupted.clone();
+            disguised.schema = PRE_AUTH_OPERATION_SCHEMA.into();
+            assert!(
+                disguised.validate().is_err(),
+                "old schema cannot bypass retirement ownership"
+            );
+            *TEST_RECOVERY_FAULT.lock().unwrap() = None;
+            let result = resume(&paths).await.unwrap();
+            assert_eq!(result["operation"]["id"], operation.id.to_string());
+            assert_eq!(result["pendingUpdateRetired"], true);
+            assert!(!paths.state_dir.join("pending-update.json").exists());
+            assert_eq!(status(&paths).unwrap()["actionRequired"], false);
+            assert_eq!(
+                package_preflight(&paths, OperationKind::Update, &next).unwrap()["ready"],
+                true
+            );
+            require_terminal_before_uninstall(&paths).unwrap();
+            let completed: Operation = state::read_json(&paths.operation()).unwrap();
+            assert_eq!(
+                completed
+                    .pending_update_retirement
+                    .unwrap()
+                    .marker_snapshot
+                    .as_bytes(),
+                original
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_update_retirement_preserves_unmatched_unknown_and_changed_bindings() {
+        let _serial = TEST_SERIAL.lock().await;
+        for changed in [
+            "unknown_marker",
+            "other_package",
+            "provider_map",
+            "receipt",
+            "inventory",
+            "plist",
+        ] {
+            let _scope = StopTestScope::start();
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let (_, _) = pending_update_retirement_fixture(&paths);
+            let marker_path = paths.state_dir.join("pending-update.json");
+            if matches!(changed, "receipt" | "inventory" | "plist") {
+                *TEST_RECOVERY_FAULT.lock().unwrap() =
+                    Some("after_pending_update_retirement_intent");
+                assert!(resume(&paths).await.is_err());
+                *TEST_RECOVERY_FAULT.lock().unwrap() = None;
+            }
+            match changed {
+                "unknown_marker" | "other_package" | "provider_map" => {
+                    let mut marker: Value = state::read_json(&marker_path).unwrap();
+                    match changed {
+                        "unknown_marker" => marker["schema"] = json!("unknown/v1"),
+                        "other_package" => marker["manifestSha256"] = json!("b".repeat(64)),
+                        _ => marker["providerExecutables"] = json!({"codex":"/changed/provider"}),
+                    }
+                    state::write_json(&marker_path, &marker).unwrap();
+                }
+                "receipt" => {
+                    let path = paths.state_dir.join("install-receipt.json");
+                    let mut receipt: Value = state::read_json(&path).unwrap();
+                    receipt["developmentApiOrigin"] = json!("http://127.0.0.1:3456");
+                    state::write_json(&path, &receipt).unwrap();
+                }
+                "inventory" => {
+                    let path = paths.state_dir.join("owned-versions.json");
+                    let mut inventory: Value = state::read_json(&path).unwrap();
+                    inventory["changed"] = json!(true);
+                    state::write_json(&path, &inventory).unwrap();
+                }
+                _ => {
+                    let mut plist = fs::read(launch_agent(&paths)).unwrap();
+                    plist.push(b'\n');
+                    fs::write(launch_agent(&paths), &plist).unwrap();
+                }
+            }
+            let before_operation = fs::read(paths.operation()).unwrap();
+            let before_marker = fs::read(&marker_path).unwrap();
+            assert!(resume(&paths).await.is_err(), "{changed}");
+            assert_eq!(
+                fs::read(paths.operation()).unwrap(),
+                before_operation,
+                "{changed}"
+            );
+            assert_eq!(fs::read(&marker_path).unwrap(), before_marker, "{changed}");
+            assert_eq!(status(&paths).unwrap()["actionRequired"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn native_prepared_cannot_cross_pending_update_or_receipt_repair_ownership() {
+        for receipt_owner in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            make_compatible_target(&paths);
+            symlink(paths.versions().join("1.2.3"), paths.current()).unwrap();
+            state::write_json(&paths.state_dir.join("install-receipt.json"), &json!({})).unwrap();
+            let package = PackageIdentity {
+                version: "1.2.3".into(),
+                target: paths.versions().join("1.2.3"),
+                manifest_sha256: "a".repeat(64),
+            };
+            let mut operation = Operation::new(OperationKind::Update, "prepared", None);
+            operation.package = Some(package.clone());
+            save_operation(&paths, &operation).unwrap();
+            let (name, marker, expected_error) = if receipt_owner {
+                (
+                    "receipt-repair.json",
+                    json!({"schema":"loomex.receipt-repair/v1","target":package.target,"version":package.version,"phase":"pending","expectedDigest":"b".repeat(64)}),
+                    "LIFECYCLE_RECEIPT_REPAIR_PENDING",
+                )
+            } else {
+                (
+                    "pending-update.json",
+                    json!({"schema":"app.loomex.runner.pending-update/v1","path":package.target,"version":package.version,"manifestSha256":package.manifest_sha256,"providerExecutables":{}}),
+                    "LIFECYCLE_PENDING_UPDATE_PROTECTED",
+                )
+            };
+            let marker_path = paths.state_dir.join(name);
+            state::write_json(&marker_path, &marker).unwrap();
+            let before = fs::read(paths.operation()).unwrap();
+            let marker_before = fs::read(&marker_path).unwrap();
+            assert_eq!(status(&paths).unwrap()["ownershipValid"], true);
+            assert_eq!(
+                resume(&paths).await.unwrap_err().to_string(),
+                expected_error
+            );
+            assert_eq!(fs::read(paths.operation()).unwrap(), before);
+            assert_eq!(fs::read(&marker_path).unwrap(), marker_before);
+            assert!(require_bootstrap_ownership_clear(&paths, None).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_native_operation_does_not_cross_legacy_bootstrap_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let operation = Operation::new(OperationKind::Update, "prepared", None);
+        save_operation(&paths, &operation).unwrap();
+        state::write_json(
+            &paths.state_dir.join("uninstall-operation.json"),
+            &json!({"schema":"app.loomex.runner.uninstall-operation/v1","phase":"owned"}),
+        )
+        .unwrap();
+        let before = fs::read(paths.operation()).unwrap();
+        let result = resume(&paths).await.unwrap();
+        assert_eq!(result["resumed"], false);
+        assert_eq!(
+            result["reason"],
+            "legacy journal is protected for native repair"
+        );
+        assert_eq!(fs::read(paths.operation()).unwrap(), before);
+        assert!(require_bootstrap_ownership_clear(&paths, None).is_err());
+    }
+
+    #[test]
+    fn conflicting_bootstrap_uninstall_terminal_marker_is_protected() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let journal = bootstrap_uninstall_ownership_fixture(&paths);
+        state::write_json(&paths.state_dir.join("bootstrap-uninstall.json"), &journal).unwrap();
+        let mut marker = journal.clone();
+        marker["phase"] = json!("terminal");
+        state::write_json(
+            &paths.state_dir.join("bootstrap-uninstall-terminal.json"),
+            &marker,
+        )
+        .unwrap();
+        assert_eq!(status(&paths).unwrap()["ownershipValid"], true);
+        marker["helperSha256"] = json!("c".repeat(64));
+        state::write_json(
+            &paths.state_dir.join("bootstrap-uninstall-terminal.json"),
+            &marker,
+        )
+        .unwrap();
+        assert_eq!(status(&paths).unwrap()["ownershipValid"], false);
+        assert!(require_terminal_before_uninstall(&paths).is_err());
+    }
+
+    #[test]
+    fn matching_bootstrap_install_is_ready_without_reconciliation_or_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let package = PackageIdentity {
+            version: "1.2.3".into(),
+            target: paths.versions().join("1.2.3"),
+            manifest_sha256: "a".repeat(64),
+        };
+        let journal = json!({"schema":"app.loomex.runner.bootstrap-install/v1","version":package.version,"target":package.target,"manifestSha256":package.manifest_sha256,"developmentApiOrigin":null,"providerExecutables":{}});
+        state::write_json(&paths.state_dir.join("bootstrap-install.json"), &journal).unwrap();
+        let before = fs::read(paths.state_dir.join("bootstrap-install.json")).unwrap();
+        assert_eq!(
+            package_preflight(&paths, OperationKind::Update, &package).unwrap()["ready"],
+            true
+        );
+        assert!(require_bootstrap_ownership_clear(&paths, None).is_err());
+        assert_eq!(
+            fs::read(paths.state_dir.join("bootstrap-install.json")).unwrap(),
+            before
+        );
+        assert!(!paths.operation().exists());
+    }
+
+    #[test]
+    fn bootstrap_install_completion_requires_completed_activation_owner() {
+        for (kind, phase, pending) in [
+            (OperationKind::Install, "completed", false),
+            (OperationKind::Update, "completed", false),
+            (OperationKind::Rollback, "completed", false),
+            (OperationKind::Update, "rolled_back", true),
+            (OperationKind::Repair, "completed", true),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = paths(temp.path());
+            let package = PackageIdentity {
+                version: "1.2.3".into(),
+                target: paths.versions().join("1.2.3"),
+                manifest_sha256: "a".repeat(64),
+            };
+            let configuration = json!({"schema":"app.loomex.runner.bootstrap-install/v1",
+                "version":package.version,"target":package.target,"manifestSha256":package.manifest_sha256});
+            state::write_json(
+                &paths.state_dir.join("bootstrap-install.json"),
+                &configuration,
+            )
+            .unwrap();
+            let mut operation = Operation::new(kind, phase, None);
+            operation.package = Some(package);
+            save_operation(&paths, &operation).unwrap();
+            let snapshot = status(&paths).unwrap();
+            assert_eq!(snapshot["ownershipValid"], true, "{kind:?}/{phase}");
+            assert_eq!(
+                snapshot["bootstrapJournal"]["install"], pending,
+                "{kind:?}/{phase}"
+            );
+            assert_eq!(snapshot["actionRequired"], pending, "{kind:?}/{phase}");
+        }
+    }
+
+    #[test]
+    fn legacy_uninstall_adoption_fence_survives_interruption_before_journal_upgrade() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let journal = bootstrap_uninstall_ownership_fixture(&paths);
+        let journal_path = paths.state_dir.join("bootstrap-uninstall.json");
+        state::write_json(&journal_path, &journal).unwrap();
+        let digest = regular_digest(&journal_path).unwrap().unwrap();
+        begin_uninstall_fence_locked(&paths, Uuid::new_v4(), &digest).unwrap();
+        require_terminal_before_uninstall(&paths).unwrap();
+        assert_eq!(status(&paths).unwrap()["ownershipValid"], true);
+        assert!(require_bootstrap_ownership_clear(&paths, None).is_err());
+        let mut changed = journal;
+        changed["helperSha256"] = json!("b".repeat(64));
+        state::write_json(&journal_path, &changed).unwrap();
+        assert!(require_terminal_before_uninstall(&paths).is_err());
+        assert_eq!(status(&paths).unwrap()["ownershipValid"], false);
+    }
+
+    #[test]
+    fn uninstall_v2_fence_requires_same_operation_and_immutable_journal_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let id = Uuid::new_v4();
+        let mut journal = bootstrap_uninstall_ownership_fixture(&paths);
+        journal["schema"] = json!("app.loomex.runner.bootstrap-uninstall/v2");
+        journal["operationId"] = json!(id);
+        journal["drainKey"] = json!(Uuid::new_v4());
+        journal["receiptSha256"] = json!(state::json_digest(&journal["receipt"]));
+        journal["fenceJournalSha256"] = json!("a".repeat(64));
+        let journal_path = paths.state_dir.join("bootstrap-uninstall.json");
+        state::write_json(&journal_path, &journal).unwrap();
+        begin_uninstall_fence_locked(&paths, id, &"a".repeat(64)).unwrap();
+        require_terminal_before_uninstall(&paths).unwrap();
+        assert_eq!(status(&paths).unwrap()["ownershipValid"], true);
+        journal["fenceJournalSha256"] = json!("b".repeat(64));
+        state::write_json(&journal_path, &journal).unwrap();
+        assert!(require_terminal_before_uninstall(&paths).is_err());
+        assert_eq!(status(&paths).unwrap()["ownershipValid"], false);
+    }
+
+    #[test]
+    fn uninstall_fence_preserves_original_bytes_and_blocks_old_operation_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let operation = Operation::new(OperationKind::Update, "completed", None);
+        save_operation(&paths, &operation).unwrap();
+        let original = fs::read(paths.operation()).unwrap();
+        let id = Uuid::new_v4();
+        begin_uninstall_fence_locked(&paths, id, &"a".repeat(64)).unwrap();
+        let fenced: Operation = state::read_json(&paths.operation()).unwrap();
+        fenced.validate().unwrap();
+        assert_eq!(fenced.schema, UNINSTALL_FENCE_SCHEMA);
+        assert_ne!(fenced.schema, OPERATION_SCHEMA);
+        let fence = fenced.uninstall_fence.as_ref().unwrap();
+        assert_eq!(fence.original_operation.as_deref(), Some(&operation));
+        assert_eq!(
+            fence
+                .original_operation_snapshot
+                .as_deref()
+                .unwrap()
+                .as_bytes(),
+            original
+        );
+        assert_eq!(
+            fence.original_operation_sha256.as_deref(),
+            Some(state::digest(&original).as_str())
+        );
+        let before = fs::read(paths.operation()).unwrap();
+        begin_uninstall_fence_locked(&paths, id, &"a".repeat(64)).unwrap();
+        assert_eq!(fs::read(paths.operation()).unwrap(), before);
+        assert!(begin_uninstall_fence_locked(&paths, Uuid::new_v4(), &"a".repeat(64)).is_err());
+        let mut corrupt = fenced;
+        corrupt
+            .uninstall_fence
+            .as_mut()
+            .unwrap()
+            .original_operation_snapshot = Some("{}".into());
+        assert!(corrupt.validate().is_err());
+    }
 
     #[test]
     fn integrity_streams_large_files_and_rejects_fresh_mutation() {
@@ -5542,13 +7361,45 @@ mod tests {
             target: paths.versions().join("1.2.3"),
             version: "1.2.3".into(),
             plist_digest: state::digest(b"fixture plist"),
+            provider_executables: None,
+            development_api_origin: None,
         };
         let repaired = reconcile_install_receipt(&paths, &observed).unwrap();
         assert_eq!(repaired["reconciled"], true);
         let intent_path = paths.state_dir.join("receipt-repair.json");
         let mut intent: Value = state::read_json(&intent_path).unwrap();
+        for field in ["target", "version", "expectedDigest"] {
+            let mut conflicting = intent.clone();
+            conflicting["phase"] = json!("pending");
+            conflicting[field] = match field {
+                "target" => json!(paths.versions().join("1.2.4")),
+                "version" => json!("1.2.4"),
+                _ => json!("b".repeat(64)),
+            };
+            state::write_json(&intent_path, &conflicting).unwrap();
+            let before_intent = fs::read(&intent_path).unwrap();
+            let before_receipt = fs::read(paths.state_dir.join("install-receipt.json")).unwrap();
+            assert_eq!(
+                reconcile_install_receipt(&paths, &observed)
+                    .unwrap_err()
+                    .to_string(),
+                "LIFECYCLE_RECEIPT_REPAIR_MISMATCH"
+            );
+            assert_eq!(fs::read(&intent_path).unwrap(), before_intent);
+            assert_eq!(
+                fs::read(paths.state_dir.join("install-receipt.json")).unwrap(),
+                before_receipt
+            );
+        }
         intent["phase"] = json!("pending");
         state::write_json(&intent_path, &intent).unwrap();
+        let before_resume = fs::read(&intent_path).unwrap();
+        assert_eq!(
+            resume(&paths).await.unwrap()["nextAction"],
+            "repair_receipt"
+        );
+        assert_eq!(fs::read(&intent_path).unwrap(), before_resume);
+
         reconcile_install_receipt(&paths, &observed).unwrap();
         assert_eq!(
             state::read_json::<Value>(&intent_path).unwrap()["phase"],
@@ -5694,7 +7545,7 @@ mod tests {
         });
         state::write_json(
             &paths.state_dir.join("drain.json"),
-            &json!({"draining":true}),
+            &json!({"requestedAt":state::now(),"idempotencyKey":Uuid::new_v4()}),
         )
         .unwrap();
         save_operation(paths, &operation).unwrap();
@@ -6353,7 +8204,11 @@ mod tests {
         *TEST_RECOVERY_STATUS.lock().unwrap() =
             Some(json!({"version":"1.2.3","activeJobs":0,"draining":drained}));
         if drained {
-            fs::write(paths.state_dir.join("drain.json"), b"{}").unwrap();
+            state::write_json(
+                &paths.state_dir.join("drain.json"),
+                &json!({"requestedAt":state::now(),"idempotencyKey":Uuid::new_v4()}),
+            )
+            .unwrap();
         }
         *TEST_AUTH_STATUS.lock().unwrap() = Some(json!({"authenticated":true,
             "code":"AUTHENTICATED","installationId":installation_id,
@@ -6843,11 +8698,19 @@ mod tests {
                 .unwrap(),
                 _ => unreachable!(),
             }
-            let result = resume(&paths).await.unwrap();
-            assert_ne!(
-                result["operation"]["phase"], "completed",
-                "{case}: {result}"
-            );
+            let result = resume(&paths).await;
+            if case == "drain_symlink" {
+                assert!(
+                    result.is_err(),
+                    "unsafe ownership must fail before recovery writes"
+                );
+            } else {
+                let result = result.unwrap();
+                assert_ne!(
+                    result["operation"]["phase"], "completed",
+                    "{case}: {result}"
+                );
+            }
             let saved: Operation = state::read_json(&paths.operation()).unwrap();
             assert_eq!(saved.service_stops, original.service_stops, "{case}");
             assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1, "{case}");
@@ -7643,14 +9506,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reviewed_stop_real_idle_drain_socket_does_not_reopen_auth_admission() {
+    async fn reviewed_stop_real_idle_drain_socket_allows_status_without_reopening_writers() {
         let _serial = TEST_SERIAL.lock().await;
         let _scope = StopTestScope::start();
         let temp = tempfile::tempdir().unwrap();
         let paths = paths(temp.path());
         state::write_json(
             &paths.state_dir.join("drain.json"),
-            &json!({"draining":true}),
+            &json!({"requestedAt":state::now(),"idempotencyKey":Uuid::new_v4()}),
         )
         .unwrap();
         *TEST_AUTH_STATUS.lock().unwrap() = None;
@@ -7679,7 +9542,19 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(auth["error"]["code"], "RUNNER_NOT_READY");
+        assert!(
+            auth.get("error").is_none(),
+            "read-only identity observation remains available"
+        );
+        assert_eq!(auth["result"]["authenticated"], false);
+        let logout = crate::control::client(
+            &paths.state_dir,
+            "auth.logout",
+            json!({"idempotencyKey":Uuid::new_v4()}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(logout["error"]["code"], "LIFECYCLE_OPERATION_PENDING");
         assert_eq!(daemon.managed_work(), 0);
         serving.abort();
         let _ = serving.await;
@@ -7858,7 +9733,7 @@ mod tests {
             Some(json!({"version":"1.2.3","activeJobs":0,"draining":true}));
         state::write_json(
             &paths.state_dir.join("drain.json"),
-            &json!({"draining":true}),
+            &json!({"requestedAt":state::now(),"idempotencyKey":Uuid::new_v4()}),
         )
         .unwrap();
         prepare_service_stop(&paths, &mut original, StopDirection::RestorePrevious)
@@ -8647,7 +10522,7 @@ mod tests {
             });
             state::write_json(
                 &paths.state_dir.join("drain.json"),
-                &json!({"draining":true}),
+                &json!({"requestedAt":state::now(),"idempotencyKey":Uuid::new_v4()}),
             )
             .unwrap();
             save_operation(&paths, &operation).unwrap();
@@ -8816,6 +10691,64 @@ mod tests {
             *TEST_RECOVERY_FAULT.lock().unwrap() = None;
             *TEST_PROCESS_OBSERVATION.lock().unwrap() = None;
         }
+    }
+
+    #[tokio::test]
+    async fn rolled_back_abandonment_keeps_bootstrap_pending_until_exact_owner_tombstone() {
+        let _serial = TEST_SERIAL.lock().await;
+        let _scope = AbandonmentTestScope::start();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let (operation, configuration) = abandonment_fixture(&paths);
+        let bootstrap_path = paths.state_dir.join("bootstrap-install.json");
+        let original_bootstrap = fs::read(&bootstrap_path).unwrap();
+        *TEST_RECOVERY_FAULT.lock().unwrap() = Some("before_abandonment_tombstone");
+        assert!(
+            rollback_with_expected(&paths, "1.2.4", Some(operation.id))
+                .await
+                .is_err()
+        );
+        let restored: Operation = state::read_json(&paths.operation()).unwrap();
+        assert_eq!(restored.id, operation.id);
+        assert_eq!(restored.phase, "rolled_back");
+        assert!(restored.abandonment.is_some());
+        assert_eq!(fs::read(&bootstrap_path).unwrap(), original_bootstrap);
+
+        let snapshot = status(&paths).unwrap();
+        assert_eq!(snapshot["ownershipValid"], true);
+        assert_eq!(snapshot["bootstrapJournal"]["install"], true);
+        assert_eq!(snapshot["actionRequired"], true);
+        assert_eq!(
+            snapshot["ownership"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|record| record["owner"] == "bootstrap_install")
+                .unwrap()["phase"],
+            "prepared"
+        );
+        assert!(require_terminal_before_uninstall(&paths).is_err());
+        assert!(require_bootstrap_ownership_clear(&paths, None).is_err());
+        assert_eq!(fs::read(&bootstrap_path).unwrap(), original_bootstrap);
+
+        *TEST_RECOVERY_FAULT.lock().unwrap() = None;
+        let result = resume(&paths).await.unwrap();
+        assert_eq!(result["abandoned"], true);
+        assert_eq!(result["operation"]["id"], operation.id.to_string());
+        let tombstone: Value = state::read_json(&bootstrap_path).unwrap();
+        assert_eq!(
+            tombstone["schema"],
+            "app.loomex.runner.bootstrap-install/v2"
+        );
+        assert_eq!(tombstone["phase"], "aborted");
+        assert_eq!(tombstone["operationId"], operation.id.to_string());
+        assert_eq!(tombstone["configuration"], configuration);
+        assert_eq!(
+            status(&paths).unwrap()["bootstrapJournal"]["install"],
+            false
+        );
+        assert_eq!(TEST_STOP_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(TEST_RESTART_COUNT.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -9465,31 +11398,28 @@ mod tests {
         let _serial = TEST_SERIAL.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let paths = paths(temp.path());
-        make_compatible_target(&paths);
-        let staged = paths.state_dir.join("lifecycle-staged-pending.plist");
-        fs::write(&staged, b"candidate").unwrap();
-        let mut operation = Operation::new(OperationKind::Update, "pending_active_work", None);
-        operation.schema = PRE_AUTH_OPERATION_SCHEMA.into();
-        operation.package = Some(PackageIdentity {
-            version: "1.2.3".into(),
-            target: paths.versions().join("1.2.3"),
-            manifest_sha256: "d".repeat(64),
-        });
-        operation.resources = Some(OperationResources {
-            launch_agent: launch_agent(&paths),
-            staged_launch_agent: staged.clone(),
-            staged_launch_agent_sha256: state::digest(b"candidate"),
-            launch_agent_backup: paths.state_dir.join("lifecycle-agent-pending.plist"),
-            launch_agent_backup_sha256: None,
-            owned_versions: vec![paths.versions().join("1.2.3")],
-        });
+        let (mut operation, _) = pending_update_retirement_fixture(&paths);
+        fs::remove_file(paths.current()).unwrap();
+        fs::remove_file(launch_agent(&paths)).unwrap();
+        operation.phase = "pending_active_work".into();
         save_operation(&paths, &operation).unwrap();
+        assert!(require_bootstrap_ownership_clear(&paths, operation.package.as_ref()).is_ok());
         TEST_MODE.store(true, Ordering::SeqCst);
         let result = resume(&paths).await.unwrap();
         TEST_MODE.store(false, Ordering::SeqCst);
-        assert_eq!(result["state"], "candidate_healthy_after_pending");
+        assert_eq!(
+            result["state"], "candidate_healthy_after_pending",
+            "{result}"
+        );
         let saved: Operation = state::read_json(&paths.operation()).unwrap();
         assert_eq!(saved.phase, "completed");
+        assert_eq!(saved.id, operation.id);
+        assert_eq!(
+            resume(&paths).await.unwrap()["operation"]["id"],
+            operation.id.to_string()
+        );
+        assert!(!paths.state_dir.join("pending-update.json").exists());
+        assert_eq!(status(&paths).unwrap()["actionRequired"], false);
     }
 
     #[tokio::test]

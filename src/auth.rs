@@ -31,6 +31,218 @@ pub(crate) const AUTH_LOCK_BUDGET: Duration = Duration::from_secs(2);
 // operation admission. Health may wait for an existing owner, never recover it.
 const AUTH_STARTUP_OBSERVATION_BUDGET: Duration = Duration::from_secs(15);
 
+/// Non-authorizing identity metadata. Never carries a token, key or proof.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CredentialIdentity {
+    pub(crate) installation_id: String,
+    pub(crate) device_id: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct RevocationEvidence {
+    identity: CredentialIdentity,
+    kind: String,
+    confirmed_at: u64,
+}
+
+#[derive(Debug)]
+struct StoreFailure {
+    code: &'static str,
+    category: &'static str,
+    native_os_status: Option<i32>,
+}
+impl std::fmt::Display for StoreFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.code)
+    }
+}
+impl std::error::Error for StoreFailure {}
+
+#[derive(Debug)]
+struct CleanupFailure {
+    code: &'static str,
+    stage: &'static str,
+    category: &'static str,
+    native_os_status: Option<i32>,
+    http_status: Option<u16>,
+    correlation_id: Option<String>,
+    remote_code: Option<String>,
+    remote_revocation: &'static str,
+}
+impl std::fmt::Display for CleanupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.code)
+    }
+}
+impl std::error::Error for CleanupFailure {}
+
+/// Safe fixed categories only; original provider/store error text is never projected.
+pub(crate) fn cleanup_error_metadata(error: &anyhow::Error) -> Option<Value> {
+    if let Some(error) = error.downcast_ref::<CleanupFailure>() {
+        return Some(
+            json!({"failureStage":error.stage,"failureCategory":error.category,
+            "nativeOsStatus":error.native_os_status,"httpStatus":error.http_status,
+            "correlationId":error.correlation_id,"remoteCode":error.remote_code,
+            "remoteRevocation":error.remote_revocation,"protectedStoreRemoved":false}),
+        );
+    }
+    error.downcast_ref::<StoreFailure>().map(|error| {
+        json!({
+            "failureStage":"credential_store","failureCategory":error.category,
+            "nativeOsStatus":error.native_os_status,"httpStatus":null,"correlationId":null,
+            "remoteCode":null,"remoteRevocation":"not_dispatched","protectedStoreRemoved":false
+        })
+    })
+}
+
+fn cleanup_failure(
+    error: anyhow::Error,
+    stage: &'static str,
+    remote: &'static str,
+) -> anyhow::Error {
+    if error.downcast_ref::<CleanupFailure>().is_some() {
+        return error;
+    }
+    let text = error.to_string();
+    let code = match text.as_str() {
+        "STORE_ACCESS_REQUIRED" => "STORE_ACCESS_REQUIRED",
+        "STORE_ACCESS_DENIED" => "STORE_ACCESS_DENIED",
+        "STORE_OPERATION_PENDING" => "STORE_OPERATION_PENDING",
+        "STORE_INVALID" => "STORE_INVALID",
+        "STORE_OWNER_BUSY" => "STORE_OWNER_BUSY",
+        "STORE_UNAVAILABLE" => "STORE_UNAVAILABLE",
+        "AUTH_IDENTITY_CHANGED" => "AUTH_IDENTITY_CHANGED",
+        "AUTH_RECONCILIATION_REQUIRED" => "AUTH_RECONCILIATION_REQUIRED",
+        "AUTH_RECOVERY_PENDING" => "AUTH_RECOVERY_PENDING",
+        _ => "AUTH_LOGOUT_FAILED",
+    };
+    let native = error.downcast_ref::<StoreFailure>();
+    let category = native
+        .map(|failure| failure.category)
+        .unwrap_or(match code {
+            "STORE_ACCESS_REQUIRED" => "access_required",
+            "STORE_ACCESS_DENIED" => "access_denied",
+            "STORE_OPERATION_PENDING" => "native_operation_pending",
+            "STORE_INVALID" => "invalid_store",
+            "STORE_OWNER_BUSY" => "owner_busy",
+            "AUTH_IDENTITY_CHANGED" => "identity_mismatch",
+            "AUTH_RECONCILIATION_REQUIRED" => "unresolved_authority",
+            "AUTH_RECOVERY_PENDING" => "operation_busy",
+            _ if stage == "remote_revocation" => "remote_unconfirmed",
+            _ => "unavailable",
+        });
+    let api = error.downcast_ref::<crate::api::ApiError>();
+    CleanupFailure {
+        code,
+        stage,
+        category,
+        native_os_status: native.and_then(|failure| failure.native_os_status),
+        http_status: api
+            .and_then(|failure| failure.status)
+            .filter(|status| (100..=599).contains(status)),
+        correlation_id: api
+            .and_then(|failure| failure.correlation_id.as_deref())
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            .map(|value| value.to_string()),
+        remote_code: api
+            .map(|failure| failure.code.as_str())
+            .filter(|code| {
+                !code.is_empty()
+                    && code.len() <= 120
+                    && code.bytes().all(|byte| {
+                        byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
+            })
+            .map(str::to_owned),
+        remote_revocation: remote,
+    }
+    .into()
+}
+
+fn store_failure(code: &'static str, category: &'static str) -> anyhow::Error {
+    StoreFailure {
+        code,
+        category,
+        native_os_status: None,
+    }
+    .into()
+}
+
+/// The native item is fixed for this OS user, regardless of LOOMEX_STATE_DIR.
+/// Resolve the account home through the OS account database, never ambient HOME.
+fn credential_owner_path() -> Result<std::path::PathBuf> {
+    let mut record: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buffer = vec![0u8; 65536];
+    let mut found = std::ptr::null_mut();
+    let result = unsafe {
+        libc::getpwuid_r(
+            libc::geteuid(),
+            &mut record,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    ensure!(
+        result == 0 && !found.is_null() && !record.pw_dir.is_null(),
+        "STORE_UNAVAILABLE"
+    );
+    use std::os::unix::ffi::OsStrExt;
+    let home = unsafe { std::ffi::CStr::from_ptr(record.pw_dir) }.to_bytes();
+    let home = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(home));
+    ensure!(home.is_absolute(), "STORE_UNAVAILABLE");
+    Ok(home.join(".loomex-credential-owner"))
+}
+
+fn acquire_credential_owner_at(directory: &std::path::Path) -> Result<Arc<std::fs::File>> {
+    use fs2::FileExt;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    let home = directory
+        .parent()
+        .ok_or_else(|| anyhow!("STORE_UNAVAILABLE"))?;
+    let metadata = std::fs::symlink_metadata(home)?;
+    ensure!(
+        metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.permissions().mode() & 0o022 == 0,
+        "STORE_UNAVAILABLE"
+    );
+    match std::fs::DirBuilder::new().mode(0o700).create(directory) {
+        Ok(()) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+        Err(error) => return Err(error.into()),
+    }
+    let metadata = std::fs::symlink_metadata(directory)?;
+    ensure!(
+        metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.permissions().mode() & 0o077 == 0,
+        "STORE_UNAVAILABLE"
+    );
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(directory.join("owner.lock"))?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.permissions().mode() & 0o077 == 0
+            && metadata.nlink() == 1,
+        "STORE_UNAVAILABLE"
+    );
+    file.try_lock_exclusive()
+        .map_err(|_| store_failure("STORE_OWNER_BUSY", "owner_busy"))?;
+    Ok(Arc::new(file))
+}
+
 fn credential_store_code(error: &anyhow::Error) -> &'static str {
     match error.to_string().as_str() {
         "STORE_ACCESS_REQUIRED" => "STORE_ACCESS_REQUIRED",
@@ -106,11 +318,17 @@ pub fn credential_store_probe(foreground_authorization: bool) -> &'static str {
 fn native_store_error(status: i32) -> anyhow::Error {
     // InteractionNotAllowed/InteractionRequired do not identify an ACL or a
     // globally locked keychain. Preserve that uncertainty in the public code.
-    anyhow!(match status {
-        -25308 | -25315 => "STORE_ACCESS_REQUIRED",
-        -25293 => "STORE_ACCESS_DENIED",
-        _ => "STORE_UNAVAILABLE",
-    })
+    let (code, category) = match status {
+        -25308 | -25315 => ("STORE_ACCESS_REQUIRED", "access_required"),
+        -25293 => ("STORE_ACCESS_DENIED", "access_denied"),
+        _ => ("STORE_UNAVAILABLE", "native_os_error"),
+    };
+    StoreFailure {
+        code,
+        category,
+        native_os_status: Some(status),
+    }
+    .into()
 }
 const BROWSER_AUTH_CSS: &str = include_str!("../assets/browser_authority.css");
 
@@ -352,6 +570,8 @@ struct ProtectedState {
     login: Option<Login>,
     pending: Option<Pending>,
     logout_pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revocation: Option<RevocationEvidence>,
     #[serde(default)]
     persona_state: BTreeMap<String, Value>,
 }
@@ -367,6 +587,7 @@ impl ProtectedState {
             login: None,
             pending: None,
             logout_pending: false,
+            revocation: None,
             persona_state: BTreeMap::new(),
         }
     }
@@ -379,6 +600,7 @@ pub struct Auth {
     operation_lock: Arc<Mutex<()>>,
     store_lock: Arc<Mutex<()>>,
     store_owner: Arc<std::sync::Mutex<Option<std::sync::Weak<std::fs::File>>>>,
+    credential_owner: Option<Arc<std::fs::File>>,
     listeners: Arc<Mutex<BTreeMap<String, JoinHandle<()>>>>,
 }
 impl Auth {
@@ -390,6 +612,7 @@ impl Auth {
             operation_lock: Arc::new(Mutex::new(())),
             store_lock: Arc::new(Mutex::new(())),
             store_owner: Arc::new(std::sync::Mutex::new(None)),
+            credential_owner: None,
             listeners: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -513,12 +736,16 @@ impl Auth {
         self.operation_lock.clone().lock_owned().await
     }
     pub fn new(api: Api) -> Result<Self> {
+        let credential_owner = credential_owner_path()
+            .and_then(|path| acquire_credential_owner_at(&path))
+            .map_err(|error| cleanup_failure(error, "credential_owner", "not_dispatched"))?;
         Ok(Self {
             api,
             store: Arc::new(NativeStore),
             operation_lock: Arc::new(Mutex::new(())),
             store_lock: Arc::new(Mutex::new(())),
             store_owner: Arc::new(std::sync::Mutex::new(None)),
+            credential_owner: Some(credential_owner),
             listeners: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
@@ -540,7 +767,7 @@ impl Auth {
         let deadline = tokio::time::Instant::now() + STORE_IO_BUDGET;
         let io_guard = tokio::time::timeout_at(deadline, self.store_lock.clone().lock_owned())
             .await
-            .map_err(|_| anyhow!("STORE_UNAVAILABLE"))?;
+            .map_err(|_| store_failure("STORE_UNAVAILABLE", "serialization_timeout"))?;
         let store = self.store.clone();
         let owner = match self.store_owner.lock().unwrap().as_ref() {
             Some(owner) => Some(
@@ -550,8 +777,10 @@ impl Auth {
             ),
             None => None,
         };
+        let credential_owner = self.credential_owner.clone();
         let task = tokio::task::spawn_blocking(move || {
             let _owner = owner;
+            let _credential_owner = credential_owner;
             // A started OS call cannot be aborted. This guard survives caller
             // timeout/cancellation, so no later store operation can overtake it
             // and repeated calls cannot spawn further blocked OS tasks.
@@ -561,18 +790,24 @@ impl Auth {
         tokio::time::timeout_at(deadline, task)
             .await
             .map_err(|_| {
-                anyhow!(if mutating {
-                    "STORE_OPERATION_PENDING"
-                } else {
-                    "STORE_UNAVAILABLE"
-                })
+                store_failure(
+                    if mutating {
+                        "STORE_OPERATION_PENDING"
+                    } else {
+                        "STORE_UNAVAILABLE"
+                    },
+                    "native_io_timeout",
+                )
             })?
             .map_err(|_| {
-                anyhow!(if mutating {
-                    "STORE_OPERATION_PENDING"
-                } else {
-                    "STORE_UNAVAILABLE"
-                })
+                store_failure(
+                    if mutating {
+                        "STORE_OPERATION_PENDING"
+                    } else {
+                        "STORE_UNAVAILABLE"
+                    },
+                    "native_worker_failed",
+                )
             })?
     }
     async fn load(&self) -> Result<Option<ProtectedState>> {
@@ -635,7 +870,7 @@ impl Auth {
                 Ok(json!({"authenticated":false,"code":"AUTH_REQUIRED","loginPending":false}))
             }
             Ok(Some(state)) => Ok(
-                json!({"authenticated":state.device.is_some() && !state.logout_pending,"code":if state.logout_pending {"LOGOUT_PENDING"} else if state.pending.is_some() {"AUTH_RECOVERY_PENDING"} else if state.device.is_some() {"AUTHENTICATED"} else {"AUTH_REQUIRED"},"installationId":state.installation_id,"activeOrganization":state.active_organization,"organizations":state.children.keys().collect::<Vec<_>>(),"loginPending":state.login.is_some()}),
+                json!({"authenticated":state.device.is_some() && !state.logout_pending,"code":if state.logout_pending {"LOGOUT_PENDING"} else if state.pending.is_some() {"AUTH_RECOVERY_PENDING"} else if state.device.is_some() {"AUTHENTICATED"} else {"AUTH_REQUIRED"},"installationId":state.installation_id,"deviceId":state.device.as_ref().map(|device| &device.subject),"activeOrganization":state.active_organization,"organizations":state.children.keys().collect::<Vec<_>>(),"loginPending":state.login.is_some()}),
             ),
         }
     }
@@ -914,6 +1149,7 @@ impl Auth {
                 Some(listener),
             )
         };
+        state.revocation = None;
         state.login = Some(login.clone());
         self.save(&state).await?;
         if let Some(listener) = listener {
@@ -1631,86 +1867,178 @@ impl Auth {
         )
         .await
     }
+    pub(crate) async fn maintenance_identity(&self) -> Result<Option<CredentialIdentity>> {
+        let _guard = self
+            .auth_guard()
+            .await
+            .map_err(|error| cleanup_failure(error, "identity_probe", "not_dispatched"))?;
+        Ok(self
+            .load()
+            .await
+            .map_err(|error| cleanup_failure(error, "identity_probe", "not_dispatched"))?
+            .map(|state| credential_identity(&state)))
+    }
+
+    pub(crate) async fn maintenance_logout(
+        &self,
+        expected: &CredentialIdentity,
+        delete: bool,
+    ) -> Result<Value> {
+        let _guard = self
+            .auth_guard()
+            .await
+            .map_err(|error| cleanup_failure(error, "operation_admission", "not_dispatched"))?;
+        self.cleanup_locked(Some(expected), delete).await
+    }
+
     pub async fn logout(&self) -> Result<Value> {
-        let _guard = self.auth_guard().await?;
-        self.logout_locked().await
+        let _guard = self
+            .auth_guard()
+            .await
+            .map_err(|error| cleanup_failure(error, "operation_admission", "not_dispatched"))?;
+        self.cleanup_locked(None, false).await
     }
     pub async fn offline_logout(&self) -> Result<Value> {
-        let _guard = self.auth_guard().await?;
-        if let Some(mut state) = self.load().await? {
-            if state.device.is_none() && (state.pending.is_some() || !state.children.is_empty()) {
-                if state
+        let _guard = self
+            .auth_guard()
+            .await
+            .map_err(|error| cleanup_failure(error, "operation_admission", "not_dispatched"))?;
+        self.cleanup_locked(None, true).await
+    }
+    async fn cleanup_locked(
+        &self,
+        expected: Option<&CredentialIdentity>,
+        delete: bool,
+    ) -> Result<Value> {
+        let Some(mut state) = self
+            .load()
+            .await
+            .map_err(|error| cleanup_failure(error, "protected_store_read", "not_dispatched"))?
+        else {
+            if expected.is_some() {
+                return Err(cleanup_failure(
+                    anyhow!("AUTH_IDENTITY_CHANGED"),
+                    "identity_verification",
+                    "unverified",
+                ));
+            }
+            return Ok(json!({"revoked":false,"alreadyLoggedOut":true,
+                "remoteRevocation":"unverified","protectedStoreRemoved":false,"identity":null}));
+        };
+        if expected.is_some_and(|expected| *expected != credential_identity(&state)) {
+            return Err(cleanup_failure(
+                anyhow!("AUTH_IDENTITY_CHANGED"),
+                "identity_verification",
+                "not_dispatched",
+            ));
+        }
+        let mut confirmed = valid_revocation(&state);
+        if !confirmed {
+            state.logout_pending = true;
+            self.save(&state)
+                .await
+                .map_err(|error| cleanup_failure(error, "logout_intent", "not_dispatched"))?;
+            if state.device.is_none() {
+                if let Some(login) = state
                     .login
                     .as_ref()
-                    .is_some_and(|login| login.transaction_id.is_some())
-                    && state.pending.as_ref().is_some_and(|pending| {
-                        matches!(
-                            pending.target,
-                            Target::BrowserExchange | Target::Bootstrap | Target::BrowserCancel
-                        )
-                    })
+                    .filter(|login| login.transaction_id.is_some())
                 {
-                    // Explicit uninstall/logout may abandon this browser-owned
-                    // authority without recovering expired issuance material.
-                    // Deletion still follows confirmed remote revocation.
-                    let result = self.logout_locked().await?;
-                    self.store_operation(true, |store| store.delete()).await?;
-                    return Ok(result);
+                    // Canceling a browser transaction proves nothing about
+                    // orphaned children from a different device authority.
+                    if !state.children.is_empty() {
+                        return Err(cleanup_failure(
+                            anyhow!("AUTH_RECONCILIATION_REQUIRED"),
+                            "authority_reconciliation",
+                            "pending",
+                        ));
+                    }
+                    let flow = login.flow_id.clone();
+                    self.cancel_login_locked(&mut state, &flow)
+                        .await
+                        .map_err(|error| cleanup_failure(error, "remote_revocation", "pending"))?;
+                    if let Some(listener) = self.listeners.lock().await.remove(&flow) {
+                        listener.abort()
+                    }
+                    confirmed = valid_revocation(&state);
+                } else if state.pending.is_some() || !state.children.is_empty() {
+                    if !state.pending.as_ref().is_some_and(|pending| {
+                        matches!(pending.target, Target::Bootstrap) && pending.can_recover()
+                    }) {
+                        return Err(cleanup_failure(
+                            anyhow!("AUTH_RECONCILIATION_REQUIRED"),
+                            "authority_reconciliation",
+                            "pending",
+                        ));
+                    }
+                    self.recover(&mut state).await.map_err(|error| {
+                        // Preserve native failure diagnostics; other recovery failures
+                        // retain the historical reconciliation-required contract.
+                        let error = if error.downcast_ref::<StoreFailure>().is_some() {
+                            error
+                        } else {
+                            anyhow!("AUTH_RECONCILIATION_REQUIRED")
+                        };
+                        cleanup_failure(error, "authority_reconciliation", "pending")
+                    })?;
+                    if state.device.is_none() {
+                        return Err(cleanup_failure(
+                            anyhow!("AUTH_RECONCILIATION_REQUIRED"),
+                            "authority_reconciliation",
+                            "pending",
+                        ));
+                    }
                 }
-                // A lost bootstrap reply can represent an active remote authority.
-                // Preserve its only proof and reconcile through the existing one-use
-                // recovery protocol before claiming revocation or deleting anything.
-                state.logout_pending = true;
-                self.save(&state).await?;
-                if !state.pending.as_ref().is_some_and(|pending| {
-                    matches!(pending.target, Target::Bootstrap) && pending.can_recover()
-                }) {
-                    bail!("AUTH_RECONCILIATION_REQUIRED");
-                }
-                self.recover(&mut state)
+            }
+            if let Some(device) = state.device.as_ref() {
+                self.revalidate(&state).await.map_err(|error| {
+                    cleanup_failure(error, "identity_verification", "not_dispatched")
+                })?;
+                let credential = device.signed(&state);
+                let response = self
+                    .api
+                    .request(
+                        "POST",
+                        "v2/device-authorities/logout/",
+                        Some(json!({})),
+                        Some(&credential),
+                        None,
+                    )
                     .await
-                    .map_err(|_| anyhow!("AUTH_RECONCILIATION_REQUIRED"))?;
-                ensure!(state.device.is_some(), "AUTH_RECONCILIATION_REQUIRED");
-            }
-        }
-        let result = self.logout_locked().await?;
-        self.store_operation(true, |store| store.delete()).await?;
-        Ok(result)
-    }
-    async fn logout_locked(&self) -> Result<Value> {
-        let Some(mut state) = self.load().await? else {
-            return Ok(json!({"revoked":true,"alreadyLoggedOut":true}));
-        };
-        if state.device.is_none() {
-            if let Some(login) = state
-                .login
-                .as_ref()
-                .filter(|login| login.transaction_id.is_some())
-            {
-                let flow = login.flow_id.clone();
-                self.cancel_login_locked(&mut state, &flow).await?;
-                if let Some(listener) = self.listeners.lock().await.remove(&flow) {
-                    listener.abort()
+                    .map_err(|error| {
+                        cleanup_failure(error.into(), "remote_revocation", "pending")
+                    })?;
+                if response["revoked"] != true {
+                    return Err(cleanup_failure(
+                        anyhow!("AUTH_LOGOUT_FAILED"),
+                        "remote_revocation",
+                        "pending",
+                    ));
                 }
+                self.revalidate(&state).await.map_err(|error| {
+                    cleanup_failure(error, "identity_verification", "confirmed")
+                })?;
+                state.revocation = Some(RevocationEvidence {
+                    identity: credential_identity(&state),
+                    kind: "device_logout".into(),
+                    confirmed_at: now(),
+                });
+                // Write confirmation with all recovery authority still intact.
+                // A subsequent clearing/delete failure can resume without dispatch.
+                self.save(&state)
+                    .await
+                    .map_err(|error| cleanup_failure(error, "revocation_evidence", "confirmed"))?;
+                confirmed = true;
             }
         }
-        if let Some(device) = state.device.as_ref() {
-            // Logout accepts the historical signed access token, including after
-            // expiry or revocation. Never rotate credentials before recording intent.
-            state.logout_pending = true;
-            self.save(&state).await?;
-            let credential = device.signed(&state);
-            self.api
-                .request(
-                    "POST",
-                    "v2/device-authorities/logout/",
-                    Some(json!({})),
-                    Some(&credential),
-                    None,
-                )
-                .await?;
-        }
-        self.revalidate(&state).await?;
+        let remote = if confirmed {
+            "confirmed"
+        } else {
+            "not_required"
+        };
+        self.revalidate(&state)
+            .await
+            .map_err(|error| cleanup_failure(error, "identity_verification", remote))?;
         state.device = None;
         state.children.clear();
         state.organization_profiles.clear();
@@ -1719,8 +2047,21 @@ impl Auth {
         state.login = None;
         state.logout_pending = false;
         state.active_organization = None;
-        self.save(&state).await?;
-        Ok(json!({"revoked":true}))
+        self.save(&state)
+            .await
+            .map_err(|error| cleanup_failure(error, "protected_store_clear", remote))?;
+        if delete {
+            self.revalidate(&state)
+                .await
+                .map_err(|error| cleanup_failure(error, "identity_verification", remote))?;
+            self.store_operation(true, |store| store.delete())
+                .await
+                .map_err(|error| cleanup_failure(error, "protected_store_delete", remote))?;
+        }
+        Ok(
+            json!({"revoked":confirmed,"remoteRevocation":remote,"protectedStoreRemoved":delete,
+            "identity":credential_identity(&state)}),
+        )
     }
     async fn ensure_device(&self, state: &mut ProtectedState) -> Result<()> {
         Self::allowed(state)?;
@@ -1755,6 +2096,7 @@ impl Auth {
         body: Value,
     ) -> Result<()> {
         ensure!(state.pending.is_none(), "AUTH_RECOVERY_PENDING");
+        state.revocation = None;
         state.pending = Some(Pending {
             target,
             route,
@@ -1861,6 +2203,16 @@ impl Auth {
                     self.save(state).await?;
                     bail!("LOGIN_ALREADY_APPROVED")
                 }
+                if state.logout_pending {
+                    state.revocation = Some(RevocationEvidence {
+                        identity: credential_identity(state),
+                        kind: "browser_cancel".into(),
+                        confirmed_at: now(),
+                    });
+                    self.save(state).await.map_err(|error| {
+                        cleanup_failure(error, "revocation_evidence", "confirmed")
+                    })?;
+                }
                 state.login = None;
             }
             Target::Bootstrap => {
@@ -1926,8 +2278,45 @@ impl Auth {
             }
         }
         state.pending = None;
-        self.save(state).await
+        self.save(state).await.map_err(|error| {
+            if state.logout_pending && valid_revocation(state) {
+                cleanup_failure(error, "protected_store_clear", "confirmed")
+            } else {
+                error
+            }
+        })
     }
+}
+fn credential_identity(state: &ProtectedState) -> CredentialIdentity {
+    CredentialIdentity {
+        installation_id: state.installation_id.clone(),
+        device_id: state
+            .device
+            .as_ref()
+            .map(|device| device.subject.clone())
+            .or_else(|| {
+                state
+                    .revocation
+                    .as_ref()
+                    .filter(|proof| proof.identity.installation_id == state.installation_id)
+                    .and_then(|proof| proof.identity.device_id.clone())
+            }),
+    }
+}
+fn valid_revocation(state: &ProtectedState) -> bool {
+    state.revocation.as_ref().is_some_and(|proof| {
+        proof.identity == credential_identity(state)
+            && match proof.kind.as_str() {
+                "device_logout" => proof.identity.device_id.is_some(),
+                "browser_cancel" => {
+                    state.device.is_none()
+                        && state.children.is_empty()
+                        && proof.identity.device_id.is_none()
+                }
+                _ => false,
+            }
+            && proof.confirmed_at > 0
+    })
 }
 const PERSONA_SCOPES: [&str; 4] = [
     "runner.personas.read",
@@ -2469,6 +2858,7 @@ mod tests {
             operation_lock: Arc::new(Mutex::new(())),
             store_lock: Arc::new(Mutex::new(())),
             store_owner: Arc::new(std::sync::Mutex::new(None)),
+            credential_owner: None,
             listeners: Arc::new(Mutex::new(BTreeMap::new())),
         };
         let projection = auth.connection(None, 0).await;
@@ -2602,6 +2992,7 @@ mod tests {
             operation_lock: Arc::new(Mutex::new(())),
             store_lock: Arc::new(Mutex::new(())),
             store_owner: Arc::new(std::sync::Mutex::new(None)),
+            credential_owner: None,
             listeners: Arc::new(Mutex::new(BTreeMap::new())),
         };
         (auth, store, listener)
@@ -3346,6 +3737,614 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn online_logout_preserves_unresolved_bootstrap_authority() {
+        let (auth, store, listener) = test_auth().await;
+        let mut state = ProtectedState::fresh();
+        state.pending = Some(Pending {
+            target: Target::Bootstrap,
+            route: "v2/device-authorities/bootstrap/".into(),
+            body: json!({"bootstrapGrant":"original-grant","proof":"original-proof"}),
+            started_at: now(),
+            recovery_used: false,
+            superseded: None,
+        });
+        let installation = state.installation_id.clone();
+        let signing_key = state.private_key;
+        auth.save(&state).await.unwrap();
+        let server = tokio::spawn(async move {
+            let accepted =
+                tokio::time::timeout(Duration::from_millis(100), listener.accept()).await;
+            if let Ok(Ok((mut stream, _))) = accepted {
+                assert_eq!(read_request(&mut stream).await["proof"], "original-proof");
+                respond(
+                    &mut stream,
+                    409,
+                    json!({"error":{"code":"RECOVERY_EXHAUSTED"}}),
+                )
+                .await;
+            }
+        });
+        assert!(auth.logout().await.is_err());
+        server.await.unwrap();
+        let durable: ProtectedState =
+            serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+        assert_eq!(durable.installation_id, installation);
+        assert_eq!(durable.private_key, signing_key);
+        assert!(durable.logout_pending);
+        assert_eq!(durable.pending.unwrap().body["proof"], "original-proof");
+    }
+
+    #[tokio::test]
+    async fn absent_credential_store_is_not_confirmed_remote_revocation() {
+        let (auth, store, _) = test_auth().await;
+        assert_eq!(auth.offline_logout().await.unwrap()["revoked"], false);
+        assert!(store.load().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn browser_cancellation_cannot_discard_orphaned_child_authority() {
+        let (auth, store, listener) = test_auth().await;
+        let mut state = ProtectedState::fresh();
+        state.children.insert(
+            "organization".into(),
+            Token {
+                access: "child-access".into(),
+                refresh: "child-refresh".into(),
+                subject: "runner".into(),
+                expires_at: 0,
+            },
+        );
+        state.login = Some(Login {
+            flow_id: "browser-flow".into(),
+            transaction_id: Some("transaction".into()),
+            browser_state: Some("original-state".into()),
+            ..Login::default()
+        });
+        auth.save(&state).await.unwrap();
+        let error = auth.logout().await.unwrap_err();
+        assert_eq!(error.to_string(), "AUTH_RECONCILIATION_REQUIRED");
+        let durable: ProtectedState =
+            serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+        assert!(durable.logout_pending && durable.revocation.is_none());
+        assert_eq!(durable.children["organization"].refresh, "child-refresh");
+        assert_eq!(
+            durable.login.unwrap().browser_state.unwrap(),
+            "original-state"
+        );
+        assert_eq!(
+            listener.into_std().unwrap().accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_bootstrap_recovery_reports_effective_identity_for_two_phase_cleanup() {
+        let (auth, store, listener) = test_auth().await;
+        let mut state = ProtectedState::fresh();
+        state.pending = Some(Pending {
+            target: Target::Bootstrap,
+            route: "v2/device-authorities/bootstrap/".into(),
+            body: json!({"bootstrapGrant":"original-grant","proof":"original-proof"}),
+            started_at: now(),
+            recovery_used: false,
+            superseded: None,
+        });
+        auth.save(&state).await.unwrap();
+        let expected = auth.maintenance_identity().await.unwrap().unwrap();
+        assert!(expected.device_id.is_none());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(read_request(&mut stream).await["proof"], "original-proof");
+            respond(
+                &mut stream,
+                200,
+                json!({"data":{"device":{"deviceId":"recovered-device",
+                "accessToken":"lmxda_prefix_access","refreshToken":"refresh","expiresInSeconds":3600}}}),
+            )
+            .await;
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(read_request(&mut stream).await, json!({}));
+            respond(&mut stream, 200, json!({"data":{"revoked":true}})).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let first = auth.maintenance_logout(&expected, false).await.unwrap();
+        let effective: CredentialIdentity =
+            serde_json::from_value(first["identity"].clone()).unwrap();
+        assert_eq!(effective.installation_id, expected.installation_id);
+        assert_eq!(effective.device_id.as_deref(), Some("recovered-device"));
+        assert_eq!(first["remoteRevocation"], "confirmed");
+        assert_eq!(first["protectedStoreRemoved"], false);
+        assert!(store.load().unwrap().is_some());
+        assert_eq!(
+            auth.maintenance_identity().await.unwrap(),
+            Some(effective.clone())
+        );
+        let second = auth.maintenance_logout(&effective, true).await.unwrap();
+        assert_eq!(second["remoteRevocation"], "confirmed");
+        assert_eq!(second["protectedStoreRemoved"], true);
+        assert!(store.load().unwrap().is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn maintenance_identity_mismatch_refuses_dispatch_and_preserves_store() {
+        for mismatch in ["installation", "device"] {
+            let (auth, store, listener) = test_auth().await;
+            let mut state = ProtectedState::fresh();
+            state.device = Some(Token {
+                access: "lmxda_prefix_SECRET-access".into(),
+                refresh: "SECRET-refresh".into(),
+                subject: "device".into(),
+                expires_at: 0,
+            });
+            auth.save(&state).await.unwrap();
+            let before = store.load().unwrap();
+            let mut expected = auth.maintenance_identity().await.unwrap().unwrap();
+            let safe = serde_json::to_string(&expected).unwrap();
+            assert!(!safe.contains("SECRET"));
+            if mismatch == "installation" {
+                expected.installation_id = "different-installation".into();
+            } else {
+                expected.device_id = Some("different-device".into());
+            }
+            let error = auth.maintenance_logout(&expected, true).await.unwrap_err();
+            assert_eq!(error.to_string(), "AUTH_IDENTITY_CHANGED");
+            assert_eq!(
+                cleanup_error_metadata(&error).unwrap()["failureStage"],
+                "identity_verification"
+            );
+            assert_eq!(store.load().unwrap(), before);
+            assert_eq!(
+                listener.into_std().unwrap().accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn maintenance_identity_change_after_remote_ack_never_clears_replacement() {
+        let (auth, store, listener) = test_auth().await;
+        let mut state = ProtectedState::fresh();
+        state.device = Some(Token {
+            access: "lmxda_prefix_access".into(),
+            refresh: "refresh".into(),
+            subject: "device".into(),
+            expires_at: 0,
+        });
+        auth.save(&state).await.unwrap();
+        let expected = auth.maintenance_identity().await.unwrap().unwrap();
+        let replacement = ProtectedState::fresh();
+        let replacement_bytes = serde_json::to_vec(&replacement).unwrap();
+        let remote_store = store.clone();
+        let expected_bytes = replacement_bytes.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            read_request(&mut stream).await;
+            remote_store.save(&replacement_bytes).unwrap();
+            respond(&mut stream, 200, json!({"data":{"revoked":true}})).await;
+        });
+        let error = auth.maintenance_logout(&expected, true).await.unwrap_err();
+        server.await.unwrap();
+        assert_eq!(error.to_string(), "AUTH_IDENTITY_CHANGED");
+        assert_eq!(
+            cleanup_error_metadata(&error).unwrap()["remoteRevocation"],
+            "confirmed"
+        );
+        assert_eq!(store.load().unwrap().unwrap(), expected_bytes);
+    }
+
+    fn assert_post_remote_cleanup_error_envelopes(error: &anyhow::Error, code: &str, stage: &str) {
+        let rpc = crate::control::rpc_public_error(error);
+        assert_eq!(rpc["code"], "AUTH_CLEANUP_OUTCOME_PENDING");
+        assert_eq!(rpc["outcome"], "unknown");
+        assert_eq!(rpc["recovery"], "reconcile_outcome");
+        assert_eq!(rpc["data"]["failureStage"], stage);
+        assert_eq!(rpc["data"]["remoteRevocation"], "confirmed");
+        let cli = crate::control::public_error_record(error);
+        assert_eq!(cli["code"], code);
+        assert_eq!(cli["outcome"], "unknown");
+        assert_eq!(cli["recovery"], "reconcile_outcome");
+        assert_eq!(cli["data"], cleanup_error_metadata(error).unwrap());
+        assert_eq!(rpc["data"], cli["data"]);
+        assert!(!rpc.to_string().contains("SECRET"));
+        assert!(!cli.to_string().contains("SECRET"));
+    }
+
+    #[test]
+    fn rpc_cleanup_error_preserves_not_dispatched_store_codes() {
+        for code in [
+            "STORE_ACCESS_REQUIRED",
+            "STORE_ACCESS_DENIED",
+            "STORE_UNAVAILABLE",
+            "STORE_OPERATION_PENDING",
+            "STORE_OWNER_BUSY",
+        ] {
+            let error = cleanup_failure(anyhow!(code), "protected_store_read", "not_dispatched");
+            let rpc = crate::control::rpc_public_error(&error);
+            assert_eq!(rpc["code"], code);
+            assert_eq!(rpc["outcome"], "not_dispatched");
+            assert_eq!(rpc["data"]["remoteRevocation"], "not_dispatched");
+            assert_eq!(rpc["data"]["failureStage"], "protected_store_read");
+            let cli = crate::control::public_error_record(&error);
+            assert_eq!(cli["code"], code);
+            assert_eq!(cli["outcome"], "not_dispatched");
+        }
+        let error = cleanup_failure(anyhow!("STORE_UNAVAILABLE"), "remote_revocation", "pending");
+        let rpc = crate::control::rpc_public_error(&error);
+        assert_eq!(rpc["code"], "AUTH_CLEANUP_OUTCOME_PENDING");
+        assert_eq!(rpc["outcome"], "unknown");
+        assert_eq!(rpc["recovery"], "reconcile_outcome");
+    }
+
+    #[tokio::test]
+    async fn revocation_evidence_precedes_clear_and_survives_clear_failure_without_replay() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct FailClear {
+            memory: Arc<MemoryStore>,
+            fail: AtomicBool,
+        }
+        impl Store for FailClear {
+            fn load(&self) -> Result<Option<Vec<u8>>> {
+                self.memory.load()
+            }
+            fn save(&self, bytes: &[u8]) -> Result<()> {
+                let next: ProtectedState = serde_json::from_slice(bytes)?;
+                if next.revocation.is_some()
+                    && next.device.is_none()
+                    && self.fail.swap(false, Ordering::SeqCst)
+                {
+                    let durable: ProtectedState =
+                        serde_json::from_slice(&self.memory.load()?.unwrap())?;
+                    ensure!(
+                        durable.device.is_some() && valid_revocation(&durable),
+                        "proof cleared before evidence"
+                    );
+                    bail!("STORE_ACCESS_DENIED")
+                }
+                self.memory.save(bytes)
+            }
+            fn delete(&self) -> Result<()> {
+                self.memory.delete()
+            }
+        }
+        let (mut auth, memory, listener) = test_auth().await;
+        auth.store = Arc::new(FailClear {
+            memory: memory.clone(),
+            fail: AtomicBool::new(true),
+        });
+        let mut state = ProtectedState::fresh();
+        state.device = Some(Token {
+            access: "lmxda_prefix_SECRET-access".into(),
+            refresh: "SECRET-refresh".into(),
+            subject: "device".into(),
+            expires_at: 0,
+        });
+        auth.save(&state).await.unwrap();
+        let expected = auth.maintenance_identity().await.unwrap().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            read_request(&mut stream).await;
+            respond(&mut stream, 200, json!({"data":{"revoked":true}})).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let error = auth.maintenance_logout(&expected, true).await.unwrap_err();
+        let metadata = cleanup_error_metadata(&error).unwrap();
+        assert_eq!(metadata["failureStage"], "protected_store_clear");
+        assert_post_remote_cleanup_error_envelopes(
+            &error,
+            "STORE_ACCESS_DENIED",
+            "protected_store_clear",
+        );
+        assert_eq!(metadata["failureCategory"], "access_denied");
+        assert_eq!(metadata["remoteRevocation"], "confirmed");
+        assert!(!metadata.to_string().contains("SECRET"));
+        let durable: ProtectedState =
+            serde_json::from_slice(&memory.load().unwrap().unwrap()).unwrap();
+        assert!(durable.device.is_some() && durable.logout_pending && valid_revocation(&durable));
+        assert_eq!(durable.revocation.as_ref().unwrap().identity, expected);
+        let result = auth.maintenance_logout(&expected, true).await.unwrap();
+        assert_eq!(result["revoked"], true);
+        assert_eq!(result["protectedStoreRemoved"], true);
+        assert!(memory.load().unwrap().is_none());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_revocation_evidence_write_retains_original_authority() {
+        struct FailEvidence(Arc<MemoryStore>);
+        impl Store for FailEvidence {
+            fn load(&self) -> Result<Option<Vec<u8>>> {
+                self.0.load()
+            }
+            fn save(&self, bytes: &[u8]) -> Result<()> {
+                let state: ProtectedState = serde_json::from_slice(bytes)?;
+                if state.revocation.is_some() {
+                    bail!("STORE_UNAVAILABLE")
+                }
+                self.0.save(bytes)
+            }
+            fn delete(&self) -> Result<()> {
+                panic!("evidence failure must not delete")
+            }
+        }
+        let (mut auth, memory, listener) = test_auth().await;
+        auth.store = Arc::new(FailEvidence(memory.clone()));
+        let mut state = ProtectedState::fresh();
+        state.device = Some(Token {
+            access: "lmxda_prefix_access".into(),
+            refresh: "refresh".into(),
+            subject: "device".into(),
+            expires_at: 0,
+        });
+        let original_key = state.private_key;
+        auth.save(&state).await.unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            read_request(&mut stream).await;
+            respond(&mut stream, 200, json!({"data":{"revoked":true}})).await;
+        });
+        let error = auth.offline_logout().await.unwrap_err();
+        server.await.unwrap();
+        let metadata = cleanup_error_metadata(&error).unwrap();
+        assert_eq!(metadata["failureStage"], "revocation_evidence");
+        assert_post_remote_cleanup_error_envelopes(
+            &error,
+            "STORE_UNAVAILABLE",
+            "revocation_evidence",
+        );
+        assert_eq!(metadata["remoteRevocation"], "confirmed");
+        let durable: ProtectedState =
+            serde_json::from_slice(&memory.load().unwrap().unwrap()).unwrap();
+        assert_eq!(durable.private_key, original_key);
+        assert!(durable.device.is_some() && durable.logout_pending && durable.revocation.is_none());
+    }
+
+    #[tokio::test]
+    async fn logout_http_rejection_preserves_only_typed_remote_diagnostics() {
+        let (auth, store, listener) = test_auth().await;
+        let mut state = ProtectedState::fresh();
+        state.device = Some(Token {
+            access: "lmxda_prefix_SECRET-access".into(),
+            refresh: "SECRET-refresh".into(),
+            subject: "device".into(),
+            expires_at: 0,
+        });
+        let original_key = state.private_key;
+        auth.save(&state).await.unwrap();
+        let correlation = "11111111-1111-4111-8111-111111111111";
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            read_request(&mut stream).await;
+            respond(&mut stream, 409, json!({
+                "error":{"code":"DEVICE_AUTHORITY_REVOKE_REJECTED","message":"SECRET provider message", "details":{"token":"SECRET body field"}},
+                "meta":{"correlationId":correlation},"providerOutput":"SECRET provider output",
+            })).await;
+        });
+        let error = auth.logout().await.unwrap_err();
+        server.await.unwrap();
+        assert_eq!(error.to_string(), "AUTH_LOGOUT_FAILED");
+        let metadata = cleanup_error_metadata(&error).unwrap();
+        assert_eq!(metadata["failureStage"], "remote_revocation");
+        assert_eq!(metadata["remoteRevocation"], "pending");
+        assert_eq!(metadata["httpStatus"], 409);
+        assert_eq!(metadata["correlationId"], correlation);
+        assert_eq!(metadata["remoteCode"], "DEVICE_AUTHORITY_REVOKE_REJECTED");
+        assert!(metadata["nativeOsStatus"].is_null());
+        let cli = crate::control::public_error_record(&error);
+        assert_eq!(cli["code"], "AUTH_LOGOUT_FAILED");
+        assert_eq!(cli["data"], metadata);
+        let rpc = crate::control::rpc_public_error(&error);
+        assert_eq!(rpc["code"], "AUTH_CLEANUP_OUTCOME_PENDING");
+        assert_eq!(rpc["outcome"], "unknown");
+        assert_eq!(rpc["data"], metadata);
+        for projection in [metadata, cli, rpc] {
+            assert!(!projection.to_string().contains("SECRET"));
+        }
+        let durable: ProtectedState =
+            serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+        assert_eq!(durable.private_key, original_key);
+        assert!(durable.device.is_some() && durable.logout_pending && durable.revocation.is_none());
+    }
+
+    #[test]
+    fn cleanup_remote_diagnostics_filter_untrusted_reference_and_code_fields() {
+        for (code, accepted) in [
+            ("A".repeat(120), true),
+            ("A".repeat(121), false),
+            ("".into(), false),
+            ("lowercase".into(), false),
+            ("BAD CODE".into(), false),
+            ("CODE\nSECRET".into(), false),
+        ] {
+            let error = cleanup_failure(
+                crate::api::ApiError {
+                    code: code.clone(),
+                    retryable: false,
+                    status: Some(999),
+                    correlation_id: Some("SECRET invalid correlation reference".into()),
+                    data: Some(json!({"providerOutput":"SECRET arbitrary body"})),
+                }
+                .into(),
+                "remote_revocation",
+                "pending",
+            );
+            let metadata = cleanup_error_metadata(&error).unwrap();
+            assert!(metadata["httpStatus"].is_null());
+            assert!(metadata["correlationId"].is_null());
+            if accepted {
+                assert_eq!(metadata["remoteCode"], code);
+            } else {
+                assert!(metadata["remoteCode"].is_null());
+            }
+            assert!(!metadata.to_string().contains("SECRET"));
+        }
+        let error = cleanup_failure(
+            store_failure("STORE_UNAVAILABLE", "native_io_timeout"),
+            "protected_store_read",
+            "not_dispatched",
+        );
+        let metadata = cleanup_error_metadata(&error).unwrap();
+        for field in ["httpStatus", "correlationId", "remoteCode"] {
+            assert!(metadata[field].is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn success_response_without_revocation_ack_retains_authority() {
+        let (auth, store, listener) = test_auth().await;
+        let mut state = ProtectedState::fresh();
+        state.device = Some(Token {
+            access: "lmxda_prefix_access".into(),
+            refresh: "refresh".into(),
+            subject: "device".into(),
+            expires_at: 0,
+        });
+        auth.save(&state).await.unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            read_request(&mut stream).await;
+            respond(&mut stream, 200, json!({"data":{}})).await;
+        });
+        let error = auth.logout().await.unwrap_err();
+        server.await.unwrap();
+        assert_eq!(
+            cleanup_error_metadata(&error).unwrap()["remoteRevocation"],
+            "pending"
+        );
+        let durable: ProtectedState =
+            serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+        assert!(durable.device.is_some() && durable.logout_pending && durable.revocation.is_none());
+    }
+
+    #[tokio::test]
+    async fn new_login_cannot_reuse_old_revocation_evidence() {
+        let (auth, store, listener) = test_auth().await;
+        let mut state = ProtectedState::fresh();
+        state.revocation = Some(RevocationEvidence {
+            identity: CredentialIdentity {
+                installation_id: state.installation_id.clone(),
+                device_id: Some("old-device".into()),
+            },
+            kind: "device_logout".into(),
+            confirmed_at: now(),
+        });
+        assert!(valid_revocation(&state));
+        auth.save(&state).await.unwrap();
+        let server_store = store.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            read_request(&mut stream).await;
+            let durable: ProtectedState =
+                serde_json::from_slice(&server_store.load().unwrap().unwrap()).unwrap();
+            assert!(durable.revocation.is_none() && durable.login.is_some());
+            respond(
+                &mut stream,
+                503,
+                json!({"error":{"code":"BACKEND_UNAVAILABLE"}}),
+            )
+            .await;
+        });
+        assert!(
+            auth.login("runner", "new-login-abcdefghijklmnop")
+                .await
+                .is_err()
+        );
+        server.await.unwrap();
+        let durable: ProtectedState =
+            serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+        assert!(!valid_revocation(&durable));
+        assert_eq!(credential_identity(&durable).device_id, None);
+    }
+
+    #[test]
+    fn credential_owner_is_shared_and_rejects_symlink_or_public_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("owner");
+        let owner = acquire_credential_owner_at(&path).unwrap();
+        assert_eq!(
+            acquire_credential_owner_at(&path).unwrap_err().to_string(),
+            "STORE_OWNER_BUSY"
+        );
+        drop(owner);
+        drop(acquire_credential_owner_at(&path).unwrap());
+        let lock_path = path.join("owner.lock");
+        let alias = path.join("alias.lock");
+        std::fs::hard_link(&lock_path, &alias).unwrap();
+        assert!(acquire_credential_owner_at(&path).is_err());
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::remove_file(&lock_path).unwrap();
+        std::os::unix::fs::symlink(&alias, &lock_path).unwrap();
+        assert!(acquire_credential_owner_at(&path).is_err());
+        std::fs::remove_file(&lock_path).unwrap();
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = root.path().join("linked");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(acquire_credential_owner_at(&link).is_err());
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(acquire_credential_owner_at(&path).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_status_metadata_stays_distinct_from_timeout_without_acl_inference() {
+        let error = cleanup_failure(
+            native_store_error(-36),
+            "protected_store_delete",
+            "confirmed",
+        );
+        let metadata = cleanup_error_metadata(&error).unwrap();
+        assert_eq!(metadata["nativeOsStatus"], -36);
+        assert_eq!(metadata["failureCategory"], "native_os_error");
+        for field in ["httpStatus", "correlationId", "remoteCode"] {
+            assert!(metadata[field].is_null());
+        }
+        assert_eq!(metadata["remoteRevocation"], "confirmed");
+        let error = cleanup_failure(
+            store_failure("STORE_OPERATION_PENDING", "native_io_timeout"),
+            "protected_store_delete",
+            "confirmed",
+        );
+        let metadata = cleanup_error_metadata(&error).unwrap();
+        assert!(metadata["nativeOsStatus"].is_null());
+        assert_eq!(metadata["failureCategory"], "native_io_timeout");
+        assert!(!metadata.to_string().contains("ACL"));
+    }
+
+    #[tokio::test]
     async fn offline_cleanup_preserves_recovery_until_revocation_and_retries_delete_failure() {
         use std::sync::atomic::{AtomicBool, Ordering};
         struct DeleteOnce {
@@ -3410,9 +4409,12 @@ mod tests {
         let durable: ProtectedState =
             serde_json::from_slice(&memory.load().unwrap().unwrap()).unwrap();
         assert!(durable.logout_pending && durable.device.is_some());
-        assert_eq!(
-            auth.offline_logout().await.unwrap_err().to_string(),
-            "STORE_UNAVAILABLE"
+        let delete_error = auth.offline_logout().await.unwrap_err();
+        assert_eq!(delete_error.to_string(), "STORE_UNAVAILABLE");
+        assert_post_remote_cleanup_error_envelopes(
+            &delete_error,
+            "STORE_UNAVAILABLE",
+            "protected_store_delete",
         );
         let durable: ProtectedState =
             serde_json::from_slice(&memory.load().unwrap().unwrap()).unwrap();
@@ -3459,6 +4461,7 @@ mod tests {
             operation_lock: Arc::new(Mutex::new(())),
             store_lock: Arc::new(Mutex::new(())),
             store_owner: Arc::new(std::sync::Mutex::new(None)),
+            credential_owner: None,
             listeners: Arc::new(Mutex::new(BTreeMap::new())),
         };
         let original = auth.installation_id().await.unwrap();
@@ -3677,6 +4680,7 @@ mod tests {
                 operation_lock: Arc::new(Mutex::new(())),
                 store_lock: Arc::new(Mutex::new(())),
                 store_owner: Arc::new(std::sync::Mutex::new(None)),
+                credential_owner: None,
                 listeners: Arc::new(Mutex::new(BTreeMap::new())),
             };
             let operation_auth = auth.clone();
@@ -3802,6 +4806,7 @@ mod tests {
             operation_lock: Arc::new(Mutex::new(())),
             store_lock: Arc::new(Mutex::new(())),
             store_owner: Arc::new(std::sync::Mutex::new(None)),
+            credential_owner: None,
             listeners: Arc::new(Mutex::new(BTreeMap::new())),
         };
         let copy = auth.clone();
@@ -3830,6 +4835,7 @@ mod tests {
             operation_lock: Arc::new(Mutex::new(())),
             store_lock: Arc::new(Mutex::new(())),
             store_owner: Arc::new(std::sync::Mutex::new(None)),
+            credential_owner: None,
             listeners: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -3866,6 +4872,12 @@ mod tests {
             auth.credential("org").await.err().unwrap().to_string(),
             "STORE_ACCESS_DENIED"
         );
+        let error = auth.offline_logout().await.unwrap_err();
+        let rpc = crate::control::rpc_public_error(&error);
+        assert_eq!(rpc["code"], "STORE_ACCESS_DENIED");
+        assert_eq!(rpc["outcome"], "not_dispatched");
+        assert_eq!(rpc["data"]["remoteRevocation"], "not_dispatched");
+        assert_eq!(rpc["data"]["failureStage"], "protected_store_read");
     }
     #[tokio::test]
     async fn timed_out_write_retains_serialization_and_late_completion_cannot_overtake_logout() {
@@ -3917,7 +4929,9 @@ mod tests {
         );
         assert_eq!(store.writes.load(std::sync::atomic::Ordering::SeqCst), 1);
         release.send(()).unwrap();
-        assert_eq!(auth.offline_logout().await.unwrap()["revoked"], true);
+        let result = auth.offline_logout().await.unwrap();
+        assert_eq!(result["revoked"], false);
+        assert_eq!(result["remoteRevocation"], "not_required");
         assert!(store.bytes.lock().unwrap().is_none());
         assert_eq!(auth.status().await.unwrap()["authenticated"], false);
     }
@@ -4152,9 +5166,11 @@ mod tests {
             .open(&path)
             .unwrap();
         let (release, receiver) = std::sync::mpsc::channel();
-        let auth = auth_with_store(Arc::new(DelayedDelete {
+        let mut auth = auth_with_store(Arc::new(DelayedDelete {
             release: std::sync::Mutex::new(receiver),
         }));
+        let credential_path = dir.path().join("global-owner");
+        auth.credential_owner = Some(acquire_credential_owner_at(&credential_path).unwrap());
         auth.retain_store_owner(&owner);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -4170,6 +5186,7 @@ mod tests {
         runtime.shutdown_timeout(Duration::from_millis(20));
         let disposed_in = before.elapsed();
         let still_owned = contender.try_lock_exclusive().is_err();
+        let credential_still_owned = acquire_credential_owner_at(&credential_path).is_err();
         // Release our fake native worker even if an assertion is going to fail.
         release.send(()).unwrap();
         assert!(
@@ -4177,6 +5194,10 @@ mod tests {
             "runtime disposal blocked"
         );
         assert!(still_owned, "late native delete lost singleton ownership");
+        assert!(
+            credential_still_owned,
+            "late native delete lost user-global credential ownership"
+        );
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while contender.try_lock_exclusive().is_err() {
             assert!(
@@ -4185,6 +5206,7 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+        drop(acquire_credential_owner_at(&credential_path).unwrap());
     }
     #[tokio::test]
     async fn disposed_daemon_owner_cannot_start_late_native_io() {

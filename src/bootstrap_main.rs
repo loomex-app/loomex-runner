@@ -17,6 +17,12 @@ use std::{
     process::Stdio,
 };
 use uuid::Uuid;
+#[path = "bootstrap_preflight.rs"]
+mod bootstrap_preflight;
+#[path = "bootstrap_uninstall.rs"]
+mod bootstrap_uninstall;
+#[path = "uninstall_state.rs"]
+mod uninstall_state;
 
 fn main() {
     if let Err(error) = entry() {
@@ -45,11 +51,12 @@ struct Arguments {
     launch_agents_dir: Option<PathBuf>,
     settled_abandonment: Option<Uuid>,
     authorize_keychain_transition: bool,
+    expected_old_journal_sha256: Option<String>,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: loomex-lifecycle-bootstrap install RELEASE [--public-key FILE | --allow-unsigned-development (--development-api-origin LOOPBACK_URL | --preview-api-origin HTTPS_URL)] [--authorize-keychain-transition] [--settled-abandonment UUID] [--provider-executable PROVIDER=/absolute/path] [--install-base DIR --state-dir DIR --launch-agents-dir DIR]\n       loomex-lifecycle-bootstrap uninstall [--install-base DIR --state-dir DIR --launch-agents-dir DIR]"
+        "usage: loomex-lifecycle-bootstrap install RELEASE [--public-key FILE | --allow-unsigned-development (--development-api-origin LOOPBACK_URL | --preview-api-origin HTTPS_URL)] [--authorize-keychain-transition] [--settled-abandonment UUID] [--provider-executable PROVIDER=/absolute/path] [--install-base DIR --state-dir DIR --launch-agents-dir DIR]\n       loomex-lifecycle-bootstrap uninstall [--install-base DIR --state-dir DIR --launch-agents-dir DIR]\n       loomex-lifecycle-bootstrap preflight RELEASE [install options]\n       loomex-lifecycle-bootstrap recover-uninstall RELEASE --expected-old-journal-sha256 SHA256 [release verification and path options]"
     );
     std::process::exit(2)
 }
@@ -62,7 +69,10 @@ fn parse() -> (String, Arguments) {
         .to_string_lossy()
         .into_owned();
     let mut parsed = Arguments::default();
-    if command == "install" {
+    if matches!(
+        command.as_str(),
+        "install" | "preflight" | "recover-uninstall"
+    ) {
         parsed.release = Some(PathBuf::from(values.next().unwrap_or_else(|| usage())));
     }
     while let Some(value) = values.next() {
@@ -76,12 +86,28 @@ fn parse() -> (String, Arguments) {
                         .unwrap_or_else(|_| usage()),
                 );
             }
+            "--expected-old-journal-sha256" => {
+                if command != "recover-uninstall" || parsed.expected_old_journal_sha256.is_some() {
+                    usage();
+                }
+                parsed.expected_old_journal_sha256 = Some(
+                    values
+                        .next()
+                        .unwrap_or_else(|| usage())
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
             "--public-key" => {
                 parsed.public_key = Some(PathBuf::from(values.next().unwrap_or_else(|| usage())))
             }
             "--allow-unsigned-development" => parsed.allow_unsigned_development = true,
             "--authorize-keychain-transition" => {
-                if command != "install" || parsed.authorize_keychain_transition {
+                if !matches!(
+                    command.as_str(),
+                    "install" | "preflight" | "recover-uninstall"
+                ) || parsed.authorize_keychain_transition
+                {
                     usage();
                 }
                 parsed.authorize_keychain_transition = true;
@@ -96,7 +122,11 @@ fn parse() -> (String, Arguments) {
                 )
             }
             "--preview-api-origin" => {
-                if command != "install" || parsed.preview_api_origin.is_some() {
+                if !matches!(
+                    command.as_str(),
+                    "install" | "preflight" | "recover-uninstall"
+                ) || parsed.preview_api_origin.is_some()
+                {
                     usage();
                 }
                 parsed.preview_api_origin = Some(
@@ -1254,276 +1284,15 @@ fn pending_update_message(value: &Value) -> &'static str {
 }
 
 async fn uninstall(args: Arguments) -> Result<()> {
-    let paths = paths(&args)?;
-    let _lock = lifecycle::LifecycleLock::acquire(&paths)?;
-    lifecycle::require_terminal_before_uninstall(&paths)?;
-    let journal_path = paths.state_dir.join("bootstrap-uninstall.json");
-    let mut journal: Value = if journal_path.exists() {
-        let value: Value = state::read_json(&journal_path)?;
-        if value["schema"] != "app.loomex.runner.bootstrap-uninstall/v1"
-            || !matches!(value["phase"].as_str(), Some("prepared") | Some("revoked"))
-            || value["helper"].as_str().is_none()
-            || value["helperSha256"].as_str().is_none()
-            || !value["inventories"].is_array()
-        {
-            bail!("invalid bootstrap uninstall journal")
-        }
-        value
-    } else {
-        let receipt: Value = state::read_json(&paths.state_dir.join("install-receipt.json"))
-            .context("owned installation receipt is required")?;
-        let owned: Value = state::read_json(&paths.state_dir.join("owned-versions.json"))
-            .context("owned version inventory is required")?;
-        validate_owned_installation(&paths, &receipt, &owned, false)?;
-        let helper = paths.state_dir.join("bootstrap-uninstall-helper");
-        let bootstrap = PathBuf::from(
-            receipt["versionPath"]
-                .as_str()
-                .context("owned installation receipt has no version path")?,
-        )
-        .join("bin/loomex-lifecycle-bootstrap");
-        let expected = receipt["bootstrapSha256"]
-            .as_str()
-            .context("owned installation receipt has no bootstrap digest")?;
-        let metadata = fs::symlink_metadata(&bootstrap)?;
-        if !metadata.is_file()
-            || metadata.file_type().is_symlink()
-            || state::digest(&fs::read(&bootstrap)?) != expected
-        {
-            bail!("installed lifecycle bootstrap is invalid")
-        }
-        state::atomic_write(&helper, &fs::read(&bootstrap)?)?;
-        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700))?;
-        let value = json!({
-            "schema":"app.loomex.runner.bootstrap-uninstall/v1",
-            "phase":"prepared",
-            "receipt":receipt,
-            "paths":owned["paths"],
-            "inventories":owned["inventories"].clone(),
-            "helper":helper,
-            "helperSha256":expected,
-        });
-        state::write_json(&journal_path, &value)?;
-        value
-    };
-    let journal_owned = json!({"schema":"app.loomex.runner.owned-versions/v1","paths":journal["paths"],"inventories":journal["inventories"]});
-    validate_owned_installation(
-        &paths,
-        &journal["receipt"],
-        &journal_owned,
-        journal["phase"] == "revoked",
-    )?;
-    if journal["phase"] == "revoked" {
-        return cleanup_owned_installation(&paths, &journal);
-    }
-    let test_mode = std::env::var_os("LOOMEX_INSTALL_TEST_MODE").is_some();
-    if !test_mode {
-        control::client(
-            &paths.state_dir,
-            "daemon.drain",
-            json!({"idempotencyKey":Uuid::new_v4()}),
-        )
-        .await?;
-        let status = control::client(&paths.state_dir, "status.get", json!({})).await?;
-        if status["result"]["activeJobs"].as_u64() != Some(0) {
-            bail!("uninstall deferred while runner jobs remain")
-        }
-    }
-    if !test_mode {
-        let uid = unsafe { libc::geteuid() };
-        let status = tokio::process::Command::new("/bin/launchctl")
-            .arg("bootout")
-            .arg(format!("gui/{uid}/app.loomex.runner"))
-            .status()
-            .await?;
-        if !status.success() && !bootstrap_label_absent().await? {
-            bail!("runner LaunchAgent could not be stopped")
-        }
-        if !bootstrap_label_absent().await? {
-            bail!("runner LaunchAgent remains loaded")
-        }
-    }
-    if !test_mode {
-        control::offline_logout(&paths.state_dir).await?;
-    }
-    journal["phase"] = json!("revoked");
-    state::write_json(&journal_path, &journal)?;
-    cleanup_owned_installation(&paths, &journal)
+    bootstrap_uninstall::run(args, false).await
 }
-
 fn validate_owned_installation(
     paths: &lifecycle::Paths,
     receipt: &Value,
     owned: &Value,
     allow_missing: bool,
 ) -> Result<()> {
-    let expected_agent = paths.launch_agents_dir.join("app.loomex.runner.plist");
-    if receipt["schema"] != "app.loomex.runner.install-receipt/v2"
-        || receipt["launchAgent"].as_str() != Some(expected_agent.to_string_lossy().as_ref())
-    {
-        bail!("invalid owned installation receipt")
-    }
-    let versions = fs::canonicalize(paths.install_base.join("versions"))?;
-    let entries = owned["paths"]
-        .as_array()
-        .context("invalid owned version inventory")?;
-    if owned["schema"] != "app.loomex.runner.owned-versions/v1" || entries.is_empty() {
-        bail!("invalid owned version inventory")
-    }
-    for value in entries {
-        let path = PathBuf::from(value.as_str().context("invalid owned version path")?);
-        let file_name = path.file_name().and_then(|v| v.to_str());
-        let semver = file_name.is_some_and(|v| {
-            let parts: Vec<_> = v.split('.').collect();
-            parts.len() == 3
-                && parts
-                    .iter()
-                    .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-        });
-        if !path.is_absolute()
-            || !semver
-            || fs::canonicalize(path.parent().context("invalid owned version path")?)? != versions
-        {
-            bail!("unsafe owned version path")
-        }
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {
-                lifecycle::verify_owned_version_from_inventory(&path, owned)?;
-            }
-            Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {}
-            _ => bail!("unsafe owned version path"),
-        }
-    }
-    Ok(())
-}
-
-async fn bootstrap_label_absent() -> Result<bool> {
-    let uid = unsafe { libc::geteuid() };
-    for _ in 0..20 {
-        let status = tokio::process::Command::new("/bin/launchctl")
-            .arg("print")
-            .arg(format!("gui/{uid}/app.loomex.runner"))
-            .status()
-            .await?;
-        if !status.success() {
-            return Ok(true);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
-    Ok(false)
-}
-
-fn cleanup_owned_installation(paths: &lifecycle::Paths, journal: &Value) -> Result<()> {
-    // Resume uses the inventory captured in the revoked journal, rather than
-    // reconstructing ownership from mutable state that may already have been
-    // removed by an earlier cleanup attempt.
-    let owned = json!({
-        "schema":"app.loomex.runner.owned-versions/v1",
-        "paths":journal["paths"],
-        "inventories":journal["inventories"],
-    });
-    validate_owned_installation(paths, &journal["receipt"], &owned, true)?;
-    for value in journal["paths"].as_array().unwrap() {
-        // A prior attempt may have removed an owned version and then crashed
-        // before checkpointing the rest of cleanup.  The journal remains the
-        // authority for the exact deletion set, so an absent path is a
-        // reconciled effect; any present path was validated above.
-        match fs::remove_dir_all(PathBuf::from(value.as_str().unwrap())) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    if std::env::var_os("LOOMEX_TEST_UNINSTALL_FAIL_AFTER_PAYLOAD").is_some() {
-        bail!("injected uninstall failure after payload deletion")
-    }
-    let agent = paths.launch_agents_dir.join("app.loomex.runner.plist");
-    match fs::symlink_metadata(&agent) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
-            fs::remove_file(&agent)?
-        }
-        Ok(_) => bail!("unsafe runner LaunchAgent"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    // The uninstall journal is now revoked, so lifecycle recovery resources
-    // have reached a verified terminal boundary and may be released.
-    lifecycle::remove_operation_resources_after_uninstall(paths)?;
-    for name in [
-        "drain.json",
-        "pending-update.json",
-        "control.sock",
-        "daemon.lock",
-    ] {
-        let path = paths.state_dir.join(name);
-        if path.exists() && !fs::symlink_metadata(&path)?.file_type().is_symlink() {
-            fs::remove_file(path)?;
-        }
-    }
-    // Keep the verified bootstrap reachable through `current` until all
-    // journal/state cleanup has succeeded. A failure above is therefore
-    // resumable with the same native helper.
-    let current = paths.install_base.join("current");
-    if current.exists() || current.is_symlink() {
-        if !current.is_symlink() {
-            bail!("unsafe runner current pointer")
-        }
-        fs::remove_file(current)?;
-    }
-    // Receipt and journal deliberately remain available through current/helper
-    // validation and removal, so a failure at either boundary has a trusted
-    // launcher path on the next invocation.
-    let helper = PathBuf::from(
-        journal["helper"]
-            .as_str()
-            .context("uninstall helper is missing")?,
-    );
-    if helper.parent() != Some(paths.state_dir.as_path())
-        || helper.file_name().and_then(|name| name.to_str()) != Some("bootstrap-uninstall-helper")
-        || state::digest(&fs::read(&helper)?) != journal["helperSha256"]
-    {
-        bail!("uninstall helper is invalid")
-    }
-    for name in ["lifecycle-operation.json", "install-receipt.json"] {
-        let path = paths.state_dir.join(name);
-        if path.exists() && !fs::symlink_metadata(&path)?.file_type().is_symlink() {
-            fs::remove_file(path)?;
-        }
-    }
-    if std::env::var_os("LOOMEX_TEST_UNINSTALL_FAIL_AFTER_RECEIPT_REMOVAL").is_some() {
-        bail!("injected uninstall failure after receipt removal")
-    }
-    let owned = paths.state_dir.join("owned-versions.json");
-    if owned.exists() && !fs::symlink_metadata(&owned)?.file_type().is_symlink() {
-        fs::remove_file(owned)?;
-    }
-    // Seal a terminal marker before dropping the resumable journal.  It binds
-    // the exact helper digest and operation record for a crash after journal
-    // removal but before helper unlink.
-    let marker = paths.state_dir.join("bootstrap-uninstall-terminal.json");
-    let mut terminal = journal.clone();
-    terminal["phase"] = json!("terminal");
-    state::write_json(&marker, &terminal)?;
-    let journal_path = paths.state_dir.join("bootstrap-uninstall.json");
-    if journal_path.exists()
-        && !fs::symlink_metadata(&journal_path)?
-            .file_type()
-            .is_symlink()
-    {
-        fs::remove_file(journal_path)?;
-    }
-    if std::env::var_os("LOOMEX_TEST_UNINSTALL_FAIL_AFTER_JOURNAL_REMOVAL").is_some() {
-        bail!("injected uninstall failure after journal removal")
-    }
-    // This is the final fallible mutation. All journal/current metadata is
-    // terminal before the out-of-payload helper is unlinked.
-    remove_regular(&helper)?;
-    if std::env::var_os("LOOMEX_TEST_UNINSTALL_FAIL_AFTER_HELPER_UNLINK").is_some() {
-        bail!("injected uninstall failure after terminal helper unlink")
-    }
-    remove_regular(&marker)?;
-    println!("Revoked Loomex credentials and removed only the inventoried runner files and state.");
-    Ok(())
+    bootstrap_uninstall::validate_owned_installation(paths, receipt, owned, allow_missing)
 }
 
 fn remove_regular(path: &Path) -> Result<()> {
@@ -1540,6 +1309,8 @@ async fn run() -> Result<()> {
     match command.as_str() {
         "install" => install(args).await,
         "uninstall" => uninstall(args).await,
+        "recover-uninstall" => bootstrap_uninstall::run(args, true).await,
+        "preflight" => bootstrap_preflight::run(args).await,
         _ => usage(),
     }
 }
@@ -1557,5 +1328,36 @@ mod pending_stop_tests {
             pending_update_message(&json!({"pending":true,"reason":"active_work"}))
                 .contains("active work")
         );
+    }
+}
+
+#[cfg(test)]
+mod uninstall_regression_tests {
+    use super::*;
+    #[test]
+    fn cleanup_validation_accepts_only_the_remaining_owned_subset_after_interruption() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical_root = fs::canonicalize(root.path()).unwrap();
+        let paths = lifecycle::Paths {
+            install_base: canonical_root.join("install"),
+            state_dir: canonical_root.join("state"),
+            launch_agents_dir: canonical_root.join("agents"),
+        };
+        let version = paths.install_base.join("versions/1.2.3");
+        fs::create_dir_all(version.join("bin")).unwrap();
+        fs::write(version.join("bin/remaining"), b"owned").unwrap();
+        fs::set_permissions(
+            version.join("bin/remaining"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let owned = json!({"schema":"app.loomex.runner.owned-versions/v1","paths":[version],"inventories":[{"path":version,"files":[{"path":"bin/deleted","sha256":state::digest(b"deleted"),"size":7,"mode":384},{"path":"bin/remaining","sha256":state::digest(b"owned"),"size":5,"mode":384}]}]});
+        let receipt = json!({"schema":"app.loomex.runner.install-receipt/v2","version":"1.2.3","versionPath":version,"launchAgent":paths.launch_agents_dir.join("app.loomex.runner.plist")});
+        assert!(
+            validate_owned_installation(&paths, &receipt, &owned, true).is_ok(),
+            "an interrupted exact deletion must resume from a verified subset"
+        );
+        fs::write(version.join("user-file"), b"preserve").unwrap();
+        assert!(validate_owned_installation(&paths, &receipt, &owned, true).is_err());
     }
 }

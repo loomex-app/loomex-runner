@@ -1,6 +1,6 @@
 //! Transport/verifier only. Persistent mutations belong to existing lifecycle owners.
 use anyhow::{Context, Result, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
@@ -12,6 +12,19 @@ use std::{
 };
 use url::Url;
 
+mod namespace_names;
+
+const RUNNER_OWNED_NAMES: &[&str] = &["versions", "current"];
+const PLUGIN_OWNED_NAMES: &[&str] = &[
+    "versions",
+    "current",
+    ".lifecycle-runtime",
+    ".agents",
+    "install-receipt.json",
+    "lifecycle.json",
+    "lifecycle.terminal.json",
+    ".lifecycle.lock",
+];
 const SCHEMA: &str = "app.loomex.release-set/v2";
 const REPOSITORY: &str = "loomex-app/loomex-runner";
 const MAX_MANIFEST: u64 = 1024 * 1024;
@@ -580,29 +593,256 @@ fn evidence(path: &Path, s: &ReleaseSet, runner: &Value, plugin: &Value) -> Resu
     Ok(())
 }
 fn run_owner(script: &Path, release: &Path, args: &[String]) -> Result<()> {
-    let status = Command::new("/bin/bash")
+    let output = Command::new("/bin/bash")
         .arg(script)
         .arg(release)
         .args(args)
         .env("LOOMEX_ALLOW_UNSAFE_DEV_INSTALL", "1")
-        .status()?;
+        .output()?;
     ensure!(
-        status.success(),
+        output.status.success(),
         "lifecycle owner returned failure; retained state belongs to that owner"
     );
     Ok(())
 }
-fn execute_plan<F, G>(runner: F, plugin: Option<G>) -> Result<bool>
-where
-    F: FnOnce() -> Result<()>,
-    G: FnOnce() -> Result<()>,
-{
-    runner()?;
-    if let Some(install) = plugin {
-        install().context("plugin installation incomplete; runner remains installed. Retry this exact release set to resume its lifecycle owner")?;
-        return Ok(true);
+// Keep owner output private: it can contain paths, account details or arbitrary errors.
+fn owner_preflight(cmd: &mut Command, schema: &str) -> Result<Value> {
+    let value = command_json(cmd)?;
+    ensure!(
+        value["schema"] == schema
+            && value["artifact"]["eligible"] == true
+            && value["activation"]["eligible"] == true,
+        "unsupported or ineligible owner preflight response"
+    );
+    Ok(value)
+}
+fn preflight_owners(
+    runner: &Path,
+    plugin: Option<&Path>,
+    runner_args: &[String],
+    plugin_args: &[String],
+    completion: &mut Completion,
+) -> Result<()> {
+    completion.phase = "runner-preflight";
+    owner_preflight(
+        Command::new(runner.join("loomex-lifecycle-bootstrap"))
+            .arg("preflight")
+            .arg(runner)
+            .args(runner_args),
+        "app.loomex.runner.install-preflight/v1",
+    )?;
+    if let Some(plugin) = plugin {
+        completion.phase = "plugin-preflight";
+        owner_preflight(
+            Command::new(plugin.join("lifecycle-runtime/node"))
+                .arg(plugin.join("lifecycle.mjs"))
+                .arg("preflight")
+                .arg("--release")
+                .arg(plugin)
+                .args(plugin_args),
+            "app.loomex.plugin.install-preflight/v1",
+        )?;
     }
-    Ok(false)
+    // Never relay the owners' extensible fields or errors through the transport.
+    Ok(())
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Completion {
+    schema: &'static str,
+    phase: &'static str,
+    runner: &'static str,
+    plugin: &'static str,
+    host_registration: &'static str,
+}
+impl Default for Completion {
+    fn default() -> Self {
+        Self {
+            schema: "app.loomex.paired-install-result/v1",
+            phase: "artifact-verification",
+            runner: "not-attempted",
+            plugin: "not-attempted",
+            host_registration: "not-attempted",
+        }
+    }
+}
+fn failure_report(completion: &Completion) -> Value {
+    let message = match completion.phase {
+        "runner-preflight" => {
+            "Runner installed eligibility was rejected by the native lifecycle owner. Inspect its preflight result and retry this exact release set."
+        }
+        "plugin-preflight" => {
+            "Plugin installed eligibility was rejected by the plugin lifecycle owner. Inspect its preflight result and retry this exact release set."
+        }
+        "runner-activation" | "runner-health" => {
+            "Runner activation or health is unconfirmed. Resolve the native lifecycle owner before retrying this exact release set."
+        }
+        "plugin-activation" => {
+            "Plugin installation is incomplete; the healthy runner remains installed. Retry this exact release set to resume the plugin owner."
+        }
+        "host-registration" => {
+            "Codex registration is incomplete; the healthy runner and plugin files remain installed. Retry this exact release set."
+        }
+        "host-preflight" => {
+            "Codex marketplace eligibility failed. Review the existing marketplace before retrying this exact release set."
+        }
+        "namespace-preflight" => {
+            "Paired install bases overlap another owner's installed or state namespace. Select distinct bases outside the other owner's managed paths."
+        }
+        "cache-persistence" => {
+            "Verified artifact cache could not be retained. Retry this exact release set after resolving the cache issue."
+        }
+        _ => {
+            "Release-set verification failed. Review the exact artifacts and invocation before retrying."
+        }
+    };
+    serde_json::json!({"schema":completion.schema,"ok":false,"category":"PAIRED_INSTALL_REJECTED","phase":completion.phase,"completion":completion,"message":message})
+}
+// Resolve existing aliases component by component while retaining normalized
+// missing suffixes. This reads metadata only and never creates an install root.
+fn normalized_namespace(path: &Path) -> Result<PathBuf> {
+    ensure!(path.is_absolute(), "install namespace must be absolute");
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            PathComponent::RootDir => result.push(Path::new("/")),
+            PathComponent::CurDir => {}
+            PathComponent::ParentDir => {
+                result.pop();
+            }
+            PathComponent::Normal(part) => {
+                result.push(part);
+                match fs::symlink_metadata(&result) {
+                    Ok(_) => result = fs::canonicalize(&result)?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            _ => bail!("unsupported install namespace"),
+        }
+    }
+    Ok(result)
+}
+// Component comparisons consult the actual containing volume only when byte
+// spellings differ. Missing suffixes inherit the nearest existing volume.
+fn namespace_contains(parent: &Path, child: &Path) -> Result<bool> {
+    let mut prefix = PathBuf::new();
+    let mut children = child.components();
+    for part in parent.components() {
+        let Some(other) = children.next() else {
+            return Ok(false);
+        };
+        if part != other {
+            let policy = namespace_names::volume_policy(&prefix)?;
+            if !namespace_names::equivalent(part.as_os_str(), other.as_os_str(), policy)? {
+                return Ok(false);
+            }
+        }
+        prefix.push(part.as_os_str());
+    }
+    Ok(true)
+}
+fn plugin_bootstrap_anchor(plugin: &Path) -> Result<PathBuf> {
+    let mut name = std::ffi::OsString::from(".");
+    name.push(plugin.file_name().context("plugin base name unavailable")?);
+    name.push(".lifecycle.bootstrap.lock");
+    normalized_namespace(
+        &plugin
+            .parent()
+            .context("plugin parent unavailable")?
+            .join(name),
+    )
+}
+fn validate_launch_agent_namespace(
+    runner: &Path,
+    plugin: &Path,
+    runner_state: &Path,
+    launch_agent: &Path,
+) -> Result<()> {
+    let owned = normalized_namespace(launch_agent)?;
+    let runner = normalized_namespace(runner)?;
+    let plugin = normalized_namespace(plugin)?;
+    for base in [&runner, &plugin] {
+        ensure!(
+            !namespace_contains(&owned, base)?,
+            "install base enters the runner LaunchAgent file namespace"
+        );
+    }
+    let mut managed = vec![
+        normalized_namespace(runner_state)?,
+        plugin_bootstrap_anchor(&plugin)?,
+    ];
+    for (base, names) in [(&runner, RUNNER_OWNED_NAMES), (&plugin, PLUGIN_OWNED_NAMES)] {
+        for name in names {
+            managed.push(normalized_namespace(&base.join(name))?);
+        }
+    }
+    for namespace in managed {
+        ensure!(
+            !namespace_contains(&namespace, &owned)? && !namespace_contains(&owned, &namespace)?,
+            "runner LaunchAgent file overlaps an owner-managed namespace"
+        );
+    }
+    Ok(())
+}
+fn validate_install_namespaces(runner: &Path, plugin: &Path, runner_state: &Path) -> Result<()> {
+    let runner = normalized_namespace(runner)?;
+    let plugin = normalized_namespace(plugin)?;
+    let state = normalized_namespace(runner_state)?;
+    ensure!(
+        !(namespace_contains(&runner, &plugin)? && namespace_contains(&plugin, &runner)?),
+        "paired install bases share one namespace"
+    );
+    // Only reserve paths actually owned by these lifecycle implementations.
+    // Unrelated sibling or nested directories keep their existing policy.
+    for (base, other, names) in [
+        (&runner, &plugin, RUNNER_OWNED_NAMES),
+        (&plugin, &runner, PLUGIN_OWNED_NAMES),
+    ] {
+        for name in names {
+            let owned = normalized_namespace(&base.join(name))?;
+            ensure!(
+                !namespace_contains(&owned, other)?,
+                "paired install base enters another owner's namespace"
+            );
+        }
+    }
+    // The plugin owner acquires this narrowly named sibling lock before its
+    // root exists, so it is part of the paired namespace plan as well.
+    let anchor = plugin_bootstrap_anchor(&plugin)?;
+    ensure!(
+        !namespace_contains(&anchor, &runner)?,
+        "runner base enters the plugin bootstrap lock namespace"
+    );
+    for base in [&runner, &plugin] {
+        ensure!(
+            !namespace_contains(&state, base)? && !namespace_contains(base, &state)?,
+            "install base overlaps the runner state namespace"
+        );
+    }
+    Ok(())
+}
+// Existing complete cache bytes may carry a pending owner's exact release-path binding.
+// Reading it must not repair, chmod, create, or remove any entry.
+fn preflight_root<'a>(stage: &'a Path, cache: &'a Path) -> Result<&'a Path> {
+    if !cache.exists() {
+        return Ok(stage);
+    }
+    for ancestor in cache.ancestors() {
+        if ancestor.exists() {
+            ensure!(
+                !fs::symlink_metadata(ancestor)?.file_type().is_symlink(),
+                "artifact cache ancestor symlink forbidden"
+            );
+        }
+    }
+    let expected = directory_inventory(stage)?;
+    let actual = cache_inventory(cache)?;
+    ensure!(
+        actual.iter().all(|entry| expected.contains(entry)),
+        "immutable artifact cache differs from verified release set"
+    );
+    Ok(if actual == expected { cache } else { stage })
 }
 fn find_codex() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
@@ -855,7 +1095,7 @@ fn register_plugin(codex: &Path, base: &Path, version: &str) -> Result<()> {
     );
     Ok(())
 }
-fn main() -> Result<()> {
+fn install(completion: &mut Completion) -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut manifest = None;
     let mut offline = None;
@@ -863,6 +1103,7 @@ fn main() -> Result<()> {
     let mut preview = false;
     let mut runner_only = false;
     let mut verify_only = false;
+    let mut preflight_only = false;
     let mut authorize_keychain_transition = false;
     let mut bases = Vec::new();
     let mut cache = None;
@@ -893,6 +1134,10 @@ fn main() -> Result<()> {
                 authorize_keychain_transition = true;
                 i += 1;
             }
+            "--preflight-only" => {
+                preflight_only = true;
+                i += 1;
+            }
             "--verify-only" => {
                 verify_only = true;
                 i += 1;
@@ -906,6 +1151,10 @@ fn main() -> Result<()> {
             ),
         }
     }
+    ensure!(
+        !(verify_only && preflight_only),
+        "choose one verification mode"
+    );
     ensure!(
         preview && std::env::var("LOOMEX_ALLOW_UNSAFE_DEV_INSTALL").as_deref() == Ok("1"),
         "unsigned distribution requires --allow-unsigned-development and LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1"
@@ -972,7 +1221,8 @@ fn main() -> Result<()> {
     )?;
     if verify_only {
         println!(
-            "Verified frozen paired preview artifacts and compatibility evidence; no lifecycle owner invoked."
+            "{}",
+            serde_json::json!({"schema":"app.loomex.paired-install-result/v1","ok":true,"mode":"verify-only","artifactIntegrity":true,"installedEligibilityVerified":false})
         );
         return Ok(());
     }
@@ -981,9 +1231,6 @@ fn main() -> Result<()> {
     let cache = cache
         .unwrap_or_else(|| home.join("Library/Caches/Loomex/release-sets"))
         .join(&expected);
-    persist_cache(stage.path(), &cache)?;
-    let runner = cache.join("runner");
-    let plugin = cache.join("plugin");
     let mut plugin_base = home.join("Library/Application Support/Loomex/plugin");
     let mut runner_base = home.join("Library/Application Support/Loomex/runner");
     let mut runner_args = vec![
@@ -1003,40 +1250,88 @@ fn main() -> Result<()> {
     for (key, value) in bases {
         if key == "--runner-install-base" {
             runner_base = PathBuf::from(&value);
-            runner_args.extend(["--install-base".into(), value]);
         } else {
             plugin_base = PathBuf::from(&value);
-            plugin_args.extend(["--install-base".into(), value]);
         }
     }
+    ensure!(
+        runner_base.is_absolute() && plugin_base.is_absolute(),
+        "install bases must be absolute"
+    );
+    if !runner_only {
+        completion.phase = "namespace-preflight";
+        let runner_state = std::env::var_os("LOOMEX_STATE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/share/loomex/runner"));
+        validate_install_namespaces(&runner_base, &plugin_base, &runner_state)?;
+        let launch_agents = std::env::var_os("LOOMEX_LAUNCH_AGENTS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("Library/LaunchAgents"));
+        validate_launch_agent_namespace(
+            &runner_base,
+            &plugin_base,
+            &runner_state,
+            &launch_agents.join("app.loomex.runner.plist"),
+        )?;
+    }
+    runner_args.extend([
+        "--install-base".into(),
+        runner_base.to_string_lossy().into_owned(),
+    ]);
+    plugin_args.extend([
+        "--install-base".into(),
+        plugin_base.to_string_lossy().into_owned(),
+    ]);
+    let root = preflight_root(stage.path(), &cache)?;
+    preflight_owners(
+        &root.join("runner"),
+        (!runner_only).then(|| root.join("plugin")).as_deref(),
+        &runner_args,
+        &plugin_args,
+        completion,
+    )?;
     let codex = find_codex();
     let has_codex = codex.is_some();
+    completion.phase = "host-preflight";
     if !runner_only && has_codex {
         check_marketplace(codex.as_deref().unwrap(), &plugin_base)?;
     }
-    let plugin_action = if !runner_only {
-        Some(|| {
-            run_owner(&plugin.join("scripts/install.sh"), &plugin, &plugin_args)?;
-            if has_codex {
-                register_plugin(
-                    codex.as_deref().unwrap(),
-                    &plugin_base,
-                    &s.components.plugin.version,
-                )?;
-            }
-            Ok(())
-        })
-    } else {
-        None
-    };
-    let installed = execute_plan(
-        || {
-            run_owner(&runner.join("scripts/install.sh"), &runner, &runner_args).with_context(||format!("Runner owner prerequisites retained at {}. Review this exact candidate before any explicit --authorize-keychain-transition retry; default installation does not authorize Keychain transitions",runner.display()))?;
-            runner_health(&runner_base, &s.components.runner.version)?;
-            Ok(())
-        },
-        plugin_action,
-    )?;
+    if preflight_only {
+        println!(
+            "{}",
+            serde_json::json!({"schema":"app.loomex.paired-install-result/v1","ok":true,"mode":"preflight-only","artifactIntegrity":true,"installedEligibilityVerified":true,"runnerOnly":runner_only,"hostRegistrationVerified":false})
+        );
+        return Ok(());
+    }
+    completion.phase = "cache-persistence";
+    persist_cache(stage.path(), &cache)?;
+    let runner = cache.join("runner");
+    let plugin = cache.join("plugin");
+    completion.phase = "runner-activation";
+    completion.runner = "unconfirmed";
+    run_owner(&runner.join("scripts/install.sh"), &runner, &runner_args)?;
+    completion.phase = "runner-health";
+    runner_health(&runner_base, &s.components.runner.version)?;
+    completion.runner = "healthy";
+    let installed = !runner_only;
+    if installed {
+        completion.phase = "plugin-activation";
+        completion.plugin = "unconfirmed";
+        run_owner(&plugin.join("scripts/install.sh"), &plugin, &plugin_args)?;
+        completion.plugin = "installed";
+        if has_codex {
+            completion.phase = "host-registration";
+            completion.host_registration = "unconfirmed";
+            register_plugin(
+                codex.as_deref().unwrap(),
+                &plugin_base,
+                &s.components.plugin.version,
+            )?;
+            completion.host_registration = "verified";
+        } else {
+            completion.host_registration = "manual-action-required";
+        }
+    }
     if installed && has_codex {
         println!(
             "Runner and Loomex plugin installed and read back through Codex. Restart Codex to load the plugin."
@@ -1051,7 +1346,16 @@ fn main() -> Result<()> {
         );
     }
 
+    completion.phase = "complete";
     Ok(())
+}
+
+fn main() {
+    let mut completion = Completion::default();
+    if install(&mut completion).is_err() {
+        eprintln!("{}", failure_report(&completion));
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
@@ -1202,32 +1506,128 @@ mod tests {
         assert!(safe_path("a/b"));
     }
     #[test]
-    fn no_plugin_preserves_runner() {
-        let calls = std::cell::Cell::new(0);
-        let r = execute_plan(
-            || {
-                calls.set(calls.get() + 1);
-                Ok(())
-            },
-            None::<fn() -> Result<()>>,
-        )
-        .unwrap();
-        assert!(!r);
-        assert_eq!(calls.get(), 1);
+    fn paired_namespaces_reject_aliases_and_owned_subtrees_without_writes() {
+        let t = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(t.path()).unwrap();
+        let runner = root.join("runner");
+        let plugin = root.join("plugin");
+        let state = root.join("runner-state");
+        assert!(validate_install_namespaces(&runner, &plugin, &state).is_ok());
+        assert!(validate_install_namespaces(&runner, &runner, &state).is_err());
+        assert!(
+            validate_install_namespaces(&runner, &root.join("missing/../runner"), &state).is_err()
+        );
+        for name in ["versions", "current"] {
+            assert!(
+                validate_install_namespaces(&runner, &runner.join(name).join("nested"), &state)
+                    .is_err()
+            );
+        }
+        for name in [
+            "versions",
+            "current",
+            ".lifecycle-runtime",
+            ".agents",
+            "install-receipt.json",
+            "lifecycle.json",
+            "lifecycle.terminal.json",
+            ".lifecycle.lock",
+        ] {
+            assert!(
+                validate_install_namespaces(&plugin.join(name).join("nested"), &plugin, &state)
+                    .is_err()
+            );
+        }
+        assert!(validate_install_namespaces(&runner, &state.join("plugin"), &state).is_err());
+        assert!(
+            validate_install_namespaces(
+                &runner,
+                &root.join("state-parent"),
+                &root.join("state-parent/runner-state")
+            )
+            .is_err()
+        );
+        assert!(validate_install_namespaces(&runner, &runner.join("unrelated"), &state).is_ok());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&root, root.join("alias")).unwrap();
+            assert!(
+                validate_install_namespaces(&runner, &root.join("alias/runner"), &state).is_err()
+            );
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        }
     }
     #[test]
-    fn plugin_failure_does_not_roll_back_runner() {
-        let calls = std::cell::Cell::new(0);
-        let r = execute_plan(
-            || {
-                calls.set(1);
-                Ok(())
-            },
-            Some(|| bail!("fixture failure")),
+    fn cache_preflight_reads_complete_exact_cache_without_repair() {
+        let t = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(t.path()).unwrap();
+        let stage = root.join("stage");
+        let cache = root.join("cache");
+        fs::create_dir(&stage).unwrap();
+        fs::write(stage.join("envelope"), b"same bytes").unwrap();
+        assert_eq!(preflight_root(&stage, &cache).unwrap(), stage);
+        assert!(!cache.exists());
+        fs::create_dir(&cache).unwrap();
+        // Incomplete artifacts carry no preflight authority.
+        assert_eq!(preflight_root(&stage, &cache).unwrap(), stage);
+        fs::copy(stage.join("envelope"), cache.join("envelope")).unwrap();
+        let modified = fs::metadata(cache.join("envelope"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(preflight_root(&stage, &cache).unwrap(), cache);
+        assert_eq!(
+            fs::metadata(cache.join("envelope"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            modified
         );
-        assert!(r.is_err());
-        assert_eq!(calls.get(), 1);
-        assert!(format!("{:#}", r.unwrap_err()).contains("runner remains installed"));
+        assert!(!cache.join(".incoming").exists());
+        fs::write(cache.join("envelope"), b"different bytes").unwrap();
+        assert!(preflight_root(&stage, &cache).is_err());
+    }
+    #[test]
+    fn partial_completion_never_claims_failed_activation_installed() {
+        let mut completion = Completion {
+            phase: "runner-health",
+            runner: "unconfirmed",
+            ..Completion::default()
+        };
+        let report = failure_report(&completion);
+        assert_eq!(report["completion"]["runner"], "unconfirmed");
+        assert!(!report.to_string().contains("runner remains installed"));
+        completion.phase = "plugin-activation";
+        completion.runner = "healthy";
+        completion.plugin = "unconfirmed";
+        let report = failure_report(&completion);
+        assert_eq!(report["completion"]["runner"], "healthy");
+        assert_eq!(report["completion"]["plugin"], "unconfirmed");
+        assert!(
+            report["message"]
+                .as_str()
+                .unwrap()
+                .contains("runner remains installed")
+        );
+    }
+    #[test]
+    fn owner_preflight_rejects_missing_or_false_eligibility() {
+        for output in [
+            r#"{"schema":"fixture","artifact":{"eligible":true},"activation":{"eligible":true}}"#,
+            r#"{"schema":"fixture","artifact":{"eligible":true},"activation":{"eligible":false}}"#,
+            r#"{"schema":"fixture"}"#,
+        ] {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg("-c")
+                .arg("printf '%s' \"$1\"")
+                .arg("fixture")
+                .arg(output);
+            assert_eq!(
+                owner_preflight(&mut cmd, "fixture").is_ok(),
+                output.contains(r#""activation":{"eligible":true}"#)
+            );
+        }
     }
     #[test]
     fn symlink_archive_rejected() {

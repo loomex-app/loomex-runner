@@ -338,6 +338,15 @@ fn select_origin(
     )
 }
 impl Api {
+    /// Maintenance must use the verified installation's destination, never the
+    /// invoking shell's development override. Production still uses its pin.
+    pub(crate) fn from_installation_origin(origin: Option<&str>) -> anyhow::Result<Self> {
+        Self::with_origin(select_origin(
+            option_env!("LOOMEX_API_ORIGIN"),
+            origin,
+            cfg!(debug_assertions),
+        )?)
+    }
     /// Explicit product destination; an API origin does not imply a web UI.
     pub fn web_app_url(&self) -> Option<String> {
         self.web_app_origin.as_ref().map(Url::to_string)
@@ -580,6 +589,26 @@ fn parse_envelope(status: u16, payload: Value) -> Result<Value, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn maintenance_destination_requires_the_receipted_origin_or_compiled_pin() {
+        if let Some(compiled) = option_env!("LOOMEX_API_ORIGIN") {
+            assert_eq!(
+                Api::from_installation_origin(None).unwrap().origin.as_str(),
+                validate_origin(compiled, false).unwrap().as_str()
+            );
+            assert!(Api::from_installation_origin(Some("http://127.0.0.1:9/")).is_err());
+        } else if cfg!(debug_assertions) {
+            assert!(Api::from_installation_origin(None).is_err());
+            assert_eq!(
+                Api::from_installation_origin(Some("http://127.0.0.1:28080/"))
+                    .unwrap()
+                    .origin
+                    .as_str(),
+                "http://127.0.0.1:28080/"
+            );
+            assert!(Api::from_installation_origin(Some("https://unrelated.example/")).is_err());
+        }
+    }
     use base64::engine::general_purpose::STANDARD;
     use ed25519_dalek::{Signature, Verifier};
     use std::sync::{

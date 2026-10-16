@@ -40,7 +40,22 @@ def local_fixture(root,offline_extra=None,offline=False,profile=None,modern=Fals
 def checksum(assets):
     (assets/'SHA256SUMS').write_text(''.join(f'{release.pack.sha(p)}  {p.name}\n' for p in sorted(assets.iterdir()) if p.is_file() and p.name!='SHA256SUMS'))
 
+class PublicSigningPublicationGateTests(unittest.TestCase):
+    def test_unsigned_candidate_is_rejected_before_any_remote_action(self):
+        with tempfile.TemporaryDirectory() as d:
+            assets,_,_=local_fixture(Path(d))
+            with patch.object(release.pack,'approved_development_signer',return_value='a'*40),patch.object(release,'command') as remote:
+                with self.assertRaisesRegex(ValueError,'regular file required'):
+                    release.local_inventory(assets)
+                remote.assert_not_called()
+
 class ApprovalBindingRegressionTests(unittest.TestCase):
+    def setUp(self):
+        # These fixtures exercise transport/publication identity; native signing
+        # has separate failure/identity tests using read-only codesign mocks.
+        signer=patch.object(release.pack,'qualify_development_signing',return_value={})
+        signer.start();self.addCleanup(signer.stop)
+
     def test_exact_deterministic_online_and_offline_inventory_accepted(self):
         with tempfile.TemporaryDirectory() as d:
             assets,_,_=local_fixture(Path(d),offline=True)
@@ -98,6 +113,8 @@ class ApprovalBindingRegressionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'offline'):release.local_inventory(assets)
 
 class OfflineLauncherRegressionTests(unittest.TestCase):
+    setUp = ApprovalBindingRegressionTests.setUp
+
     def test_offline_altered_launcher_rejected(self):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d); assets,manifest,digest=local_fixture(root,offline_extra="temporary-extra.sh")

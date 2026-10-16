@@ -24,6 +24,11 @@ jobs:
   qualify-build-once:
     runs-on: macos-14
     timeout-minutes: 60
+    env:
+      # Pre-provisioned approved local identity only; this workflow never imports keys.
+      LOOMEX_DEVELOPMENT_CODESIGN_IDENTITY: ${{ vars.LOOMEX_DEVELOPMENT_CODESIGN_IDENTITY }}
+      LOOMEX_DEVELOPMENT_CODESIGN_FINGERPRINT: ${{ vars.LOOMEX_DEVELOPMENT_CODESIGN_FINGERPRINT }}
+      LOOMEX_DEVELOPMENT_CODESIGN_KEYCHAIN: ${{ vars.LOOMEX_DEVELOPMENT_CODESIGN_KEYCHAIN }}
     defaults:
       run:
         working-directory: runner-source
@@ -78,6 +83,9 @@ jobs:
         with:
           toolchain: 1.88.0
           targets: aarch64-apple-darwin
+      - name: Require the approved persistent development signer
+        run: |
+          python -c 'import runpy; runpy.run_path("scripts/release-set.py")["approved_development_signer"](require_identity=True)'
       - name: Build plugin before any compiled contract export
         working-directory: component-inputs/plugin
         run: |

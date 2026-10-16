@@ -36,6 +36,14 @@ if [[ "$mode" == "--production" ]]; then
   [[ "$LOOMEX_CODESIGN_IDENTITY" == Developer\ ID\ Application:* ]] || { echo "production requires a Developer ID Application identity" >&2; exit 1; }
   openssl rsa -in "$LOOMEX_MANIFEST_SIGNING_KEY" -check -noout >/dev/null
 fi
+# Public candidates fail closed before compilation; isolated --unsigned-development
+# fixtures without a qualified deployment profile may remain unsigned.
+if [[ "$mode" == "--unsigned-cloud-preview" || -n "$local_origin" ]]; then
+  python3 - "$repo" <<'PYSIGNER'
+import runpy,sys
+runpy.run_path(sys.argv[1]+'/scripts/release-set.py')['approved_development_signer'](require_identity=True)
+PYSIGNER
+fi
 if [[ -n "$failure_workspace" ]]; then
   [[ ! -e "$failure_workspace" && ! -L "$failure_workspace" ]] || { echo "failure workspace already exists; refusing replacement" >&2; exit 1; }
   [[ -d "$(dirname "$failure_workspace")" && ! -L "$(dirname "$failure_workspace")" ]] || { echo "failure workspace parent must be an existing directory" >&2; exit 1; }
@@ -192,6 +200,13 @@ PY
   else
     echo "WARNING: building unsigned development artifact for isolated testing only" >&2
   fi
+fi
+if [[ "$mode" == "--unsigned-cloud-preview" || -n "$local_origin" ]]; then
+  python3 - "$build_root" "$payload" <<'PYQUALIFY'
+import runpy,sys
+from pathlib import Path
+runpy.run_path(sys.argv[1]+'/scripts/release-set.py')['qualify_development_signing'](Path(sys.argv[2]))
+PYQUALIFY
 fi
 python3 - "$payload" "${HOME:?}" "$build_root" "$canonical_build_root" <<'PY'
 import sys

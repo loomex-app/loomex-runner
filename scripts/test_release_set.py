@@ -14,6 +14,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parent.parent
 spec=importlib.util.spec_from_file_location('release_set',ROOT/'scripts/release-set.py');pack=importlib.util.module_from_spec(spec);spec.loader.exec_module(pack)
@@ -41,7 +42,13 @@ def fixture(root,installer,profile=None):
             contracts[kind]={'protocol':'loomex.local-control/v2','fixture':kind}
             put(payload/'metadata/compatibility-manifest.json',contracts[kind])
             source_name='metadata/source-content-manifest.json';source_root=payload
-            put(envelope/'loomex-lifecycle-bootstrap','#!/bin/bash\nexit 0\n',0o755)
+            put(envelope/'loomex-lifecycle-bootstrap',r'''#!/bin/bash
+set -euo pipefail
+[[ "$1" == preflight ]]
+echo runner >> "$FIXTURE_STATE/preflights.log"
+if [[ "${FIXTURE_RUNNER_PREFLIGHT_FAIL:-}" == 1 ]]; then echo 'SECRET runner detail' >&2; exit 40; fi
+echo '{"schema":"app.loomex.runner.install-preflight/v1","artifact":{"eligible":true},"activation":{"eligible":true}}'
+''',0o755)
             side=envelope/'loomex-lifecycle-bootstrap';bootstrap={'file':side.name,'sha256':pack.sha(side),'size':side.stat().st_size}
             put(envelope/'scripts/install.sh',r'''#!/bin/bash
 set -euo pipefail
@@ -56,6 +63,7 @@ if [[ ! -f "$base/installed" ]]; then
   echo "$release" > "$base/installed"
   /bin/cat > "$base/current/bin/loomex" <<'STATUS'
 #!/bin/bash
+if [[ "${FIXTURE_HEALTH_FAIL:-}" == 1 ]]; then echo 'SECRET runner health detail' >&2;exit 55;fi
 echo '{"version":"0.5.2","protocol":"loomex.local-control/v2","draining":false,"updateDeferred":false}'
 STATUS
   /bin/chmod 0755 "$base/current/bin/loomex"
@@ -67,7 +75,17 @@ fi
             contracts[kind]={'schemaVersion':'loomex.plugin-compatibility-components/v1','fixture':kind}
             put(envelope/'plugin-components.json',contracts[kind])
             put(payload/'plugin/package.json',{'version':version})
-            runtime=put(envelope/'lifecycle-runtime/node','#!/bin/bash\nexit 0\n',0o755);manager=put(envelope/'lifecycle.mjs','// compiled fixture owner\n')
+            runtime=put(envelope/'lifecycle-runtime/node',r'''#!/bin/bash
+set -euo pipefail
+shift
+[[ "$1" == preflight ]]; shift
+base=""; release=""
+while (($#)); do case "$1" in --install-base) base="$2";shift 2;; --release) release="$2";shift 2;; *) shift;; esac; done
+echo plugin >> "$FIXTURE_STATE/preflights.log"
+if [[ "${FIXTURE_PLUGIN_PREFLIGHT_FAIL:-}" == 1 ]]; then echo 'SECRET plugin detail' >&2; exit 41; fi
+if [[ -f "$base/pending" ]]; then [[ "$(/bin/cat "$base/pending")" == "$release" ]] || exit 44; fi
+echo '{"schema":"app.loomex.plugin.install-preflight/v1","artifact":{"eligible":true},"activation":{"eligible":true}}'
+''',0o755);manager=put(envelope/'lifecycle.mjs','// compiled fixture owner\n')
             bootstrap={role:{'file':p.relative_to(envelope).as_posix(),'sha256':pack.sha(p),'size':p.stat().st_size,'mode':p.stat().st_mode&0o777} for role,p in [('runtime',runtime),('manager',manager)]}
             put(envelope/'scripts/install.sh',r'''#!/bin/bash
 set -euo pipefail
@@ -143,6 +161,29 @@ class SchemaTests(unittest.TestCase):
             bad=copy.deepcopy(m);bad['components']['runner']['releaseTag']='runner-v9.9.9-plugin-v0.16.2'
             with self.assertRaises(ValueError):pack.validate_manifest(bad)
 
+    def test_regular_release_notes_distinguish_unsigned_envelope_and_persistent_native_identity(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);_,manifest=fixture(root,put(root/'installer','fixture',0o755),'local-development')
+            historical=pack.release_notes(manifest,'e'*64)
+            self.assertTrue(historical.startswith('Unsigned development preview for macOS ARM64 only. Not Developer ID signed or notarized. Explicit opt-in required.'))
+            manifest['releaseTag']='runner-v1.2.7-plugin-v1.2.3'
+            manifest['components']['runner']['version']='1.2.7';manifest['components']['plugin']['version']='1.2.3'
+            digest='f'*64;notes=pack.release_notes(manifest,digest)
+            classification=notes.split('\n\n',1)[0]
+            self.assertIn('release envelope is unsigned',classification)
+            self.assertIn('all three runner executables',classification)
+            self.assertIn('persistent self-signed development identity',classification)
+            self.assertIn('not Apple Developer ID signatures',classification)
+            self.assertIn('not notarized',classification)
+            self.assertNotIn('preview',classification.lower())
+            self.assertNotIn('unsigned development builds',notes)
+            self.assertIn('Live recovery, Keychain access and installation on another Mac remain unverified.',notes)
+            for line in [f'Release-set SHA256: {digest}',f'Runner 1.2.7: {"a"*40}',f'Plugin 1.2.3: {"b"*40}',f'Backend qualified source: {"d"*40}','Deployment profile: local-development','API origin: http://127.0.0.1:28080/']:
+                self.assertIn(line,notes)
+            self.assertIn('/releases/download/runner-v1.2.7-plugin-v1.2.3/install.sh',notes)
+            self.assertNotIn('/releases/latest/',notes)
+            self.assertEqual(notes,pack.release_notes(manifest,digest))
+
     def test_local_deployment_is_explicit_and_loopback_only(self):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d);_,m=fixture(p,put(p/'installer','fixture',0o755),'local-development')
@@ -185,6 +226,82 @@ class SchemaTests(unittest.TestCase):
             text=pack.launcher_script(m,pack.sha(assets/'release-set.json'))
             self.assertIn('--allow-unsigned-preview required',text);self.assertNotIn('/latest/',text)
             self.assertNotIn('eval ',text);self.assertIn(m['installer']['sha256'],text)
+
+class PublicSigningQualificationTests(unittest.TestCase):
+    fingerprint='a'*40
+    def signing_fixture(self, root):
+        requirements={name:f'identifier "app.loomex.runner.{name}" and certificate leaf = H"{self.fingerprint}"' for name in pack.NATIVE_BINARIES}
+        for name in pack.NATIVE_BINARIES:put(root/'bin'/name,'fixture',0o755)
+        put(root/'metadata/development-signing.json',{'schema':'app.loomex.runner.development-signing/v1','requirements':requirements})
+        return requirements
+    def signed_command(self, requirements, *, adhoc=None, bad_requirement=None):
+        def command(args,**kwargs):
+            name=Path(args[-1]).name
+            if '-dr' in args:
+                requirement=bad_requirement if name=='loomex-runner' and bad_requirement else requirements[name]
+                return subprocess.CompletedProcess(args,0,'',f'designated => {requirement}\n')
+            if '-dv' in args:return subprocess.CompletedProcess(args,0,'','Signature=adhoc\n' if name==adhoc else 'Authority=Approved Local Fixture\nTeamIdentifier=not set\n')
+            return subprocess.CompletedProcess(args,0,'','')
+        return command
+    def test_all_three_require_exact_approved_stable_signer_and_actual_metadata(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);requirements=self.signing_fixture(root)
+            with patch.object(pack.subprocess,'run',side_effect=self.signed_command(requirements)) as calls:
+                result=pack.qualify_development_signing(root,approved_fingerprint=self.fingerprint)
+                self.assertEqual(len(calls.call_args_list),9);self.assertEqual(result['binaries'],list(pack.NATIVE_BINARIES))
+            for name in pack.NATIVE_BINARIES:
+                with patch.object(pack.subprocess,'run',side_effect=self.signed_command(requirements,adhoc=name)):
+                    with self.subTest(name=name),self.assertRaisesRegex(ValueError,'ad-hoc'):pack.qualify_development_signing(root,approved_fingerprint=self.fingerprint)
+            with patch.object(pack.subprocess,'run',side_effect=self.signed_command(requirements)):
+                with self.assertRaisesRegex(ValueError,'approved persistent'):pack.qualify_development_signing(root,approved_fingerprint='b'*40)
+            with patch.object(pack.subprocess,'run',side_effect=self.signed_command(requirements,bad_requirement='cdhash H"abc"')):
+                with self.assertRaisesRegex(ValueError,'metadata'):pack.qualify_development_signing(root,approved_fingerprint=self.fingerprint)
+            (root/'metadata/development-signing.json').unlink()
+            with self.assertRaises(ValueError):pack.qualify_development_signing(root,approved_fingerprint=self.fingerprint)
+    def test_public_outer_bootstrap_must_equal_the_qualified_signed_payload(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);payload=root/'payload';envelope=root/'envelope'
+            requirements=self.signing_fixture(payload)
+            put(envelope/'loomex-lifecycle-bootstrap','different bootstrap',0o755)
+            with patch.object(pack.subprocess,'run',side_effect=self.signed_command(requirements)):
+                with self.assertRaisesRegex(ValueError,'bootstrap differs'):pack.qualify_development_signing(payload,approved_fingerprint=self.fingerprint,envelope=envelope)
+                shutil.copy2(payload/'bin/loomex-lifecycle-bootstrap',envelope/'loomex-lifecycle-bootstrap')
+                pack.qualify_development_signing(payload,approved_fingerprint=self.fingerprint,envelope=envelope)
+
+    def test_missing_or_adhoc_approved_signer_fails_before_host_lookup(self):
+        for identity in ['', '-']:
+            with patch.dict(os.environ,{'LOOMEX_DEVELOPMENT_CODESIGN_IDENTITY':identity,'LOOMEX_DEVELOPMENT_CODESIGN_FINGERPRINT':''}),patch.object(pack.subprocess,'run') as run:
+                with self.assertRaisesRegex(ValueError,'approved persistent'):pack.approved_development_signer()
+                run.assert_not_called()
+    def test_approved_existing_identity_resolves_without_mutation(self):
+        output=f'  1) {self.fingerprint.upper()} "Approved Development"\n     1 valid identities found\n'
+        with patch.dict(os.environ,{'LOOMEX_DEVELOPMENT_CODESIGN_IDENTITY':'Approved Development','LOOMEX_DEVELOPMENT_CODESIGN_KEYCHAIN':'','LOOMEX_DEVELOPMENT_CODESIGN_FINGERPRINT':''}),patch.object(pack.subprocess,'run',return_value=subprocess.CompletedProcess([],0,output,'')) as run:
+            self.assertEqual(pack.approved_development_signer(),self.fingerprint)
+            self.assertEqual(run.call_args.args[0],['/usr/bin/security','find-identity','-p','codesigning'])
+
+    def test_approved_available_self_signed_identity_does_not_require_apple_trust(self):
+        output=f'  1) {self.fingerprint.upper()} "Approved Development" (CSSMERR_TP_NOT_TRUSTED)\n     0 valid identities found\n'
+        env={'LOOMEX_DEVELOPMENT_CODESIGN_IDENTITY':'Approved Development','LOOMEX_DEVELOPMENT_CODESIGN_KEYCHAIN':'','LOOMEX_DEVELOPMENT_CODESIGN_FINGERPRINT':self.fingerprint}
+        with patch.dict(os.environ,env),patch.object(pack.subprocess,'run',return_value=subprocess.CompletedProcess([],0,output,'')) as run:
+            self.assertEqual(pack.approved_development_signer(require_identity=True),self.fingerprint)
+            self.assertNotIn('-v',run.call_args.args[0])
+        with patch.dict(os.environ,{**env,'LOOMEX_DEVELOPMENT_CODESIGN_FINGERPRINT':'b'*40}),patch.object(pack.subprocess,'run',return_value=subprocess.CompletedProcess([],0,output,'')):
+            with self.assertRaisesRegex(ValueError,'differs from the approved fingerprint'):pack.approved_development_signer(require_identity=True)
+
+    def test_artifact_verification_uses_explicit_pin_without_private_identity_lookup(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);requirements=self.signing_fixture(root)
+            env={'LOOMEX_DEVELOPMENT_CODESIGN_IDENTITY':'','LOOMEX_DEVELOPMENT_CODESIGN_FINGERPRINT':self.fingerprint.upper()}
+            with patch.dict(os.environ,env),patch.object(pack.subprocess,'run',side_effect=self.signed_command(requirements)) as run:
+                pack.qualify_development_signing(root)
+                self.assertEqual(len(run.call_args_list),9)
+                self.assertTrue(all(call.args[0][0]=='/usr/bin/codesign' for call in run.call_args_list))
+            with patch.dict(os.environ,env),patch.object(pack.subprocess,'run') as run:
+                with self.assertRaisesRegex(ValueError,'building requires'):pack.approved_development_signer(require_identity=True)
+                run.assert_not_called()
+        with patch.dict(os.environ,{'LOOMEX_DEVELOPMENT_CODESIGN_IDENTITY':self.fingerprint.upper(),'LOOMEX_DEVELOPMENT_CODESIGN_FINGERPRINT':''}),patch.object(pack.subprocess,'run') as run:
+            self.assertEqual(pack.approved_development_signer(),self.fingerprint)
+            run.assert_not_called()
 
 @unittest.skipUnless(sys.platform=='darwin' and os.uname().machine=='arm64','native installation transport supports macOS ARM64')
 class NativeWholeCallTests(unittest.TestCase):
@@ -277,7 +394,7 @@ esac
         self.fake_codex(collision=True);result=self.invoke();self.assertNotEqual(result.returncode,0);self.assert_no_owner()
         self.fake_codex(fail_add=True);result=self.invoke();self.assertNotEqual(result.returncode,0,result.stdout)
         self.assertTrue((self.runner/'installed').is_file());self.assertTrue((self.plugin/'installed').is_file())
-        self.assertIn('runner remains installed',result.stderr)
+        self.assertIn('runner and plugin files remain installed',result.stderr)
     def test_keychain_transition_requires_explicit_passthrough(self):
         result=self.invoke(["--runner-only"]);self.assertEqual(result.returncode,0,result.stderr)
         self.assertNotIn("--authorize-keychain-transition",(self.state/"runner-args.log").read_text())
@@ -295,6 +412,109 @@ esac
     def test_verify_only_has_no_cache_or_owner_mutation(self):
         result=self.invoke(["--verify-only"]);self.assertEqual(result.returncode,0,result.stderr)
         self.assert_no_owner();self.assertFalse((self.root/"cache").exists())
+        self.assertFalse((self.state/"preflights.log").exists())
+
+    def test_colliding_install_bases_rejected_before_owners_or_persistent_changes(self):
+        alias=self.root/'alias';alias.symlink_to(self.root,target_is_directory=True)
+        for candidate in [self.runner, self.root/'missing/../runner-install', alias/'runner-install', self.runner/'versions/nested', self.runner/'current/nested']:
+            for mode in [[],['--preflight-only']]:
+                result=self.invoke(['--plugin-install-base',str(candidate)]+mode)
+                self.assertNotEqual(result.returncode,0)
+                self.assertEqual(json.loads(result.stderr)['phase'],'namespace-preflight')
+                self.assert_no_owner();self.assertFalse((self.state/'preflights.log').exists())
+                self.assertFalse((self.root/'cache').exists());self.assertFalse(self.runner.exists());self.assertFalse(self.plugin.exists())
+        for name in ['versions','.lifecycle-runtime','lifecycle.json']:
+            result=self.invoke(['--runner-install-base',str(self.plugin/name/'nested')])
+            self.assertNotEqual(result.returncode,0)
+            self.assertEqual(json.loads(result.stderr)['phase'],'namespace-preflight')
+            self.assert_no_owner();self.assertFalse((self.state/'preflights.log').exists())
+            self.assertFalse((self.root/'cache').exists());self.assertFalse(self.plugin.exists())
+        self.env['LOOMEX_STATE_DIR']=str(self.root/'runner-state')
+        result=self.invoke(['--plugin-install-base',str(self.root/'runner-state/nested')])
+        self.assertNotEqual(result.returncode,0)
+        self.assertEqual(json.loads(result.stderr)['phase'],'namespace-preflight')
+        self.assert_no_owner();self.assertFalse((self.state/'preflights.log').exists())
+        self.assertFalse((self.root/'runner-state').exists());self.assertFalse((self.root/'cache').exists())
+
+    def test_missing_case_and_unicode_aliases_rejected_before_owner_invocation(self):
+        probe=self.root/'NamespaceCaseProbe';probe.mkdir()
+        if not (self.root/'namespacecaseprobe').exists():self.skipTest('fixture volume is case sensitive')
+        pairs=[(self.root/'future-runner',self.root/'FUTURE-RUNNER'),(self.root/'future-runner',self.root/'future-runner/Versions/nested'),(self.root/'café',self.root/'café')]
+        for runner,plugin in pairs:
+            result=self.invoke(['--runner-install-base',str(runner),'--plugin-install-base',str(plugin),'--preflight-only'])
+            self.assertNotEqual(result.returncode,0,(runner,plugin,result.stdout))
+            self.assertEqual(json.loads(result.stderr)['phase'],'namespace-preflight')
+            self.assert_no_owner();self.assertFalse((self.state/'preflights.log').exists())
+            self.assertFalse((self.root/'cache').exists());self.assertFalse(runner.exists());self.assertFalse(plugin.exists())
+
+    def test_external_owner_file_and_bootstrap_lock_namespaces_rejected_read_only(self):
+        agents=self.root/'launch-agents'
+        self.env['LOOMEX_LAUNCH_AGENTS_DIR']=str(agents)
+        plist=agents/'app.loomex.runner.plist'
+        anchor=self.plugin.parent/f'.{self.plugin.name}.lifecycle.bootstrap.lock'
+        for option,base in [('--plugin-install-base',plist),('--plugin-install-base',plist/'nested'),('--runner-install-base',anchor),('--runner-install-base',anchor/'nested')]:
+            result=self.invoke([option,str(base),'--preflight-only'])
+            self.assertNotEqual(result.returncode,0,(base,result.stdout))
+            self.assertEqual(json.loads(result.stderr)['phase'],'namespace-preflight')
+            self.assert_no_owner();self.assertFalse((self.state/'preflights.log').exists())
+            self.assertFalse((self.root/'cache').exists());self.assertFalse(agents.exists());self.assertFalse(anchor.exists())
+
+    def test_managed_launch_agent_cannot_enter_owned_subtrees_but_unrelated_child_is_allowed(self):
+        for agents in [self.plugin/'current',self.plugin/'.lifecycle-runtime',self.runner/'versions/nested',self.plugin.parent/f'.{self.plugin.name}.lifecycle.bootstrap.lock',self.root/'runner-state']:
+            self.env['LOOMEX_LAUNCH_AGENTS_DIR']=str(agents)
+            self.env['LOOMEX_STATE_DIR']=str(self.root/'runner-state')
+            result=self.invoke(['--preflight-only'])
+            self.assertNotEqual(result.returncode,0,(agents,result.stdout))
+            self.assertEqual(json.loads(result.stderr)['phase'],'namespace-preflight')
+            self.assert_no_owner();self.assertFalse((self.state/'preflights.log').exists())
+            self.assertFalse((self.root/'cache').exists());self.assertFalse(agents.exists())
+        self.env['LOOMEX_LAUNCH_AGENTS_DIR']=str(self.plugin/'unrelated-agents')
+        result=self.invoke(['--preflight-only']);self.assertEqual(result.returncode,0,result.stderr)
+        self.assertFalse(self.plugin.exists());self.assertFalse((self.root/'cache').exists())
+
+    def test_preflight_only_invokes_both_owners_without_cache_or_install_mutation(self):
+        result=self.invoke(['--preflight-only']);self.assertEqual(result.returncode,0,result.stderr)
+        self.assertTrue(json.loads(result.stdout)['installedEligibilityVerified'])
+        self.assertEqual((self.state/'preflights.log').read_text().splitlines(),['runner','plugin'])
+        self.assert_no_owner();self.assertFalse((self.root/'cache').exists())
+        self.assertFalse(self.runner.exists());self.assertFalse(self.plugin.exists())
+
+    def test_owner_preflight_failure_happens_before_cache_or_activation(self):
+        for owner in ['RUNNER','PLUGIN']:
+            self.env[f'FIXTURE_{owner}_PREFLIGHT_FAIL']='1'
+            result=self.invoke();self.assertNotEqual(result.returncode,0)
+            report=json.loads(result.stderr)
+            self.assertEqual(report['phase'],owner.lower()+'-preflight')
+            self.assertEqual(report['completion']['runner'],'not-attempted')
+            self.assertNotIn('SECRET',result.stderr)
+            self.assert_no_owner();self.assertFalse((self.root/'cache').exists())
+            self.env.pop(f'FIXTURE_{owner}_PREFLIGHT_FAIL')
+
+    def test_plugin_failure_reports_healthy_runner_and_unconfirmed_plugin(self):
+        self.env['FIXTURE_PLUGIN_FAIL']='1';result=self.invoke()
+        report=json.loads(result.stderr)
+        self.assertEqual(report['phase'],'plugin-activation')
+        self.assertEqual(report['completion']['runner'],'healthy')
+        self.assertEqual(report['completion']['plugin'],'unconfirmed')
+        self.assertEqual(report['completion']['hostRegistration'],'not-attempted')
+
+    def test_runner_health_failure_blocks_plugin_and_reports_unconfirmed_activation(self):
+        self.env['FIXTURE_HEALTH_FAIL']='1';result=self.invoke()
+        self.assertNotEqual(result.returncode,0)
+        report=json.loads(result.stderr)
+        self.assertEqual(report['phase'],'runner-health')
+        self.assertEqual(report['completion']['runner'],'unconfirmed')
+        self.assertEqual(report['completion']['plugin'],'not-attempted')
+        self.assertFalse(self.plugin.exists());self.assertNotIn('SECRET',result.stderr)
+
+    def test_preflight_existing_pending_cache_reuses_exact_owner_release_path(self):
+        self.env['FIXTURE_PLUGIN_FAIL']='1';self.assertNotEqual(self.invoke().returncode,0)
+        pending=(self.plugin/'pending').read_bytes()
+        cache=self.root/'cache';before={str(p.relative_to(cache)):(p.read_bytes(),p.stat().st_mtime_ns) for p in cache.rglob('*') if p.is_file()}
+        self.env.pop('FIXTURE_PLUGIN_FAIL')
+        result=self.invoke(['--preflight-only']);self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual((self.plugin/'pending').read_bytes(),pending)
+        self.assertEqual(before,{str(p.relative_to(cache)):(p.read_bytes(),p.stat().st_mtime_ns) for p in cache.rglob('*') if p.is_file()})
 
     def test_offline_success_runner_only(self):
         result=self.invoke(['--runner-only']);self.assertEqual(result.returncode,0,result.stderr)

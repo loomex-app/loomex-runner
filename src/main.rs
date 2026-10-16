@@ -5,8 +5,7 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     if let Err(error) = entry() {
-        let (code, retryable, _) = control::public_error(&error);
-        eprintln!("{}", state::safe_error(&code, retryable));
+        eprintln!("{}", control::public_error_record(&error));
         std::process::exit(1)
     }
 }

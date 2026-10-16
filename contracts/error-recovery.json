@@ -171,16 +171,16 @@
       "outcome": "rejected"
     },
     "STORE_ACCESS_REQUIRED": {
-      "recovery": "unavailable",
-      "outcome": "not_dispatched"
+      "recovery": "reconcile_outcome",
+      "outcome": "unknown"
     },
     "STORE_ACCESS_DENIED": {
-      "recovery": "unavailable",
-      "outcome": "not_dispatched"
+      "recovery": "reconcile_outcome",
+      "outcome": "unknown"
     },
     "STORE_UNAVAILABLE": {
-      "recovery": "unavailable",
-      "outcome": "not_dispatched"
+      "recovery": "reconcile_outcome",
+      "outcome": "unknown"
     },
     "STORE_OPERATION_PENDING": {
       "recovery": "reconcile_outcome",
@@ -233,6 +233,18 @@
     "WORKFLOW_DEPLOYMENT_UNAVAILABLE": {
       "recovery": "correct_input",
       "outcome": "rejected"
+    },
+    "STORE_OWNER_BUSY": {
+      "recovery": "unavailable",
+      "outcome": "not_dispatched"
+    },
+    "LIFECYCLE_OPERATION_PENDING": {
+      "recovery": "unavailable",
+      "outcome": "not_dispatched"
+    },
+    "LIFECYCLE_RECOVERY_REQUIRED": {
+      "recovery": "unavailable",
+      "outcome": "not_dispatched"
     }
   }
 }

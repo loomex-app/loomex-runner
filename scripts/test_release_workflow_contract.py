@@ -45,6 +45,22 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn('[[ "$PLUGIN_REF" =~ ^[0-9a-f]{40}$ ]]', text)
         self.assertIn('[[ "$BACKEND_REF" =~ ^[0-9a-f]{40}$ ]]', text)
 
+    def test_public_development_candidate_requires_existing_approved_signer(self):
+        text=(ROOT/'.github/workflows/preview-release.yml').read_text()
+        self.assertIn('LOOMEX_DEVELOPMENT_CODESIGN_IDENTITY: ${{ vars.LOOMEX_DEVELOPMENT_CODESIGN_IDENTITY }}',text)
+        self.assertIn('["approved_development_signer"](require_identity=True)',text)
+        self.assertLess(text.index('name: Require the approved persistent development signer'),text.index('name: Build plugin'))
+        self.assertNotIn('security import',text)
+        self.assertNotIn('security create-keychain',text)
+        self.assertIn('toolchain: 1.88.0',text)
+        self.assertIn("python-version: '3.12'",text)
+
+    def test_public_signing_gate_does_not_ban_unsigned_isolated_builds(self):
+        text=(ROOT/'scripts/build-release.sh').read_text()
+        self.assertIn('building unsigned development artifact for isolated testing only',text)
+        self.assertIn('"$mode" == "--unsigned-cloud-preview" || -n "$local_origin"',text)
+        self.assertIn("['qualify_development_signing'](Path(sys.argv[2]))",text)
+
 
 if __name__ == "__main__":
     unittest.main()

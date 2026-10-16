@@ -6,6 +6,7 @@ pub mod fingerprint;
 pub mod follow;
 pub mod jobs;
 pub mod lifecycle;
+pub mod maintenance;
 pub mod power;
 pub mod presentation;
 pub mod progress;

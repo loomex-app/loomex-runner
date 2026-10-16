@@ -126,6 +126,73 @@ def verify_deployment(payload, component, deployment):
     if value!=expected or (payload/file).read_bytes()!=canonical(value): raise ValueError('runner deployment metadata differs from exact reviewed profile/origins/source')
     return value
 
+NATIVE_BINARIES = ('loomex', 'loomex-runner', 'loomex-lifecycle-bootstrap')
+
+def approved_development_signer(*, require_identity=False):
+    """Resolve an approved certificate pin; building additionally needs its identity.
+
+    Self-signed development certificates need not chain to an Apple-trusted root.
+    `find-identity` without -v lists available private-key identities independently
+    of trust; actual signatures and exact leaf pins are verified separately.
+    """
+    identity = os.environ.get('LOOMEX_DEVELOPMENT_CODESIGN_IDENTITY', '')
+    approved = os.environ.get('LOOMEX_DEVELOPMENT_CODESIGN_FINGERPRINT', '').lower()
+    if approved and not re.fullmatch(r'[0-9a-f]{40}', approved):
+        raise ValueError('approved development signer fingerprint is invalid')
+    if not require_identity:
+        if approved:
+            return approved
+        if re.fullmatch(r'[0-9A-Fa-f]{40}', identity):
+            return identity.lower()
+    if not identity or identity == '-':
+        raise ValueError('public development qualification requires an approved persistent development signing identity or explicit fingerprint; building requires the existing signing identity')
+    command = ['/usr/bin/security', 'find-identity', '-p', 'codesigning']
+    keychain = os.environ.get('LOOMEX_DEVELOPMENT_CODESIGN_KEYCHAIN')
+    if keychain:
+        regular(Path(keychain))
+        command.append(keychain)
+    result = subprocess.run(command, capture_output=True, text=True, check=True)
+    identities = re.findall(r'(?m)^\s*\d+\) ([0-9A-Fa-f]{40}) "([^"\n]+)"(?: \([A-Z0-9_]+\))?\s*$', result.stdout)
+    selected = {fingerprint.lower() for fingerprint, name in identities if identity.lower() == fingerprint.lower() or identity == name}
+    if len(selected) != 1:
+        raise ValueError('approved development signing identity is unavailable or ambiguous')
+    fingerprint = selected.pop()
+    if approved and fingerprint != approved:
+        raise ValueError('selected development identity differs from the approved fingerprint')
+    return fingerprint
+
+def qualify_development_signing(payload, *, approved_fingerprint=None, envelope=None):
+    """Public-release gate only. Generic isolated unsigned artifacts remain valid."""
+    fingerprint = approved_fingerprint or approved_development_signer()
+    if not re.fullmatch(r'[0-9a-f]{40}', fingerprint):
+        raise ValueError('approved development signer fingerprint is invalid')
+    value = read(payload/'metadata/development-signing.json')
+    if not isinstance(value, dict) or set(value) != {'schema', 'requirements'} or value['schema'] != 'app.loomex.runner.development-signing/v1' or not isinstance(value['requirements'], dict) or set(value['requirements']) != set(NATIVE_BINARIES):
+        raise ValueError('public release requires development-signing metadata for all three native binaries')
+    if (payload/'metadata/development-signing.json').read_bytes() != canonical(value):
+        raise ValueError('development-signing metadata must be canonical')
+    for name in NATIVE_BINARIES:
+        binary = payload/'bin'/name
+        regular(binary)
+        subprocess.run(['/usr/bin/codesign', '--verify', '--strict', str(binary)], capture_output=True, text=True, check=True)
+        info = subprocess.run(['/usr/bin/codesign', '-dv', '--verbose=4', str(binary)], capture_output=True, text=True, check=True)
+        details = info.stdout + info.stderr
+        if 'Signature=adhoc' in details or not any(line.startswith('Authority=') for line in details.splitlines()):
+            raise ValueError('public release rejects missing or ad-hoc native signing')
+        display = subprocess.run(['/usr/bin/codesign', '-dr', '-', str(binary)], capture_output=True, text=True, check=True)
+        lines = [line.split('designated => ', 1)[1].strip() for line in (display.stdout + display.stderr).splitlines() if line.startswith(('designated => ', '# designated => '))]
+        if len(lines) != 1 or lines[0] != value['requirements'][name]:
+            raise ValueError('native signing requirement differs from inventory-bound development metadata')
+        match = re.fullmatch(r'identifier "app\.loomex\.runner\.' + re.escape(name) + r'" and certificate leaf = H"([0-9a-fA-F]{40})"', lines[0])
+        if not match or match.group(1).lower() != fingerprint:
+            raise ValueError('native binary is not signed by the approved persistent development identity')
+    if envelope is not None:
+        bootstrap = envelope/'loomex-lifecycle-bootstrap'
+        regular(bootstrap)
+        if sha(bootstrap) != sha(payload/'bin/loomex-lifecycle-bootstrap'):
+            raise ValueError('public envelope bootstrap differs from the qualified signed payload')
+    return {'schema': value['schema'], 'signerSha1': fingerprint, 'binaries': list(NATIVE_BINARIES)}
+
 def package(args):
     output=Path(args.output).absolute()
     if any(parent.is_symlink() for parent in output.parents) or os.path.lexists(output): raise ValueError('output already exists; no overwrite')
@@ -152,6 +219,7 @@ def package(args):
         if args.deployment_profile=='local-development': deployment['webAppOrigin']=args.web_app_origin
         elif args.web_app_origin is not None: raise ValueError('cloud web origin belongs to existing compiled configuration')
         verify_deployment(verified,runner_manifest,deployment)
+        qualify_development_signing(verified, envelope=runner)
         extracted=temporary/'plugin-envelope';safe_extract(plugin_archive,extracted)
         plugin_manifest=read(extracted/'manifest.json'); public=read(extracted/'public-distribution.json')
         plugin_members={p.relative_to(extracted).as_posix() for p in extracted.rglob('*') if p.is_file()}
@@ -226,7 +294,11 @@ def release_notes(manifest,digest):
     notes=f'Unsigned development preview for macOS ARM64 only. Not Developer ID signed or notarized. Explicit opt-in required.\n\nRunner {runner["version"]}: {runner["sourceRevision"]}\nPlugin {plugin["version"]}: {plugin["sourceRevision"]}\nBackend qualified source: {manifest["evidence"]["backendSourceRevision"]}\nRelease-set SHA256: {digest}\nDeployment profile: {manifest["deployment"]["profile"]}\nAPI origin: {manifest["deployment"]["apiOrigin"]}\nWeb app origin: {manifest["deployment"].get("webAppOrigin", "compiled cloud build configuration")}\nProtocol: {manifest["protocolVersion"]}\n\nLicense: existing Proprietary decision; no new license grant.\n\nInspect all assets and inventories before the separate operator publication checkpoint. Installation defaults to runner and plugin; --runner-only is supported. No login or organization selection is forced.\n'
 
     if legacy_names(manifest): return notes
-    notes=notes.replace('Unsigned development preview for macOS ARM64 only.', 'Loomex for macOS Apple silicon. These artifacts are unsigned development builds.')
+    notes=notes.replace(
+        'Unsigned development preview for macOS ARM64 only. Not Developer ID signed or notarized. Explicit opt-in required.',
+        'Loomex release for macOS Apple silicon. The release envelope is unsigned; all three runner executables use the approved persistent self-signed development identity. These are not Apple Developer ID signatures; the release is not notarized. Explicit development-install opt-in is required.'
+    )
+    notes+='\nQualification uses isolated fixtures and verifies artifact signatures. Live recovery, Keychain access and installation on another Mac remain unverified.\n'
     url=f'https://github.com/{REPOSITORY}/releases/download/{manifest["releaseTag"]}/install.sh'
     return notes+f'''## Install runner and Codex plugin\n\nA compatible backend must already be available at the API origin above. Provider CLIs and their account access are separate prerequisites.\n\n```sh\nloomex_installer="$(mktemp)" &&\ncurl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' {url} -o "$loomex_installer" &&\nLOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 /bin/bash "$loomex_installer" --allow-unsigned-development\n```\n\nReview the downloaded script before executing it if desired. The release-specific launcher pins the helper and paired manifest hashes; it never mixes component downloads from latest. Restart Codex after installation, then use `$loomex:loomex-connect` to sign in and choose an organization.\n'''
 

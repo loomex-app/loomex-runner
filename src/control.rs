@@ -289,11 +289,21 @@ impl Daemon {
         json!({"draining":true,"activeJobs":work,"updateDeferred":work>0})
     }
     fn control_writer(&self, method: &str, write: bool) -> Result<Option<ControlWriter<'_>>> {
-        if ["protocol.negotiate", "status.get", "connection.get"].contains(&method) {
+        if [
+            "protocol.negotiate",
+            "status.get",
+            "connection.get",
+            "auth.status",
+        ]
+        .contains(&method)
+        {
             return Ok(None);
         }
         let _admission = self.execution.admission_lock()?;
         if self.lifecycle_draining.load(Ordering::SeqCst) {
+            if method == "auth.logout" {
+                bail!("LIFECYCLE_OPERATION_PENDING");
+            }
             if method == "daemon.drain" && self.dir.join("drain.json").exists() {
                 return Ok(None);
             }
@@ -4508,7 +4518,7 @@ async fn read_spool(dir: &Path, p: &Value) -> Result<Value> {
     Ok(page)
 }
 
-fn daemon_lock(dir: &Path) -> Result<std::fs::File> {
+pub(crate) fn daemon_lock(dir: &Path) -> Result<std::fs::File> {
     state::private_dir(dir)?;
     let lock = std::fs::OpenOptions::new()
         .read(true)
@@ -4530,12 +4540,9 @@ fn daemon_lock(dir: &Path) -> Result<std::fs::File> {
     Ok(lock)
 }
 pub async fn offline_logout(dir: &Path) -> Result<Value> {
-    // Acquire ownership before constructing a native auth operation. No socket or
-    // execution service starts in this explicitly selected maintenance command.
-    let lock = daemon_lock(dir)?;
-    let auth = Auth::new(Api::new()?)?;
-    finish_offline_logout(lock, auth).await
+    crate::maintenance::delegate_offline_logout(dir).await
 }
+#[cfg(test)]
 async fn finish_offline_logout(lock: std::fs::File, auth: Auth) -> Result<Value> {
     // The worker keeps exclusive ownership through native IO even if the caller
     // stops awaiting it. No later daemon may race protected credential cleanup.
@@ -4549,6 +4556,16 @@ async fn finish_offline_logout(lock: std::fs::File, auth: Auth) -> Result<Value>
     .map_err(|_| anyhow::anyhow!("AUTH_LOGOUT_FAILED"))?
 }
 pub async fn serve(daemon: Arc<Daemon>) -> Result<()> {
+    // A stopped uninstaller must not be raced by normal daemon startup. Native
+    // maintenance is a separate entrypoint and never starts execution admission.
+    if daemon.dir.join("bootstrap-uninstall.json").try_exists()?
+        || daemon
+            .dir
+            .join("bootstrap-uninstall-terminal.json")
+            .try_exists()?
+    {
+        bail!("LIFECYCLE_OPERATION_PENDING");
+    }
     let lock = Arc::new(daemon_lock(&daemon.dir)?);
     daemon.auth.retain_store_owner(&lock);
     let socket = daemon.dir.join("control.sock");
@@ -4715,13 +4732,16 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
                             json!({"protocol":PROTOCOL,"id":id,"result":result})
                         }
                         Err(error) => {
-                            let (code, retryable, data) = public_error(&error);
-                            let data = if validation_errors_negotiated {
-                                data
-                            } else {
-                                None
-                            };
-                            json!({"protocol":PROTOCOL,"id":id,"error":state::safe_error_with_data(&code,retryable,data.as_ref())})
+                            let mut projected = rpc_public_error(&error);
+                            // Credential diagnostics are available through the
+                            // deliberate local maintenance surface. Existing RPC
+                            // clients negotiate only workflow validation data.
+                            if !validation_errors_negotiated
+                                || crate::auth::cleanup_error_metadata(&error).is_some()
+                            {
+                                projected.as_object_mut().unwrap().remove("data");
+                            }
+                            json!({"protocol":PROTOCOL,"id":id,"error":projected})
                         }
                     }
                 }
@@ -4767,6 +4787,9 @@ pub async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(
     }
 }
 pub fn public_error(error: &anyhow::Error) -> (String, bool, Option<Value>) {
+    if let Some(details) = crate::auth::cleanup_error_metadata(error) {
+        return (error.to_string(), false, Some(details));
+    }
     if let Some(api) = error.downcast_ref::<ApiError>() {
         return (api.code.clone(), api.retryable, api.data.clone());
     }
@@ -4801,6 +4824,37 @@ pub fn public_error(error: &anyhow::Error) -> (String, bool, Option<Value>) {
     } else {
         ("INTERNAL".into(), false, None)
     }
+}
+/// Stage-aware errors preserve uncertainty after a remote side effect. A local
+/// store code alone cannot establish that a cleanup was never dispatched.
+pub fn public_error_record(error: &anyhow::Error) -> Value {
+    if let Some(record) = crate::maintenance::delegated_error_record(error) {
+        return record;
+    }
+    let (code, retryable, data) = public_error(error);
+    let mut result = state::safe_error_with_data(&code, retryable, data.as_ref());
+    if let Some(details) = crate::auth::cleanup_error_metadata(error) {
+        result["recovery"] = json!("reconcile_outcome");
+        result["outcome"] = json!(if details["remoteRevocation"] == "not_dispatched" {
+            "not_dispatched"
+        } else {
+            "unknown"
+        });
+    }
+    result
+}
+pub(crate) fn rpc_public_error(error: &anyhow::Error) -> Value {
+    let mut projected = public_error_record(error);
+    if crate::auth::cleanup_error_metadata(error)
+        .is_some_and(|details| details["remoteRevocation"] != "not_dispatched")
+    {
+        // Released clients derive recovery from their pinned code table.
+        // Unknown-default codes remain conservative even in those clients.
+        projected["code"] = json!("AUTH_CLEANUP_OUTCOME_PENDING");
+        projected["message"] =
+            json!("Credential cleanup needs reconciliation; preserve this operation.");
+    }
+    projected
 }
 pub async fn client(dir: &Path, method: &str, params: Value) -> Result<Value> {
     client_with_semantics(dir, method, params, &REQUIRED_SEMANTICS).await
@@ -6524,6 +6578,29 @@ mod conformance {
             Some(org)
         );
         assert_eq!(daemon.auth.status().await.unwrap()["code"], "AUTHENTICATED");
+    }
+    #[tokio::test]
+    async fn drained_auth_observation_does_not_reopen_writers_or_admit_logout() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = fixture(
+            temp.path(),
+            Api::for_test_origin("http://127.0.0.1:9").unwrap(),
+        );
+        daemon.lifecycle_draining.store(true, Ordering::SeqCst);
+        assert_eq!(daemon.managed_work(), 0);
+        let result = daemon.dispatch("auth.status", json!({})).await.unwrap();
+        assert_eq!(result["code"], "AUTHENTICATED");
+        assert_eq!(daemon.managed_work(), 0);
+        assert_eq!(
+            daemon
+                .dispatch("auth.logout", json!({"idempotencyKey":Uuid::new_v4()}))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "LIFECYCLE_OPERATION_PENDING"
+        );
+        assert_eq!(daemon.managed_work(), 0);
+        assert!(!daemon.execution.logout_requested());
     }
     #[tokio::test]
     async fn idle_logout_clears_the_public_organization_selection() {
@@ -8344,8 +8421,9 @@ mod conformance {
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
         let result = finish_offline_logout(retry_lock, check_auth).await.unwrap();
-        assert_eq!(result["revoked"], true);
+        assert_eq!(result["revoked"], false);
         assert_eq!(result["alreadyLoggedOut"], true);
+        assert_eq!(result["remoteRevocation"], "unverified");
         assert!(!temp.path().join("control.sock").exists());
         assert!(!temp.path().join("jobs").exists());
         assert!(

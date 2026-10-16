@@ -59,7 +59,9 @@ def local_inventory(directory):
             payload=Path(temp)/f'{name}-payload';pack.safe_extract(root/'payload.tar.gz',payload)
             if pack.artifact.inventory(payload) != m['payload']['files']:raise ValueError('component payload file inventory differs')
             component_inventories[name]=m['payload']['files']
-            if name=='runner':pack.verify_deployment(payload,c,manifest['deployment'])
+            if name=='runner':
+                pack.verify_deployment(payload,c,manifest['deployment'])
+                pack.qualify_development_signing(payload, envelope=root)
             source=m['sourceContent'];source_root=payload if name=='runner' else root
             if source['file'] != ('metadata/source-content-manifest.json' if name=='runner' else 'source-content.json') or pack.sha(source_root/source['file']) != source['sha256']:raise ValueError('source content binding differs')
             source_content=pack.read(source_root/source['file'])
