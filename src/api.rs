@@ -36,6 +36,10 @@ impl fmt::Display for ApiError {
 }
 impl std::error::Error for ApiError {}
 impl ApiError {
+    pub(crate) fn rejected_workflow_deployment(&self) -> bool {
+        self.status == Some(503) && self.code == "WORKFLOW_DEPLOYMENT_UNAVAILABLE"
+    }
+
     fn new(code: &str, retryable: bool) -> Self {
         Self {
             code: code.into(),
@@ -461,7 +465,8 @@ impl Api {
                 prepared.method.as_str(),
                 prepared.url.path().strip_prefix(BASE).unwrap_or(""),
             ))
-            .header("Accept", "application/json");
+            .header("Accept", "application/json")
+            .header("X-Loomex-Capabilities", "workflow.queue-observation/v1");
         if let Some(key) = &prepared.idempotency_key {
             request = request.header("Idempotency-Key", key);
         }
@@ -524,6 +529,11 @@ fn parse_envelope(status: u16, payload: Value) -> Result<Value, ApiError> {
         .unwrap_or("API_REQUEST_FAILED");
     let mut error = ApiError::new(code, status >= 500 || status == 429 || status == 408);
     error.status = Some(status);
+    if error.rejected_workflow_deployment() {
+        // Repairing deployment configuration requires an explicit retry. This
+        // exact admission rejection has no execution effect to reconcile.
+        error.retryable = false;
+    }
     error.correlation_id = payload
         .pointer("/meta/correlationId")
         .and_then(Value::as_str)
@@ -549,6 +559,24 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+
+    #[test]
+    fn deployment_rejection_is_not_retryable_and_does_not_reclassify_other_server_errors() {
+        for (status, code, expected_retryable) in [
+            (503, "WORKFLOW_DEPLOYMENT_UNAVAILABLE", false),
+            (500, "WORKFLOW_DEPLOYMENT_UNAVAILABLE", true),
+            (503, "RUNNER_PROOF_REPLAY_CACHE_UNAVAILABLE", true),
+            (503, "API_REQUEST_FAILED", true),
+        ] {
+            let error = parse_envelope(
+                status,
+                json!({"error":{"code":code,"details":{"private":"secret"}}}),
+            )
+            .unwrap_err();
+            assert_eq!(error.retryable, expected_retryable, "{status}/{code}");
+            assert!(error.data.is_none());
+        }
+    }
 
     async fn capture_request(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
         let mut bytes = Vec::new();

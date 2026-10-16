@@ -116,6 +116,7 @@
     "recovery.coordination/v1",
     "transfer.chunked/v1",
     "transfer.response-utf8/v1",
+    "workflow.queue-observation/v1",
     "workflows.atomic-draft-create/v1",
     "workflows.canonical-authoring-contract/v1",
     "workflows.patch.notes-preserve/v1",
@@ -128,7 +129,7 @@
       "path": "contracts/backend-routes.json"
     },
     "methodCatalog": {
-      "digest": "sha256:0bd2338b5efa2dae8fc9ff57bd2367175d7ea98106f8b39322a358903cb3f20b",
+      "digest": "sha256:40fba737c02efe416135c5f7e736e64d4080b576125cce067522005f7894a284",
       "path": "contracts/method-catalog.json"
     }
   },
@@ -941,7 +942,7 @@
       "inputSchemaDigest": "sha256:fbe3d5301300ae79feaf7084600a360065f37f31c3cde4ab8e884fcf29580a85",
       "mutating": true,
       "name": "runs.commit",
-      "outputSchemaDigest": "sha256:c074dcbefb0714ebc73fab21ec0922f3b660e95842f93efc31773d66af69e0d2",
+      "outputSchemaDigest": "sha256:391b3d3e2209e46120c043e2b5a0f06452f4d8175f8221b236434efc9ce422a8",
       "routeIds": [
         "execution.commit"
       ],
@@ -977,7 +978,7 @@
       "inputSchemaDigest": "sha256:f63aad9a2dcb72fe66bcb95fba2de4971851b849ed7797adfe45ba425f8df597",
       "mutating": false,
       "name": "runs.events",
-      "outputSchemaDigest": "sha256:37fda534233340030036cc5be4cd0f7030b235d7e6356c90434e387416b8b354",
+      "outputSchemaDigest": "sha256:4cccd862443cb32425983b3d4d5f242dae98cbedec52fefb811f13c293b5c98f",
       "routeIds": [
         "execution.detail"
       ],
@@ -989,7 +990,7 @@
       "inputSchemaDigest": "sha256:f63aad9a2dcb72fe66bcb95fba2de4971851b849ed7797adfe45ba425f8df597",
       "mutating": false,
       "name": "runs.get",
-      "outputSchemaDigest": "sha256:37fda534233340030036cc5be4cd0f7030b235d7e6356c90434e387416b8b354",
+      "outputSchemaDigest": "sha256:4cccd862443cb32425983b3d4d5f242dae98cbedec52fefb811f13c293b5c98f",
       "routeIds": [
         "execution.detail"
       ],
@@ -1025,7 +1026,7 @@
       "inputSchemaDigest": "sha256:f63aad9a2dcb72fe66bcb95fba2de4971851b849ed7797adfe45ba425f8df597",
       "mutating": false,
       "name": "runs.result",
-      "outputSchemaDigest": "sha256:37fda534233340030036cc5be4cd0f7030b235d7e6356c90434e387416b8b354",
+      "outputSchemaDigest": "sha256:4cccd862443cb32425983b3d4d5f242dae98cbedec52fefb811f13c293b5c98f",
       "routeIds": [
         "execution.detail"
       ],
@@ -1099,7 +1100,7 @@
       "inputSchemaDigest": "sha256:f63aad9a2dcb72fe66bcb95fba2de4971851b849ed7797adfe45ba425f8df597",
       "mutating": false,
       "name": "runs.wait",
-      "outputSchemaDigest": "sha256:37fda534233340030036cc5be4cd0f7030b235d7e6356c90434e387416b8b354",
+      "outputSchemaDigest": "sha256:4cccd862443cb32425983b3d4d5f242dae98cbedec52fefb811f13c293b5c98f",
       "routeIds": [
         "execution.detail"
       ],
@@ -1697,7 +1698,7 @@
   "schemaVersion": "loomex.runner.compatibility-manifest/v1",
   "summary": {
     "backendRouteCount": 73,
-    "capabilityCount": 120,
+    "capabilityCount": 121,
     "methodClassifications": {
       "backend-auth": 7,
       "backend-proxy": 55,

@@ -337,6 +337,179 @@ async fn scoped_authoring_read_rejects_account_drift_during_transport_without_sp
 }
 
 #[tokio::test]
+async fn deployment_rejection_is_durable_and_only_an_explicit_exact_start_retries() {
+    for method in ["builder.start", "editor.start"] {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let owner = daemon(temp.path(), api.clone(), "owner");
+        owner.public.lock().await.active_organization = Some("org".into());
+        let input = arguments(method);
+        let exact = input.clone();
+        let expected = receipt(method);
+        let result = expected.clone();
+        let server = tokio::spawn(async move {
+            for index in 0..2 {
+                let (stream, head, body) = request(&listener).await;
+                assert!(head.contains(if method == "builder.start" {
+                    "/v2/workflow-builder/start/"
+                } else {
+                    "/v2/workflow-edit/start/"
+                }));
+                assert_eq!(body, exact);
+                if index == 0 {
+                    respond(stream, 503, json!({"error":{"code":"WORKFLOW_DEPLOYMENT_UNAVAILABLE","message":"private deployment details"}})).await;
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                            .await
+                            .is_err()
+                    );
+                } else {
+                    respond(stream, 200, result.clone()).await;
+                }
+            }
+        });
+        let error = owner.dispatch(method, input.clone()).await.unwrap_err();
+        let key = state::json_digest(
+            &json!({"organizationId":"org","accountSubject":"owner","idempotencyKey":input["idempotencyKey"]}),
+        );
+        let journal: Value =
+            state::read_json(&temp.path().join("operations").join(format!("{key}.json"))).unwrap();
+        assert_eq!(journal["status"], "rejected_before_execution");
+        assert_eq!(
+            journal["rejection"],
+            json!({"code":"WORKFLOW_DEPLOYMENT_UNAVAILABLE","httpStatus":503})
+        );
+        let (code, retryable, data) = public_error(&error);
+        assert_eq!(code, "WORKFLOW_DEPLOYMENT_UNAVAILABLE");
+        assert!(!retryable);
+        assert!(data.is_none());
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let restarted = daemon(temp.path(), api, "owner");
+        restarted.public.lock().await.active_organization = Some("org".into());
+        let mut changed = input.clone();
+        changed["prompt"] = json!("Changed intent");
+        assert_eq!(
+            restarted
+                .dispatch(method, changed)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "IDEMPOTENCY_CONFLICT"
+        );
+        assert_eq!(restarted.dispatch(method, input).await.unwrap(), expected);
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn deployment_rejection_is_consumed_before_a_retry_with_lost_response() {
+    let temp = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api = Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let owner = daemon(temp.path(), api, "owner");
+    owner.public.lock().await.active_organization = Some("org".into());
+    let input = arguments("builder.start");
+    let key = input["idempotencyKey"].clone();
+    let server = tokio::spawn(async move {
+        let (stream, _, _) = request(&listener).await;
+        respond(
+            stream,
+            503,
+            json!({"error":{"code":"WORKFLOW_DEPLOYMENT_UNAVAILABLE"}}),
+        )
+        .await;
+        let (stream, head, _) = request(&listener).await;
+        assert!(head.contains("/v2/workflow-builder/start/"));
+        drop(stream);
+        let (stream, head, body) = request(&listener).await;
+        assert!(head.contains("/v2/workflow-operations/get/"));
+        assert_eq!(
+            body,
+            json!({"operation":"builder.start","idempotencyKey":key})
+        );
+        respond(
+            stream,
+            200,
+            json!({"operation":"builder.start","idempotencyKey":key,"status":"not_found"}),
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    });
+    assert_eq!(
+        owner
+            .dispatch("builder.start", input.clone())
+            .await
+            .unwrap_err()
+            .to_string(),
+        "WORKFLOW_DEPLOYMENT_UNAVAILABLE"
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            owner
+                .dispatch("builder.start", input.clone())
+                .await
+                .unwrap_err()
+                .to_string(),
+            "NETWORK_AMBIGUOUS"
+        );
+    }
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn deployment_code_with_wrong_status_or_generic_503_never_authorizes_start_replay() {
+    for (status, code) in [
+        (500, "WORKFLOW_DEPLOYMENT_UNAVAILABLE"),
+        (422, "WORKFLOW_DEPLOYMENT_UNAVAILABLE"),
+        (503, "API_REQUEST_FAILED"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let owner = daemon(temp.path(), api, "owner");
+        owner.public.lock().await.active_organization = Some("org".into());
+        let input = arguments("builder.start");
+        let key = input["idempotencyKey"].clone();
+        let server = tokio::spawn(async move {
+            let (stream, _, _) = request(&listener).await;
+            respond(stream, status, json!({"error":{"code":code}})).await;
+            let (stream, head, _) = request(&listener).await;
+            assert!(head.contains("/v2/workflow-operations/get/"));
+            respond(
+                stream,
+                200,
+                json!({"operation":"builder.start","idempotencyKey":key,"status":"not_found"}),
+            )
+            .await;
+        });
+        assert_eq!(
+            owner
+                .dispatch("builder.start", input.clone())
+                .await
+                .unwrap_err()
+                .to_string(),
+            code
+        );
+        assert_eq!(
+            owner
+                .dispatch("builder.start", input)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "NETWORK_AMBIGUOUS"
+        );
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn native_stale_proof_rejection_allows_only_exact_args_to_retry_start() {
     for method in ["builder.start", "editor.start"] {
         let temp = tempfile::tempdir().unwrap();

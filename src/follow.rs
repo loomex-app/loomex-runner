@@ -1250,6 +1250,40 @@ fn signal_from_observation(
         }
         return Some(json!({"kind":"terminal","receiptId":receipt}));
     }
+    // Infrastructure loss is an actionable observation, not an active provider
+    // or permission to replay. Keep existing event/input/terminal precedence.
+    if snapshot.get("hasMoreEvents") == Some(&Value::Bool(false)) {
+        let queue = &snapshot["queueObservation"];
+        let timestamps = ["queuedAt", "observedAt"].map(|key| {
+            queue[key].as_str().and_then(|value| {
+                time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+                    .ok()
+            })
+        });
+        if status == "queued"
+            && snapshot.get("humanRequest").is_none_or(Value::is_null)
+            && snapshot.get("agentRequest").is_none_or(Value::is_null)
+            && snapshot.get("requiresAgentResponse") != Some(&Value::Bool(true))
+            && snapshot
+                .get("waitState")
+                .is_none_or(|value| value.is_null() || value == "automated_progress")
+            && snapshot
+                .pointer("/progress/activeNodes")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
+            && queue["schemaVersion"] == "loomex.workflow-queue-observation/v1"
+            && queue["executionId"] == binding.run
+            && queue["state"] == "queued"
+            && queue["workerState"] == "unavailable"
+            && queue["code"] == "WORKFLOW_WORKER_UNAVAILABLE"
+            && queue["waitSeconds"]
+                .as_u64()
+                .is_some_and(|value| value <= 9_007_199_254_740_991)
+            && matches!(timestamps, [Some(queued), Some(observed)] if observed >= queued)
+        {
+            return Some(json!({"kind":"interrupted","code":"WORKFLOW_WORKER_UNAVAILABLE"}));
+        }
+    }
     if [
         "queued",
         "running",
@@ -2637,6 +2671,46 @@ mod tests {
         );
         assert_eq!(
             signal_from_observation(&snapshot(&run, "running", false), &binding, None).unwrap()["kind"],
+            "active"
+        );
+        let mut queued = snapshot(&run, "queued", false);
+        queued["queueObservation"] = json!({"schemaVersion":"loomex.workflow-queue-observation/v1",
+            "executionId":run,"state":"queued","workerState":"unavailable",
+            "code":"WORKFLOW_WORKER_UNAVAILABLE","waitSeconds":31,
+            "queuedAt":"2026-10-16T12:00:00.123456+00:00","observedAt":"2026-10-16T12:00:31.123456+00:00"});
+        let lost = signal_from_observation(&queued, &binding, None).unwrap();
+        assert_eq!(lost["kind"], "interrupted");
+        assert_eq!(decision_for(&lost, "none")["decision"], "suspend");
+        queued["hasMoreEvents"] = json!(true);
+        queued["events"] = json!([{"sequence":1}]);
+        queued["latestSequence"] = json!(2);
+        assert_eq!(
+            signal_from_observation(&queued, &binding, None).unwrap()["kind"],
+            "event_page"
+        );
+        queued["hasMoreEvents"] = json!(false);
+        queued["queueObservation"]["executionId"] = json!(Uuid::new_v4());
+        assert_eq!(
+            signal_from_observation(&queued, &binding, None).unwrap()["kind"],
+            "active"
+        );
+        queued["queueObservation"]["executionId"] = json!(run);
+        for (field, value) in [
+            ("requiresAgentResponse", json!(true)),
+            ("agentRequest", json!({"id":Uuid::new_v4()})),
+            ("waitState", json!("agent_response_required")),
+            ("progress", json!({"activeNodes":[{"id":"running"}]})),
+        ] {
+            let mut other = queued.clone();
+            other[field] = value;
+            assert_eq!(
+                signal_from_observation(&other, &binding, None).unwrap()["kind"],
+                "active"
+            );
+        }
+        queued["queueObservation"]["observedAt"] = json!("2026-10-15T12:00:31.123456+00:00");
+        assert_eq!(
+            signal_from_observation(&queued, &binding, None).unwrap()["kind"],
             "active"
         );
     }

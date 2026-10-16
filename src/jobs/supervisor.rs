@@ -12,7 +12,19 @@ pub struct ExecutionSupervisor {
     recovery_tasks: Mutex<tokio::task::JoinSet<()>>,
     owned_jobs: Mutex<HashSet<String>>,
     shutdown: AtomicBool,
+    lease_polls: LeasePollCounters,
 }
+
+#[derive(Default)]
+struct LeasePollCounters {
+    requests: std::sync::atomic::AtomicU64,
+    empty_responses: std::sync::atomic::AtomicU64,
+    fast_empty_responses: std::sync::atomic::AtomicU64,
+    paced_waits: std::sync::atomic::AtomicU64,
+    interrupted_waits: std::sync::atomic::AtomicU64,
+    protocol_errors: std::sync::atomic::AtomicU64,
+}
+
 impl ExecutionSupervisor {
     pub fn new(draining: bool) -> Self {
         Self {
@@ -26,6 +38,7 @@ impl ExecutionSupervisor {
             recovery_tasks: Mutex::new(tokio::task::JoinSet::new()),
             owned_jobs: Default::default(),
             shutdown: AtomicBool::new(false),
+            lease_polls: Default::default(),
         }
     }
     pub fn is_draining(&self) -> bool {
@@ -50,6 +63,18 @@ impl ExecutionSupervisor {
     }
     pub fn active_work(&self) -> usize {
         self.active.load(Ordering::SeqCst)
+    }
+    /// Aggregate local counters only; no session, organization or backend data.
+    pub fn lease_poll_diagnostics(&self) -> Value {
+        let counters = &self.lease_polls;
+        json!({
+            "requests": counters.requests.load(Ordering::Relaxed),
+            "emptyResponses": counters.empty_responses.load(Ordering::Relaxed),
+            "fastEmptyResponses": counters.fast_empty_responses.load(Ordering::Relaxed),
+            "pacedWaits": counters.paced_waits.load(Ordering::Relaxed),
+            "interruptedWaits": counters.interrupted_waits.load(Ordering::Relaxed),
+            "protocolErrors": counters.protocol_errors.load(Ordering::Relaxed),
+        })
     }
     pub fn admission_lock(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
         self.admission
@@ -249,6 +274,69 @@ async fn drain_owned_workers(workers: &mut tokio::task::JoinSet<()>) {
     while workers.join_next().await.is_some() {}
 }
 
+const FAST_EMPTY_THRESHOLD: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct LeaseIdlePacing {
+    fast_empty_streak: usize,
+}
+
+impl LeaseIdlePacing {
+    fn reset(&mut self) {
+        self.fast_empty_streak = 0;
+    }
+
+    fn empty_delay(&mut self, elapsed: Duration, jitter_per_mille: u32) -> Duration {
+        if elapsed >= FAST_EMPTY_THRESHOLD {
+            self.reset();
+            return Duration::ZERO;
+        }
+        debug_assert!((800..=1200).contains(&jitter_per_mille));
+        let cycle_seconds = [1, 2, 4, 5][self.fast_empty_streak.min(3)];
+        self.fast_empty_streak = (self.fast_empty_streak + 1).min(3);
+        // The target is the entire request cycle, not an extra delay after it.
+        Duration::from_millis(cycle_seconds * u64::from(jitter_per_mille)).saturating_sub(elapsed)
+    }
+}
+
+fn lease_job(response: &Value) -> Result<Option<&Value>> {
+    let job = response.get("job").context("BACKEND_PROTOCOL_ERROR")?;
+    if job.is_null() {
+        return Ok(None);
+    }
+    let id = job
+        .as_object()
+        .and_then(|object| object.get("id"))
+        .and_then(Value::as_str)
+        .context("BACKEND_PROTOCOL_ERROR")?;
+    Uuid::parse_str(id).map_err(|_| anyhow::anyhow!("BACKEND_PROTOCOL_ERROR"))?;
+    Ok(Some(job))
+}
+
+async fn wait_for_idle_cycle(
+    supervisor: &ExecutionSupervisor,
+    reconnect_requested: &AtomicBool,
+    delay: Duration,
+) -> bool {
+    let deadline = TokioInstant::now() + delay;
+    loop {
+        if supervisor.stopping()
+            || supervisor.is_draining()
+            || supervisor.logout_requested()
+            || reconnect_requested.load(Ordering::SeqCst)
+        {
+            return false;
+        }
+        let now = TokioInstant::now();
+        if now >= deadline {
+            return true;
+        }
+        // All existing stop flags are observable within 50ms without changing
+        // ownership or delaying independently spawned heartbeat/worker tasks.
+        tokio::time::sleep_until(deadline.min(now + Duration::from_millis(50))).await;
+    }
+}
+
 pub async fn run(daemon: Arc<Daemon>) {
     let mut last_sweep = 0;
     let mut running = HashSet::new();
@@ -344,6 +432,7 @@ pub(super) async fn session(daemon: Arc<Daemon>, org: String) -> Result<()> {
     }));
     let mut workers = tokio::task::JoinSet::new();
     let reconnect_requested = Arc::new(AtomicBool::new(false));
+    let mut idle_pacing = LeaseIdlePacing::default();
     let result: Result<()> = async {
         while !daemon.execution.is_draining()
             && !reconnect_requested.load(Ordering::SeqCst)
@@ -353,6 +442,9 @@ pub(super) async fn session(daemon: Arc<Daemon>, org: String) -> Result<()> {
             if reconnect_requested.load(Ordering::SeqCst) {
                 break;
             }
+            let lease_started = Instant::now();
+            let counters = &daemon.execution.lease_polls;
+            counters.requests.fetch_add(1, Ordering::Relaxed);
             let response = daemon
                 .backend(
                     &org,
@@ -362,13 +454,17 @@ pub(super) async fn session(daemon: Arc<Daemon>, org: String) -> Result<()> {
                     None,
                 )
                 .await?;
-            if let Some(job) = response.get("job").filter(|v| !v.is_null()) {
+            let elapsed = lease_started.elapsed();
+            let job = lease_job(&response).inspect_err(|_| {
+                counters.protocol_errors.fetch_add(1, Ordering::Relaxed);
+            })?;
+            if let Some(job) = job {
+                idle_pacing.reset();
                 let job = job.clone();
                 let id = job["id"]
                     .as_str()
                     .context("BACKEND_PROTOCOL_ERROR")?
                     .to_string();
-                Uuid::parse_str(&id)?;
                 let path = daemon.dir.join("jobs").join(&id).join("journal.json");
                 if path.exists() {
                     // A server retry never authorizes duplicate local spawn.
@@ -443,8 +539,21 @@ pub(super) async fn session(daemon: Arc<Daemon>, org: String) -> Result<()> {
                             }
                         }
                     }
-
                 });
+            } else {
+                counters.empty_responses.fetch_add(1, Ordering::Relaxed);
+                if elapsed < FAST_EMPTY_THRESHOLD {
+                    counters.fast_empty_responses.fetch_add(1, Ordering::Relaxed);
+                }
+                let jitter_per_mille = 800 + rand::random::<u32>() % 401;
+                let delay = idle_pacing.empty_delay(elapsed, jitter_per_mille);
+                if !delay.is_zero() {
+                    counters.paced_waits.fetch_add(1, Ordering::Relaxed);
+                    if !wait_for_idle_cycle(&daemon.execution, &reconnect_requested, delay).await {
+                        counters.interrupted_waits.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                }
             }
         }
         Ok(())
@@ -468,6 +577,217 @@ pub(super) async fn session(daemon: Arc<Daemon>, org: String) -> Result<()> {
 #[cfg(test)]
 mod ownership_tests {
     use super::*;
+
+    #[test]
+    fn idle_cycles_escalate_with_bounded_jitter_and_subtract_request_time() {
+        for jitter in [800, 1000, 1200] {
+            let mut pacing = LeaseIdlePacing::default();
+            for seconds in [1, 2, 4, 5, 5, 5] {
+                assert_eq!(
+                    pacing.empty_delay(Duration::from_millis(200), jitter),
+                    Duration::from_millis(seconds * u64::from(jitter) - 200),
+                );
+            }
+        }
+        let mut pacing = LeaseIdlePacing::default();
+        assert_eq!(
+            pacing.empty_delay(Duration::from_millis(1200), 800),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            pacing.empty_delay(Duration::from_millis(100), 1000),
+            Duration::from_millis(1900),
+        );
+    }
+
+    #[test]
+    fn idle_cycle_resets_after_a_job_or_real_backend_wait() {
+        let mut pacing = LeaseIdlePacing::default();
+        pacing.empty_delay(Duration::ZERO, 1000);
+        pacing.empty_delay(Duration::ZERO, 1000);
+        pacing.reset(); // The job branch resets before deduplication/admission.
+        assert_eq!(
+            pacing.empty_delay(Duration::ZERO, 1000),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            pacing.empty_delay(Duration::from_secs(5), 1200),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            pacing.empty_delay(Duration::ZERO, 1000),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            pacing.empty_delay(Duration::from_secs(20), 1200),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            pacing.empty_delay(Duration::ZERO, 1000),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn only_explicit_null_is_an_empty_lease_and_protocol_errors_are_sanitized() {
+        assert!(lease_job(&json!({"job":null})).unwrap().is_none());
+        let valid = json!({"job":{"id":"11111111-1111-4111-8111-111111111111"}});
+        assert_eq!(lease_job(&valid).unwrap(), valid.get("job"));
+        for malformed in [
+            Value::Null,
+            json!({"private":"secret backend data"}),
+            json!({"job":false}),
+            json!({"job":42}),
+            json!({"job":"secret backend data"}),
+            json!({"job":[]}),
+            json!({"job":{}}),
+            json!({"job":{"id":null}}),
+            json!({"job":{"id":"secret backend data"}}),
+        ] {
+            assert_eq!(
+                lease_job(&malformed).unwrap_err().to_string(),
+                "BACKEND_PROTOCOL_ERROR"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_wait_observes_every_stop_signal_within_100ms() {
+        for signal in ["drain", "logout", "shutdown", "reconnect"] {
+            let supervisor = Arc::new(ExecutionSupervisor::new(false));
+            let reconnect = Arc::new(AtomicBool::new(false));
+            let waiting_supervisor = supervisor.clone();
+            let waiting_reconnect = reconnect.clone();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let waiter = tokio::spawn(async move {
+                let _ = started.send(());
+                wait_for_idle_cycle(
+                    &waiting_supervisor,
+                    &waiting_reconnect,
+                    Duration::from_secs(6),
+                )
+                .await
+            });
+            ready.await.unwrap();
+            // This sibling continues to run while the lease loop is sleeping.
+            tokio::task::yield_now().await;
+            match signal {
+                "drain" => supervisor.set_draining(true),
+                "logout" => supervisor.set_logout_requested(true),
+                "shutdown" => supervisor.shutdown(),
+                "reconnect" => reconnect.store(true, Ordering::SeqCst),
+                _ => unreachable!(),
+            }
+            assert!(
+                !tokio::time::timeout(Duration::from_millis(100), waiter)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                "{signal}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_wait_finishes_normally_and_already_stopped_wait_never_sleeps() {
+        let supervisor = ExecutionSupervisor::new(false);
+        let reconnect = AtomicBool::new(false);
+        assert!(wait_for_idle_cycle(&supervisor, &reconnect, Duration::from_millis(1)).await);
+        supervisor.set_logout_requested(true);
+        assert!(
+            !tokio::time::timeout(
+                Duration::from_millis(20),
+                wait_for_idle_cycle(&supervisor, &reconnect, Duration::from_secs(6)),
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn lease_poll_diagnostics_are_only_fixed_numeric_counters() {
+        let supervisor = ExecutionSupervisor::new(false);
+        supervisor
+            .lease_polls
+            .requests
+            .fetch_add(7, Ordering::Relaxed);
+        supervisor
+            .lease_polls
+            .empty_responses
+            .fetch_add(6, Ordering::Relaxed);
+        assert_eq!(
+            supervisor.lease_poll_diagnostics(),
+            json!({
+                "requests":7,"emptyResponses":6,"fastEmptyResponses":0,
+                "pacedWaits":0,"interruptedWaits":0,"protocolErrors":0,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_empty_lease_does_not_immediately_poll_again() {
+        use super::super::protocol_tests::{daemon, receive, reply};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = daemon(
+            temp.path(),
+            format!("http://{}", listener.local_addr().unwrap()),
+        );
+        let session_daemon = daemon.clone();
+        let session = tokio::spawn(async move { session(session_daemon, "org".into()).await });
+        let (stream, _) = receive(&listener).await;
+        reply(stream, json!({"session":{"id":"session"}})).await;
+        let (stream, body) = receive(&listener).await;
+        assert_eq!(body, json!({"sessionId":"session","waitSeconds":20}));
+        reply(stream, json!({"job":null})).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), receive(&listener))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            daemon.execution.lease_poll_diagnostics(),
+            json!({
+                "requests":1,"emptyResponses":1,"fastEmptyResponses":1,
+                "pacedWaits":1,"interruptedWaits":0,"protocolErrors":0,
+            })
+        );
+        daemon.execution.shutdown();
+        let (stream, body) = tokio::time::timeout(Duration::from_millis(100), receive(&listener))
+            .await
+            .unwrap();
+        assert_eq!(body, json!({"reason":"daemon drained"}));
+        reply(stream, json!({})).await;
+        session.await.unwrap().unwrap();
+        assert_eq!(
+            daemon.execution.lease_poll_diagnostics()["interruptedWaits"],
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_lease_job_is_a_protocol_error_without_repolling() {
+        use super::super::protocol_tests::{daemon, receive, reply};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = daemon(
+            temp.path(),
+            format!("http://{}", listener.local_addr().unwrap()),
+        );
+        let session = tokio::spawn(async move { session(daemon, "org".into()).await });
+        let (stream, _) = receive(&listener).await;
+        reply(stream, json!({"session":{"id":"session"}})).await;
+        let (stream, _) = receive(&listener).await;
+        reply(stream, json!({"private":"backend response detail"})).await;
+        let (stream, body) = receive(&listener).await;
+        assert_eq!(body, json!({"reason":"daemon drained"}));
+        reply(stream, json!({})).await;
+        assert_eq!(
+            session.await.unwrap().unwrap_err().to_string(),
+            "BACKEND_PROTOCOL_ERROR"
+        );
+    }
+
     #[tokio::test]
     async fn reconnect_drain_preserves_healthy_sibling_until_it_finishes() {
         let reconnect = Arc::new(AtomicBool::new(false));

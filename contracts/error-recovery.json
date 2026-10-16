@@ -229,6 +229,10 @@
     "IDEMPOTENCY_KEY_INVALID": {
       "recovery": "correct_input",
       "outcome": "rejected"
+    },
+    "WORKFLOW_DEPLOYMENT_UNAVAILABLE": {
+      "recovery": "correct_input",
+      "outcome": "rejected"
     }
   }
 }

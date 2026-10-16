@@ -4511,6 +4511,10 @@
               "progress": {
                 "type": "object",
                 "additionalProperties": true
+              },
+              "queueObservation": {
+                "type": "object",
+                "additionalProperties": true
               }
             },
             "required": [
@@ -4888,6 +4892,10 @@
                   "draft"
                 ],
                 "additionalProperties": false
+              },
+              "queueObservation": {
+                "type": "object",
+                "additionalProperties": true
               }
             },
             "required": [
@@ -5174,6 +5182,10 @@
                   "draft"
                 ],
                 "additionalProperties": false
+              },
+              "queueObservation": {
+                "type": "object",
+                "additionalProperties": true
               }
             },
             "required": [
@@ -5460,6 +5472,10 @@
                   "draft"
                 ],
                 "additionalProperties": false
+              },
+              "queueObservation": {
+                "type": "object",
+                "additionalProperties": true
               }
             },
             "required": [
@@ -5746,6 +5762,10 @@
                   "draft"
                 ],
                 "additionalProperties": false
+              },
+              "queueObservation": {
+                "type": "object",
+                "additionalProperties": true
               }
             },
             "required": [
@@ -12195,6 +12215,7 @@
     "workflows.atomic-draft-create/v1",
     "workflows.canonical-authoring-contract/v1",
     "workflows.patch.notes-preserve/v1",
-    "workflows.runtime-draft-mutations/v1"
+    "workflows.runtime-draft-mutations/v1",
+    "workflow.queue-observation/v1"
   ]
 }

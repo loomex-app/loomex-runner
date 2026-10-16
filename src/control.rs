@@ -37,6 +37,9 @@ mod native_authoring_tests;
 pub const PROTOCOL: &str = "loomex.local-control/v2";
 pub const MAX_FRAME: usize = 1_048_576;
 pub const VALIDATION_ERRORS_CAPABILITY: &str = "error.validation-issues/v1";
+tokio::task_local! {
+    static QUEUE_OBSERVATION_CLIENT: bool;
+}
 pub const REQUIRED_SEMANTICS: [&str; 5] = [
     "execution.host_user/v1",
     "authorization.prepare-commit/v1",
@@ -501,11 +504,10 @@ impl Daemon {
                 }
                 if matches!(method, "builder.start" | "editor.start") {
                     if record["status"] == "rejected_before_execution"
-                        && record["rejection"]["code"] == "RUNNER_PROOF_STALE"
-                        && record["rejection"]["httpStatus"] == 422
+                        && known_start_rejection(&record["rejection"])
                     {
-                        // The backend's authenticated stale-proof rejection is
-                        // before its handler. Consume that narrow nonexecution
+                        // Only these exact authenticated rejections establish
+                        // no execution was accepted. Consume that nonexecution
                         // fact durably before sending the exact operation again.
                         // A crash or uncertain retry then remains pending and
                         // can only reconcile; not_found never grants a replay.
@@ -635,12 +637,14 @@ impl Daemon {
             if let Err(error) = &attempt {
                 if matches!(method, "builder.start" | "editor.start")
                     && error.downcast_ref::<ApiError>().is_some_and(|api| {
-                        api.status == Some(422) && api.code == "RUNNER_PROOF_STALE"
+                        (api.status == Some(422) && api.code == "RUNNER_PROOF_STALE")
+                            || api.rejected_workflow_deployment()
                     })
                 {
+                    let api = error.downcast_ref::<ApiError>().context("INTERNAL")?;
                     state::write_json(
                         operation.as_ref().context("INTERNAL")?,
-                        &json!({"digest":identity,"method":method,"status":"rejected_before_execution","rejection":{"code":"RUNNER_PROOF_STALE","httpStatus":422}}),
+                        &json!({"digest":identity,"method":method,"status":"rejected_before_execution","rejection":{"code":api.code,"httpStatus":api.status}}),
                     )?;
                 }
             }
@@ -682,10 +686,21 @@ impl Daemon {
     fn spool_response(
         &self,
         params: &Value,
-        result: Value,
+        mut result: Value,
         organization: Option<&str>,
         account: Option<&str>,
     ) -> Result<Value> {
+        // Project optional read metadata before serializing immutable bytes.
+        // Internal daemon reads use the current contract. Socket callers must
+        // explicitly negotiate it, including for responses exceeding a frame.
+        if !QUEUE_OBSERVATION_CLIENT
+            .try_with(|enabled| *enabled)
+            .unwrap_or(true)
+        {
+            if let Some(object) = result.as_object_mut() {
+                object.remove("queueObservation");
+            }
+        }
         let bytes = serde_json::to_vec(&result)?;
         let native_task = result.get("humanRequest").filter(|request| {
             request["type"] == "plugin_agent"
@@ -843,6 +858,7 @@ impl Daemon {
             "protocol.negotiate" => return negotiate(p),
             "status.get" => {
                 let mut status = json!({"version":env!("CARGO_PKG_VERSION"),"protocol":PROTOCOL,"activeJobs":self.reported_work(),"draining":self.execution.is_draining(),"updateDeferred":self.dir.join("pending-update.json").exists(),"details":{"monitoring":{"schemaVersion":"loomex.monitoring-readiness/v1","runObservationAvailable":true,"hostHookDeliveryAuthority":"host_managed","hostRecoveryAuthority":"host_managed","guarantee":"none"}}});
+                status["details"]["leasePolling"] = self.execution.lease_poll_diagnostics();
                 if p["includeFingerprintDiagnostics"] == true {
                     status["fingerprint"] = self.fingerprint_diagnostics();
                 }
@@ -2017,7 +2033,7 @@ impl Daemon {
             })
             .context("PREPARATION_INVALID")?;
         let stale = |reason: &str, next_action: &str| json!({"status":"stale","operation":operation,"preparationId":preparation,"reason":reason,"nextAction":next_action});
-        if record.get("commitAuthorization").is_some() {
+        if record.get("commitAuthorization").is_some() && !rejected_preparation_commit(&record) {
             // A sealed preparation is never usable for another commit.  Once the
             // original commit response is durable, however, its execution is a
             // safe recovery destination for a restored presentation session.
@@ -2741,11 +2757,17 @@ impl Daemon {
         let commit = &record["commit"];
         let preparation = required(commit, "preparationId")?;
         let digest = required(commit, "bindingDigest")?;
-        let key = required(commit, "idempotencyKey")?;
         ensure!(
             record["preparationId"] == preparation && record["bindingDigest"] == digest,
             "START_HANDOFF_STALE"
         );
+        if self.restore_deployment_rejected_handoff(path, record)? {
+            return Ok(());
+        }
+        let commit = &record["commit"];
+        let preparation = required(commit, "preparationId")?;
+        let digest = required(commit, "bindingDigest")?;
+        let key = required(commit, "idempotencyKey")?;
         let outcome = match self.backend(
             org,
             "POST",
@@ -2830,6 +2852,38 @@ impl Daemon {
         Ok(())
     }
 
+    /// Recover the crash window after a durable zero-effect rejection but
+    /// before the handoff was restored. The same authorization stays reserved.
+    fn restore_deployment_rejected_handoff(&self, path: &Path, record: &mut Value) -> Result<bool> {
+        let preparation = required(record, "preparationId")?;
+        let preparation_path = self
+            .dir
+            .join("preparations")
+            .join(format!("{preparation}.json"));
+        let Ok(prepared) = state::read_json::<Value>(&preparation_path) else {
+            return Ok(false);
+        };
+        if !rejected_preparation_commit(&prepared)
+            || prepared["organizationId"] != record["organizationId"]
+            || prepared["accountSubject"] != record["accountSubject"]
+            || prepared["installationId"] != record["installationId"]
+            || prepared["bindingDigest"] != record["bindingDigest"]
+            || prepared["review"]["preparationId"] != record["preparationId"]
+            || record["commit"]["preparationId"] != record["preparationId"]
+            || record["commit"]["bindingDigest"] != record["bindingDigest"]
+            || prepared["confirmationKey"] != record["commit"]["confirmationKey"]
+            || prepared["commitAuthorization"]["idempotencyKey"]
+                != record["commit"]["idempotencyKey"]
+        {
+            return Ok(false);
+        }
+        record["lifecycle"] = json!("approved");
+        record["lastError"] = json!("WORKFLOW_DEPLOYMENT_UNAVAILABLE");
+        record["updatedAt"] = json!(state::now());
+        state::write_json(path, record)?;
+        Ok(true)
+    }
+
     /// Reconcile an interrupted app-side issue using the original issue key.
     /// The key identifies an existing record owned by this organization,
     /// account, and installation only. It cannot recover the private
@@ -2892,6 +2946,13 @@ impl Daemon {
         let result = match self.commit("runs.commit", org, &commit).await {
             Ok(result) => result,
             Err(error) => {
+                if error
+                    .downcast_ref::<ApiError>()
+                    .is_some_and(ApiError::rejected_workflow_deployment)
+                    && self.restore_deployment_rejected_handoff(&path, &mut record)?
+                {
+                    return Err(error);
+                }
                 record["lifecycle"] = json!("ambiguous");
                 record["lastError"] = json!(error.to_string());
                 record["updatedAt"] = json!(state::now());
@@ -3056,7 +3117,11 @@ impl Daemon {
         {
             bail!("PRECONDITION_FAILED")
         }
-        if method == "runs.commit" && record.get("commitAuthorization").is_some() {
+        if method == "runs.commit"
+            && record.get("commitAuthorization").is_some()
+            && !(rejected_preparation_commit(&record)
+                && record["commitAuthorization"]["idempotencyKey"] == p["idempotencyKey"])
+        {
             // Cached accepted operations are served by dispatch. An uncached
             // or uncertain operation cannot replace a consumed authorization.
             bail!("PRECONDITION_FAILED");
@@ -3087,6 +3152,12 @@ impl Daemon {
         // The separate confirmation authorizes this exact preparation before the
         // backend can enqueue a job. A lost response never removes this grant.
         record["commitAuthorization"] = json!({"preparationId":preparation,"bindingDigest":p["bindingDigest"],"idempotencyKey":p["idempotencyKey"],"authorizedAt":state::now()});
+        // Consume the no-effect fact before transport. A lost retry response
+        // leaves authorization consumed and cannot authorize another replay.
+        record
+            .as_object_mut()
+            .context("INTERNAL")?
+            .remove("commitRejection");
         state::write_json(&record_path, &record)?;
         let result = self
             .backend(
@@ -3100,7 +3171,18 @@ impl Daemon {
                 Some(json!({"preparationId":preparation,"bindingDigest":p["bindingDigest"]})),
                 p["idempotencyKey"].as_str(),
             )
-            .await?;
+            .await;
+        if method == "runs.commit"
+            && result.as_ref().is_err_and(|error| {
+                error
+                    .downcast_ref::<ApiError>()
+                    .is_some_and(ApiError::rejected_workflow_deployment)
+            })
+        {
+            record["commitRejection"] = json!({"code":"WORKFLOW_DEPLOYMENT_UNAVAILABLE","httpStatus":503,"idempotencyKey":p["idempotencyKey"]});
+            state::write_json(&record_path, &record)?;
+        }
+        let result = result?;
         if let Some(run) = result["execution"]["id"]
             .as_str()
             .or_else(|| result["id"].as_str())
@@ -3625,6 +3707,28 @@ fn lowercase_sha256(value: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
+fn deployment_start_rejection(rejection: &Value) -> bool {
+    rejection["code"] == "WORKFLOW_DEPLOYMENT_UNAVAILABLE" && rejection["httpStatus"] == 503
+}
+
+fn known_start_rejection(rejection: &Value) -> bool {
+    (rejection["code"] == "RUNNER_PROOF_STALE" && rejection["httpStatus"] == 422)
+        || deployment_start_rejection(rejection)
+}
+
+fn rejected_preparation_commit(record: &Value) -> bool {
+    let authorization = &record["commitAuthorization"];
+    record["operation"] == "runs.prepare"
+        && record.get("commitResult").is_none()
+        && deployment_start_rejection(&record["commitRejection"])
+        && record["commitRejection"]["idempotencyKey"]
+            .as_str()
+            .is_some_and(|key| Uuid::parse_str(key).is_ok())
+        && record["commitRejection"]["idempotencyKey"] == authorization["idempotencyKey"]
+        && authorization["preparationId"] == record["review"]["preparationId"]
+        && authorization["bindingDigest"] == record["bindingDigest"]
+}
+
 fn verify_native_authoring_start(method: &str, result: &Value) -> Result<()> {
     let catalog: Value = serde_json::from_str(include_str!("../contracts/method-catalog.json"))?;
     let schema = &catalog["methods"]
@@ -4526,6 +4630,7 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
     let mut negotiated = false;
     let mut validation_errors_negotiated = false;
     let mut recovery_errors_negotiated = false;
+    let mut queue_observation_negotiated = false;
     loop {
         let frame = match read_frame(&mut reader).await {
             Ok(Some(frame)) => frame,
@@ -4563,6 +4668,7 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
                         negotiated = false;
                         validation_errors_negotiated = false;
                         recovery_errors_negotiated = false;
+                        queue_observation_negotiated = false;
                     }
                     // Disconnect cancels only fingerprint waiters. Dispatch and its
                     // durable mutation receipt continue to completion/reconciliation.
@@ -4571,9 +4677,12 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
                         id.clone(),
                         crate::fingerprint::REQUEST_CANCELLATION.scope(
                             cancellation.clone(),
-                            daemon.dispatch(
-                                request["method"].as_str().unwrap_or(""),
-                                request["params"].clone(),
+                            QUEUE_OBSERVATION_CLIENT.scope(
+                                queue_observation_negotiated,
+                                daemon.dispatch(
+                                    request["method"].as_str().unwrap_or(""),
+                                    request["params"].clone(),
+                                ),
                             ),
                         ),
                     );
@@ -4586,6 +4695,12 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
                         Ok(result) => {
                             if request["method"] == "protocol.negotiate" {
                                 negotiated = true;
+                                queue_observation_negotiated =
+                                    request["params"]["requiredCapabilities"]
+                                        .as_array()
+                                        .is_some_and(|caps| {
+                                            caps.contains(&json!("workflow.queue-observation/v1"))
+                                        });
                                 recovery_errors_negotiated =
                                     request["params"]["requiredCapabilities"]
                                         .as_array()
@@ -6871,6 +6986,250 @@ mod conformance {
     }
 
     #[tokio::test]
+    async fn deployment_rejection_keeps_exact_start_handoff_approved_for_explicit_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let daemon = fixture(
+            temp.path(),
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap(),
+        );
+        let params = headless_preparation_fixture(&daemon, temp.path()).await;
+        let approved = daemon
+            .dispatch("runs.start_handoff.approve_headless", params.clone())
+            .await
+            .unwrap();
+        let handoff_ref = approved["handoffRef"].clone();
+        let handoff_path = temp
+            .path()
+            .join("start-handoffs")
+            .join(format!("{}.json", handoff_ref.as_str().unwrap()));
+        let original: Value = state::read_json(&handoff_path).unwrap();
+        let prep_path = temp.path().join("preparations").join(format!(
+            "{}.json",
+            params["preparationId"].as_str().unwrap()
+        ));
+        let run = Uuid::new_v4().to_string();
+        let result = json!({"execution":{"id":run,"status":"queued"},"executionId":run,"preparationId":params["preparationId"],"executionPolicy":"host_user/v1"});
+        let exact_key = original["commit"]["idempotencyKey"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let expected_body = json!({"preparationId":params["preparationId"],"bindingDigest":params["bindingDigest"]});
+        let server = tokio::spawn(async move {
+            for index in 0..2 {
+                let (stream, head, body) = receive_http_with_body(&listener).await;
+                assert!(head.starts_with(
+                    "POST /api/v1/runner-control/runner/v2/executions/commit/ HTTP/1.1"
+                ));
+                assert!(
+                    head.to_ascii_lowercase()
+                        .contains(&format!("idempotency-key: {exact_key}"))
+                );
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&body).unwrap(),
+                    expected_body
+                );
+                if index == 0 {
+                    reply_http(
+                        stream,
+                        503,
+                        json!({"error":{"code":"WORKFLOW_DEPLOYMENT_UNAVAILABLE"}}),
+                    )
+                    .await;
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                            .await
+                            .is_err()
+                    );
+                } else {
+                    reply_http(stream, 200, result.clone()).await;
+                }
+            }
+        });
+        let commit = json!({"handoffRef":handoff_ref});
+        let error = daemon
+            .dispatch("runs.start_handoff.commit", commit.clone())
+            .await
+            .unwrap_err();
+        let durable: Value = state::read_json(&handoff_path).unwrap();
+        assert_eq!(durable["lifecycle"], "approved");
+        assert_eq!(durable["commit"], original["commit"]);
+        assert_eq!(durable["review"], original["review"]);
+        let prep: Value = state::read_json(&prep_path).unwrap();
+        assert_eq!(
+            prep["commitRejection"]["code"],
+            "WORKFLOW_DEPLOYMENT_UNAVAILABLE"
+        );
+        assert_eq!(
+            prep["commitAuthorization"]["idempotencyKey"],
+            original["commit"]["idempotencyKey"]
+        );
+        assert!(!public_error(&error).1);
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        // Simulate process loss after preparation rejection was durable but
+        // before its handoff was restored. Reading must never send a commit.
+        let mut interrupted = durable;
+        interrupted["lifecycle"] = json!("committing");
+        state::write_json(&handoff_path, &interrupted).unwrap();
+        assert_eq!(
+            daemon
+                .dispatch("runs.start_handoff.get", commit.clone())
+                .await
+                .unwrap()["nextAction"],
+            "commit"
+        );
+        let mut other_key = original["commit"].clone();
+        other_key["idempotencyKey"] = json!(Uuid::new_v4());
+        assert_eq!(
+            daemon
+                .commit(
+                    "runs.commit",
+                    "11111111-1111-4111-8111-111111111111",
+                    &other_key
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
+            "PRECONDITION_FAILED"
+        );
+        assert_eq!(
+            daemon
+                .dispatch("runs.start_handoff.commit", commit)
+                .await
+                .unwrap()["runId"],
+            run
+        );
+        assert!(
+            state::read_json::<Value>(&prep_path)
+                .unwrap()
+                .get("commitRejection")
+                .is_none()
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_handoff_retry_with_lost_response_stays_ambiguous_without_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let daemon = fixture(
+            temp.path(),
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap(),
+        );
+        let params = headless_preparation_fixture(&daemon, temp.path()).await;
+        let approved = daemon
+            .dispatch("runs.start_handoff.approve_headless", params.clone())
+            .await
+            .unwrap();
+        let commit = json!({"handoffRef":approved["handoffRef"]});
+        let server = tokio::spawn(async move {
+            let (stream, head) = receive_http(&listener).await;
+            assert!(head.contains("/v2/executions/commit/"));
+            reply_http(
+                stream,
+                503,
+                json!({"error":{"code":"WORKFLOW_DEPLOYMENT_UNAVAILABLE"}}),
+            )
+            .await;
+            let (stream, head) = receive_http(&listener).await;
+            assert!(head.contains("/v2/executions/commit/"));
+            drop(stream);
+            let (stream, head) = receive_http(&listener).await;
+            assert!(head.contains("/v2/executions/commit-outcome/"));
+            reply_http(stream, 200, json!({"status":"not_found"})).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        assert_eq!(
+            daemon
+                .dispatch("runs.start_handoff.commit", commit.clone())
+                .await
+                .unwrap_err()
+                .to_string(),
+            "WORKFLOW_DEPLOYMENT_UNAVAILABLE"
+        );
+        assert_eq!(
+            daemon
+                .dispatch("runs.start_handoff.commit", commit.clone())
+                .await
+                .unwrap_err()
+                .to_string(),
+            "NETWORK_UNAVAILABLE"
+        );
+        let prep: Value = state::read_json(&temp.path().join("preparations").join(format!(
+            "{}.json",
+            params["preparationId"].as_str().unwrap()
+        )))
+        .unwrap();
+        assert!(prep.get("commitRejection").is_none());
+        assert!(prep.get("commitAuthorization").is_some());
+        assert_eq!(
+            daemon
+                .dispatch("runs.start_handoff.commit", commit)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "START_HANDOFF_AMBIGUOUS"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn generic_server_rejection_keeps_start_handoff_ambiguous() {
+        for (status, code) in [
+            (503, "API_REQUEST_FAILED"),
+            (500, "WORKFLOW_DEPLOYMENT_UNAVAILABLE"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let daemon = fixture(
+                temp.path(),
+                Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                    .unwrap(),
+            );
+            let params = headless_preparation_fixture(&daemon, temp.path()).await;
+            let approved = daemon
+                .dispatch("runs.start_handoff.approve_headless", params)
+                .await
+                .unwrap();
+            let commit = json!({"handoffRef":approved["handoffRef"]});
+            let server = tokio::spawn(async move {
+                let (stream, head) = receive_http(&listener).await;
+                assert!(head.contains("/v2/executions/commit/"));
+                reply_http(stream, status, json!({"error":{"code":code}})).await;
+                let (stream, head) = receive_http(&listener).await;
+                assert!(head.contains("/v2/executions/commit-outcome/"));
+                reply_http(stream, 200, json!({"status":"not_found"})).await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            assert_eq!(
+                daemon
+                    .dispatch("runs.start_handoff.commit", commit.clone())
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                code
+            );
+            assert_eq!(
+                daemon
+                    .dispatch("runs.start_handoff.commit", commit)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "START_HANDOFF_AMBIGUOUS"
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn headless_start_and_direct_commit_share_one_backend_effect() {
         for headless_first in [true, false] {
             let temp = tempfile::tempdir().unwrap();
@@ -8306,6 +8665,86 @@ mod conformance {
         assert!(!serialized.contains("secret-authored-node-key"));
         assert!(!serialized.contains("secret-node-name"));
         assert!(!serialized.contains("exfiltrate_credentials"));
+        backend.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queue_observation_extension_is_only_sent_to_negotiated_clients() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = Arc::new(fixture(temp.path(), api));
+        daemon.public.lock().await.active_organization =
+            Some("11111111-1111-4111-8111-111111111111".into());
+        let run = Uuid::new_v4().to_string();
+        let response_run = run.clone();
+        let backend = tokio::spawn(async move {
+            for index in 0..4 {
+                let (stream, head) = receive_http(&listener).await;
+                assert!(head.contains("workflow.queue-observation/v1"));
+                reply_http(stream, 200, json!({
+                    "execution":{"id":response_run,"status":"queued","inputs":{"large":if index >= 2 {"x".repeat(MAX_FRAME)} else {String::new()}}},
+                    "events":[],"latestSequence":1,"hasMoreEvents":false,"timedOut":false,
+                    "queueObservation":{"schemaVersion":"loomex.workflow-queue-observation/v1",
+                        "executionId":response_run,"state":"queued","workerState":"unavailable",
+                        "code":"WORKFLOW_WORKER_UNAVAILABLE","waitSeconds":31,
+                        "queuedAt":"2026-10-16T12:00:00.123456+00:00",
+                        "observedAt":"2026-10-16T12:00:31.123456+00:00"}
+                })).await;
+            }
+        });
+        let old = local_call_with_capabilities(
+            daemon.clone(),
+            vec!["method:runs.get"],
+            "runs.get",
+            json!({"runId":run}),
+        )
+        .await;
+        assert!(old.get("error").is_none(), "{old}");
+        assert!(old["result"].get("queueObservation").is_none());
+        let new = local_call_with_capabilities(
+            daemon.clone(),
+            vec!["method:runs.get", "workflow.queue-observation/v1"],
+            "runs.get",
+            json!({"runId":run}),
+        )
+        .await;
+        assert_eq!(
+            new["result"]["queueObservation"]["code"], "WORKFLOW_WORKER_UNAVAILABLE",
+            "{new}"
+        );
+        for negotiated in [false, true] {
+            let mut capabilities = vec!["method:runs.get"];
+            if negotiated {
+                capabilities.push("workflow.queue-observation/v1");
+            }
+            let reply = local_call_with_capabilities(
+                daemon.clone(),
+                capabilities,
+                "runs.get",
+                json!({"runId":run}),
+            )
+            .await;
+            assert!(reply.get("error").is_none(), "{reply}");
+            let reference = reply["result"]["responseRef"].as_str().unwrap();
+            let bytes = std::fs::read(
+                temp.path()
+                    .join("responses")
+                    .join(format!("{reference}.json")),
+            )
+            .unwrap();
+            assert_eq!(state::digest(&bytes), reply["result"]["checksumSha256"]);
+            let hydrated: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(hydrated.get("queueObservation").is_some(), negotiated);
+            assert_eq!(
+                hydrated["execution"]["inputs"]["large"]
+                    .as_str()
+                    .unwrap()
+                    .len(),
+                MAX_FRAME
+            );
+        }
         backend.await.unwrap();
     }
     #[tokio::test]
