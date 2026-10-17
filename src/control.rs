@@ -33,6 +33,9 @@ use uuid::Uuid;
 #[cfg(test)]
 #[path = "control_native_authoring_tests.rs"]
 mod native_authoring_tests;
+#[cfg(test)]
+#[path = "control_operation_cache_tests.rs"]
+mod operation_cache_tests;
 
 pub const PROTOCOL: &str = "loomex.local-control/v2";
 pub const MAX_FRAME: usize = 1_048_576;
@@ -117,6 +120,9 @@ impl Drop for LogoutAdmission {
 impl Daemon {
     pub fn new(dir: PathBuf, api: Api, auth: Auth) -> Result<Self> {
         state::private_dir(&dir)?;
+        // Required denial evidence must be understood before any worker or
+        // provider can be admitted by this daemon.
+        crate::lifecycle::require_operation_retirement_reader_state(&dir)?;
         let public = PublicState::load(&dir)?;
         let presentation = PresentationStore::open(&dir)?;
         let recovery = RecoveryStore::open(&dir)?;
@@ -429,6 +435,18 @@ impl Daemon {
         } else {
             None
         };
+        let bound_account = if scoped_account.is_some() {
+            scoped_account.clone()
+        } else if key.is_some() && scope.is_some() && method != "organizations.select" {
+            Some(
+                self.auth
+                    .credential(scope.as_deref().context("ORGANIZATION_REQUIRED")?)
+                    .await?
+                    .subject,
+            )
+        } else {
+            None
+        };
         let identity =
             operation_cache_identity(method, &params, scope.as_deref(), scoped_account.as_deref());
         let journal_key = key.map(|key| {
@@ -454,6 +472,7 @@ impl Daemon {
             && !matches!(
                 method,
                 "auth.scope_upgrade"
+                    | "auth.recover"
                     | "runs.start_handoff.issue"
                     | "runs.start_handoff.approve"
                     | "runs.start_handoff.approve_headless"
@@ -466,8 +485,43 @@ impl Daemon {
                 .map(|key| self.dir.join("operations").join(format!("{key}.json")))
         })
         .flatten();
+        // A retired observation consumes its historical slot even if a caller
+        // changes the method, arguments or installation after uninstall.
+        if let Some(key) = key {
+            crate::operation_cache::deny_retired_slot(&self.dir, key)?;
+        }
+        if let Some(slot) = journal_key.as_deref() {
+            crate::operation_cache::deny_retired_slot(&self.dir, slot)?;
+        }
+        if let (Some(key), Some(account)) = (key, bound_account.as_deref()) {
+            let legacy_scoped_slot =
+                operation_cache_scoped_key(scope.as_deref(), Some(account), key);
+            crate::operation_cache::deny_retired_slot(&self.dir, &legacy_scoped_slot)?;
+        }
+        // auth.recover now has a protected method-owner receipt. Historical
+        // generic pending observations cannot authorize unbound recovery.
+        if method == "auth.recover" {
+            if let Some(key) = key {
+                let path = self.dir.join("operations").join(format!("{key}.json"));
+                if path.try_exists()? {
+                    let record: Value = serde_json::from_slice(&crate::operation_cache::read(
+                        &self.dir,
+                        &format!("operations/{key}.json"),
+                    )?)?;
+                    ensure!(record["digest"] == identity, "IDEMPOTENCY_CONFLICT");
+                    if record.get("result").is_none() {
+                        bail!("OPERATION_RECONCILIATION_REQUIRED");
+                    }
+                }
+            }
+        }
         if let Some(path) = operation.as_ref().filter(|path| path.exists()) {
-            let record: Value = state::read_json(path)?;
+            let relative = path
+                .strip_prefix(&self.dir)?
+                .to_str()
+                .context("UNSAFE_STATE")?;
+            let record: Value =
+                serde_json::from_slice(&crate::operation_cache::read(&self.dir, relative)?)?;
             if record["digest"] != identity {
                 bail!("IDEMPOTENCY_CONFLICT");
             }
@@ -510,16 +564,88 @@ impl Daemon {
             Some(lock) => Some(lock.lock_owned().await),
             None => None,
         };
+        if let Some(slot) = journal_key.as_deref() {
+            crate::operation_cache::deny_retired_slot(&self.dir, slot)?;
+        }
+        if let (Some(key), Some(account)) = (key, bound_account.as_deref()) {
+            let legacy_scoped_slot =
+                operation_cache_scoped_key(scope.as_deref(), Some(account), key);
+            crate::operation_cache::deny_retired_slot(&self.dir, &legacy_scoped_slot)?;
+        }
+        let pending_record = if let Some(key) = key.filter(|_| operation.is_some()) {
+            let mut binding = crate::operation_cache::binding(
+                method,
+                key,
+                &identity,
+                &entry["inputSchema"],
+                &params,
+                crate::operation_cache::BindingOrigin {
+                    organization: scope.as_deref(),
+                    account: bound_account.as_deref(),
+                    installation: &self.auth.installation_id().await?,
+                    control_reference: crate::fingerprint::REQUEST_REFERENCE
+                        .try_with(Clone::clone)
+                        .ok()
+                        .as_deref(),
+                },
+            );
+            if let Some(receipt) = interaction_cache_receipt(method, &params)? {
+                binding["backendSubmissionDigest"] =
+                    receipt["params"]["submissionFingerprint"].clone();
+                binding["receipt"] = receipt;
+            }
+            Some(crate::operation_cache::pending(&identity, method, binding))
+        } else {
+            None
+        };
+        let mut observed_record = None;
+        let mut cached_execution = None;
         let cached = if let Some(path) = &operation {
             if path.exists() {
-                let record: Value = state::read_json(path)?;
+                let relative = path
+                    .strip_prefix(&self.dir)?
+                    .to_str()
+                    .context("UNSAFE_STATE")?;
+                let record: Value =
+                    serde_json::from_slice(&crate::operation_cache::read(&self.dir, relative)?)?;
                 if record["digest"] != identity {
                     bail!("IDEMPOTENCY_CONFLICT");
                 }
                 if record["expired"] == true {
                     bail!("RESULT_EXPIRED");
                 }
-                if matches!(method, "builder.start" | "editor.start") {
+                ensure!(
+                    crate::operation_cache::known_record(&record),
+                    "OPERATION_CACHE_BINDING_MISMATCH"
+                );
+                if record.get("binding").is_some() {
+                    let expected = &pending_record.as_ref().context("INTERNAL")?["binding"];
+                    for field in [
+                        "schema",
+                        "method",
+                        "operationKey",
+                        "organizationId",
+                        "accountSubject",
+                        "installationId",
+                        "requestFingerprint",
+                        "inputSchemaDigest",
+                        "references",
+                        "receipt",
+                        "backendSubmissionDigest",
+                    ] {
+                        ensure!(
+                            record["binding"][field] == expected[field],
+                            "OPERATION_CACHE_BINDING_MISMATCH"
+                        );
+                    }
+                }
+                observed_record = Some(record.clone());
+                cached_execution = record.get("executionId").filter(|v| !v.is_null()).cloned();
+                if record["stage"] == "not_dispatched"
+                    && crate::operation_cache::known_record(&record)
+                {
+                    None
+                } else if matches!(method, "builder.start" | "editor.start") {
                     if record["status"] == "rejected_before_execution"
                         && known_start_rejection(&record["rejection"])
                     {
@@ -528,10 +654,17 @@ impl Daemon {
                         // fact durably before sending the exact operation again.
                         // A crash or uncertain retry then remains pending and
                         // can only reconcile; not_found never grants a replay.
-                        state::write_json(
-                            path,
-                            &json!({"digest":identity,"method":method,"status":"pending"}),
-                        )?;
+                        let mut retry = record.clone();
+                        retry["status"] = json!("pending");
+                        if retry.get("binding").is_some() {
+                            retry["stage"] = json!("not_dispatched");
+                        }
+                        retry
+                            .as_object_mut()
+                            .context("UNSAFE_STATE")?
+                            .remove("rejection");
+                        state::write_json(path, &retry)?;
+                        observed_record = Some(retry);
                         None
                     } else {
                         // An uncertain native start is reconciled through its exact
@@ -597,14 +730,134 @@ impl Daemon {
                         .context("BACKEND_PROTOCOL_ERROR")?;
                     verify_persona_creation(method, &params, &response)?;
                     Some(response)
+                } else if let Some(result) = record.get("result") {
+                    Some(result.clone())
+                } else if method == "runs.start_handoff.commit" {
+                    Some(
+                        self.commit_run_start_handoff(
+                            scope.as_deref().context("ORGANIZATION_REQUIRED")?,
+                            &params,
+                        )
+                        .await?,
+                    )
+                } else if method == "runs.commit" {
+                    Some(
+                        self.commit(
+                            method,
+                            scope.as_deref().context("ORGANIZATION_REQUIRED")?,
+                            &params,
+                        )
+                        .await?,
+                    )
+                } else if method == "workflows.patch" {
+                    let path = self.dir.join("workflow-patches").join(format!(
+                        "{}.json",
+                        journal_key.as_deref().context("INTERNAL")?
+                    ));
+                    ensure!(path.try_exists()?, "OPERATION_RECONCILIATION_REQUIRED");
+                    Some(
+                        self.patch_workflow_draft(
+                            scope.as_deref().context("ORGANIZATION_REQUIRED")?,
+                            &params,
+                        )
+                        .await?,
+                    )
+                } else if method == "runs.continuation.requeue" {
+                    // Reconciliation reads the original owner receipt; the
+                    // original requeue endpoint is never replayed here.
+                    let receipt = self
+                        .backend(
+                            scope.as_deref().context("ORGANIZATION_REQUIRED")?,
+                            "POST",
+                            "v2/execution-continuation-receipts/get/",
+                            Some(params.clone()),
+                            None,
+                        )
+                        .await?;
+                    ensure!(
+                        receipt["status"] == "completed",
+                        "OPERATION_RECONCILIATION_REQUIRED"
+                    );
+                    let response = receipt
+                        .get("response")
+                        .filter(|value| value.is_object())
+                        .context("BACKEND_PROTOCOL_ERROR")?;
+                    ensure!(
+                        response["executionId"] == params["runId"]
+                            && response["deliveryId"] == params["deliveryId"]
+                            && response["expectedContinuationDigest"]
+                                == params["expectedContinuationDigest"]
+                            && response["status"] == "pending"
+                            && response["requeued"].is_boolean(),
+                        "BACKEND_PROTOCOL_ERROR"
+                    );
+                    Some(response.clone())
+                } else if matches!(
+                    method,
+                    "workflows.create" | "workflows.update" | "workflows.publish"
+                ) {
+                    let descriptor = crate::operation_cache::receipt_descriptor(
+                        method,
+                        key.context("INTERNAL")?,
+                    );
+                    let (verb, route, body) =
+                        backend_route("workflow.operations.get", &descriptor["params"])?;
+                    let receipt = self
+                        .backend(
+                            scope.as_deref().context("ORGANIZATION_REQUIRED")?,
+                            &verb,
+                            &route,
+                            body,
+                            None,
+                        )
+                        .await?;
+                    let candidate = json!({"method":method,"params":params,"organizationId":scope,"accountSubject":scoped_account,"operationKey":key,"reconciliation":descriptor});
+                    crate::presentation::verify_maintenance_operation_receipt(
+                        &candidate, &receipt,
+                    )?;
+                    Some(receipt["response"].clone())
+                } else if matches!(
+                    method,
+                    "interactions.respond" | "interactions.decide" | "interactions.draft.delete"
+                ) {
+                    let descriptor = interaction_cache_receipt(method, &params)?
+                        .context("OPERATION_RECONCILIATION_REQUIRED")?;
+                    let receipt = self
+                        .backend(
+                            scope.as_deref().context("ORGANIZATION_REQUIRED")?,
+                            "POST",
+                            "v2/interaction-operations/get/",
+                            Some(descriptor["params"].clone()),
+                            None,
+                        )
+                        .await?;
+                    ensure!(
+                        receipt["operation"] == descriptor["params"]["operation"]
+                            && receipt["requestId"] == params["requestId"]
+                            && receipt["status"] == "completed"
+                            && receipt["match"] == "exact_request_match"
+                            && receipt["submissionFingerprint"]
+                                == descriptor["params"]["submissionFingerprint"]
+                            && receipt["submissionFingerprintVersion"]
+                                == "loomex.operation-submission/v1"
+                            && receipt["result"].is_object(),
+                        "OPERATION_RECONCILIATION_REQUIRED"
+                    );
+                    let mut response = receipt["result"].clone();
+                    if matches!(method, "interactions.respond" | "interactions.decide") {
+                        let fields = response.as_object_mut().context("BACKEND_PROTOCOL_ERROR")?;
+                        for field in ["executionId", "executionStatus", "error"] {
+                            fields.entry(field).or_insert(Value::Null);
+                        }
+                    }
+                    Some(normalize_catalog_output(response, &entry["outputSchema"])?)
                 } else {
-                    record.get("result").cloned()
+                    bail!("OPERATION_RECONCILIATION_REQUIRED")
                 }
             } else {
-                state::write_json(
-                    path,
-                    &json!({"digest":identity,"method":method,"status":"pending"}),
-                )?;
+                let record = pending_record.clone().context("INTERNAL")?;
+                state::write_json(path, &record)?;
+                observed_record = Some(record);
                 None
             }
         } else {
@@ -628,6 +881,13 @@ impl Daemon {
                     "AUTH_IDENTITY_CHANGED"
                 );
             }
+            let execution = self.cache_execution_binding(
+                &params,
+                &result,
+                cached_execution.as_ref(),
+                scope.as_deref(),
+                scoped_account.as_deref(),
+            )?;
             let result = self.spool_response_for_method(
                 method,
                 &params,
@@ -636,18 +896,25 @@ impl Daemon {
                 scoped_account.as_deref(),
             )?;
             if let Some(path) = operation.as_ref() {
-                let execution = params
-                    .get("runId")
-                    .or_else(|| result.get("executionId"))
-                    .or_else(|| result.get("execution").and_then(|value| value.get("id")))
-                    .cloned();
                 state::write_json(
                     path,
-                    &json!({"digest":identity,"method":method,"cachedAt":state::now(),"executionId":execution,"result":result}),
+                    &crate::operation_cache::completed(
+                        observed_record.clone().context("INTERNAL")?,
+                        result.clone(),
+                        execution,
+                    ),
                 )?;
             }
             result
         } else {
+            if let Some(path) = operation.as_ref() {
+                let mut record = observed_record.clone().context("INTERNAL")?;
+                if record.get("binding").is_some() {
+                    record["stage"] = json!("dispatch_uncertain");
+                }
+                state::write_json(path, &record)?;
+                observed_record = Some(record);
+            }
             let attempt = self
                 .fingerprints
                 .measure(
@@ -657,6 +924,19 @@ impl Daemon {
                 )
                 .await;
             if let Err(error) = &attempt {
+                // runs.prepare checks this local grant before fingerprinting
+                // or backend transport. An authenticated backend error with
+                // the same code is deliberately not a non-dispatch proof.
+                if method == "runs.prepare"
+                    && error.downcast_ref::<ApiError>().is_none()
+                    && error.to_string() == "WORKSPACE_DENIED"
+                {
+                    let mut record = observed_record.clone().context("INTERNAL")?;
+                    if record.get("binding").is_some() {
+                        record["stage"] = json!("not_dispatched");
+                    }
+                    state::write_json(operation.as_ref().context("INTERNAL")?, &record)?;
+                }
                 if matches!(method, "builder.start" | "editor.start")
                     && error.downcast_ref::<ApiError>().is_some_and(|api| {
                         (api.status == Some(422) && api.code == "RUNNER_PROOF_STALE")
@@ -664,10 +944,13 @@ impl Daemon {
                     })
                 {
                     let api = error.downcast_ref::<ApiError>().context("INTERNAL")?;
-                    state::write_json(
-                        operation.as_ref().context("INTERNAL")?,
-                        &json!({"digest":identity,"method":method,"status":"rejected_before_execution","rejection":{"code":api.code,"httpStatus":api.status}}),
-                    )?;
+                    let mut record = observed_record.clone().context("INTERNAL")?;
+                    record["status"] = json!("rejected_before_execution");
+                    if record.get("binding").is_some() {
+                        record["stage"] = json!("rejected_before_execution");
+                    }
+                    record["rejection"] = json!({"code":api.code,"httpStatus":api.status});
+                    state::write_json(operation.as_ref().context("INTERNAL")?, &record)?;
                 }
             }
             if fenced_authoring_method(method) {
@@ -681,11 +964,13 @@ impl Daemon {
                 );
             }
             let result = normalize_catalog_output(attempt?, &entry["outputSchema"])?;
-            let execution = params
-                .get("runId")
-                .or_else(|| result.get("executionId"))
-                .or_else(|| result.get("execution").and_then(|value| value.get("id")))
-                .cloned();
+            let execution = self.cache_execution_binding(
+                &params,
+                &result,
+                None,
+                scope.as_deref(),
+                scoped_account.as_deref(),
+            )?;
             // Spooling remains inside writer coverage; socket delivery below is not
             // counted once no more local files or backend state can be changed.
             let result = self.spool_response_for_method(
@@ -698,7 +983,11 @@ impl Daemon {
             if let Some(path) = operation.as_ref() {
                 state::write_json(
                     path,
-                    &json!({"digest":identity,"method":method,"cachedAt":state::now(),"executionId":execution,"result":result}),
+                    &crate::operation_cache::completed(
+                        observed_record.clone().context("INTERNAL")?,
+                        result.clone(),
+                        execution,
+                    ),
                 )?;
             }
             result
@@ -709,6 +998,59 @@ impl Daemon {
         } else {
             Ok(result)
         }
+    }
+    /// Compare every retained execution identity before a spool replaces the
+    /// inline response. A reference never erases a known execution binding.
+    fn cache_execution_binding(
+        &self,
+        params: &Value,
+        result: &Value,
+        stored: Option<&Value>,
+        organization: Option<&str>,
+        account: Option<&str>,
+    ) -> Result<Option<Value>> {
+        let mut execution: Option<Value> = None;
+        let mut accept = |value: Option<&Value>| -> Result<()> {
+            if let Some(value) = value.filter(|v| !v.is_null()) {
+                let id = value.as_str().context("OPERATION_CACHE_BINDING_MISMATCH")?;
+                Uuid::parse_str(id)
+                    .map_err(|_| anyhow::anyhow!("OPERATION_CACHE_BINDING_MISMATCH"))?;
+                ensure!(
+                    execution.as_ref().is_none_or(|known| known == value),
+                    "OPERATION_CACHE_BINDING_MISMATCH"
+                );
+                execution = Some(value.clone());
+            }
+            Ok(())
+        };
+        for identity in [
+            params.get("runId"),
+            result.get("executionId"),
+            result.pointer("/execution/id"),
+            result.pointer("/details/executionId"),
+            result.pointer("/humanRequest/execution/id"),
+            stored,
+        ] {
+            accept(identity)?;
+        }
+        if let Some(reference) = result.get("responseRef").and_then(Value::as_str) {
+            Uuid::parse_str(reference)
+                .map_err(|_| anyhow::anyhow!("OPERATION_CACHE_BINDING_MISMATCH"))?;
+            let relative = format!("responses/{reference}.meta.json");
+            if self.dir.join(&relative).try_exists()? {
+                let metadata: Value =
+                    serde_json::from_slice(&crate::operation_cache::read(&self.dir, &relative)?)?;
+                if let Some(account) = account {
+                    ensure!(
+                        metadata["ownerScope"]["organizationId"].as_str() == organization
+                            && metadata["ownerScope"]["accountSubject"] == account,
+                        "OPERATION_CACHE_BINDING_MISMATCH"
+                    );
+                }
+                accept(metadata.get("executionId"))?;
+            }
+        }
+        Ok(execution)
     }
     #[cfg(test)]
     fn spool_response(
@@ -791,7 +1133,7 @@ impl Daemon {
                 .dir
                 .join("responses")
                 .join(format!("{reference}.meta.json")),
-            &json!({"executionId":native_task.map(|request|&request["execution"]["id"]).unwrap_or(&params["runId"]),"lastAccessAt":state::now(),"ownerScope":account.map(|account|json!({"organizationId":organization,"accountSubject":account}))}),
+            &json!({"executionId":self.cache_execution_binding(params, &result, None, organization, account)?,"lastAccessAt":state::now(),"ownerScope":account.map(|account|json!({"organizationId":organization,"accountSubject":account}))}),
         )?;
         let mut reference = json!({"responseRef":reference,"sizeBytes":bytes.len(),"encoding":"json","nextOffset":0,"checksumSha256":checksum});
         if let Some(request) = native_task {
@@ -938,7 +1280,15 @@ impl Daemon {
                 return self.auth.open_browser(required(p, "flowId")?).await;
             }
             "auth.cancel" => return self.auth.cancel_login(required(p, "flowId")?).await,
-            "auth.recover" => return self.auth.reconcile().await,
+            "auth.recover" => {
+                return self
+                    .auth
+                    .reconcile_bound(
+                        required(p, "idempotencyKey")?,
+                        p.get("recoveryRef").and_then(Value::as_str),
+                    )
+                    .await;
+            }
             "auth.status" => {
                 return match p.get("observation") {
                     None => self.auth.status().await,
@@ -1031,9 +1381,10 @@ impl Daemon {
                 ["create", "get", "update"].contains(&operation),
                 "METHOD_NOT_FOUND"
             );
-            return self.presentation.dispatch(
+            return self.presentation.dispatch_bound(
                 "local-connection",
                 "host-user",
+                &self.auth.installation_id().await?,
                 &format!("presentation.sessions.{operation}"),
                 p,
             );
@@ -1046,7 +1397,13 @@ impl Daemon {
             // The child runner identity is uniquely bound by the backend to one
             // account and organization. Neither scope component is accepted from UI.
             let account = self.auth.credential(&org).await?.subject;
-            return self.presentation.dispatch(&org, &account, method, p);
+            return self.presentation.dispatch_bound(
+                &org,
+                &account,
+                &self.auth.installation_id().await?,
+                method,
+                p,
+            );
         }
         if method.starts_with("recovery.") {
             let account = self.auth.credential(&org).await?.subject;
@@ -1387,19 +1744,23 @@ impl Daemon {
             "organizationId":org,
             "accountSubject":account,
         }));
-        if path.exists() {
+        let existing = if path.exists() {
             let existing: Value = state::read_json(&path)?;
             ensure!(existing["digest"] == digest, "IDEMPOTENCY_CONFLICT");
-        }
+            existing
+        } else {
+            json!({"digest":digest,"method":method})
+        };
         state::write_json(
             &path,
-            &json!({
-                "digest":digest,
-                "method":method,
-                "cachedAt":state::now(),
-                "executionId":result.get("executionId").cloned().or_else(|| result.pointer("/execution/id").cloned()),
-                "result":result,
-            }),
+            &crate::operation_cache::completed(
+                existing,
+                result.clone(),
+                result
+                    .get("executionId")
+                    .cloned()
+                    .or_else(|| result.pointer("/execution/id").cloned()),
+            ),
         )
     }
 
@@ -3173,6 +3534,16 @@ impl Daemon {
             bail!("PRECONDITION_FAILED")
         }
         if method == "runs.commit"
+            && record["commitAuthorization"]["idempotencyKey"] == p["idempotencyKey"]
+        {
+            if let Some(result) = record
+                .get("commitResult")
+                .filter(|result| result.is_object())
+            {
+                return Ok(result.clone());
+            }
+        }
+        if method == "runs.commit"
             && record.get("commitAuthorization").is_some()
             && !(rejected_preparation_commit(&record)
                 && record["commitAuthorization"]["idempotencyKey"] == p["idempotencyKey"])
@@ -3449,9 +3820,8 @@ impl Daemon {
                 self.auth.current_child_identity(org).await? == owner,
                 "AUTH_IDENTITY_CHANGED"
             );
-            // First reconcile the original key. A backend `not_found` is the
-            // only condition under which the exact journaled update may be
-            // resent with that same key and byte-equivalent JSON payload.
+            // Only the exact owner receipt or a retained acknowledgement can
+            // close uncertainty. A missing receipt never permits resubmission.
             let receipt = self
                 .backend(
                     org,
@@ -3494,21 +3864,7 @@ impl Daemon {
                 return Ok(result.clone());
             }
             if receipt["status"] == "not_found" {
-                return self
-                    .submit_workflow_patch_exact(PatchSubmission {
-                        org,
-                        owner: (&owner.0, &owner.1),
-                        params: p,
-                        workflow_id,
-                        key,
-                        identity: record["identity"]
-                            .as_str()
-                            .context("BACKEND_PROTOCOL_ERROR")?,
-                        path: &path,
-                        body: Value::Object(body.clone()),
-                        expected_notes,
-                    })
-                    .await;
+                bail!("OPERATION_RECONCILIATION_REQUIRED");
             }
             bail!("NETWORK_AMBIGUOUS");
         }
@@ -3817,7 +4173,7 @@ fn deployment_start_rejection(rejection: &Value) -> bool {
     rejection["code"] == "WORKFLOW_DEPLOYMENT_UNAVAILABLE" && rejection["httpStatus"] == 503
 }
 
-fn known_start_rejection(rejection: &Value) -> bool {
+pub(crate) fn known_start_rejection(rejection: &Value) -> bool {
     (rejection["code"] == "RUNNER_PROOF_STALE" && rejection["httpStatus"] == 422)
         || deployment_start_rejection(rejection)
 }
@@ -3871,6 +4227,36 @@ fn operation_cache_scoped_key(
     state::json_digest(
         &json!({"organizationId":organization,"accountSubject":account,"idempotencyKey":key}),
     )
+}
+/// This is a digest of the original backend submission, not the backend's
+/// historical normalized idempotency digest. JSON floats are deliberately
+/// unavailable until both implementations share a numeric canonicalization.
+pub(crate) fn interaction_cache_receipt(method: &str, params: &Value) -> Result<Option<Value>> {
+    let operation = match method {
+        "interactions.respond" | "interactions.decide" => "interaction.resolve",
+        "interactions.draft.update" => "interactions.draft.update",
+        "interactions.draft.delete" => "interactions.draft.delete",
+        _ => return Ok(None),
+    };
+    fn portable(value: &Value) -> bool {
+        match value {
+            Value::Number(number) => number.is_i64() || number.is_u64(),
+            Value::Object(fields) => fields.values().all(portable),
+            Value::Array(values) => values.iter().all(portable),
+            _ => true,
+        }
+    }
+    let (_, _, body) = backend_route(method, params)?;
+    let payload = body.context("INTERNAL")?;
+    if !portable(&payload) {
+        return Ok(None);
+    }
+    let fingerprint = state::json_digest(
+        &json!({"schemaVersion":"loomex.operation-submission/v1","operation":operation,"requestId":params["requestId"],"payload":payload}),
+    );
+    Ok(Some(
+        json!({"method":"interactions.operations.get","params":{"operation":operation,"requestId":params["requestId"],"idempotencyKey":params["idempotencyKey"],"submissionFingerprint":fingerprint}}),
+    ))
 }
 /// Native mutation acknowledgement is separate from a canonical operation
 /// receipt. Direct authenticated responses never manufacture receipt evidence.
@@ -6269,7 +6655,8 @@ mod conformance {
         backend.await.unwrap();
     }
     #[tokio::test]
-    async fn continuation_requeue_lost_response_waits_for_explicit_same_key_reconciliation() {
+    async fn continuation_requeue_lost_response_requires_receipt_reconciliation_without_resending()
+    {
         let temp = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api =
@@ -6284,7 +6671,7 @@ mod conformance {
             let input = input.clone();
             let receipt = receipt.clone();
             async move {
-                let (stream, first_head, first_body) = receive_http_with_body(&listener).await;
+                let (stream, _, _) = receive_http_with_body(&listener).await;
                 drop(stream); // Backend accepted the operation but its response was lost.
                 assert!(
                     tokio::time::timeout(Duration::from_millis(150), listener.accept())
@@ -6292,17 +6679,16 @@ mod conformance {
                         .is_err()
                 );
                 quiet_tx.send(()).unwrap();
-                let (stream, second_head, second_body) = receive_http_with_body(&listener).await;
-                assert_eq!(first_body, second_body);
-                for head in [first_head, second_head] {
-                    assert!(head.to_ascii_lowercase().contains(&format!(
-                        "idempotency-key: {}",
-                        input["idempotencyKey"].as_str().unwrap()
-                    )));
-                }
-                // The existing backend operation journal returns its original
-                // receipt, even when that continuation has since progressed.
-                reply_http(stream, 200, receipt).await;
+                let (stream, head, body) = receive_http_with_body(&listener).await;
+                assert!(head.starts_with("POST /api/v1/runner-control/runner/v2/execution-continuation-receipts/get/ HTTP/1.1"));
+                assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), input);
+                assert!(!head.to_ascii_lowercase().contains("idempotency-key:"));
+                reply_http(
+                    stream,
+                    200,
+                    json!({"status":"completed","response":receipt}),
+                )
+                .await;
                 assert!(
                     tokio::time::timeout(Duration::from_millis(100), listener.accept())
                         .await
@@ -6758,7 +7144,7 @@ mod conformance {
     }
 
     #[tokio::test]
-    async fn installed_legacy_patch_journal_retries_only_original_body_after_not_found() {
+    async fn installed_legacy_patch_journal_missing_receipt_never_resends_original_body() {
         let temp = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api =
@@ -6769,24 +7155,12 @@ mod conformance {
         let checksum = "b".repeat(64);
         let definition = json!({"nodes":[{"key":"n","config":{"prompt":"new"}}],"transitions":[]});
         let input = write_legacy_patch_journal(&daemon, &workflow, &checksum, &key, &definition);
-        let result = json!({"workflow":{"id":workflow},"draft":{"revision":6,"definition":definition,"notes":"runner draft save"}});
         let backend = tokio::spawn({
-            let workflow = workflow.clone();
             let key = key.clone();
-            let definition = definition.clone();
-            let result = result.clone();
             async move {
                 let (stream, head) = receive_http(&listener).await;
                 assert!(head.contains("/v2/workflow-operations/get/"));
                 reply_http(stream, 200, json!({"operation":"workflows.update","idempotencyKey":key,"status":"not_found"})).await;
-                let (stream, head, body) = receive_http_with_body(&listener).await;
-                assert!(head.contains(&format!("/v1/workflows/{workflow}/draft/")));
-                assert!(head.contains(&key));
-                assert_eq!(
-                    serde_json::from_slice::<Value>(&body).unwrap(),
-                    json!({"definition":definition,"expectedVersion":5})
-                );
-                reply_http(stream, 200, result).await;
                 assert!(
                     tokio::time::timeout(Duration::from_millis(100), listener.accept())
                         .await
@@ -6798,14 +7172,15 @@ mod conformance {
             daemon
                 .patch_workflow_draft("11111111-1111-4111-8111-111111111111", &input)
                 .await
-                .unwrap(),
-            result
+                .unwrap_err()
+                .to_string(),
+            "OPERATION_RECONCILIATION_REQUIRED"
         );
         backend.await.unwrap();
     }
 
     #[tokio::test]
-    async fn workflow_patch_retries_only_exact_journaled_update_after_receipt_not_found() {
+    async fn workflow_patch_missing_receipt_keeps_exact_journal_without_resending() {
         let temp = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let api =
@@ -6818,14 +7193,12 @@ mod conformance {
         let checksum = "d".repeat(64);
         let original = json!({"nodes":[{"key":"n","config":{"prompt":"old"}}],"transitions":[]});
         let canonical = json!({"nodes":[{"key":"n","config":{"prompt":"new"}}],"transitions":[]});
-        let result = json!({"workflow":{"id":workflow},"draft":{"revision":6,"definition":canonical,"notes":"Keep this draft guidance"}});
         let backend = tokio::spawn({
             let workflow = workflow.clone();
             let key = key.clone();
             let checksum = checksum.clone();
             let original = original.clone();
             let canonical = canonical.clone();
-            let result = result.clone();
             async move {
                 let (stream, _) = receive_http(&listener).await;
                 reply_http(stream, 200, json!({"selectedVersion":{"workflowId":workflow,"status":"draft","revision":5,"definitionChecksum":checksum,"definition":original,"notes":"Keep this draft guidance"}})).await;
@@ -6836,24 +7209,13 @@ mod conformance {
                     json!({"valid":true,"workflow":canonical,"issues":[],"errors":[]}),
                 )
                 .await;
-                let (stream, original_head, original_body) =
-                    receive_http_with_body(&listener).await;
+                let (stream, original_head, _) = receive_http_with_body(&listener).await;
                 assert!(original_head.contains(&format!("/v1/workflows/{workflow}/draft/")));
                 assert!(original_head.contains(&key));
                 drop(stream); // transport ended before backend committed any update
                 let (stream, head) = receive_http(&listener).await;
                 assert!(head.contains("/v2/workflow-operations/get/"));
                 reply_http(stream, 200, json!({"operation":"workflows.update","idempotencyKey":key,"status":"not_found"})).await;
-                let (stream, repeated_head, repeated_body) =
-                    receive_http_with_body(&listener).await;
-                assert!(repeated_head.contains(&format!("/v1/workflows/{workflow}/draft/")));
-                assert!(repeated_head.contains(&key));
-                assert_eq!(original_body, repeated_body);
-                assert_eq!(
-                    serde_json::from_slice::<Value>(&repeated_body).unwrap(),
-                    json!({"definition":canonical,"expectedVersion":5})
-                );
-                reply_http(stream, 200, result).await;
                 assert!(
                     tokio::time::timeout(Duration::from_millis(100), listener.accept())
                         .await
@@ -6869,8 +7231,14 @@ mod conformance {
                 .await
                 .is_err()
         );
-        let recovered = daemon.dispatch("workflows.patch", input).await.unwrap();
-        assert_eq!(recovered, result);
+        assert_eq!(
+            daemon
+                .dispatch("workflows.patch", input)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "OPERATION_RECONCILIATION_REQUIRED"
+        );
         backend.await.unwrap();
     }
 
@@ -9060,7 +9428,7 @@ mod conformance {
             }
         }
     }
-    async fn receive_http_with_body(
+    pub(super) async fn receive_http_with_body(
         listener: &TcpListener,
     ) -> (tokio::net::TcpStream, String, Vec<u8>) {
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -9086,7 +9454,7 @@ mod conformance {
             }
         }
     }
-    async fn reply_http(mut stream: tokio::net::TcpStream, status: u16, value: Value) {
+    pub(super) async fn reply_http(mut stream: tokio::net::TcpStream, status: u16, value: Value) {
         let body = if status == 200 {
             json!({"data":value,"meta":{}})
         } else {
@@ -9344,7 +9712,7 @@ mod conformance {
         assert_eq!(d.managed_work(), 0);
     }
     #[tokio::test]
-    async fn queued_retry_keeps_organization_captured_before_selection_changes() {
+    async fn queued_retry_keeps_original_scope_and_never_resends_uncertain_download() {
         let (_temp, d, listener, params) = download_fixture().await;
         let d1 = d.clone();
         let p1 = params.clone();
@@ -9365,19 +9733,22 @@ mod conformance {
         d.public.lock().await.active_organization = Some(Uuid::new_v4().to_string());
         reply_http(held, 503, json!({"error":{"code":"BACKEND_UNAVAILABLE"}})).await;
         assert!(first.await.unwrap().is_err());
-        let (stream, _) =
-            tokio::time::timeout(std::time::Duration::from_secs(1), receive_http(&listener))
+        assert_eq!(
+            retry.await.unwrap().unwrap_err().to_string(),
+            "OPERATION_RECONCILIATION_REQUIRED"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
                 .await
-                .unwrap();
-        reply_http(stream, 200, download_page()).await;
-        assert_eq!(retry.await.unwrap().unwrap()["sizeBytes"], 3);
+                .is_err()
+        );
         assert_eq!(d.managed_work(), 0);
         assert_eq!(
             d.dispatch("artifacts.download", params)
                 .await
                 .unwrap_err()
                 .to_string(),
-            "IDEMPOTENCY_CONFLICT"
+            "ORGANIZATION_NOT_ENROLLED"
         );
     }
     #[tokio::test]

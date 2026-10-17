@@ -64,6 +64,11 @@ nothing. The same operation can then continue through stopped maintenance; it
 must not start a daemon or relaunch a command merely to obtain an acknowledgement.
 Unresolved children, deliveries, schedules and uncertain outcomes block cleanup.
 
+Operation observations can also block cleanup even when no process is active.
+A pending cache records local preparation or uncertainty, not proof that its
+backend mutation ran. The immutable response from a completed Start can still
+say `queued`; inspect its current execution separately.
+
 Credential maintenance runs in the verified daemon executable without starting
 a socket server or worker. Its destination comes from the validated receipt,
 not ambient shell variables. Remote revocation confirmation, protected-state
@@ -169,7 +174,42 @@ that review use `--uninstall-work retire-local` with the same arguments plus
 the exact assessment under its locks and rejects drift. Retirement records local
 supersession evidence; it does not claim workflow completion, remote cancellation,
 delivery acknowledgement, schedule removal or credential revocation. Uncertain
-operations, recovery schedules, response spools and domain mutations remain blockers.
+operations, recovery schedules, response spools and domain mutations remain blockers
+under this default `continuations` scope.
+
+### Operation-observation recovery
+
+The newer verified distribution also accepts
+`--retirement-scope operation-observations` with `--uninstall-work inspect` or
+`--uninstall-work retire-local`. The default remains `continuations`; an older
+approval cannot silently select operation observations. Inspect with the exact
+release and original journal binding, run supported reconciliation, and inspect
+again. The resulting preview identifies the exact eligible records, byte
+fingerprints, dependencies and current assessment digest. Obtain explicit
+approval of that preview before `retire-local --expected-assessment-sha256`.
+
+Canonical reconciliation reads receipts under the original runner identity.
+An exact request fingerprint can prove a submission; a same-key-only match,
+missing/expired receipt or unavailable backend leaves its outcome unknown.
+Native authoring completion additionally requires current execution observation,
+drained events and the full terminal result. Reconciliation never resubmits the
+mutation, commits Start, sends a message or launches provider work.
+
+Reviewed retirement closes only local observation/retry tracking. It leaves
+remote workflows, accepted answers and draft mutations unchanged, and does not
+assert that the original operation succeeded or was never sent. The owner
+publishes immutable private denial evidence before making source files eligible
+for deletion. Required evidence and its minimum-reader lifecycle fence survive
+uninstall and reinstall; incompatible activation/rollback is refused. Old cards
+or attempts without a verifiable original installation cannot acquire the new
+installation's credentials. A legacy hashed slot whose original key is missing
+cannot be correlated universally after an account-subject change.
+
+Protected authentication operations, managed execution, terminal-delivery
+evidence, external recovery registrations, unsafe files and unreadable required
+evidence remain independent blockers. This scope cannot clear those owners.
+`actionCompleted: true` means only the selected maintenance action finished;
+`cleanupEligible` and the fresh assessment determine whether cleanup may proceed.
 
 Every `--uninstall-work` invocation ends after the selected maintenance action.
 It never uninstalls, installs, activates the plugin, registers it with Codex, or

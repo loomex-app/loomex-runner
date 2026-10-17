@@ -346,13 +346,172 @@ fn terminal_status(result: &Value) -> bool {
         Some("completed" | "failed" | "cancelled" | "canceled" | "deleted" | "succeeded" | "error")
     )
 }
-fn operation_cache_record(
+fn canonical_operation_completion(dir: &Path, path: &Path, record: &Value) -> Result<bool> {
+    let slot = path
+        .file_stem()
+        .and_then(|slot| slot.to_str())
+        .ok_or_else(|| anyhow::anyhow!(PENDING))?;
+    let proof_path = dir.join(format!(
+        "recovery-evidence/operation-canonical-{}.json",
+        crate::state::digest(slot.as_bytes())
+    ));
+    if !proof_path.try_exists()? {
+        return Ok(false);
+    }
+    let proof = json(&proof_path)?;
+    validate_canonical_operation_completion(
+        record,
+        &proof,
+        slot,
+        &crate::state::digest(&crate::operation_cache::read(
+            dir,
+            &format!("operations/{slot}.json"),
+        )?),
+    )?;
+    Ok(true)
+}
+
+pub(crate) fn validate_canonical_operation_completion(
+    record: &Value,
+    proof: &Value,
+    slot: &str,
+    source_sha256: &str,
+) -> Result<()> {
+    ensure!(
+        proof["schema"] == "loomex.operation-cache-canonical-observation/v1"
+            && proof["legacySlot"] == slot
+            && proof["method"] == record["method"]
+            && proof["originalCacheSha256"] == source_sha256,
+        "{PENDING}"
+    );
+    for name in ["operationId", "attemptId"] {
+        ensure!(
+            proof[name]
+                .as_str()
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok()),
+            "{PENDING}"
+        );
+    }
+    for name in ["journalSha256", "receiptSha256"] {
+        ensure!(proof[name].as_str().is_some_and(|hash|hash.len()==64 && hash.bytes().all(|b|b.is_ascii_hexdigit())),"{PENDING}");
+    }
+    let observed = &proof["observation"];
+    let receipt = &observed["canonicalReceipt"];
+    ensure!(
+        present(&observed["organizationId"])
+            && present(&observed["accountSubject"])
+            && present(&observed["installationId"])
+            && receipt["status"] == "completed"
+            && receipt["match"] == "exact_request_match",
+        "{PENDING}"
+    );
+    let method = record["method"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!(PENDING))?;
+    if matches!(method, "builder.start" | "editor.start") {
+        ensure!(
+            receipt["operation"] == method
+                && receipt["cacheRequestDigest"] == record["digest"]
+                && receipt["provenance"] == "native_authoring_queued_receipt",
+            "{PENDING}"
+        );
+        crate::control::verify_native_authoring_start(method, &receipt["result"])?;
+        ensure!(
+            receipt["result"]["executionId"] == record["executionId"],
+            "{PENDING}"
+        );
+    } else if matches!(
+        method,
+        "interactions.respond" | "interactions.decide" | "interactions.draft.delete"
+    ) {
+        let binding = &proof["binding"];
+        ensure!(
+            binding["requestFingerprint"] == record["digest"]
+                && binding["method"] == method
+                && binding["organizationId"] == observed["organizationId"]
+                && binding["accountSubject"] == observed["accountSubject"]
+                && binding["installationId"] == observed["installationId"],
+            "{PENDING}"
+        );
+        if !record["binding"].is_null() {
+            ensure!(record["binding"] == *binding, "{PENDING}");
+        } else {
+            let (relative, digest) =
+                crate::control::maintenance_cache_identity(&proof["ownerJournal"])?;
+            ensure!(
+                relative == format!("operations/{slot}.json") && digest == record["digest"],
+                "{PENDING}"
+            );
+        }
+        ensure!(
+            receipt["operation"]
+                == (if method == "interactions.draft.delete" {
+                    method
+                } else {
+                    "interaction.resolve"
+                })
+                && receipt["submissionFingerprintVersion"] == "loomex.operation-submission/v1"
+                && !binding["backendSubmissionDigest"].is_null()
+                && receipt["submissionFingerprint"] == binding["backendSubmissionDigest"]
+                && receipt["requestId"] == binding["references"]["requestId"],
+            "{PENDING}"
+        );
+        if method == "interactions.draft.delete" && observed["remoteOutcome"] == "completed" {
+            ensure!(receipt["result"]["deleted"].is_boolean(), "{PENDING}");
+            return Ok(());
+        }
+    } else {
+        anyhow::bail!("{PENDING}")
+    }
+    let terminal = &observed["observation"]["terminalResult"];
+    let run = receipt["result"]["executionId"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!(PENDING))?;
+    ensure!(
+        observed["remoteOutcome"] == "terminal"
+            && terminal.pointer("/execution/id").and_then(Value::as_str) == Some(run)
+            && terminal_status(terminal)
+            && terminal["hasMoreEvents"] == false
+            && terminal.get("responseRef").is_none()
+            && terminal.get("hasMore").is_none_or(|value| value != true)
+            && terminal.get("nextOffset").is_none_or(Value::is_null),
+        "{PENDING}"
+    );
+    Ok(())
+}
+
+pub(crate) fn operation_response_dependencies(dir: &Path, record: &Value) -> Result<bool> {
+    let Some(id) = record
+        .pointer("/result/responseRef")
+        .and_then(Value::as_str)
+    else {
+        return Ok(record.pointer("/result/responseRef").is_none());
+    };
+    if uuid::Uuid::parse_str(id).is_err() {
+        return Ok(false);
+    }
+    let mut runs = BTreeSet::new();
+    let metadata_path = dir.join(format!("responses/{id}.meta.json"));
+    if !metadata_path.try_exists()? {
+        return Ok(false);
+    }
+    let meta = json(&metadata_path)?;
+    if let Some(run) = meta["executionId"].as_str() {
+        runs.insert(run.into());
+    }
+    Ok(response_spool_record(dir, &dir.join("responses"), id, &runs, &mut Vec::new()).is_ok())
+}
+
+pub(crate) fn operation_cache_completion(
     dir: &Path,
     path: &Path,
     terminal_runs: &BTreeSet<String>,
-    paths: &mut Vec<PathBuf>,
 ) -> Result<()> {
     let record = json(path)?;
+    if canonical_operation_completion(dir, path, &record)? {
+        ensure!(operation_response_dependencies(dir, &record)?, "{PENDING}");
+        return Ok(());
+    }
     let method = record["method"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!(PENDING))?;
@@ -440,8 +599,28 @@ fn operation_cache_record(
             );
         }
     }
+    Ok(())
+}
+
+fn operation_cache_record(
+    dir: &Path,
+    path: &Path,
+    terminal_runs: &BTreeSet<String>,
+    paths: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let candidate = crate::operation_cache::classify(dir, path, terminal_runs)?;
+    ensure!(candidate["cleanupEligible"] == true, "{PENDING}");
     paths.push(path.into());
     Ok(())
+}
+
+pub(crate) fn operation_cache_terminal_runs(dir: &Path) -> Result<BTreeSet<String>> {
+    let mut runs = BTreeSet::new();
+    let mut report = ManagedStateAssessment::empty();
+    for name in ["presentation.sqlite3", "follow.sqlite3", "recovery.sqlite3"] {
+        assessment::inspect_database(dir, name, &mut report, &mut runs)?;
+    }
+    Ok(runs)
 }
 
 fn operation_caches(

@@ -8,6 +8,7 @@ pub mod follow;
 pub mod jobs;
 pub mod lifecycle;
 pub mod maintenance;
+pub(crate) mod operation_cache;
 pub mod power;
 pub mod presentation;
 pub mod progress;

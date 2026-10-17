@@ -711,6 +711,124 @@ fn bounded_assessment(v: &Value) -> Result<Option<Value>> {
         serde_json::json!({"schema":"app.loomex.runner.managed-state-assessment/v1","assessmentDigest":digest,"resolved":resolved,"blockers":bounded}),
     ))
 }
+fn bounded_work_preview(value: &Value) -> Result<Option<Value>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let records = value["records"]
+        .as_array()
+        .context("work preview records missing")?;
+    ensure!(records.len() <= 256, "work preview exceeds limit");
+    let mut bounded = Vec::new();
+    for record in records {
+        let kind = record["kind"]
+            .as_str()
+            .context("work preview kind missing")?;
+        ensure!(
+            matches!(
+                kind,
+                "operation_cache"
+                    | "follow_session"
+                    | "presentation_delivery"
+                    | "presentation_operation"
+            ),
+            "unsupported work preview kind"
+        );
+        let mut safe = serde_json::json!({"kind":kind});
+        for key in [
+            "recordReference",
+            "scopeReference",
+            "recordDigest",
+            "attemptReference",
+        ] {
+            if let Some(text) = record[key].as_str() {
+                ensure!(hex_string(text, 64), "invalid work preview reference");
+                safe[key] = serde_json::json!(text);
+            }
+        }
+        if let Some(method) = record["method"].as_str().filter(|method| {
+            matches!(
+                *method,
+                "interactions.respond"
+                    | "interactions.draft.delete"
+                    | "interactions.draft.update"
+                    | "auth.recover"
+                    | "builder.start"
+                    | "editor.start"
+                    | "workflows.create"
+                    | "workflows.update"
+                    | "workflows.patch"
+                    | "workflows.publish"
+                    | "personas.memory.write"
+                    | "personas.memory.update"
+                    | "personas.create"
+                    | "personas.chat_context.create"
+                    | "personas.roles.create"
+            )
+        }) {
+            safe["method"] = serde_json::json!(method);
+        }
+        if let Some(reason) = record["safeReason"].as_str().filter(|reason| {
+            matches!(
+                *reason,
+                "missing_binding"
+                    | "canonical_pending"
+                    | "terminal_missing"
+                    | "unsupported_family"
+                    | "response_dependency_missing"
+            )
+        }) {
+            safe["safeReason"] = serde_json::json!(reason);
+        }
+        if let Some(status) = record["status"].as_str().filter(|status| {
+            matches!(
+                *status,
+                "ready"
+                    | "sending"
+                    | "unknown"
+                    | "acknowledged"
+                    | "rejected"
+                    | "active"
+                    | "handoff_pending"
+                    | "terminal"
+                    | "superseded"
+                    | "blocked"
+                    | "suspended"
+                    | "pending"
+                    | "completed"
+                    | "ambiguous"
+                    | "rejected_before_execution"
+                    | "local_observation_retired"
+            )
+        }) {
+            safe["status"] = serde_json::json!(status);
+        }
+        for key in [
+            "retirementEligible",
+            "cleanupEligible",
+            "reconciliationSupported",
+            "selected",
+        ] {
+            if let Some(boolean) = record[key].as_bool() {
+                safe[key] = serde_json::json!(boolean);
+            }
+        }
+        if let Some(actions) = record.get("availableActions") {
+            let actions = actions.as_array().context("work preview actions missing")?;
+            ensure!(
+                actions.len() <= 2
+                    && actions.iter().all(|action| matches!(
+                        action.as_str(),
+                        Some("reconcile" | "retire-local")
+                    )),
+                "unsupported work preview actions"
+            );
+            safe["availableActions"] = serde_json::json!(actions);
+        }
+        bounded.push(safe);
+    }
+    Ok(Some(serde_json::json!({"records":bounded})))
+}
 fn known_reason(reason: &str) -> bool {
     matches!(
         reason,
@@ -803,6 +921,13 @@ fn retain_diagnostics(value: &Value, completion: &mut Completion) -> Result<()> 
         .or_else(|| value.get("managedStateAssessment"))
     {
         completion.assessment = bounded_assessment(assessment)?;
+        completion.cleanup_eligible = completion
+            .assessment
+            .as_ref()
+            .map(|assessment| assessment["resolved"] == true);
+    }
+    if let Some(preview) = value.get("preview") {
+        completion.preview = bounded_work_preview(preview)?;
     }
     Ok(())
 }
@@ -887,6 +1012,10 @@ struct Completion {
     guidance: Option<String>,
     owner_reference: Option<Value>,
     assessment: Option<Value>,
+    retirement_scope: Option<String>,
+    action_completed: Option<bool>,
+    cleanup_eligible: Option<bool>,
+    preview: Option<Value>,
 }
 impl Default for Completion {
     fn default() -> Self {
@@ -903,6 +1032,10 @@ impl Default for Completion {
             guidance: None,
             owner_reference: None,
             assessment: None,
+            retirement_scope: None,
+            action_completed: None,
+            cleanup_eligible: None,
+            preview: None,
         }
     }
 }
@@ -939,7 +1072,7 @@ fn failure_report(c: &Completion) -> Value {
             "Release-set verification failed. Review the exact artifacts and invocation before retrying."
         }
     };
-    serde_json::json!({"schema":c.schema,"ok":false,"outcome":c.outcome,"operationId":c.operation_id,"nextAction":c.next_action,"reasonCode":c.reason_code,"ownerReference":c.owner_reference,"assessment":c.assessment,"category":"PAIRED_INSTALL_REJECTED","phase":c.phase,"completion":c,"message":message})
+    serde_json::json!({"schema":c.schema,"ok":false,"outcome":c.outcome,"operationId":c.operation_id,"nextAction":c.next_action,"reasonCode":c.reason_code,"ownerReference":c.owner_reference,"assessment":c.assessment,"retirementScope":c.retirement_scope,"actionCompleted":c.action_completed,"cleanupEligible":c.cleanup_eligible,"preview":c.preview,"category":"PAIRED_INSTALL_REJECTED","phase":c.phase,"completion":c,"message":message})
 }
 fn valid_operation_id(id: &str) -> bool {
     !id.is_empty()
@@ -1030,9 +1163,27 @@ fn work_operation_id(value: &Value) -> Result<Option<String>> {
         _ => bail!("unsupported uninstall work operation identity"),
     }
 }
+// Old native reports predate scoped retirement and authorize continuations only.
+fn require_work_scope(value: &Value, expected: &str) -> Result<()> {
+    let scopes = [
+        value.get("retirementScope"),
+        value["uninstallWorkEligibility"].get("retirementScope"),
+    ];
+    ensure!(
+        scopes.iter().all(|scope| match scope {
+            None => true,
+            Some(Value::String(scope)) => scope == expected,
+            _ => false,
+        }) && (expected == "continuations" || scopes.iter().any(Option::is_some)),
+        "uninstall work retirement scope changed or unsupported"
+    );
+    Ok(())
+}
+
 fn uninstall_work_result(
     cmd: &mut Command,
     action: &str,
+    scope: &str,
     preflight: &Value,
     completion: &mut Completion,
 ) -> Result<()> {
@@ -1044,6 +1195,7 @@ fn uninstall_work_result(
             && value["action"] == action,
         "unsupported uninstall work schema or action"
     );
+    require_work_scope(&value, scope)?;
     let reason = value["reasonCode"]
         .as_str()
         .context("uninstall work reason missing")?;
@@ -1070,6 +1222,30 @@ fn uninstall_work_result(
             .get("assessment")
             .context("uninstall work assessment missing")?,
     )?;
+    let resolved = assessment
+        .as_ref()
+        .map(|v| v["resolved"].as_bool().unwrap());
+    let action_completed = outcome == "completed";
+    for (field, expected) in [
+        ("actionCompleted", Some(action_completed)),
+        ("cleanupEligible", Some(resolved == Some(true))),
+    ] {
+        if let Some(actual) = value.get(field) {
+            ensure!(
+                actual.as_bool() == expected,
+                "uninstall work completion evidence differs"
+            );
+        } else {
+            ensure!(
+                scope == "continuations",
+                "uninstall work scoped completion evidence missing"
+            );
+        }
+    }
+    ensure!(
+        !matches!(next, "install_candidate" | "none") || resolved == Some(true),
+        "uninstall work cleanup remains blocked"
+    );
     let operation = work_operation_id(
         value
             .get("operationId")
@@ -1133,6 +1309,10 @@ fn uninstall_work_result(
         }
         _ => bail!("unsupported uninstall work outcome"),
     }
+    completion.preview = bounded_work_preview(&value["preview"])?;
+    completion.retirement_scope = Some(scope.into());
+    completion.action_completed = Some(action_completed);
+    completion.cleanup_eligible = Some(resolved == Some(true));
     completion.operation_id = operation;
     completion.reason_code = reason.into();
     completion.next_action = next.into();
@@ -1159,7 +1339,7 @@ fn uninstall_work_result(
 }
 
 fn result_report(c: &Completion) -> Value {
-    serde_json::json!({"schema":c.schema,"ok":c.outcome == "completed","outcome":c.outcome,"operationId":c.operation_id,"nextAction":c.next_action,"reasonCode":c.reason_code,"ownerReference":c.owner_reference,"assessment":c.assessment,"phase":c.phase,"completion":c})
+    serde_json::json!({"schema":c.schema,"ok":c.outcome == "completed","outcome":c.outcome,"operationId":c.operation_id,"nextAction":c.next_action,"reasonCode":c.reason_code,"ownerReference":c.owner_reference,"assessment":c.assessment,"retirementScope":c.retirement_scope,"actionCompleted":c.action_completed,"cleanupEligible":c.cleanup_eligible,"preview":c.preview,"phase":c.phase,"completion":c})
 }
 // Resolve existing aliases component by component while retaining normalized
 // missing suffixes. This reads metadata only and never creates an install root.
@@ -1579,6 +1759,7 @@ fn install(completion: &mut Completion) -> Result<()> {
     let mut recover_uninstall = false;
     let mut uninstall_work: Option<String> = None;
     let mut assessment_sha: Option<String> = None;
+    let mut retirement_scope: Option<String> = None;
     let mut old_journal_sha = None;
     let mut replace_candidate = false;
     let mut recovery_intent_sha = None;
@@ -1596,7 +1777,8 @@ fn install(completion: &mut Completion) -> Result<()> {
             | "--expected-old-journal-sha256"
             | "--expected-recovery-intent-sha256"
             | "--uninstall-work"
-            | "--expected-assessment-sha256" => {
+            | "--expected-assessment-sha256"
+            | "--retirement-scope" => {
                 let value = args.get(i + 1).context("missing option value")?.clone();
                 match args[i].as_str() {
                     "--manifest" => manifest = Some(value),
@@ -1607,6 +1789,10 @@ fn install(completion: &mut Completion) -> Result<()> {
                     "--expected-recovery-intent-sha256" => recovery_intent_sha = Some(value),
                     "--uninstall-work" => uninstall_work = Some(value),
                     "--expected-assessment-sha256" => assessment_sha = Some(value),
+                    "--retirement-scope" => {
+                        ensure!(retirement_scope.is_none(), "duplicate retirement scope");
+                        retirement_scope = Some(value);
+                    }
                     key => bases.push((key.to_owned(), value)),
                 }
                 i += 2;
@@ -1683,6 +1869,20 @@ fn install(completion: &mut Completion) -> Result<()> {
             action != "inspect" || !authorize_keychain_transition,
             "inspection cannot authorize a native credential transition"
         );
+    }
+    ensure!(
+        retirement_scope.as_deref().is_none_or(|scope| matches!(
+            scope,
+            "continuations" | "operation-observations"
+        ) && matches!(
+            uninstall_work.as_deref(),
+            Some("inspect" | "retire-local")
+        )),
+        "retirement scope requires inspection or local retirement"
+    );
+    let retirement_scope = retirement_scope.as_deref().unwrap_or("continuations");
+    if uninstall_work.is_some() {
+        completion.retirement_scope = Some(retirement_scope.into());
     }
     ensure!(
         assessment_sha.is_some() == (uninstall_work.as_deref() == Some("retire-local")),
@@ -1845,6 +2045,9 @@ fn install(completion: &mut Completion) -> Result<()> {
         preflight_runner_args = recovery_args.clone();
         if let Some(action) = &uninstall_work {
             recovery_args.extend(["--action".into(), action.clone()]);
+            if action != "reconcile" {
+                recovery_args.extend(["--retirement-scope".into(), retirement_scope.into()]);
+            }
             if let Some(sha) = &assessment_sha {
                 recovery_args.extend(["--expected-assessment-sha256".into(), sha.clone()]);
             }
@@ -1855,6 +2058,10 @@ fn install(completion: &mut Completion) -> Result<()> {
                 "--work-action".into(),
                 action.clone(),
             ]);
+            if action != "reconcile" {
+                preflight_runner_args
+                    .extend(["--retirement-scope".into(), retirement_scope.into()]);
+            }
             if let Some(sha) = &assessment_sha {
                 preflight_runner_args.extend(["--expected-assessment-sha256".into(), sha.clone()]);
             }
@@ -1876,6 +2083,10 @@ fn install(completion: &mut Completion) -> Result<()> {
         uninstall_work.is_some(),
         completion,
     )?;
+    if uninstall_work.is_some() {
+        completion.phase = "runner-preflight";
+        require_work_scope(&native, retirement_scope)?;
+    }
     if uninstall_work.is_some() && authorize_keychain_transition {
         completion.phase = "runner-preflight";
         ensure!(
@@ -1935,6 +2146,7 @@ fn install(completion: &mut Completion) -> Result<()> {
                 .args(&recovery_args)
                 .arg("--json"),
             action,
+            retirement_scope,
             &native,
             completion,
         )?;
@@ -2159,6 +2371,27 @@ mod tests {
         value["blockers"][0]["category"] = serde_json::json!("follow_pending");
         value["blockers"][0]["references"] = serde_json::json!(vec!["b".repeat(64); 33]);
         assert!(bounded_assessment(&value).is_err());
+    }
+    #[test]
+    fn retirement_scope_requires_consistent_native_proof_and_legacy_is_continuations_only() {
+        let legacy = serde_json::json!({});
+        assert!(require_work_scope(&legacy, "continuations").is_ok());
+        assert!(require_work_scope(&legacy, "operation-observations").is_err());
+        let mut scoped = serde_json::json!({"retirementScope":"operation-observations", "uninstallWorkEligibility":{"retirementScope":"operation-observations"}});
+        assert!(require_work_scope(&scoped, "operation-observations").is_ok());
+        scoped["uninstallWorkEligibility"]["retirementScope"] = serde_json::json!("continuations");
+        assert!(require_work_scope(&scoped, "operation-observations").is_err());
+    }
+    #[test]
+    fn bounded_preview_rejects_unbounded_record_sets_and_private_actions() {
+        let record = serde_json::json!({"kind":"operation_cache", "method":"interactions.respond", "safeReason":"missing_binding", "availableActions":["reconcile","retire-local"], "private":"SECRET"});
+        let bounded = bounded_work_preview(&serde_json::json!({"records":[record.clone()]}))
+            .unwrap()
+            .unwrap();
+        assert!(!serde_json::to_string(&bounded).unwrap().contains("SECRET"));
+        assert_eq!(bounded["records"][0]["method"], "interactions.respond");
+        assert!(bounded_work_preview(&serde_json::json!({"records":vec![record; 257]})).is_err());
+        assert!(bounded_work_preview(&serde_json::json!({"records":[{"kind":"operation_cache", "availableActions":["SECRET"]}]})).is_err());
     }
     #[test]
     fn pair_and_preview_fail_closed() {

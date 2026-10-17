@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import importlib.util
+import json
 import subprocess
 import unittest
 from pathlib import Path
@@ -20,6 +21,30 @@ SPEC.loader.exec_module(MODULE)
 
 
 class IntegrationCompatibilityTests(unittest.TestCase):
+    def test_private_receipt_dependencies_cannot_be_omitted_by_backend(self) -> None:
+        required = {
+            "interactions.operations.receipt": "v2/interaction-operations/get/",
+            "native.authoring.receipt": "v2/native-authoring-receipts/get/",
+            "runs.continuation.receipt": "v2/execution-continuation-receipts/get/",
+        }
+        declared = json.loads((ROOT / "contracts/backend-routes.json").read_text())
+        for identifier, path in required.items():
+            with self.subTest(receipt=identifier):
+                entry = next(route for route in declared["routes"] if route["id"] == identifier)
+                self.assertEqual((entry["method"], entry["pathTemplate"]), ("POST", path))
+                self.assertIn(identifier, declared["daemonRouteIds"])
+                _, routes, catalog, plugin, backend = self.components()
+                routes["routes"].append(entry)
+                routes["daemonRouteIds"].append(identifier)
+                manifest = MODULE.runner_manifest_projection(catalog, routes)
+                with self.assertRaisesRegex(MODULE.CompatibilityError, "backend does not register"):
+                    MODULE.verify(runner_manifest=manifest, runner_routes=routes, runner_catalog=catalog,
+                                  plugin=plugin, backend=backend)
+                backend["routes"].append({"path": routes["basePath"] + path, "methods": ["POST"]})
+                result = MODULE.verify(runner_manifest=manifest, runner_routes=routes, runner_catalog=catalog,
+                                       plugin=plugin, backend=backend)
+                self.assertEqual(result["verification"]["backendRequiredRouteCount"], 2)
+
     def components(self) -> tuple[dict, dict, dict, dict, dict]:
         runner_routes = {
             "schemaVersion": "loomex.runner.backend-routes/v1",

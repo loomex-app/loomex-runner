@@ -537,6 +537,9 @@ struct Pending {
     target: Target,
     route: String,
     body: Value,
+    // One logical generation survives the exchange-to-bootstrap transition.
+    #[serde(default)]
+    recovery_generation: Option<String>,
     // Persisted before dispatch. A retry must retain this original bound so a
     // recovered response cannot acquire a new lifetime at receipt time.
     started_at: u64,
@@ -558,6 +561,17 @@ impl Pending {
         true
     }
 }
+// Protected-store journal: an RPC key never acquires authority over a later
+// pending generation. Results contain safe metadata only and survive response loss.
+#[derive(Clone, Serialize, Deserialize)]
+struct AuthRecoveryReceipt {
+    installation_id: String,
+    recovery_ref: String,
+    #[serde(default)]
+    result: Option<Value>,
+    #[serde(default)]
+    rejection: Option<String>,
+}
 #[derive(Serialize, Deserialize)]
 struct ProtectedState {
     installation_id: String,
@@ -574,6 +588,8 @@ struct ProtectedState {
     revocation: Option<RevocationEvidence>,
     #[serde(default)]
     persona_state: BTreeMap<String, Value>,
+    #[serde(default)]
+    auth_recoveries: BTreeMap<String, AuthRecoveryReceipt>,
 }
 impl ProtectedState {
     fn fresh() -> Self {
@@ -589,6 +605,7 @@ impl ProtectedState {
             logout_pending: false,
             revocation: None,
             persona_state: BTreeMap::new(),
+            auth_recoveries: BTreeMap::new(),
         }
     }
 }
@@ -717,6 +734,7 @@ impl Auth {
                 body: json!({"refreshToken":state.children[org].refresh,"proof":"synthetic-memory-store-proof"}),
                 started_at: now(),
                 recovery_used: false,
+                recovery_generation: None,
                 superseded: None,
             });
         }
@@ -870,7 +888,7 @@ impl Auth {
                 Ok(json!({"authenticated":false,"code":"AUTH_REQUIRED","loginPending":false}))
             }
             Ok(Some(state)) => Ok(
-                json!({"authenticated":state.device.is_some() && !state.logout_pending,"code":if state.logout_pending {"LOGOUT_PENDING"} else if state.pending.is_some() {"AUTH_RECOVERY_PENDING"} else if state.device.is_some() {"AUTHENTICATED"} else {"AUTH_REQUIRED"},"installationId":state.installation_id,"deviceId":state.device.as_ref().map(|device| &device.subject),"activeOrganization":state.active_organization,"organizations":state.children.keys().collect::<Vec<_>>(),"loginPending":state.login.is_some()}),
+                json!({"authenticated":state.device.is_some() && !state.logout_pending,"code":if state.logout_pending {"LOGOUT_PENDING"} else if state.pending.is_some() {"AUTH_RECOVERY_PENDING"} else if state.device.is_some() {"AUTHENTICATED"} else {"AUTH_REQUIRED"},"installationId":state.installation_id,"deviceId":state.device.as_ref().map(|device| &device.subject),"activeOrganization":state.active_organization,"organizations":state.children.keys().collect::<Vec<_>>(),"loginPending":state.login.is_some(),"recoveryRef":auth_recovery_ref(&state)}),
             ),
         }
     }
@@ -888,8 +906,89 @@ impl Auth {
     pub async fn reconcile(&self) -> Result<Value> {
         let _guard = self.auth_guard().await?;
         let mut state = self.required().await?;
+        self.reconcile_state(&mut state).await?;
+        Ok(recovery_result(&state, None))
+    }
+    /// Public recovery binds the caller's operation key to the exact protected
+    /// generation before dispatch. A missing reference can only read a receipt.
+    pub async fn reconcile_bound(
+        &self,
+        key: &str,
+        expected_recovery_ref: Option<&str>,
+    ) -> Result<Value> {
+        ensure!((16..=256).contains(&key.len()), "INVALID_IDEMPOTENCY_KEY");
+        let _guard = self.auth_guard().await?;
+        let mut state = self.required().await?;
+        if let Some(receipt) = state.auth_recoveries.get(key) {
+            ensure!(
+                receipt.installation_id == state.installation_id
+                    && expected_recovery_ref
+                        .is_none_or(|expected| expected == receipt.recovery_ref),
+                "IDEMPOTENCY_KEY_REUSED"
+            );
+            if let Some(result) = &receipt.result {
+                return Ok(result.clone());
+            }
+            if let Some(code) = &receipt.rejection {
+                bail!("{code}")
+            }
+            ensure!(
+                expected_recovery_ref.is_some(),
+                "AUTH_RECOVERY_BINDING_REQUIRED"
+            );
+            ensure!(
+                auth_recovery_ref(&state).as_deref() == Some(&receipt.recovery_ref),
+                "AUTH_RECOVERY_REFERENCE_MISMATCH"
+            );
+        } else {
+            let expected =
+                expected_recovery_ref.ok_or_else(|| anyhow!("AUTH_RECOVERY_BINDING_REQUIRED"))?;
+            // Accept only opaque references minted by this projection. Never
+            // persist arbitrary caller data in the credential store.
+            ensure!(
+                expected.len() == 67
+                    && expected.starts_with("ar-")
+                    && expected[3..].bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "AUTH_RECOVERY_REFERENCE_MISMATCH"
+            );
+            let matches = auth_recovery_ref(&state).as_deref() == Some(expected);
+            state.auth_recoveries.insert(
+                key.into(),
+                AuthRecoveryReceipt {
+                    installation_id: state.installation_id.clone(),
+                    recovery_ref: expected.into(),
+                    result: None,
+                    rejection: (!matches).then(|| "AUTH_RECOVERY_REFERENCE_MISMATCH".into()),
+                },
+            );
+            // This protected binding is durable before any network call.
+            self.save(&state).await?;
+            ensure!(matches, "AUTH_RECOVERY_REFERENCE_MISMATCH");
+        }
+        if let Err(error) = self.reconcile_state(&mut state).await {
+            if error
+                .downcast_ref::<crate::api::ApiError>()
+                .is_some_and(|error| !error.retryable)
+            {
+                if let Some(code) = state
+                    .auth_recoveries
+                    .get(key)
+                    .and_then(|receipt| receipt.rejection.as_ref())
+                {
+                    bail!("{code}")
+                }
+            }
+            return Err(error);
+        }
+        state
+            .auth_recoveries
+            .get(key)
+            .and_then(|receipt| receipt.result.clone())
+            .ok_or_else(|| anyhow!("AUTH_RECOVERY_REFERENCE_MISMATCH"))
+    }
+    async fn reconcile_state(&self, state: &mut ProtectedState) -> Result<()> {
         if state.pending.is_some() {
-            self.recover(&mut state).await?;
+            self.recover(state).await?;
         } else if let Some(login) = state
             .login
             .as_ref()
@@ -900,7 +999,7 @@ impl Auth {
             let body = json!({"transactionId":login.transaction_id,"code":code,"codeVerifier":login.code_verifier,
                 "redirectUri":login.redirect_uri,"proof":proof});
             self.begin(
-                &mut state,
+                state,
                 Target::BrowserExchange,
                 "v2/browser-authorities/exchange/".into(),
                 body,
@@ -909,11 +1008,7 @@ impl Auth {
         } else {
             bail!("AUTH_RECOVERY_NOT_REQUIRED")
         }
-        Ok(json!({
-            "reconciled": true,
-            "authenticated": state.device.is_some() && state.pending.is_none(),
-            "activeOrganization": state.active_organization,
-        }))
+        Ok(())
     }
     /// A credential-free, local snapshot for clients that need to resume an
     /// existing device flow. This deliberately reads only the runner store: a
@@ -1071,6 +1166,7 @@ impl Auth {
             "activeWork":active_work,
             "actions":actions,
             "login":login,
+            "recoveryRef":auth_recovery_ref(&state),
         })
     }
     pub async fn login(&self, runner_name: &str, key: &str) -> Result<Value> {
@@ -1461,6 +1557,7 @@ impl Auth {
             body,
             started_at: now(),
             recovery_used: false,
+            recovery_generation: None,
             superseded: state.pending.take().map(Box::new),
         });
         self.save(state).await?;
@@ -1867,6 +1964,18 @@ impl Auth {
         )
         .await
     }
+    /// Local observation retirement cannot clear a protected operation's
+    /// ownership. Inspection remains available while authentication is pending.
+    pub(crate) async fn maintenance_observation_quiescent(&self) -> Result<()> {
+        let _guard = self.auth_guard().await?;
+        if let Some(state) = self.load().await? {
+            ensure!(
+                state.pending.is_none() && state.login.is_none() && !state.logout_pending,
+                "AUTH_RECONCILIATION_REQUIRED"
+            );
+        }
+        Ok(())
+    }
     pub(crate) async fn maintenance_identity(&self) -> Result<Option<CredentialIdentity>> {
         let _guard = self
             .auth_guard()
@@ -2103,6 +2212,7 @@ impl Auth {
             body,
             started_at: now(),
             recovery_used: false,
+            recovery_generation: Some(uuid::Uuid::new_v4().to_string()),
             superseded: None,
         });
         self.save(state).await?;
@@ -2129,6 +2239,7 @@ impl Auth {
         self.transmit(state, true).await
     }
     async fn transmit(&self, state: &mut ProtectedState, recovery: bool) -> Result<()> {
+        let recovery_ref = auth_recovery_ref(state);
         let pending = state
             .pending
             .clone()
@@ -2175,9 +2286,23 @@ impl Auth {
                 // A definite enrollment rejection issued no recoverable child
                 // credential. It must not fence unrelated enrolled organizations.
                 // Keep ambiguous transport failures and rotation records protected.
-                if matches!(pending.target, Target::Enroll(_)) && !error.retryable {
-                    state.pending = None;
-                    self.save(state).await?;
+                if !error.retryable {
+                    let mut changed = false;
+                    for receipt in state.auth_recoveries.values_mut().filter(|receipt| {
+                        Some(receipt.recovery_ref.as_str()) == recovery_ref.as_deref()
+                            && receipt.result.is_none()
+                            && receipt.rejection.is_none()
+                    }) {
+                        receipt.rejection = Some("AUTH_RECOVERY_REJECTED".into());
+                        changed = true;
+                    }
+                    if matches!(pending.target, Target::Enroll(_)) {
+                        state.pending = None;
+                        changed = true;
+                    }
+                    if changed {
+                        self.save(state).await?;
+                    }
                 }
                 return Err(error.into());
             }
@@ -2192,6 +2317,7 @@ impl Auth {
                     body: json!({"bootstrapGrant":grant,"proof":proof}),
                     started_at: now(),
                     recovery_used: false,
+                    recovery_generation: Some(pending_recovery_generation(state, &pending)),
                     superseded: None,
                 });
                 self.save(state).await?;
@@ -2278,6 +2404,16 @@ impl Auth {
             }
         }
         state.pending = None;
+        // Adoption and its receipt share the same protected write. A lost RPC
+        // response cannot turn a later authenticated snapshot into a receipt.
+        let result = recovery_result(state, recovery_ref.as_deref());
+        for receipt in state.auth_recoveries.values_mut().filter(|receipt| {
+            Some(receipt.recovery_ref.as_str()) == recovery_ref.as_deref()
+                && receipt.result.is_none()
+                && receipt.rejection.is_none()
+        }) {
+            receipt.result = Some(result.clone());
+        }
         self.save(state).await.map_err(|error| {
             if state.logout_pending && valid_revocation(state) {
                 cleanup_failure(error, "protected_store_clear", "confirmed")
@@ -2286,6 +2422,69 @@ impl Auth {
             }
         })
     }
+}
+fn recovery_result(state: &ProtectedState, recovery_ref: Option<&str>) -> Value {
+    let mut result = json!({"reconciled":true,
+        "authenticated":state.device.is_some() && state.pending.is_none(),
+        "activeOrganization":state.active_organization});
+    if let Some(reference) = recovery_ref {
+        result["recoveryRef"] = json!(reference);
+    }
+    result
+}
+fn browser_recovery_generation(state: &ProtectedState) -> Option<String> {
+    let login = state
+        .login
+        .as_ref()
+        .filter(|login| login.received_code.is_some())?;
+    let material = json!({"loginKey":login.key,"flowId":login.flow_id,
+        "transactionId":login.transaction_id,"code":login.received_code});
+    Some(runner_state::digest(
+        &[
+            state.private_key.as_slice(),
+            material.to_string().as_bytes(),
+        ]
+        .concat(),
+    ))
+}
+fn pending_recovery_generation(state: &ProtectedState, pending: &Pending) -> String {
+    if matches!(pending.target, Target::BrowserExchange | Target::Bootstrap) {
+        if let Some(generation) = browser_recovery_generation(state) {
+            return generation;
+        }
+    }
+    pending.recovery_generation.clone().unwrap_or_else(|| {
+        // Older stores have no generation field. The exact protected operation
+        // defines a stable fallback, excluding the mutable recovery-used flag.
+        let material = json!({"target":pending.target,"route":pending.route,
+            "body":pending.body,"startedAt":pending.started_at});
+        runner_state::digest(
+            &[
+                state.private_key.as_slice(),
+                material.to_string().as_bytes(),
+            ]
+            .concat(),
+        )
+    })
+}
+fn auth_recovery_ref(state: &ProtectedState) -> Option<String> {
+    let generation = match state.pending.as_ref() {
+        Some(pending) => pending_recovery_generation(state, pending),
+        None => browser_recovery_generation(state)?,
+    };
+    let material = json!({"installationId":state.installation_id,"generation":generation});
+    // Salted digest reveals neither the pending body/proof nor browser codes.
+    Some(format!(
+        "ar-{}",
+        runner_state::digest(
+            &[
+                state.private_key.as_slice(),
+                b"auth-recovery/v1",
+                material.to_string().as_bytes()
+            ]
+            .concat()
+        )
+    ))
 }
 fn credential_identity(state: &ProtectedState) -> CredentialIdentity {
     CredentialIdentity {
@@ -2406,6 +2605,369 @@ fn flow_identity(state: &ProtectedState, login: &Login) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn bound_recovery_fixture() -> ProtectedState {
+        let mut state = ProtectedState::fresh();
+        state.device = Some(Token {
+            access: "lmxda_original_secret".into(),
+            refresh: "original-refresh".into(),
+            subject: "device".into(),
+            expires_at: now() + 3600,
+        });
+        state.pending = Some(Pending {
+            target: Target::DeviceRefresh,
+            route: "v2/device-authorities/refresh/".into(),
+            body: json!({"refreshToken":"original-refresh","proof":"original-proof"}),
+            started_at: now(),
+            recovery_used: false,
+            recovery_generation: None,
+            superseded: None,
+        });
+        state
+    }
+    #[tokio::test]
+    async fn bound_recovery_stale_reference_and_legacy_key_never_recover_new_pending() {
+        let (auth, store, listener) = test_auth().await;
+        let mut state = bound_recovery_fixture();
+        let old_ref = auth_recovery_ref(&state).unwrap();
+        state.pending.as_mut().unwrap().body["proof"] = json!("replacement-proof");
+        auth.save(&state).await.unwrap();
+        assert_eq!(
+            auth.status().await.unwrap()["recoveryRef"],
+            auth.connection(None, 0).await["recoveryRef"]
+        );
+        assert_eq!(
+            auth.reconcile_bound("legacy-recovery-key", None)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "AUTH_RECOVERY_BINDING_REQUIRED"
+        );
+        assert_eq!(
+            auth.reconcile_bound("stale-recovery-key", Some(&old_ref))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "AUTH_RECOVERY_REFERENCE_MISMATCH"
+        );
+        let new_ref = auth_recovery_ref(&state).unwrap();
+        assert_ne!(old_ref, new_ref);
+        assert_eq!(
+            auth.reconcile_bound("stale-recovery-key", Some(&new_ref))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "IDEMPOTENCY_KEY_REUSED"
+        );
+        let saved: ProtectedState =
+            serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+        assert_eq!(saved.pending.unwrap().body["proof"], "replacement-proof");
+        assert!(
+            saved.auth_recoveries["stale-recovery-key"]
+                .rejection
+                .is_some()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn bound_recovery_lost_response_replays_original_receipt_after_new_pending() {
+        let (auth, store, listener) = test_auth().await;
+        let state = bound_recovery_fixture();
+        let reference = auth_recovery_ref(&state).unwrap();
+        auth.save(&state).await.unwrap();
+        let server_store = store.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_request(&mut stream).await,
+                json!({"refreshToken":"original-refresh","proof":"original-proof","recovery":true})
+            );
+            let saved: ProtectedState =
+                serde_json::from_slice(&server_store.load().unwrap().unwrap()).unwrap();
+            assert!(
+                saved.auth_recoveries["receipt-recovery-key"]
+                    .result
+                    .is_none()
+            );
+            respond(&mut stream, 200, json!({"data":{"accessToken":"lmxda_new_secret","refreshToken":"new-refresh","expiresInSeconds":3600}})).await;
+        });
+        let receipt = auth
+            .reconcile_bound("receipt-recovery-key", Some(&reference))
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(receipt["recoveryRef"], reference);
+        let mut saved = auth.required().await.unwrap();
+        assert_eq!(
+            saved.auth_recoveries["receipt-recovery-key"].result,
+            Some(receipt.clone())
+        );
+        saved.pending = bound_recovery_fixture().pending;
+        saved.pending.as_mut().unwrap().body["proof"] = json!("new-generation-proof");
+        saved.active_organization = Some("different-org".into());
+        auth.save(&saved).await.unwrap();
+        assert_eq!(
+            auth.reconcile_bound("receipt-recovery-key", Some(&reference))
+                .await
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(
+            auth.reconcile_bound("receipt-recovery-key", None)
+                .await
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(
+            auth.required().await.unwrap().pending.unwrap().body["proof"],
+            "new-generation-proof"
+        );
+        // Replacement installation cannot adopt even a copied settled receipt.
+        saved.installation_id = "replacement-installation".into();
+        auth.save(&saved).await.unwrap();
+        assert_eq!(
+            auth.reconcile_bound("receipt-recovery-key", Some(&reference))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "IDEMPOTENCY_KEY_REUSED"
+        );
+    }
+    #[tokio::test]
+    async fn bound_recovery_inflight_key_cannot_attach_to_replacement_generation() {
+        let (auth, _, listener) = test_auth().await;
+        let mut state = bound_recovery_fixture();
+        let reference = auth_recovery_ref(&state).unwrap();
+        state.auth_recoveries.insert(
+            "inflight-recovery-key".into(),
+            AuthRecoveryReceipt {
+                installation_id: state.installation_id.clone(),
+                recovery_ref: reference.clone(),
+                result: None,
+                rejection: None,
+            },
+        );
+        state.pending.as_mut().unwrap().body["proof"] = json!("new-proof");
+        auth.save(&state).await.unwrap();
+        assert_eq!(
+            auth.reconcile_bound("inflight-recovery-key", Some(&reference))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "AUTH_RECOVERY_REFERENCE_MISMATCH"
+        );
+        let replacement = auth_recovery_ref(&state).unwrap();
+        assert_eq!(
+            auth.reconcile_bound("inflight-recovery-key", Some(&replacement))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "IDEMPOTENCY_KEY_REUSED"
+        );
+        assert_eq!(
+            auth.reconcile_bound("inflight-recovery-key", None)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "AUTH_RECOVERY_BINDING_REQUIRED"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+    #[test]
+    fn bound_recovery_read_timeout_retains_native_owners_and_never_mutates() {
+        use fs2::FileExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct DelayedRead {
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+            bytes: Vec<u8>,
+            writes: AtomicUsize,
+        }
+        impl Store for DelayedRead {
+            fn load(&self) -> Result<Option<Vec<u8>>> {
+                let _ = self
+                    .release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(6));
+                Ok(Some(self.bytes.clone()))
+            }
+            fn save(&self, _: &[u8]) -> Result<()> {
+                self.writes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let fixture = bound_recovery_fixture();
+        let reference = auth_recovery_ref(&fixture).unwrap();
+        let (release, receiver) = std::sync::mpsc::channel();
+        let store = Arc::new(DelayedRead {
+            release: std::sync::Mutex::new(receiver),
+            bytes: serde_json::to_vec(&fixture).unwrap(),
+            writes: AtomicUsize::new(0),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.lock");
+        let owner = Arc::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap(),
+        );
+        owner.try_lock_exclusive().unwrap();
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let credential_path = dir.path().join("credentials.lock");
+        let mut auth = auth_with_store(store.clone());
+        auth.retain_store_owner(&owner);
+        auth.credential_owner = Some(acquire_credential_owner_at(&credential_path).unwrap());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(auth.reconcile_bound("timeout-recovery-key", Some(&reference)))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "STORE_UNAVAILABLE");
+        assert_eq!(
+            cleanup_error_metadata(&error).unwrap()["failureCategory"],
+            "native_io_timeout"
+        );
+        drop(owner);
+        drop(auth);
+        runtime.shutdown_timeout(Duration::from_millis(20));
+        let still_owned = contender.try_lock_exclusive().is_err();
+        let credential_still_owned = acquire_credential_owner_at(&credential_path).is_err();
+        release.send(()).unwrap();
+        assert!(still_owned && credential_still_owned);
+        assert_eq!(store.writes.load(Ordering::SeqCst), 0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while contender.try_lock_exclusive().is_err() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    #[tokio::test]
+    async fn bound_recovery_definite_rejection_is_durable_and_never_replayed() {
+        let (auth, _, listener) = test_auth().await;
+        let state = bound_recovery_fixture();
+        let reference = auth_recovery_ref(&state).unwrap();
+        auth.save(&state).await.unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream).await;
+            respond(
+                &mut stream,
+                403,
+                json!({"error":{"code":"REFRESH_REJECTED"}}),
+            )
+            .await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        for _ in 0..2 {
+            assert_eq!(
+                auth.reconcile_bound("reject-recovery-key", Some(&reference))
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "AUTH_RECOVERY_REJECTED"
+            );
+        }
+        server.await.unwrap();
+        assert!(auth.required().await.unwrap().pending.is_some());
+    }
+    #[tokio::test]
+    async fn bound_recovery_browser_code_exchange_and_bootstrap_share_reference() {
+        let (auth, _, listener) = test_auth().await;
+        let mut state = ProtectedState::fresh();
+        state.login = Some(Login {
+            key: "browser-generation-key".into(),
+            flow_id: "flow".into(),
+            received_code: Some("browser-secret-code".into()),
+            transaction_id: Some("transaction".into()),
+            ..Login::default()
+        });
+        let reference = auth_recovery_ref(&state).unwrap();
+        auth.save(&state).await.unwrap();
+        let server_auth = auth.clone();
+        let server_ref = reference.clone();
+        let server = tokio::spawn(async move {
+            let (mut exchange, _) = listener.accept().await.unwrap();
+            read_request(&mut exchange).await;
+            assert_eq!(
+                server_auth.status().await.unwrap()["recoveryRef"],
+                server_ref
+            );
+            respond(
+                &mut exchange,
+                200,
+                json!({"data":{"bootstrapGrant":"bootstrap-secret"}}),
+            )
+            .await;
+            let (mut bootstrap, _) = listener.accept().await.unwrap();
+            read_request(&mut bootstrap).await;
+            assert_eq!(
+                server_auth.connection(None, 0).await["recoveryRef"],
+                server_ref
+            );
+            respond(&mut bootstrap, 200, json!({"data":{"device":{"deviceId":"device","accessToken":"lmxda_new_secret","refreshToken":"new-refresh","expiresInSeconds":3600}}})).await;
+        });
+        let receipt = auth
+            .reconcile_bound("browser-recovery-key", Some(&reference))
+            .await
+            .unwrap();
+        assert_eq!(receipt["recoveryRef"], reference);
+        assert_eq!(receipt["authenticated"], true);
+        assert_eq!(auth.status().await.unwrap()["recoveryRef"], Value::Null);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn observation_retirement_refuses_all_active_protected_auth_without_writes() {
+        let (auth, store, listener) = test_auth().await;
+        assert!(auth.maintenance_observation_quiescent().await.is_ok());
+        for active in ["none", "pending", "login", "logout"] {
+            let mut state = ProtectedState::fresh();
+            match active {
+                "pending" => state.pending = bound_recovery_fixture().pending,
+                "login" => state.login = Some(Login::default()),
+                "logout" => state.logout_pending = true,
+                _ => (),
+            }
+            auth.save(&state).await.unwrap();
+            let before = store.load().unwrap();
+            let result = auth.maintenance_observation_quiescent().await;
+            if active == "none" {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "AUTH_RECONCILIATION_REQUIRED"
+                );
+            }
+            assert_eq!(store.load().unwrap(), before);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }
     #[tokio::test]
     async fn current_child_identity_never_refreshes_or_writes_expired_auth() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2558,6 +3120,7 @@ mod tests {
             body: json!({"refreshToken":"original","proof":"identical"}),
             started_at: now(),
             recovery_used: false,
+            recovery_generation: None,
             superseded: None,
         });
         auth.save(&state).await.unwrap();
@@ -2579,6 +3142,7 @@ mod tests {
             body: json!({"refreshToken":"original","proof":"identical"}),
             started_at: now(),
             recovery_used: false,
+            recovery_generation: None,
             superseded: None,
         });
         auth.save(&state).await.unwrap();
@@ -2617,6 +3181,7 @@ mod tests {
             body: json!({"refreshToken":"original","proof":"identical"}),
             started_at: 100,
             recovery_used: false,
+            recovery_generation: None,
             superseded: None,
         });
         store.save(&serde_json::to_vec(&state).unwrap()).unwrap();
@@ -2832,6 +3397,7 @@ mod tests {
             body: json!({"refreshToken":"secret"}),
             started_at: now(),
             recovery_used: false,
+            recovery_generation: None,
             superseded: None,
         });
         auth.save(&state).await.unwrap();
@@ -3198,6 +3764,7 @@ mod tests {
             body: json!({"refreshToken":"old-refresh","proof":"original-proof"}),
             started_at: old_start,
             recovery_used: false,
+            recovery_generation: None,
             superseded: None,
         });
         auth.save(&state).await.unwrap();
@@ -3261,6 +3828,7 @@ mod tests {
             body: json!({"proof":"retained-exchange-proof"}),
             started_at: now(),
             recovery_used: true,
+            recovery_generation: None,
             superseded: None,
         });
         auth.save(&state).await.unwrap();
@@ -3308,6 +3876,7 @@ mod tests {
             body: json!({"bootstrapGrant":"original-grant","proof":"original-proof"}),
             started_at: now(),
             recovery_used: true,
+            recovery_generation: None,
             superseded: None,
         });
         auth.save(&state).await.unwrap();
@@ -3364,6 +3933,7 @@ mod tests {
             body: json!({"proof":"original-proof"}),
             started_at: now(),
             recovery_used: false,
+            recovery_generation: None,
             superseded: None,
         });
         auth.save(&state).await.unwrap();
@@ -3559,6 +4129,7 @@ mod tests {
             body: json!({"bootstrapGrant":"original-grant","proof":"original-proof"}),
             started_at: old_start,
             recovery_used: false,
+            recovery_generation: None,
             superseded: None,
         });
         auth.save(&state).await.unwrap();
@@ -3601,6 +4172,7 @@ mod tests {
             body: json!({"idempotencyKey":"original-key"}),
             started_at: old_start,
             recovery_used: false,
+            recovery_generation: None,
             superseded: None,
         });
         auth.save(&state).await.unwrap();
@@ -3660,6 +4232,7 @@ mod tests {
             body: json!({"idempotencyKey":"original-key"}),
             started_at: now().saturating_sub(1_200),
             recovery_used: false,
+            recovery_generation: None,
             superseded: None,
         });
         auth.save(&state).await.unwrap();
@@ -3687,6 +4260,7 @@ mod tests {
                 body: json!({"bootstrapGrant":"original-grant","proof":"original-proof"}),
                 started_at: now(),
                 recovery_used: outcome == "exhausted",
+                recovery_generation: None,
                 superseded: None,
             });
             auth.save(&state).await.unwrap();
@@ -3746,6 +4320,7 @@ mod tests {
             body: json!({"bootstrapGrant":"original-grant","proof":"original-proof"}),
             started_at: now(),
             recovery_used: false,
+            recovery_generation: None,
             superseded: None,
         });
         let installation = state.installation_id.clone();
@@ -3827,6 +4402,7 @@ mod tests {
             body: json!({"bootstrapGrant":"original-grant","proof":"original-proof"}),
             started_at: now(),
             recovery_used: false,
+            recovery_generation: None,
             superseded: None,
         });
         auth.save(&state).await.unwrap();
@@ -4602,6 +5178,7 @@ mod tests {
             body: json!({"refreshToken":"spent-refresh","proof":"spent-proof"}),
             started_at: now().saturating_sub(100),
             recovery_used: true,
+            recovery_generation: None,
             superseded: None,
         });
         auth.save(&state).await.unwrap();
@@ -4747,6 +5324,7 @@ mod tests {
             body: json!({"refreshToken":"original-refresh","proof":"original-proof"}),
             started_at: now().saturating_sub(31),
             recovery_used: false,
+            recovery_generation: None,
             superseded: None,
         });
         auth.save(&state).await.unwrap();
@@ -5806,6 +6384,7 @@ mod tests {
             body: json!({"refreshToken":refresh,"proof":proof}),
             started_at: now(),
             recovery_used: false,
+            recovery_generation: None,
             superseded: None,
         });
         auth.save(&state).await.unwrap();

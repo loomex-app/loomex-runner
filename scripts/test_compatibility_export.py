@@ -93,7 +93,7 @@ class CompatibilityExportTests(unittest.TestCase):
             self.assertEqual(exported["classification"], "local-control")
             self.assertEqual(exported["routeIds"], [])
             self.assertEqual(exported["outputSchemaDigest"],
-                             "sha256:5f9260d8a5d4fb206556d4b2a8a6fca6fb75a3a19b0b39f764ac5e8b4aa0de5d")
+                             "sha256:0f9489a5a6bdcf6d010751e2a5a8654a3b0279065430f317420fa9c750fcd205")
             # Former {} status remains accepted, but the manifest must record
             # the reviewed optional startup input instead of its old digest.
             self.assertNotEqual(exported["inputSchemaDigest"],

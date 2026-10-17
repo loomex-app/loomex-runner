@@ -170,6 +170,7 @@ pub(super) fn fingerprints(dir: &Path) -> Result<BTreeMap<PathBuf, String>> {
         "responses",
         "tombstones",
         "workflow-patches",
+        "recovery-evidence",
     ] {
         let path = dir.join(name);
         if metadata(&path, true)?.is_some() {
@@ -210,16 +211,19 @@ pub(super) fn schema(connection: &Connection, name: &str) -> Result<u32> {
         .collect::<BTreeSet<_>>();
     let supported = match name {
         "presentation.sqlite3" => {
-            if matches!(version, 2 | 3) {
+            if matches!(version, 2..=4) {
                 allowed.insert("presentation_deliveries".into());
             }
-            if version == 3 {
+            if version >= 3 {
                 allowed.extend([
                     "continuation_resolutions".into(),
                     "continuation_observations".into(),
                 ]);
             }
-            matches!(version, 1..=3)
+            if version == 4 {
+                allowed.insert("presentation_session_origins".into());
+            }
+            matches!(version, 1..=4)
         }
         "follow.sqlite3" => {
             if version == 2 {
@@ -270,7 +274,7 @@ fn query_blockers(
     Ok(())
 }
 
-fn inspect_database(
+pub(super) fn inspect_database(
     dir: &Path,
     name: &str,
     report: &mut ManagedStateAssessment,
@@ -1012,6 +1016,7 @@ pub fn maintenance_preview(dir: &Path) -> Result<Vec<Value>> {
         }
         snapshot.verify_sources()?;
     }
+    candidates.extend(crate::operation_cache::inspect(dir)?);
     ensure!(
         before == fingerprints(dir)?,
         ManagedStateError::new(BlockerCategory::ObservationDrift)

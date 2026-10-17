@@ -61,13 +61,14 @@ struct Arguments {
     expected_release_path: Option<PathBuf>,
     work_action: Option<String>,
     expected_assessment_sha256: Option<String>,
+    retirement_scope: Option<String>,
     json: bool,
     activation: std::sync::Arc<std::sync::Mutex<ActivationFacts>>,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: loomex-lifecycle-bootstrap install RELEASE [--public-key FILE | --allow-unsigned-development (--development-api-origin LOOPBACK_URL | --preview-api-origin HTTPS_URL)] [--authorize-keychain-transition] [--settled-abandonment UUID] [--provider-executable PROVIDER=/absolute/path] [--install-base DIR --state-dir DIR --launch-agents-dir DIR]\n       loomex-lifecycle-bootstrap uninstall [--install-base DIR --state-dir DIR --launch-agents-dir DIR]\n       loomex-lifecycle-bootstrap preflight RELEASE [install options]\n       loomex-lifecycle-bootstrap recover-uninstall RELEASE --expected-old-journal-sha256 SHA256 [--replace-pre-adoption-candidate --expected-recovery-intent-sha256 SHA256] [--json] [release verification and path options]\n       loomex-lifecycle-bootstrap uninstall-work RELEASE --action inspect|reconcile|retire-local --expected-old-journal-sha256 SHA256 [--expected-assessment-sha256 SHA256 (retire-local)] [--json] [release verification and path options]\n       work inspection: preflight RELEASE --work-action ACTION --expected-old-journal-sha256 SHA256 [--expected-assessment-sha256 SHA256]\n       recovery inspection: preflight RELEASE --recovery-uninstall --expected-old-journal-sha256 SHA256 [--expected-release-path STABLE_RELEASE] [replacement options]"
+        "usage: loomex-lifecycle-bootstrap install RELEASE [--public-key FILE | --allow-unsigned-development (--development-api-origin LOOPBACK_URL | --preview-api-origin HTTPS_URL)] [--authorize-keychain-transition] [--settled-abandonment UUID] [--provider-executable PROVIDER=/absolute/path] [--install-base DIR --state-dir DIR --launch-agents-dir DIR]\n       loomex-lifecycle-bootstrap uninstall [--install-base DIR --state-dir DIR --launch-agents-dir DIR]\n       loomex-lifecycle-bootstrap preflight RELEASE [install options]\n       loomex-lifecycle-bootstrap recover-uninstall RELEASE --expected-old-journal-sha256 SHA256 [--replace-pre-adoption-candidate --expected-recovery-intent-sha256 SHA256] [--json] [release verification and path options]\n       loomex-lifecycle-bootstrap uninstall-work RELEASE --action inspect|reconcile|retire-local --expected-old-journal-sha256 SHA256 [--expected-assessment-sha256 SHA256 (retire-local)] [--retirement-scope continuations|operation-observations] [--json] [release verification and path options]\n       work inspection: preflight RELEASE --work-action ACTION --expected-old-journal-sha256 SHA256 [--expected-assessment-sha256 SHA256]\n       recovery inspection: preflight RELEASE --recovery-uninstall --expected-old-journal-sha256 SHA256 [--expected-release-path STABLE_RELEASE] [replacement options]"
     );
     std::process::exit(2)
 }
@@ -125,6 +126,18 @@ fn parse() -> (String, Arguments) {
             }
             "--work-action" if command == "preflight" && parsed.work_action.is_none() => {
                 parsed.work_action = Some(
+                    values
+                        .next()
+                        .unwrap_or_else(|| usage())
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            "--retirement-scope"
+                if matches!(command.as_str(), "uninstall-work" | "preflight")
+                    && parsed.retirement_scope.is_none() =>
+            {
+                parsed.retirement_scope = Some(
                     values
                         .next()
                         .unwrap_or_else(|| usage())
@@ -233,6 +246,15 @@ fn parse() -> (String, Arguments) {
 }
 
 fn valid_recovery_arguments(command: &str, args: &Arguments) -> bool {
+    if args.retirement_scope.is_some() && args.work_action.is_none() {
+        return false;
+    }
+    if !matches!(
+        args.retirement_scope.as_deref(),
+        None | Some("continuations" | "operation-observations")
+    ) {
+        return false;
+    }
     if command == "uninstall-work" || (command == "preflight" && args.work_action.is_some()) {
         return matches!(
             args.work_action.as_deref(),
@@ -1340,6 +1362,7 @@ async fn install(args: Arguments) -> Result<()> {
         .join(format!(".stage.{}", Uuid::new_v4()));
     let staged_plist = async {
         let payload = extract(&release, &manifest, &stage).await?;
+        lifecycle::require_operation_observation_capability(&paths, &payload)?;
         let project: Value =
             serde_json::from_slice(&fs::read(payload.join("metadata/project.json"))?)?;
         if project["project"] != "loomex-runner"
@@ -1753,6 +1776,27 @@ async fn run() -> Result<()> {
 #[cfg(test)]
 mod pending_stop_tests {
     use super::*;
+    #[test]
+    fn operation_retirement_scope_is_explicit_bounded_and_defaults_to_continuations() {
+        let mut args = Arguments {
+            work_action: Some("inspect".into()),
+            expected_old_journal_sha256: Some("a".repeat(64)),
+            ..Default::default()
+        };
+        assert!(args.retirement_scope.is_none());
+        assert!(valid_recovery_arguments("uninstall-work", &args));
+        args.retirement_scope = Some("operation-observations".into());
+        assert!(valid_recovery_arguments("uninstall-work", &args));
+        args.work_action = Some("retire-local".into());
+        assert!(!valid_recovery_arguments("uninstall-work", &args));
+        args.expected_assessment_sha256 = Some("b".repeat(64));
+        assert!(valid_recovery_arguments("uninstall-work", &args));
+        args.retirement_scope = Some("all".into());
+        assert!(!valid_recovery_arguments("uninstall-work", &args));
+        args.work_action = None;
+        assert!(!valid_recovery_arguments("install", &args));
+    }
+
     #[test]
     fn replacement_flags_must_be_paired_and_scoped_to_recovery() {
         let mut args = Arguments {

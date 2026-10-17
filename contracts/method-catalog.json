@@ -398,6 +398,14 @@
               "details": {
                 "type": "object",
                 "additionalProperties": true
+              },
+              "recoveryRef": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "minLength": 1,
+                "maxLength": 512
               }
             },
             "required": [
@@ -499,6 +507,14 @@
               "details": {
                 "type": "object",
                 "additionalProperties": true
+              },
+              "recoveryRef": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "minLength": 1,
+                "maxLength": 512
               }
             },
             "required": [
@@ -816,6 +832,11 @@
           "idempotencyKey": {
             "type": "string",
             "format": "uuid"
+          },
+          "recoveryRef": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
           }
         },
         "required": [
@@ -843,6 +864,11 @@
               "details": {
                 "type": "object",
                 "additionalProperties": true
+              },
+              "recoveryRef": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512
               }
             },
             "required": [
@@ -7672,6 +7698,59 @@
               "details": {
                 "type": "object",
                 "additionalProperties": true
+              },
+              "originIdentity": {
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "properties": {
+                  "organizationId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "accountSubject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "installationId": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                },
+                "required": [
+                  "organizationId",
+                  "accountSubject",
+                  "installationId"
+                ],
+                "additionalProperties": false
+              },
+              "currentOriginIdentity": {
+                "type": "object",
+                "properties": {
+                  "organizationId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "accountSubject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "installationId": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                },
+                "required": [
+                  "organizationId",
+                  "accountSubject",
+                  "installationId"
+                ],
+                "additionalProperties": false
               }
             },
             "required": [
@@ -7794,6 +7873,59 @@
               "details": {
                 "type": "object",
                 "additionalProperties": true
+              },
+              "originIdentity": {
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "properties": {
+                  "organizationId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "accountSubject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "installationId": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                },
+                "required": [
+                  "organizationId",
+                  "accountSubject",
+                  "installationId"
+                ],
+                "additionalProperties": false
+              },
+              "currentOriginIdentity": {
+                "type": "object",
+                "properties": {
+                  "organizationId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "accountSubject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "installationId": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                },
+                "required": [
+                  "organizationId",
+                  "accountSubject",
+                  "installationId"
+                ],
+                "additionalProperties": false
               }
             },
             "required": [
@@ -7911,6 +8043,59 @@
               "details": {
                 "type": "object",
                 "additionalProperties": true
+              },
+              "originIdentity": {
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "properties": {
+                  "organizationId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "accountSubject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "installationId": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                },
+                "required": [
+                  "organizationId",
+                  "accountSubject",
+                  "installationId"
+                ],
+                "additionalProperties": false
+              },
+              "currentOriginIdentity": {
+                "type": "object",
+                "properties": {
+                  "organizationId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "accountSubject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "installationId": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                },
+                "required": [
+                  "organizationId",
+                  "accountSubject",
+                  "installationId"
+                ],
+                "additionalProperties": false
               }
             },
             "required": [
@@ -8056,6 +8241,59 @@
               "details": {
                 "type": "object",
                 "additionalProperties": true
+              },
+              "originIdentity": {
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "properties": {
+                  "organizationId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "accountSubject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "installationId": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                },
+                "required": [
+                  "organizationId",
+                  "accountSubject",
+                  "installationId"
+                ],
+                "additionalProperties": false
+              },
+              "currentOriginIdentity": {
+                "type": "object",
+                "properties": {
+                  "organizationId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "accountSubject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "installationId": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                },
+                "required": [
+                  "organizationId",
+                  "accountSubject",
+                  "installationId"
+                ],
+                "additionalProperties": false
               }
             },
             "required": [
@@ -10270,6 +10508,59 @@
               "details": {
                 "type": "object",
                 "additionalProperties": true
+              },
+              "originIdentity": {
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "properties": {
+                  "organizationId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "accountSubject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "installationId": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                },
+                "required": [
+                  "organizationId",
+                  "accountSubject",
+                  "installationId"
+                ],
+                "additionalProperties": false
+              },
+              "currentOriginIdentity": {
+                "type": "object",
+                "properties": {
+                  "organizationId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "accountSubject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "installationId": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                },
+                "required": [
+                  "organizationId",
+                  "accountSubject",
+                  "installationId"
+                ],
+                "additionalProperties": false
               }
             },
             "required": [
@@ -10390,6 +10681,59 @@
               "details": {
                 "type": "object",
                 "additionalProperties": true
+              },
+              "originIdentity": {
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "properties": {
+                  "organizationId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "accountSubject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "installationId": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                },
+                "required": [
+                  "organizationId",
+                  "accountSubject",
+                  "installationId"
+                ],
+                "additionalProperties": false
+              },
+              "currentOriginIdentity": {
+                "type": "object",
+                "properties": {
+                  "organizationId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "accountSubject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "installationId": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                },
+                "required": [
+                  "organizationId",
+                  "accountSubject",
+                  "installationId"
+                ],
+                "additionalProperties": false
               }
             },
             "required": [
@@ -11337,6 +11681,59 @@
               "details": {
                 "type": "object",
                 "additionalProperties": true
+              },
+              "originIdentity": {
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "properties": {
+                  "organizationId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "accountSubject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "installationId": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                },
+                "required": [
+                  "organizationId",
+                  "accountSubject",
+                  "installationId"
+                ],
+                "additionalProperties": false
+              },
+              "currentOriginIdentity": {
+                "type": "object",
+                "properties": {
+                  "organizationId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "accountSubject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "installationId": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                },
+                "required": [
+                  "organizationId",
+                  "accountSubject",
+                  "installationId"
+                ],
+                "additionalProperties": false
               }
             },
             "required": [
@@ -11459,6 +11856,59 @@
               "details": {
                 "type": "object",
                 "additionalProperties": true
+              },
+              "originIdentity": {
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "properties": {
+                  "organizationId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "accountSubject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "installationId": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                },
+                "required": [
+                  "organizationId",
+                  "accountSubject",
+                  "installationId"
+                ],
+                "additionalProperties": false
+              },
+              "currentOriginIdentity": {
+                "type": "object",
+                "properties": {
+                  "organizationId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "accountSubject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "installationId": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                },
+                "required": [
+                  "organizationId",
+                  "accountSubject",
+                  "installationId"
+                ],
+                "additionalProperties": false
               }
             },
             "required": [
@@ -11593,6 +12043,59 @@
               "details": {
                 "type": "object",
                 "additionalProperties": true
+              },
+              "originIdentity": {
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "properties": {
+                  "organizationId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "accountSubject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "installationId": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                },
+                "required": [
+                  "organizationId",
+                  "accountSubject",
+                  "installationId"
+                ],
+                "additionalProperties": false
+              },
+              "currentOriginIdentity": {
+                "type": "object",
+                "properties": {
+                  "organizationId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "accountSubject": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "installationId": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                },
+                "required": [
+                  "organizationId",
+                  "accountSubject",
+                  "installationId"
+                ],
+                "additionalProperties": false
               }
             },
             "required": [
@@ -13416,6 +13919,7 @@
     }
   ],
   "capabilities": [
+    "auth.recovery-binding/v1",
     "auth:browser-pkce/v1",
     "auth:startup-observation/v1",
     "authoring.chat-native/v1",
@@ -13526,17 +14030,18 @@
     "method:workspaces.grant",
     "method:workspaces.list",
     "method:workspaces.revoke",
+    "operation-cache.retirement-fence/v1",
+    "presentation.continuation-resolution/v1",
     "presentation.delivery/v2",
     "presentation.sessions.restore/v1",
     "presentation.sessions/v1",
     "recovery.coordination/v1",
     "transfer.chunked/v1",
     "transfer.response-utf8/v1",
+    "workflow.queue-observation/v1",
     "workflows.atomic-draft-create/v1",
     "workflows.canonical-authoring-contract/v1",
     "workflows.patch.notes-preserve/v1",
-    "workflows.runtime-draft-mutations/v1",
-    "workflow.queue-observation/v1",
-    "presentation.continuation-resolution/v1"
+    "workflows.runtime-draft-mutations/v1"
   ]
 }

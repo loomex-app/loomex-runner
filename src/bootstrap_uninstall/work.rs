@@ -3,6 +3,12 @@
 use super::*;
 
 const WORK_SCHEMA: &str = "app.loomex.runner.uninstall-work/v1";
+fn retirement_scope(args: &Arguments) -> &str {
+    args.retirement_scope.as_deref().unwrap_or("continuations")
+}
+fn saved_scope(value: &Value) -> &str {
+    value["retirementScope"].as_str().unwrap_or("continuations")
+}
 #[derive(Debug)]
 pub(crate) struct WorkRefusal(pub &'static str);
 impl std::fmt::Display for WorkRefusal {
@@ -176,6 +182,7 @@ pub(crate) async fn work_preflight(
             value["attempt"]["action"] == "retire-local"
                 && value["attempt"]["expectedAssessmentSha256"].as_str()
                     == args.expected_assessment_sha256.as_deref()
+                && saved_scope(&value["attempt"]) == retirement_scope(args)
         });
         require(
             resuming
@@ -189,7 +196,7 @@ pub(crate) async fn work_preflight(
         "UNINSTALL_WORK_PREVIEW_LIMIT",
     )?;
     Ok(
-        json!({"eligible":true,"readOnly":true,"action":args.work_action,"signingTransition":if transition==SigningTransition::ForegroundAuthorizationRequired {"needs_explicit_transition"}else{"eligible"},"accessAttempted":false,"nativeAccessVerified":false,"ownerReference":work_owner_reference(paths),"assessment":assessment}),
+        json!({"eligible":true,"readOnly":true,"action":args.work_action,"retirementScope":retirement_scope(args),"signingTransition":if transition==SigningTransition::ForegroundAuthorizationRequired {"needs_explicit_transition"}else{"eligible"},"accessAttempted":false,"nativeAccessVerified":false,"ownerReference":work_owner_reference(paths),"assessment":assessment}),
     )
 }
 
@@ -344,6 +351,9 @@ async fn quiescent_singleton(paths: &lifecycle::Paths, old: &Value) -> Result<Fi
     Ok(guard)
 }
 fn audit_projection(value: &Value) -> Value {
+    if value["kind"] == "operation_cache" {
+        return json!({"kind":"operation_cache","recordReference":state::json_digest(&value["legacySlot"]),"recordDigest":value["recordDigest"],"privateRecordSha256":state::json_digest(value)});
+    }
     if value["kind"] == "presentation_operation" {
         let mut safe = json!({"kind":"presentation_operation","privateRecordSha256":state::json_digest(value)});
         for key in [
@@ -584,6 +594,7 @@ fn archive_approval(
             && context["attemptId"] == attempt
             && work["attempt"]["id"] == attempt
             && context["action"] == work["attempt"]["action"]
+            && saved_scope(&context) == saved_scope(&work["attempt"])
             && matches!(
                 context["action"].as_str(),
                 Some("reconcile" | "retire-local")
@@ -641,7 +652,7 @@ fn archive_approval(
     } else {
         None
     };
-    let approval = json!({"schema":"app.loomex.runner.uninstall-work-approval/v1","operationId":id,"attemptId":attempt,"action":context["action"],"expectedAssessmentSha256":context["expectedAssessmentSha256"],"originalJournalSha256":context["journalSha256"],"originalJournalSchema":old["schema"],"originalJournalPhase":old["phase"],"releaseManifestSha256":work["releaseManifestSha256"],"receiptSha256":context["receiptSha256"],"identityReference":state::json_digest(&context["expectedIdentity"]),"requestSetSha256":state::digest(&request_bytes),"contextSha256":state::digest(&context_bytes),"authorizationCheckpointSha256":checkpoint});
+    let approval = json!({"schema":"app.loomex.runner.uninstall-work-approval/v1","operationId":id,"attemptId":attempt,"action":context["action"],"retirementScope":saved_scope(&context),"expectedAssessmentSha256":context["expectedAssessmentSha256"],"originalJournalSha256":context["journalSha256"],"originalJournalSchema":old["schema"],"originalJournalPhase":old["phase"],"releaseManifestSha256":work["releaseManifestSha256"],"receiptSha256":context["receiptSha256"],"identityReference":state::json_digest(&context["expectedIdentity"]),"requestSetSha256":state::digest(&request_bytes),"contextSha256":state::digest(&context_bytes),"authorizationCheckpointSha256":checkpoint});
     immutable_copy(
         &root.join(format!("approval-{attempt}.json")),
         &serde_json::to_vec(&approval)?,
@@ -656,8 +667,25 @@ fn public_report(
     operation: Option<Uuid>,
 ) -> Value {
     let review = review_state(paths);
-    let (assessment, preview) = review.unwrap_or((Value::Null, Value::Null));
-    json!({"schema":"app.loomex.runner.bootstrap-uninstall-work/v1","outcome":if assessment.is_null(){"blocked"}else{outcome},"action":args.work_action,"operationId":operation,"ownerReference":work_owner_reference(paths),"assessment":assessment,"preview":preview,"reasonCode":if assessment.is_null(){"UNINSTALL_WORK_REVIEW_UNAVAILABLE"}else{reason},"nextAction":next})
+    let (assessment, mut preview) = review.unwrap_or((Value::Null, Value::Null));
+    if let Some(records) = preview["records"].as_array_mut() {
+        for record in records {
+            record["selected"] = json!(
+                record["retirementEligible"] == true
+                    && record["resolution"] == "unresolved"
+                    && if retirement_scope(args) == "operation-observations" {
+                        record["kind"] == "operation_cache"
+                    } else {
+                        record["kind"] == "follow_session"
+                            || record["kind"] == "presentation_delivery"
+                    }
+            );
+        }
+    }
+    if preview.is_object() {
+        preview["retirementScope"] = json!(retirement_scope(args));
+    }
+    json!({"schema":"app.loomex.runner.bootstrap-uninstall-work/v1","outcome":if assessment.is_null(){"blocked"}else{outcome},"action":args.work_action,"retirementScope":retirement_scope(args),"actionCompleted":outcome=="completed" && !assessment.is_null(),"cleanupEligible":assessment["resolved"]==true,"operationId":operation,"ownerReference":work_owner_reference(paths),"assessment":assessment,"preview":preview,"reasonCode":if assessment.is_null(){"UNINSTALL_WORK_REVIEW_UNAVAILABLE"}else{reason},"nextAction":next})
 }
 
 fn require_attempt_result(
@@ -696,7 +724,11 @@ fn review_state(paths: &lifecycle::Paths) -> Result<(Value, Value)> {
         let backend=&value["backendObservation"];
         let run=value["runId"].as_str().and_then(|id|Uuid::parse_str(id).ok());
         let state=value["status"].as_str().or_else(||value["lifecycle"].as_str()).filter(|state|matches!(*state,"ready"|"sending"|"unknown"|"acknowledged"|"rejected"|"active"|"handoff_pending"|"terminal"|"superseded"|"blocked"|"suspended"|"pending"|"completed"|"ambiguous"));
-        json!({"recordReference":state::json_digest(&json!([value["kind"],value["organizationId"],value["accountSubject"],value["installationId"],value["recordId"]])),"scopeReference":state::json_digest(&json!([value["organizationId"],value["accountSubject"],value["installationId"]])),"kind":value["kind"],"method":if value["reconciliationSupported"]==true {value["method"].clone()} else {Value::Null},"reconciliationSupported":value["reconciliationSupported"]==true,"runId":run,"revision":value["revision"],"generation":value["generation"],"attemptReference":value["attemptId"].as_str().map(|id|state::digest(id.as_bytes())),"status":state,"recordDigest":value["recordDigest"],"resolution":value["resolution"]["state"],"canonicalObservation":backend,"retirementEligible":value["kind"]!="presentation_operation" && (value["kind"]=="follow_session" || value["retirementEligible"]==true) && backend["recordDigest"]==value["recordDigest"],"dependencies":"exact_receipt_linked_acceptance_caches_and_response_spools"})
+        let operation = value["kind"] == "operation_cache";
+        let eligible = if operation { value["retirementEligible"] == true } else { value["kind"] != "presentation_operation" && (value["kind"] == "follow_session" || value["retirementEligible"] == true) && backend["recordDigest"] == value["recordDigest"] };
+        let reason = value["safeReason"].as_str().filter(|reason| matches!(*reason, "missing_binding" | "canonical_pending" | "terminal_missing" | "unsupported_family" | "response_dependency_missing"));
+        let method = value["method"].as_str().filter(|method| matches!(*method, "interactions.respond" | "interactions.draft.delete" | "interactions.draft.update" | "auth.recover" | "builder.start" | "editor.start" | "workflows.create" | "workflows.update" | "workflows.patch" | "workflows.publish" | "personas.memory.write" | "personas.memory.update" | "personas.create" | "personas.chat_context.create" | "persona.roles.create"));
+        json!({"recordReference":state::json_digest(&json!([value["kind"],value["organizationId"],value["accountSubject"],value["installationId"],if operation {&value["legacySlot"]}else{&value["recordId"]}])),"scopeReference":state::json_digest(&json!([value["organizationId"],value["accountSubject"],value["installationId"]])),"kind":value["kind"],"method":if operation || value["reconciliationSupported"]==true {json!(method)} else {Value::Null},"reconciliationSupported":value["reconciliationSupported"]==true,"runId":run,"revision":value["revision"],"generation":value["generation"],"attemptReference":value["attemptId"].as_str().map(|id|state::digest(id.as_bytes())),"status":state,"recordDigest":value["recordDigest"],"resolution":value["resolution"]["state"],"canonicalObservation":if operation {Value::Null}else{backend.clone()},"safeReason":reason,"retirementEligible":eligible,"cleanupEligible":value["cleanupEligible"]==true,"availableActions":if operation {if eligible {json!(["reconcile","retire-local"])}else{json!(["reconcile"])}}else{json!([])},"dependencies":"exact_receipt_linked_acceptance_caches_and_response_spools"})
     }).collect::<Vec<_>>();
     require(
         before.assessment_digest
@@ -817,7 +849,8 @@ async fn execute_work(
     *selected = Some(id);
     if !work["attempt"].is_null() {
         require(
-            work["attempt"]["action"].as_str() == args.work_action.as_deref(),
+            work["attempt"]["action"].as_str() == args.work_action.as_deref()
+                && saved_scope(&work["attempt"]) == retirement_scope(args),
             "UNINSTALL_WORK_MAINTENANCE_PENDING",
         )?;
     }
@@ -825,6 +858,9 @@ async fn execute_work(
         .as_str()
         .unwrap_or(work["journalSha256"].as_str().unwrap());
     lifecycle::begin_uninstall_work_locked(paths, id, fence_digest)?;
+    if retirement_scope(args) == "operation-observations" {
+        lifecycle::fence_operation_observation_work_locked(paths, id)?;
+    }
     save_work(paths, &work)?;
     stop_service(paths, &old, &mut work).await?;
     let guard = quiescent_singleton(paths, &old).await?;
@@ -890,7 +926,8 @@ async fn execute_work(
             .join(format!("uninstall-work-stage-{id}/bin/loomex-runner"));
         require(
             digest_file(&binary)? == context["binarySha256"]
-                && context["action"] == args.work_action.as_deref().unwrap_or(""),
+                && context["action"] == args.work_action.as_deref().unwrap_or("")
+                && saved_scope(&context) == retirement_scope(args),
             "UNINSTALL_WORK_BINDING_CHANGED",
         )?;
         let inherited = guard.try_clone()?;
@@ -953,7 +990,7 @@ async fn execute_work(
     let context_path = paths
         .state_dir
         .join(format!("uninstall-work-context-{attempt}.json"));
-    let context = json!({"schema":"app.loomex.runner.uninstall-work-context/v1","operationId":id,"attemptId":attempt,"stateDir":paths.state_dir,"installBase":paths.install_base,"launchAgentsDir":paths.launch_agents_dir,"journalSha256":work["journalSha256"],"receiptSha256":state::json_digest(&old["receipt"]),"binarySha256":digest_file(&binary)?,"action":args.work_action,"expectedAssessmentSha256":args.expected_assessment_sha256,"expectedIdentity":identity,"apiOrigin":old["receipt"]["developmentApiOrigin"],"singletonFd":fd,"authorizeKeychainTransition":args.authorize_keychain_transition && qualification["signingTransition"]=="needs_explicit_transition"});
+    let context = json!({"schema":"app.loomex.runner.uninstall-work-context/v1","operationId":id,"attemptId":attempt,"stateDir":paths.state_dir,"installBase":paths.install_base,"launchAgentsDir":paths.launch_agents_dir,"journalSha256":work["journalSha256"],"receiptSha256":state::json_digest(&old["receipt"]),"binarySha256":digest_file(&binary)?,"action":args.work_action,"retirementScope":retirement_scope(args),"expectedAssessmentSha256":args.expected_assessment_sha256,"expectedIdentity":identity,"apiOrigin":old["receipt"]["developmentApiOrigin"],"singletonFd":fd,"authorizeKeychainTransition":args.authorize_keychain_transition && qualification["signingTransition"]=="needs_explicit_transition"});
     // The context and attempt intent precede spawn. A crash in the spawn gap is
     // uncertain, and cannot authorize another child under a fresh identity.
     immutable_copy(&context_path, &serde_json::to_vec(&context)?)?;
@@ -970,7 +1007,7 @@ async fn execute_work(
         .as_array_mut()
         .unwrap()
         .push(json!(attempt));
-    work["attempt"] = json!({"id":attempt,"action":args.work_action,"expectedAssessmentSha256":args.expected_assessment_sha256,"state":"spawn_pending","contextSha256":digest_file(&context_path)?});
+    work["attempt"] = json!({"id":attempt,"action":args.work_action,"retirementScope":retirement_scope(args),"expectedAssessmentSha256":args.expected_assessment_sha256,"state":"spawn_pending","contextSha256":digest_file(&context_path)?});
     save_work(paths, &work)?;
     spawn_attempt(paths, &mut work, &binary, &context_path, fd, fd).await?;
     let result: Value = work_json(
@@ -1227,6 +1264,88 @@ mod tests {
         args.work_action = Some("reconcile".into());
         assert!(valid_recovery_arguments("uninstall-work", &args));
     }
+    #[test]
+    fn terminal_uninstall_retains_old_reader_fence_and_exact_history_after_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = lifecycle::Paths {
+            state_dir: root.path().join("state"),
+            install_base: root.path().join("install"),
+            launch_agents_dir: root.path().join("agents"),
+        };
+        state::private_dir(&paths.state_dir).unwrap();
+        let id = Uuid::new_v4();
+        lifecycle::begin_uninstall_work_locked(&paths, id, &"a".repeat(64)).unwrap();
+        let owner_path = paths.state_dir.join("lifecycle-operation.json");
+        let owner_before = regular_bytes(&owner_path).unwrap();
+        let original = serde_json::to_string(
+            &json!({"digest":"b".repeat(64),"method":"interactions.respond","status":"pending"}),
+        )
+        .unwrap();
+        let slot = "c".repeat(64);
+        let provenance = json!({"operationId":id,"attemptId":Uuid::new_v4(),"journalSha256":"a".repeat(64),"receiptSha256":"b".repeat(64),"expectedAssessmentSha256":"c".repeat(64),"requestSetSha256":"d".repeat(64),"contextSha256":"e".repeat(64),"installationId":"fixture-install","retirementScope":"operation-observations","canonicalObservation":{"remoteOutcome":"unknown","safeReason":"missing_binding"}});
+        let evidence = json!({"schema":"loomex.operation-cache-retirement/v1","legacySlot":slot,"originalCache":original,"originalCacheSha256":state::digest(original.as_bytes()),"provenance":provenance,"remoteOutcome":"unknown","denyOnly":true,"retiredAt":state::now()});
+        let evidence_root = paths.state_dir.join("recovery-evidence");
+        state::private_dir(&evidence_root).unwrap();
+        state::write_json(
+            &evidence_root.join(format!(
+                "operation-cache-{}.json",
+                state::digest(slot.as_bytes())
+            )),
+            &evidence,
+        )
+        .unwrap();
+        let terminal = json!({"schema":SCHEMA,"operationId":id,"phase":"terminal","fenceJournalSha256":"a".repeat(64),"cleanup":{"stateDeleted":true}});
+        let journal_path = paths.state_dir.join("bootstrap-uninstall.json");
+        let terminal_bytes = serde_json::to_vec_pretty(&terminal).unwrap();
+        state::atomic_write(&journal_path, &terminal_bytes).unwrap();
+        remove_terminal_fence(&paths, &terminal).unwrap();
+        let archive = evidence_root.join(id.to_string());
+        assert_eq!(
+            regular_bytes(&archive.join("terminal-lifecycle-owner.json")).unwrap(),
+            owner_before
+        );
+        assert_eq!(
+            regular_bytes(&archive.join("terminal-bootstrap-uninstall.json")).unwrap(),
+            terminal_bytes
+        );
+        let raw: Value = work_json(&owner_path).unwrap();
+        assert_eq!(raw["schema"], "app.loomex.runner.lifecycle-operation/v12");
+        assert_eq!(raw["logicalSchema"], lifecycle::OPERATION_SCHEMA);
+        remove_regular(&journal_path).unwrap();
+        remove_terminal_fence(&paths, &terminal).unwrap();
+        let retained: lifecycle::Operation = work_json(&owner_path).unwrap();
+        assert!(lifecycle::retained_retirement_terminal(&retained, id).unwrap());
+        let package = lifecycle::PackageIdentity {
+            version: "1.2.10".into(),
+            target: paths.install_base.join("versions/1.2.10"),
+            manifest_sha256: "f".repeat(64),
+        };
+        assert_eq!(
+            lifecycle::package_preflight(&paths, lifecycle::OperationKind::Install, &package)
+                .unwrap()["ready"],
+            true
+        );
+    }
+
+    #[test]
+    fn immutable_context_publication_keeps_partial_temporary_out_of_the_approved_path() {
+        let root = tempfile::tempdir().unwrap();
+        state::private_dir(root.path()).unwrap();
+        let path = root.path().join("uninstall-work-context-fixture.json");
+        state::atomic_write(
+            &root
+                .path()
+                .join(".uninstall-immutable-publication-interrupted"),
+            b"{",
+        )
+        .unwrap();
+        let bytes = b"{\"schema\":\"complete-context\"}";
+        immutable_copy(&path, bytes).unwrap();
+        immutable_copy(&path, bytes).unwrap();
+        assert!(immutable_copy(&path, b"replacement").is_err());
+        assert_eq!(regular_bytes(&path).unwrap(), bytes);
+    }
+
     #[test]
     fn historical_binding_and_v10_owner_preserve_both_original_byte_streams() {
         let fixture = super::super::tests::historical_fixture();

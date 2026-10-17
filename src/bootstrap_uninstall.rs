@@ -745,26 +745,35 @@ fn maintenance_failure(stderr: &[u8]) -> anyhow::Error {
 }
 
 fn immutable_copy(path: &Path, bytes: &[u8]) -> Result<()> {
-    match OpenOptions::new()
+    if fs::symlink_metadata(path).is_ok() {
+        ensure!(
+            regular_bytes(path)? == bytes,
+            "immutable uninstall recovery evidence changed"
+        );
+        return Ok(());
+    }
+    let parent = path.parent().context("unsafe immutable evidence path")?;
+    let temporary = parent.join(format!(
+        ".uninstall-immutable-publication-{}",
+        Uuid::new_v4()
+    ));
+    let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-    {
-        Ok(mut file) => {
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            File::open(path.parent().unwrap())?.sync_all()?;
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            ensure!(
-                regular_bytes(path)? == bytes,
-                "immutable uninstall recovery evidence changed"
-            );
-        }
-        Err(e) => return Err(e.into()),
-    }
+        .open(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    // The native lifecycle owner serializes publication. Only a complete synced
+    // inode can become an immutable context or evidence record.
+    ensure!(
+        matches!(fs::symlink_metadata(path),Err(error) if error.kind()==std::io::ErrorKind::NotFound),
+        "immutable uninstall recovery evidence changed"
+    );
+    fs::rename(&temporary, path)?;
+    File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -2156,9 +2165,19 @@ fn revocation_satisfied(journal: &Value) -> bool {
 }
 
 fn remove_terminal_fence(paths: &lifecycle::Paths, journal: &Value) -> Result<()> {
+    lifecycle::require_operation_retirement_reader_state(&paths.state_dir)?;
     let path = paths.state_dir.join("lifecycle-operation.json");
     if path.exists() {
-        let operation: lifecycle::Operation = serde_json::from_slice(&regular_bytes(&path)?)?;
+        let operation_bytes = regular_bytes(&path)?;
+        let operation: lifecycle::Operation = serde_json::from_slice(&operation_bytes)?;
+        let id = Uuid::parse_str(
+            journal["operationId"]
+                .as_str()
+                .context("terminal uninstall identity missing")?,
+        )?;
+        if lifecycle::retained_retirement_terminal(&operation, id)? {
+            return Ok(());
+        }
         ensure!(
             operation.id.to_string() == journal["operationId"]
                 && operation
@@ -2168,7 +2187,33 @@ fn remove_terminal_fence(paths: &lifecycle::Paths, journal: &Value) -> Result<()
                         == journal["fenceJournalSha256"].as_str()),
             "terminal uninstall fence changed"
         );
-        remove_regular(&path)?;
+        if lifecycle::operation_retirement_evidence_present(paths)? {
+            let root = paths
+                .state_dir
+                .join("recovery-evidence")
+                .join(id.to_string());
+            state::private_dir(&root)?;
+            immutable_copy(
+                &root.join("terminal-lifecycle-owner.json"),
+                &operation_bytes,
+            )?;
+            let terminal_path = paths.state_dir.join("bootstrap-uninstall.json");
+            let terminal_bytes = if terminal_path.try_exists()? {
+                regular_bytes(&terminal_path)?
+            } else {
+                serde_json::to_vec(journal)?
+            };
+            immutable_copy(
+                &root.join("terminal-bootstrap-uninstall.json"),
+                &terminal_bytes,
+            )?;
+            ensure!(
+                lifecycle::complete_uninstall_retirement_fence(paths, id)?,
+                "operation retirement evidence changed"
+            );
+        } else {
+            remove_regular(&path)?;
+        }
     }
     Ok(())
 }

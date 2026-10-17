@@ -61,7 +61,7 @@ impl PresentationStore {
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        ensure!(version <= 3, "UNSUPPORTED_STATE_VERSION");
+        ensure!(version <= 4, "UNSUPPORTED_STATE_VERSION");
         connection.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS presentation_sessions (
@@ -124,7 +124,11 @@ impl PresentationStore {
               updated_at INTEGER NOT NULL,
               PRIMARY KEY(organization_id, account_subject, identity)
             );
-            PRAGMA user_version = 3;
+            CREATE TABLE IF NOT EXISTS presentation_session_origins (
+              view_session_id TEXT PRIMARY KEY REFERENCES presentation_sessions(view_session_id) ON DELETE CASCADE,
+              installation_id TEXT NOT NULL
+            );
+            PRAGMA user_version = 4;
             ",
         )?;
         crate::continuation_resolution::initialize(&connection)?;
@@ -163,6 +167,57 @@ impl PresentationStore {
             "presentation.delivery.settle" => self.delivery_settle(scope, p),
             _ => bail!("METHOD_NOT_FOUND"),
         }
+    }
+
+    /// The daemon supplies the current installation; it is never accepted from
+    /// presentation state. Historical sessions deliberately remain unbound.
+    pub fn dispatch_bound(
+        &self,
+        org: &str,
+        account: &str,
+        installation: &str,
+        method: &str,
+        p: &Value,
+    ) -> Result<Value> {
+        ensure!(
+            Uuid::parse_str(installation).is_ok(),
+            "AUTH_IDENTITY_CHANGED"
+        );
+        let scope = Scope {
+            organization: org,
+            account,
+        };
+        let mut result = if method == "presentation.sessions.create" {
+            self.sweep(crate::state::now())?;
+            self.create_with_origin(scope, p, Some(installation))?
+        } else {
+            self.dispatch(org, account, method, p)?
+        };
+        if method != "presentation.sessions.delete"
+            && let Some(id) = result["viewSessionId"]
+                .as_str()
+                .or_else(|| p["viewSessionId"].as_str())
+        {
+            let connection = self
+                .connection
+                .lock()
+                .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
+            let original: Option<String> = connection.query_row(
+                "SELECT o.installation_id FROM presentation_session_origins o JOIN presentation_sessions s ON s.view_session_id=o.view_session_id WHERE s.view_session_id=?1 AND s.organization_id=?2 AND s.account_subject=?3",
+                params![id, org, account], |row| row.get(0),
+            ).optional()?;
+            let current = json!({"organizationId":org,"accountSubject":account,"installationId":installation});
+            let origin = original.map(|installation| json!({"organizationId":org,"accountSubject":account,"installationId":installation}));
+            result["originIdentity"] = json!(origin);
+            result["currentOriginIdentity"] = current.clone();
+            for name in ["operation", "pendingOperation"] {
+                if result[name].is_object() {
+                    result[name]["originIdentity"] = json!(origin);
+                    result[name]["currentOriginIdentity"] = current.clone();
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// Register runner-derived continuation authority independently of any
@@ -503,6 +558,15 @@ impl PresentationStore {
     }
 
     fn create(&self, scope: Scope<'_>, p: &Value) -> Result<Value> {
+        self.create_with_origin(scope, p, None)
+    }
+
+    fn create_with_origin(
+        &self,
+        scope: Scope<'_>,
+        p: &Value,
+        installation: Option<&str>,
+    ) -> Result<Value> {
         validate_kind(required(p, "kind")?)?;
         validate_entity(
             required(p, "kind")?,
@@ -536,6 +600,12 @@ impl PresentationStore {
                 now
             ],
         )?;
+        if let Some(installation) = installation {
+            tx.execute(
+                "INSERT INTO presentation_session_origins VALUES (?1,?2)",
+                params![id, installation],
+            )?;
+        }
         let result = session_projection(&tx, scope, &id)?;
         save_receipt(
             &tx,
@@ -1872,6 +1942,65 @@ fn forbidden_presentation_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installation_origin_is_persisted_and_never_adopted_on_restore() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PresentationStore::open(root.path()).unwrap();
+        let first = Uuid::new_v4().to_string();
+        let replacement = Uuid::new_v4().to_string();
+        let input = json!({"kind":"monitor","entityType":"execution","entityId":Uuid::new_v4(),"state":{},"idempotencyKey":Uuid::new_v4()});
+        let created = store
+            .dispatch_bound(
+                "org",
+                "account",
+                &first,
+                "presentation.sessions.create",
+                &input,
+            )
+            .unwrap();
+        assert_eq!(created["originIdentity"]["installationId"], first);
+        let saved = store
+            .dispatch_bound(
+                "org",
+                "account",
+                &replacement,
+                "presentation.sessions.get",
+                &json!({"viewSessionId":created["viewSessionId"]}),
+            )
+            .unwrap();
+        assert_eq!(saved["originIdentity"]["installationId"], first);
+        assert_eq!(
+            saved["currentOriginIdentity"]["installationId"],
+            replacement
+        );
+        let historical = store.dispatch("org", "account", "presentation.sessions.create", &json!({"kind":"monitor","entityType":"execution","entityId":Uuid::new_v4(),"state":{},"idempotencyKey":Uuid::new_v4()})).unwrap();
+        let restored = store
+            .dispatch_bound(
+                "org",
+                "account",
+                &replacement,
+                "presentation.sessions.restore",
+                &json!({"viewSessionId":historical["viewSessionId"]}),
+            )
+            .unwrap();
+        assert!(restored["originIdentity"].is_null());
+        assert_eq!(
+            restored["currentOriginIdentity"]["installationId"],
+            replacement
+        );
+        assert!(
+            store
+                .dispatch_bound(
+                    "org",
+                    "other-account",
+                    &replacement,
+                    "presentation.sessions.get",
+                    &json!({"viewSessionId":created["viewSessionId"]})
+                )
+                .is_err()
+        );
+    }
 
     fn scope() -> Scope<'static> {
         Scope {

@@ -124,6 +124,7 @@ const LEGACY_CHECKPOINTS: &[&str] = &[
 const PENDING_UPDATE_RETIREMENT_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v9";
 const UNINSTALL_FENCE_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v8";
 const UNINSTALL_WORK_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v10";
+const OPERATION_OBSERVATION_WORK_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v11";
 const LOCK_NAME: &str = "lifecycle.lock";
 const OPERATION_NAME: &str = "lifecycle-operation.json";
 const NATIVE_EXECUTABLES: &[&str] = &["/bin/launchctl"];
@@ -139,9 +140,32 @@ pub enum OperationKind {
     Prune,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Operation {
+    pub schema: String,
+    pub id: Uuid,
+    pub kind: OperationKind,
+    pub phase: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub detail: Option<String>,
+    pub package: Option<PackageIdentity>,
+    pub previous_target: Option<PathBuf>,
+    pub resources: Option<OperationResources>,
+    pub checkpoint: Option<String>,
+    pub service_stops: Vec<ServiceStopIntent>,
+    pub abandonment: Option<PendingUpdateAbandonment>,
+    pub auth_baseline: Option<AuthBaseline>,
+    pub prune: Option<PruneIntent>,
+    pub reviewed_unsent_stop: Option<ReviewedUnsentStop>,
+    pub uninstall_fence: Option<UninstallFence>,
+    pub pending_update_retirement: Option<PendingUpdateRetirement>,
+    minimum_reader: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "Operation", rename_all = "camelCase")]
+struct OperationData {
     pub schema: String,
     pub id: Uuid,
     pub kind: OperationKind,
@@ -172,6 +196,70 @@ pub struct Operation {
     pub uninstall_fence: Option<UninstallFence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_update_retirement: Option<PendingUpdateRetirement>,
+    #[serde(skip)]
+    minimum_reader: bool,
+}
+
+const OPERATION_RETIREMENT_READER_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v12";
+impl Serialize for Operation {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        if !self.minimum_reader {
+            return OperationData::serialize(self, serializer);
+        }
+        struct Unfenced<'a>(&'a Operation);
+        impl Serialize for Unfenced<'_> {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                serializer: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                OperationData::serialize(self.0, serializer)
+            }
+        }
+        let mut value = serde_json::to_value(Unfenced(self)).map_err(serde::ser::Error::custom)?;
+        value["schema"] = json!(OPERATION_RETIREMENT_READER_SCHEMA);
+        value["logicalSchema"] = json!(self.schema);
+        value["minimumReaderCapability"] = json!("operation-cache.retirement-fence/v1");
+        value.serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for Operation {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let mut value = Value::deserialize(deserializer)?;
+        let fenced = value["schema"] == OPERATION_RETIREMENT_READER_SCHEMA;
+        if fenced {
+            if value["minimumReaderCapability"] != "operation-cache.retirement-fence/v1"
+                || !value["logicalSchema"].is_string()
+                || value["logicalSchema"] == OPERATION_RETIREMENT_READER_SCHEMA
+            {
+                return Err(serde::de::Error::custom(
+                    "invalid operation retirement reader fence",
+                ));
+            }
+            value["schema"] = value["logicalSchema"].clone();
+            let fields = value.as_object_mut().ok_or_else(|| {
+                serde::de::Error::custom("invalid operation retirement reader fence")
+            })?;
+            fields.remove("logicalSchema");
+            fields.remove("minimumReaderCapability");
+        } else if value.get("logicalSchema").is_some()
+            || value.get("minimumReaderCapability").is_some()
+        {
+            return Err(serde::de::Error::custom(
+                "invalid operation retirement reader fence",
+            ));
+        }
+        let mut operation = OperationData::deserialize(value).map_err(serde::de::Error::custom)?;
+        operation.minimum_reader = fenced;
+        if fenced {
+            operation.validate().map_err(serde::de::Error::custom)?;
+        }
+        Ok(operation)
+    }
 }
 
 /// Exact legacy marker evidence retained in its native transaction before unlink.
@@ -324,6 +412,7 @@ impl Operation {
             reviewed_unsent_stop: None,
             uninstall_fence: None,
             pending_update_retirement: None,
+            minimum_reader: false,
         }
     }
 
@@ -386,7 +475,10 @@ impl Operation {
             self.pending_update_retirement.is_none(),
             "pending update retirement schema mismatch"
         );
-        if self.schema == UNINSTALL_FENCE_SCHEMA || self.schema == UNINSTALL_WORK_SCHEMA {
+        if matches!(
+            self.schema.as_str(),
+            UNINSTALL_FENCE_SCHEMA | UNINSTALL_WORK_SCHEMA | OPERATION_OBSERVATION_WORK_SCHEMA
+        ) {
             let fence = self
                 .uninstall_fence
                 .as_ref()
@@ -394,8 +486,10 @@ impl Operation {
             ensure!(
                 self.kind == OperationKind::Uninstall
                     && ((self.schema == UNINSTALL_FENCE_SCHEMA && self.phase == "bootstrap_owned")
-                        || (self.schema == UNINSTALL_WORK_SCHEMA
-                            && self.phase == "work_maintenance"))
+                        || (matches!(
+                            self.schema.as_str(),
+                            UNINSTALL_WORK_SCHEMA | OPERATION_OBSERVATION_WORK_SCHEMA
+                        ) && self.phase == "work_maintenance"))
                     && self.package.is_none()
                     && self.previous_target.is_none()
                     && self.resources.is_none()
@@ -1143,6 +1237,7 @@ fn validate_abandonment_current_previous(
             .any(|target| target == previous),
         "LIFECYCLE_ABANDONMENT_PREVIOUS_NOT_CAPTURED"
     );
+    require_operation_observation_capability(paths, previous)?;
     validate_retained_target_metadata(previous, version)
         .context("LIFECYCLE_ABANDONMENT_PREVIOUS_METADATA_MISMATCH")?;
     validate_retained_target_cli(previous).context("LIFECYCLE_ABANDONMENT_PREVIOUS_CLI_INVALID")?;
@@ -2423,6 +2518,7 @@ pub fn operation_is_terminal(operation: &Operation) -> Result<bool> {
 
 /// Must run under LifecycleLock before uninstall writes, drain or logout.
 pub fn require_terminal_before_uninstall(paths: &Paths) -> Result<()> {
+    require_operation_retirement_reader_state(&paths.state_dir)?;
     let snapshot = ownership_snapshot(paths);
     for journal in &snapshot {
         ensure!(journal["valid"] == true, "LIFECYCLE_OWNERSHIP_INVALID");
@@ -2503,9 +2599,48 @@ pub fn begin_uninstall_fence_locked(paths: &Paths, id: Uuid, journal_sha256: &st
 pub fn begin_uninstall_work_locked(paths: &Paths, id: Uuid, digest: &str) -> Result<()> {
     begin_uninstall_fence_locked(paths, id, digest)?;
     let mut operation: Operation = state::read_json(&paths.operation())?;
-    operation.schema = UNINSTALL_WORK_SCHEMA.into();
+    if operation.schema != OPERATION_OBSERVATION_WORK_SCHEMA {
+        operation.schema = UNINSTALL_WORK_SCHEMA.into();
+    }
     operation.phase = "work_maintenance".into();
     save_operation(paths, &operation)
+}
+
+/// Installed before publishing observation retirement evidence. Older owners
+/// cannot understand this schema and therefore cannot resume the old release.
+pub fn fence_operation_observation_work_locked(paths: &Paths, id: Uuid) -> Result<()> {
+    let mut operation: Operation = state::read_json(&paths.operation())?;
+    operation.validate()?;
+    ensure!(
+        operation.id == id && operation.phase == "work_maintenance",
+        "LIFECYCLE_OPERATION_PENDING"
+    );
+    operation.schema = OPERATION_OBSERVATION_WORK_SCHEMA.into();
+    save_operation(paths, &operation)
+}
+
+/// Retained deny evidence survives uninstall; every newly activated daemon must
+/// declare support for it in its immutable owned compatibility metadata.
+pub fn require_operation_observation_capability(paths: &Paths, target: &Path) -> Result<()> {
+    let evidence = crate::operation_cache::retirement_fence_present(&paths.state_dir)?;
+    let previous = read_optional::<Operation>(&paths.operation())?;
+    ensure!(
+        evidence || !previous.as_ref().is_some_and(|old| old.minimum_reader),
+        "OPERATION_RETIREMENT_EVIDENCE_REQUIRED"
+    );
+    if !evidence {
+        return Ok(());
+    }
+    let manifest: Value = state::read_json(&target.join("metadata/compatibility-manifest.json"))?;
+    ensure!(
+        manifest["capabilities"]
+            .as_array()
+            .is_some_and(|values| values
+                .iter()
+                .any(|value| value == "operation-cache.retirement-fence/v1")),
+        "OPERATION_RETIREMENT_CAPABILITY_REQUIRED"
+    );
+    Ok(())
 }
 
 /// Reconcile an interrupted install before a bootstrap stages another package
@@ -2962,6 +3097,9 @@ async fn restore_failed_candidate(paths: &Paths, operation: &mut Operation) -> R
 }
 
 async fn restore_activation(paths: &Paths, operation: &mut Operation) -> Result<()> {
+    if let Some(previous) = &operation.previous_target {
+        require_operation_observation_capability(paths, previous)?;
+    }
     // The candidate must be visibly idle before a prior daemon can be restored.
     // If it never reached launchd (for example bootstrap failed), launchd must
     // still prove the label absent.  We never infer that from an operation
@@ -3373,6 +3511,7 @@ async fn activate_as_locked(
     }
     verify_all_owned_versions(paths)?;
     validate_rollback_target(&target, &version)?;
+    require_operation_observation_capability(paths, &target)?;
     checked_regular(&staged_launch_agent)?;
     let package = PackageIdentity {
         version: version.clone(),
@@ -3891,6 +4030,9 @@ fn ownership_snapshot(paths: &Paths) -> Vec<Value> {
             "nextAction":"inspect_protected_ownership"}),
         );
     }
+    if require_operation_retirement_reader_state(&paths.state_dir).is_err() {
+        records.push(json!({"journal":OPERATION_NAME,"owner":"native","phase":"unknown","pending":true,"valid":false,"blocker":"OPERATION_RETIREMENT_EVIDENCE_REQUIRED","nextAction":"inspect_protected_ownership"}));
+    }
     records
 }
 
@@ -4195,6 +4337,7 @@ fn require_ownership_clear(
     candidate: Option<&PackageIdentity>,
     access: OwnershipAccess,
 ) -> Result<()> {
+    require_operation_retirement_reader_state(&paths.state_dir)?;
     for record in ownership_snapshot(paths) {
         ensure!(record["valid"] == true, "LIFECYCLE_OWNERSHIP_INVALID");
         if record["pending"] != true {
@@ -4355,7 +4498,9 @@ pub fn rollback_preflight(paths: &Paths) -> Result<Value> {
                 .file_name()
                 .and_then(|v| v.to_str())
                 .context("unsafe owned version path")?;
-            let reason = if verify_owned_version_from_inventory(&target, &owned).is_err() {
+            let reason = if require_operation_observation_capability(paths, &target).is_err() {
+                Some("operation_retirement_capability_required")
+            } else if verify_owned_version_from_inventory(&target, &owned).is_err() {
                 Some("inventory_verification_failed")
             } else {
                 match validate_rollback_target(&target, version) {
@@ -4379,7 +4524,51 @@ pub fn rollback_preflight(paths: &Paths) -> Result<Value> {
 
 fn save_operation(paths: &Paths, operation: &Operation) -> Result<()> {
     operation.validate()?;
-    state::write_json(&paths.operation(), operation)
+    let evidence = crate::operation_cache::retirement_fence_present(&paths.state_dir)?;
+    let previous = read_optional::<Operation>(&paths.operation())?;
+    ensure!(
+        evidence || !previous.as_ref().is_some_and(|old| old.minimum_reader),
+        "OPERATION_RETIREMENT_EVIDENCE_REQUIRED"
+    );
+    let mut persisted = operation.clone();
+    persisted.minimum_reader = evidence || operation.minimum_reader;
+    state::write_json(&paths.operation(), &persisted)
+}
+
+pub fn retained_retirement_terminal(operation: &Operation, id: Uuid) -> Result<bool> {
+    operation.validate()?;
+    Ok(operation.minimum_reader
+        && operation.id == id
+        && operation.kind == OperationKind::Uninstall
+        && operation.phase == "completed"
+        && operation.uninstall_fence.is_none())
+}
+
+pub fn require_operation_retirement_reader_state(dir: &Path) -> Result<bool> {
+    let evidence = crate::operation_cache::retirement_fence_present(dir)?;
+    let owner = read_optional::<Value>(&dir.join(OPERATION_NAME))?;
+    ensure!(
+        evidence
+            || !owner
+                .as_ref()
+                .is_some_and(|value| value["schema"] == OPERATION_RETIREMENT_READER_SCHEMA),
+        "OPERATION_RETIREMENT_EVIDENCE_REQUIRED"
+    );
+    Ok(evidence)
+}
+
+pub fn operation_retirement_evidence_present(paths: &Paths) -> Result<bool> {
+    require_operation_retirement_reader_state(&paths.state_dir)
+}
+
+pub fn complete_uninstall_retirement_fence(paths: &Paths, id: Uuid) -> Result<bool> {
+    if !crate::operation_cache::retirement_fence_present(&paths.state_dir)? {
+        return Ok(false);
+    }
+    let mut terminal = Operation::new(OperationKind::Uninstall, "completed", None);
+    terminal.id = id;
+    save_operation(paths, &terminal)?;
+    Ok(true)
 }
 
 /// Remove only files whose names are bound to the persisted operation.  The
@@ -5714,7 +5903,9 @@ async fn reconcile_prune(paths: &Paths, operation: &mut Operation) -> Result<Val
         save_operation(paths, operation)?;
     }
     prune_fault("before_journal_clear")?;
-    fs::remove_file(paths.operation())?;
+    if !require_operation_retirement_reader_state(&paths.state_dir)? {
+        fs::remove_file(paths.operation())?;
+    }
     sync_directory(&paths.state_dir)?;
     Ok(
         json!({"schema":"app.loomex.runner.lifecycle-prune/v1", "completed":true,
@@ -6129,6 +6320,7 @@ pub async fn rollback(paths: &Paths, version: &str) -> Result<Value> {
         .find(|path| path.file_name().is_some_and(|v| v == version))
         .context("VERSION_NOT_OWNED")?;
     validate_rollback_target(&target, version)?;
+    require_operation_observation_capability(paths, &target)?;
     current_target(paths)?.context("rollback requires an installed current target")?;
     let agent = launch_agent(paths);
     checked_regular(&agent)?;
@@ -7034,6 +7226,147 @@ mod tests {
         state::write_json(&journal_path, &journal).unwrap();
         assert!(require_terminal_before_uninstall(&paths).is_err());
         assert_eq!(status(&paths).unwrap()["ownershipValid"], false);
+    }
+
+    #[test]
+    fn retained_denial_owner_survives_uninstall_and_all_future_owner_schemas() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let id = Uuid::new_v4();
+        begin_uninstall_work_locked(&paths, id, &"a".repeat(64)).unwrap();
+        let slot = "a".repeat(64);
+        let original = serde_json::to_vec(
+            &json!({"method":"interactions.respond","digest":"b".repeat(64),"status":"pending"}),
+        )
+        .unwrap();
+        let provenance = json!({"operationId":id,"attemptId":Uuid::new_v4(),"journalSha256":"a".repeat(64),"receiptSha256":"b".repeat(64),"expectedAssessmentSha256":"c".repeat(64),"requestSetSha256":"d".repeat(64),"contextSha256":"e".repeat(64),"installationId":"fixture-install","retirementScope":"operation-observations","canonicalObservation":{"remoteOutcome":"unknown","safeReason":"missing_binding"}});
+        let evidence =
+            crate::operation_cache::retirement_evidence(&slot, &original, &provenance).unwrap();
+        let evidence_path = paths
+            .state_dir
+            .join(crate::operation_cache::retirement_relative(&slot).unwrap());
+        state::private_dir(evidence_path.parent().unwrap()).unwrap();
+        state::write_json(&evidence_path, &evidence).unwrap();
+        assert!(complete_uninstall_retirement_fence(&paths, id).unwrap());
+        let wire: Value = state::read_json(&paths.operation()).unwrap();
+        assert_eq!(wire["schema"], OPERATION_RETIREMENT_READER_SCHEMA);
+        assert!(
+            ![
+                OPERATION_SCHEMA,
+                LEGACY_OPERATION_SCHEMA,
+                PRE_AUTH_OPERATION_SCHEMA,
+                PRE_AUTH_ABANDONMENT_SCHEMA,
+                ABANDONMENT_OPERATION_SCHEMA,
+                PRUNE_OPERATION_SCHEMA,
+                REVIEWED_STOP_OPERATION_SCHEMA,
+                UNINSTALL_FENCE_SCHEMA,
+                PENDING_UPDATE_RETIREMENT_SCHEMA,
+                UNINSTALL_WORK_SCHEMA
+            ]
+            .iter()
+            .any(|schema| wire["schema"] == *schema),
+            "frozen 1.2.9 validation rejects the retained owner before activation"
+        );
+        let retained: Operation = state::read_json(&paths.operation()).unwrap();
+        assert!(retained_retirement_terminal(&retained, id).unwrap());
+        assert!(operation_is_terminal(&retained).unwrap());
+        let package = PackageIdentity {
+            version: "1.2.10".into(),
+            target: paths.versions().join("1.2.10"),
+            manifest_sha256: "f".repeat(64),
+        };
+        assert_eq!(
+            package_preflight(&paths, OperationKind::Install, &package).unwrap()["ready"],
+            true,
+            "a capable fresh installation can adopt the terminal owner"
+        );
+        for (kind, logical_schema) in [
+            (OperationKind::Install, OPERATION_SCHEMA),
+            (OperationKind::Update, OPERATION_SCHEMA),
+            (OperationKind::Update, PRE_AUTH_OPERATION_SCHEMA),
+        ] {
+            let mut next = Operation::new(kind, "completed", None);
+            next.schema = logical_schema.into();
+            save_operation(&paths, &next).unwrap();
+            let raw: Value = state::read_json(&paths.operation()).unwrap();
+            assert_eq!(
+                raw["schema"], OPERATION_RETIREMENT_READER_SCHEMA,
+                "every future write retains the minimum reader schema"
+            );
+            assert_eq!(raw["logicalSchema"], logical_schema);
+            let decoded: Operation = state::read_json(&paths.operation()).unwrap();
+            assert_eq!(decoded.schema, logical_schema);
+            decoded.validate().unwrap();
+        }
+        fs::remove_file(evidence_path).unwrap();
+        assert_eq!(
+            save_operation(
+                &paths,
+                &Operation::new(OperationKind::Install, "completed", None)
+            )
+            .unwrap_err()
+            .to_string(),
+            "OPERATION_RETIREMENT_EVIDENCE_REQUIRED"
+        );
+        assert_eq!(
+            state::read_json::<Value>(&paths.operation()).unwrap()["schema"],
+            OPERATION_RETIREMENT_READER_SCHEMA
+        );
+    }
+
+    #[test]
+    fn observation_retirement_fences_old_owners_and_incapable_retained_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let id = Uuid::new_v4();
+        begin_uninstall_work_locked(&paths, id, &"a".repeat(64)).unwrap();
+        fence_operation_observation_work_locked(&paths, id).unwrap();
+        let fenced: Operation = state::read_json(&paths.operation()).unwrap();
+        assert_eq!(fenced.schema, OPERATION_OBSERVATION_WORK_SCHEMA);
+        fenced.validate().unwrap();
+        begin_uninstall_work_locked(&paths, id, &"a".repeat(64)).unwrap();
+        assert_eq!(
+            state::read_json::<Operation>(&paths.operation())
+                .unwrap()
+                .schema,
+            OPERATION_OBSERVATION_WORK_SCHEMA,
+            "resume cannot downgrade the denial owner"
+        );
+        let slot = "a".repeat(64);
+        let original = serde_json::to_vec(
+            &json!({"method":"interactions.respond","digest":"b".repeat(64),"status":"pending"}),
+        )
+        .unwrap();
+        let provenance = json!({"operationId":id,"attemptId":Uuid::new_v4(),"journalSha256":"a".repeat(64),"receiptSha256":"b".repeat(64),"expectedAssessmentSha256":"c".repeat(64),"requestSetSha256":"d".repeat(64),"contextSha256":"e".repeat(64),"installationId":"fixture-install","retirementScope":"operation-observations","canonicalObservation":{"remoteOutcome":"unknown","safeReason":"missing_binding"}});
+        let evidence =
+            crate::operation_cache::retirement_evidence(&slot, &original, &provenance).unwrap();
+        let relative = crate::operation_cache::retirement_relative(&slot).unwrap();
+        state::private_dir(&paths.state_dir.join("recovery-evidence")).unwrap();
+        state::write_json(&paths.state_dir.join(&relative), &evidence).unwrap();
+        let target = temp.path().join("candidate");
+        fs::create_dir_all(target.join("metadata")).unwrap();
+        state::write_json(
+            &target.join("metadata/compatibility-manifest.json"),
+            &json!({"capabilities":[]}),
+        )
+        .unwrap();
+        assert_eq!(
+            require_operation_observation_capability(&paths, &target)
+                .unwrap_err()
+                .to_string(),
+            "OPERATION_RETIREMENT_CAPABILITY_REQUIRED"
+        );
+        state::write_json(
+            &target.join("metadata/compatibility-manifest.json"),
+            &json!({"capabilities":["operation-cache.retirement-fence/v1"]}),
+        )
+        .unwrap();
+        require_operation_observation_capability(&paths, &target).unwrap();
+        state::atomic_write(&paths.state_dir.join(relative), b"{").unwrap();
+        assert!(
+            require_operation_observation_capability(&paths, &target).is_err(),
+            "malformed denial evidence cannot permit activation"
+        );
     }
 
     #[test]
@@ -12087,6 +12420,61 @@ mod tests {
             verify_all_owned_versions(&paths).unwrap();
             reset_prune_fixture();
         }
+    }
+
+    #[tokio::test]
+    async fn completed_wrapped_prune_refuses_missing_denial_evidence_before_journal_clear() {
+        let _serial = TEST_SERIAL.lock().await;
+        let (_temp, paths) = prune_fixture();
+        let slot = "c".repeat(64);
+        let original = serde_json::to_vec(
+            &json!({"method":"interactions.respond","digest":"b".repeat(64),"status":"pending"}),
+        )
+        .unwrap();
+        let provenance = json!({"operationId":Uuid::new_v4(),"attemptId":Uuid::new_v4(),"journalSha256":"a".repeat(64),"receiptSha256":"b".repeat(64),"expectedAssessmentSha256":"c".repeat(64),"requestSetSha256":"d".repeat(64),"contextSha256":"e".repeat(64),"installationId":"fixture-install","retirementScope":"operation-observations","canonicalObservation":{"remoteOutcome":"unknown","safeReason":"missing_binding"}});
+        let evidence =
+            crate::operation_cache::retirement_evidence(&slot, &original, &provenance).unwrap();
+        let path = paths
+            .state_dir
+            .join(crate::operation_cache::retirement_relative(&slot).unwrap());
+        state::private_dir(path.parent().unwrap()).unwrap();
+        state::write_json(&path, &evidence).unwrap();
+        *TEST_PRUNE_FAULT.lock().unwrap() = Some("before_journal_clear");
+        assert!(
+            prune(&paths, &["1.2.5".into()], &["1.2.4".into()])
+                .await
+                .is_err()
+        );
+        *TEST_PRUNE_FAULT.lock().unwrap() = None;
+        let before = fs::read(paths.operation()).unwrap();
+        let wire: Value = serde_json::from_slice(&before).unwrap();
+        assert_eq!(wire["schema"], OPERATION_RETIREMENT_READER_SCHEMA);
+        assert_eq!(wire["phase"], "completed");
+        fs::remove_file(&path).unwrap();
+        let error = resume(&paths).await.unwrap_err();
+        assert_eq!(error.to_string(), "LIFECYCLE_OWNERSHIP_INVALID");
+        assert_eq!(fs::read(paths.operation()).unwrap(), before);
+        let mut operation: Operation = serde_json::from_slice(&before).unwrap();
+        assert_eq!(
+            reconcile_prune(&paths, &mut operation)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "OPERATION_RETIREMENT_EVIDENCE_REQUIRED"
+        );
+        assert_eq!(
+            fs::read(paths.operation()).unwrap(),
+            before,
+            "completed prune cannot remove the last old-reader-visible owner"
+        );
+        let report = status(&paths).unwrap();
+        assert_eq!(report["ownershipValid"], false);
+        assert_eq!(report["actionRequired"], true);
+        assert_eq!(report["nextAction"], "inspect_protected_ownership");
+        state::write_json(&path, &evidence).unwrap();
+        assert_eq!(resume(&paths).await.unwrap()["completed"], true);
+        assert_eq!(fs::read(paths.operation()).unwrap(), before);
+        reset_prune_fixture();
     }
 
     #[tokio::test]

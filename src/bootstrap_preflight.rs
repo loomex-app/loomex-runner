@@ -439,6 +439,7 @@ async fn inspect(args: &Arguments, report: &mut Value) -> Result<()> {
     let scratch =
         Scratch(std::env::temp_dir().join(format!("loomex-install-preflight-{}", Uuid::new_v4())));
     let payload = extract_artifact(&release, &manifest, &scratch.0).await?;
+    lifecycle::require_operation_observation_capability(&paths, &payload)?;
     verify_envelope(&release, &payload, &manifest)?;
     let project: Value = serde_json::from_slice(&fs::read(payload.join("metadata/project.json"))?)?;
     if project["project"] != "loomex-runner"
@@ -472,6 +473,7 @@ async fn inspect(args: &Arguments, report: &mut Value) -> Result<()> {
         let work = bootstrap_uninstall::work_preflight(&paths, args, &release, &manifest, &payload)
             .await?;
         report["ownerReference"] = work["ownerReference"].clone();
+        report["retirementScope"] = work["retirementScope"].clone();
         report["assessment"] = work
             .get("assessment")
             .unwrap_or(&work["managedStateAssessment"])
@@ -547,7 +549,7 @@ fn publish_work_eligibility(report: &mut Value, work: &Value) -> Result<()> {
                 .context(OwnerDiagnostic::BindingMismatch),
         );
     }
-    report["uninstallWorkEligibility"] = json!({"eligible":true,"readOnly":true,"signingTransition":signing,"accessAttempted":false,"nativeAccessVerified":false});
+    report["uninstallWorkEligibility"] = json!({"eligible":true,"readOnly":true,"retirementScope":work["retirementScope"],"signingTransition":signing,"accessAttempted":false,"nativeAccessVerified":false});
     Ok(())
 }
 

@@ -9,6 +9,36 @@
   ],
   "routes": [
     {
+      "id": "artifact.content",
+      "method": "GET",
+      "pathTemplate": "v2/artifacts/{artifactId}/content/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "artifact.list",
+      "method": "GET",
+      "pathTemplate": "v2/executions/{executionId}/artifacts/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "artifact.transfer.append",
+      "method": "PUT",
+      "pathTemplate": "v2/artifact-transfers/{transferId}/",
+      "source": "src/jobs/transfer.rs"
+    },
+    {
+      "id": "artifact.transfer.complete",
+      "method": "POST",
+      "pathTemplate": "v2/artifact-transfers/{transferId}/complete/",
+      "source": "src/jobs/transfer.rs"
+    },
+    {
+      "id": "artifact.transfer.create",
+      "method": "POST",
+      "pathTemplate": "v2/artifact-transfers/",
+      "source": "src/jobs/transfer.rs"
+    },
+    {
       "id": "auth.browser.cancel",
       "method": "POST",
       "pathTemplate": "v2/browser-authorities/cancel/",
@@ -27,15 +57,15 @@
       "source": "src/auth.rs"
     },
     {
-      "id": "auth.device.bootstrap",
+      "id": "auth.delegation.refresh",
       "method": "POST",
-      "pathTemplate": "v2/device-authorities/bootstrap/",
+      "pathTemplate": "v1/delegations/refresh/",
       "source": "src/auth.rs"
     },
     {
-      "id": "auth.device.refresh",
+      "id": "auth.device.bootstrap",
       "method": "POST",
-      "pathTemplate": "v2/device-authorities/refresh/",
+      "pathTemplate": "v2/device-authorities/bootstrap/",
       "source": "src/auth.rs"
     },
     {
@@ -45,9 +75,9 @@
       "source": "src/auth.rs"
     },
     {
-      "id": "auth.organizations.list",
-      "method": "GET",
-      "pathTemplate": "v2/organizations/",
+      "id": "auth.device.refresh",
+      "method": "POST",
+      "pathTemplate": "v2/device-authorities/refresh/",
       "source": "src/auth.rs"
     },
     {
@@ -57,63 +87,33 @@
       "source": "src/auth.rs"
     },
     {
-      "id": "auth.delegation.refresh",
-      "method": "POST",
-      "pathTemplate": "v1/delegations/refresh/",
+      "id": "auth.organizations.list",
+      "method": "GET",
+      "pathTemplate": "v2/organizations/",
       "source": "src/auth.rs"
-    },
-    {
-      "id": "workflow.list",
-      "method": "GET",
-      "pathTemplate": "v1/workflows/",
-      "source": "src/control.rs"
-    },
-    {
-      "id": "workflow.get",
-      "method": "GET",
-      "pathTemplate": "v1/workflows/{workflowId}/",
-      "source": "src/control.rs"
-    },
-    {
-      "id": "workflow.create",
-      "method": "POST",
-      "pathTemplate": "v2/workflows/",
-      "source": "src/control.rs"
-    },
-    {
-      "id": "workflow.update",
-      "method": "POST",
-      "pathTemplate": "v1/workflows/{workflowId}/draft/",
-      "source": "src/control.rs"
-    },
-    {
-      "id": "workflow.operation.get",
-      "method": "POST",
-      "pathTemplate": "v2/workflow-operations/get/",
-      "source": "src/control.rs"
-    },
-    {
-      "id": "workflow.validate",
-      "method": "POST",
-      "pathTemplate": "v1/workflows/validate/",
-      "source": "src/control.rs"
-    },
-    {
-      "id": "workflow.publish",
-      "method": "POST",
-      "pathTemplate": "v1/workflows/{workflowId}/publish/",
-      "source": "src/control.rs"
-    },
-    {
-      "id": "workflow.activate",
-      "method": "POST",
-      "pathTemplate": "v1/workflow-versions/{versionId}/activate/",
-      "source": "src/control.rs"
     },
     {
       "id": "builder.catalog",
       "method": "GET",
       "pathTemplate": "v2/builder/catalog/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "builder.commit",
+      "method": "POST",
+      "pathTemplate": "v2/workflow-builder/commit/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "builder.prepare",
+      "method": "POST",
+      "pathTemplate": "v2/workflow-builder/prepare/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "builder.session.finalize",
+      "method": "POST",
+      "pathTemplate": "v1/workflow-builder/sessions/{sessionId}/finalize/",
       "source": "src/control.rs"
     },
     {
@@ -129,33 +129,75 @@
       "source": "src/control.rs"
     },
     {
-      "id": "builder.session.finalize",
+      "id": "builder.start",
       "method": "POST",
-      "pathTemplate": "v1/workflow-builder/sessions/{sessionId}/finalize/",
+      "pathTemplate": "v2/workflow-builder/start/",
       "source": "src/control.rs"
     },
     {
-      "id": "builder.prepare",
+      "id": "daemon.job.complete",
       "method": "POST",
-      "pathTemplate": "v2/workflow-builder/prepare/",
-      "source": "src/control.rs"
+      "pathTemplate": "v1/jobs/{jobId}/complete/",
+      "source": "src/jobs/delivery.rs"
     },
     {
-      "id": "builder.commit",
+      "id": "daemon.job.events",
       "method": "POST",
-      "pathTemplate": "v2/workflow-builder/commit/",
-      "source": "src/control.rs"
+      "pathTemplate": "v1/jobs/{jobId}/events/",
+      "source": "src/jobs/transfer.rs"
     },
     {
-      "id": "editor.session.respond",
+      "id": "daemon.job.fail",
       "method": "POST",
-      "pathTemplate": "v1/workflow-edit/sessions/{sessionId}/responses/",
-      "source": "src/control.rs"
+      "pathTemplate": "v1/jobs/{jobId}/fail/",
+      "source": "src/jobs/delivery.rs"
     },
     {
-      "id": "editor.session.finalize",
+      "id": "daemon.job.lease",
       "method": "POST",
-      "pathTemplate": "v1/workflow-edit/sessions/{sessionId}/finalize/",
+      "pathTemplate": "v1/jobs/lease/",
+      "source": "src/jobs/supervisor.rs"
+    },
+    {
+      "id": "daemon.job.reclaim",
+      "method": "POST",
+      "pathTemplate": "v1/jobs/{jobId}/reclaim/",
+      "source": "src/jobs/delivery.rs"
+    },
+    {
+      "id": "daemon.job.renew",
+      "method": "POST",
+      "pathTemplate": "v1/jobs/{jobId}/renew/",
+      "source": "src/jobs/execution.rs"
+    },
+    {
+      "id": "daemon.job.start",
+      "method": "POST",
+      "pathTemplate": "v1/jobs/{jobId}/start/",
+      "source": "src/jobs/execution.rs"
+    },
+    {
+      "id": "daemon.session.create",
+      "method": "POST",
+      "pathTemplate": "v1/sessions/",
+      "source": "src/jobs/supervisor.rs"
+    },
+    {
+      "id": "daemon.session.disconnect",
+      "method": "POST",
+      "pathTemplate": "v1/sessions/{sessionId}/disconnect/",
+      "source": "src/jobs/supervisor.rs"
+    },
+    {
+      "id": "daemon.session.heartbeat",
+      "method": "POST",
+      "pathTemplate": "v1/sessions/{sessionId}/heartbeat/",
+      "source": "src/jobs/supervisor.rs"
+    },
+    {
+      "id": "editor.commit",
+      "method": "POST",
+      "pathTemplate": "v2/workflow-edit/commit/",
       "source": "src/control.rs"
     },
     {
@@ -165,15 +207,27 @@
       "source": "src/control.rs"
     },
     {
-      "id": "editor.commit",
+      "id": "editor.session.finalize",
       "method": "POST",
-      "pathTemplate": "v2/workflow-edit/commit/",
+      "pathTemplate": "v1/workflow-edit/sessions/{sessionId}/finalize/",
       "source": "src/control.rs"
     },
     {
-      "id": "execution.prepare",
+      "id": "editor.session.respond",
       "method": "POST",
-      "pathTemplate": "v2/executions/prepare/",
+      "pathTemplate": "v1/workflow-edit/sessions/{sessionId}/responses/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "editor.start",
+      "method": "POST",
+      "pathTemplate": "v2/workflow-edit/start/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "execution.cancel",
+      "method": "POST",
+      "pathTemplate": "v1/executions/{executionId}/cancel/",
       "source": "src/control.rs"
     },
     {
@@ -189,27 +243,9 @@
       "source": "src/control.rs"
     },
     {
-      "id": "execution.list",
-      "method": "GET",
-      "pathTemplate": "v2/executions/",
-      "source": "src/control.rs"
-    },
-    {
-      "id": "execution.detail",
-      "method": "GET",
-      "pathTemplate": "v1/executions/{executionId}/",
-      "source": "src/control.rs"
-    },
-    {
       "id": "execution.continuation.requeue",
       "method": "POST",
       "pathTemplate": "v2/executions/{executionId}/continuations/{deliveryId}/requeue/",
-      "source": "src/control.rs"
-    },
-    {
-      "id": "execution.cancel",
-      "method": "POST",
-      "pathTemplate": "v1/executions/{executionId}/cancel/",
       "source": "src/control.rs"
     },
     {
@@ -219,9 +255,9 @@
       "source": "src/control.rs"
     },
     {
-      "id": "interaction.list",
+      "id": "execution.detail",
       "method": "GET",
-      "pathTemplate": "v1/human-requests/",
+      "pathTemplate": "v1/executions/{executionId}/",
       "source": "src/control.rs"
     },
     {
@@ -231,26 +267,20 @@
       "source": "src/control.rs"
     },
     {
-      "id": "interaction.get",
+      "id": "execution.list",
       "method": "GET",
-      "pathTemplate": "v1/human-requests/{requestId}/",
+      "pathTemplate": "v2/executions/",
       "source": "src/control.rs"
     },
     {
-      "id": "interaction.resolve",
+      "id": "execution.prepare",
       "method": "POST",
-      "pathTemplate": "v1/human-requests/{requestId}/resolve/",
+      "pathTemplate": "v2/executions/prepare/",
       "source": "src/control.rs"
     },
     {
       "id": "interaction.draft",
       "method": "GET",
-      "pathTemplate": "v1/human-requests/{requestId}/draft/",
-      "source": "src/control.rs"
-    },
-    {
-      "id": "interaction.draft.update",
-      "method": "PUT",
       "pathTemplate": "v1/human-requests/{requestId}/draft/",
       "source": "src/control.rs"
     },
@@ -261,104 +291,68 @@
       "source": "src/control.rs"
     },
     {
-      "id": "artifact.list",
-      "method": "GET",
-      "pathTemplate": "v2/executions/{executionId}/artifacts/",
-      "source": "src/control.rs"
-    },
-    {
-      "id": "artifact.content",
-      "method": "GET",
-      "pathTemplate": "v2/artifacts/{artifactId}/content/",
-      "source": "src/control.rs"
-    },
-    {
-      "id": "artifact.transfer.create",
-      "method": "POST",
-      "pathTemplate": "v2/artifact-transfers/",
-      "source": "src/jobs/transfer.rs"
-    },
-    {
-      "id": "artifact.transfer.append",
+      "id": "interaction.draft.update",
       "method": "PUT",
-      "pathTemplate": "v2/artifact-transfers/{transferId}/",
-      "source": "src/jobs/transfer.rs"
-    },
-    {
-      "id": "artifact.transfer.complete",
-      "method": "POST",
-      "pathTemplate": "v2/artifact-transfers/{transferId}/complete/",
-      "source": "src/jobs/transfer.rs"
-    },
-    {
-      "id": "daemon.session.create",
-      "method": "POST",
-      "pathTemplate": "v1/sessions/",
-      "source": "src/jobs/supervisor.rs"
-    },
-    {
-      "id": "daemon.session.heartbeat",
-      "method": "POST",
-      "pathTemplate": "v1/sessions/{sessionId}/heartbeat/",
-      "source": "src/jobs/supervisor.rs"
-    },
-    {
-      "id": "daemon.session.disconnect",
-      "method": "POST",
-      "pathTemplate": "v1/sessions/{sessionId}/disconnect/",
-      "source": "src/jobs/supervisor.rs"
-    },
-    {
-      "id": "daemon.job.lease",
-      "method": "POST",
-      "pathTemplate": "v1/jobs/lease/",
-      "source": "src/jobs/supervisor.rs"
-    },
-    {
-      "id": "daemon.job.start",
-      "method": "POST",
-      "pathTemplate": "v1/jobs/{jobId}/start/",
-      "source": "src/jobs/execution.rs"
-    },
-    {
-      "id": "daemon.job.renew",
-      "method": "POST",
-      "pathTemplate": "v1/jobs/{jobId}/renew/",
-      "source": "src/jobs/execution.rs"
-    },
-    {
-      "id": "daemon.job.reclaim",
-      "method": "POST",
-      "pathTemplate": "v1/jobs/{jobId}/reclaim/",
-      "source": "src/jobs/delivery.rs"
-    },
-    {
-      "id": "daemon.job.events",
-      "method": "POST",
-      "pathTemplate": "v1/jobs/{jobId}/events/",
-      "source": "src/jobs/transfer.rs"
-    },
-    {
-      "id": "daemon.job.complete",
-      "method": "POST",
-      "pathTemplate": "v1/jobs/{jobId}/complete/",
-      "source": "src/jobs/delivery.rs"
-    },
-    {
-      "id": "daemon.job.fail",
-      "method": "POST",
-      "pathTemplate": "v1/jobs/{jobId}/fail/",
-      "source": "src/jobs/delivery.rs"
-    },
-    {
-      "id": "workflow.draft.create",
-      "method": "POST",
-      "pathTemplate": "v2/workflow-drafts/",
+      "pathTemplate": "v1/human-requests/{requestId}/draft/",
       "source": "src/control.rs"
     },
     {
-      "id": "persona.persona.roles.list",
+      "id": "interaction.get",
       "method": "GET",
+      "pathTemplate": "v1/human-requests/{requestId}/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "interaction.list",
+      "method": "GET",
+      "pathTemplate": "v1/human-requests/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "interaction.resolve",
+      "method": "POST",
+      "pathTemplate": "v1/human-requests/{requestId}/resolve/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "interactions.operations.receipt",
+      "method": "POST",
+      "pathTemplate": "v2/interaction-operations/get/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "job.persona-memory.operation",
+      "method": "GET",
+      "pathTemplate": "v1/jobs/{jobId}/memory-operations/{operation}/{key}/",
+      "source": "src/jobs/persona_memory.rs"
+    },
+    {
+      "id": "job.persona-memory.tool",
+      "method": "POST",
+      "pathTemplate": "v1/jobs/{jobId}/memory-tools/{operation}/",
+      "source": "src/jobs/persona_memory.rs"
+    },
+    {
+      "id": "native.authoring.receipt",
+      "method": "POST",
+      "pathTemplate": "v2/native-authoring-receipts/get/",
+      "source": "src/maintenance/domain_reconciliation.rs"
+    },
+    {
+      "id": "persona.auth.scope_upgrade",
+      "method": "POST",
+      "pathTemplate": "v2/device-authorities/organizations/{organizationId}/scope-upgrade/",
+      "source": "src/auth.rs"
+    },
+    {
+      "id": "persona.memory.tool",
+      "method": "POST",
+      "pathTemplate": "v1/personas/{personId}/memory-tools/{operation}/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "persona.persona.roles.create",
+      "method": "POST",
       "pathTemplate": "v1/persona-roles/",
       "source": "src/control.rs"
     },
@@ -369,15 +363,9 @@
       "source": "src/control.rs"
     },
     {
-      "id": "persona.personas.list",
+      "id": "persona.persona.roles.list",
       "method": "GET",
-      "pathTemplate": "v1/personas/",
-      "source": "src/control.rs"
-    },
-    {
-      "id": "persona.personas.get",
-      "method": "GET",
-      "pathTemplate": "v1/personas/{personId}/",
+      "pathTemplate": "v1/persona-roles/",
       "source": "src/control.rs"
     },
     {
@@ -393,78 +381,111 @@
       "source": "src/control.rs"
     },
     {
+      "id": "persona.personas.create",
+      "method": "POST",
+      "pathTemplate": "v1/personas/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "persona.personas.get",
+      "method": "GET",
+      "pathTemplate": "v1/personas/{personId}/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "persona.personas.list",
+      "method": "GET",
+      "pathTemplate": "v1/personas/",
+      "source": "src/control.rs"
+    },
+    {
       "id": "persona.personas.operations.get",
       "method": "GET",
       "pathTemplate": "v1/personas/operations/{operation}/{key}/",
       "source": "src/control.rs"
     },
     {
-      "id": "persona.auth.scope_upgrade",
+      "id": "runs.continuation.receipt",
       "method": "POST",
-      "pathTemplate": "v2/device-authorities/organizations/{organizationId}/scope-upgrade/",
-      "source": "src/auth.rs"
+      "pathTemplate": "v2/execution-continuation-receipts/get/",
+      "source": "src/control.rs"
     },
     {
-      "id": "job.persona-memory.tool",
+      "id": "workflow.activate",
       "method": "POST",
-      "pathTemplate": "v1/jobs/{jobId}/memory-tools/{operation}/",
-      "source": "src/jobs/persona_memory.rs"
+      "pathTemplate": "v1/workflow-versions/{versionId}/activate/",
+      "source": "src/control.rs"
     },
     {
-      "id": "job.persona-memory.operation",
+      "id": "workflow.create",
+      "method": "POST",
+      "pathTemplate": "v2/workflows/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "workflow.draft.create",
+      "method": "POST",
+      "pathTemplate": "v2/workflow-drafts/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "workflow.get",
       "method": "GET",
-      "pathTemplate": "v1/jobs/{jobId}/memory-operations/{operation}/{key}/",
-      "source": "src/jobs/persona_memory.rs"
-    },
-    {
-      "id": "persona.memory.tool",
-      "method": "POST",
-      "pathTemplate": "v1/personas/{personId}/memory-tools/{operation}/",
+      "pathTemplate": "v1/workflows/{workflowId}/",
       "source": "src/control.rs"
     },
     {
-      "id": "builder.start",
-      "method": "POST",
-      "pathTemplate": "v2/workflow-builder/start/",
+      "id": "workflow.list",
+      "method": "GET",
+      "pathTemplate": "v1/workflows/",
       "source": "src/control.rs"
     },
     {
-      "id": "editor.start",
+      "id": "workflow.operation.get",
       "method": "POST",
-      "pathTemplate": "v2/workflow-edit/start/",
+      "pathTemplate": "v2/workflow-operations/get/",
       "source": "src/control.rs"
     },
     {
-      "id": "persona.persona.roles.create",
+      "id": "workflow.publish",
       "method": "POST",
-      "pathTemplate": "v1/persona-roles/",
+      "pathTemplate": "v1/workflows/{workflowId}/publish/",
       "source": "src/control.rs"
     },
     {
-      "id": "persona.personas.create",
+      "id": "workflow.update",
       "method": "POST",
-      "pathTemplate": "v1/personas/",
+      "pathTemplate": "v1/workflows/{workflowId}/draft/",
+      "source": "src/control.rs"
+    },
+    {
+      "id": "workflow.validate",
+      "method": "POST",
+      "pathTemplate": "v1/workflows/validate/",
       "source": "src/control.rs"
     }
   ],
   "daemonRouteIds": [
-    "auth.device.refresh",
-    "auth.delegation.refresh",
-    "artifact.transfer.create",
     "artifact.transfer.append",
     "artifact.transfer.complete",
-    "daemon.session.create",
-    "daemon.session.heartbeat",
-    "daemon.session.disconnect",
-    "daemon.job.lease",
-    "daemon.job.start",
-    "daemon.job.renew",
-    "daemon.job.reclaim",
-    "daemon.job.events",
+    "artifact.transfer.create",
+    "auth.delegation.refresh",
+    "auth.device.refresh",
     "daemon.job.complete",
+    "daemon.job.events",
     "daemon.job.fail",
+    "daemon.job.lease",
+    "daemon.job.reclaim",
+    "daemon.job.renew",
+    "daemon.job.start",
+    "daemon.session.create",
+    "daemon.session.disconnect",
+    "daemon.session.heartbeat",
+    "interactions.operations.receipt",
+    "job.persona-memory.operation",
     "job.persona-memory.tool",
-    "job.persona-memory.operation"
+    "native.authoring.receipt",
+    "runs.continuation.receipt"
   ],
   "methodBindings": [
     {

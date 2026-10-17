@@ -32,7 +32,13 @@ fn main() -> anyhow::Result<()> {
                 params["identity"].as_str().unwrap_or(""),
                 &params["continuation"],
             ),
-            _ => store.dispatch(org, "fixture-account", method, params),
+            _ => store.dispatch_bound(
+                org,
+                "fixture-account",
+                "00000000-0000-4000-8000-000000000001",
+                method,
+                params,
+            ),
         };
         let response = match result {
             Ok(value) => json!({"result":value}),

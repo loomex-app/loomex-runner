@@ -22,11 +22,17 @@ struct WorkContext {
     binary_sha256: String,
     action: String,
     expected_assessment_sha256: Option<String>,
+    #[serde(default = "default_retirement_scope")]
+    retirement_scope: String,
     expected_identity: crate::auth::CredentialIdentity,
     api_origin: Option<String>,
     singleton_fd: i32,
     #[serde(default)]
     authorize_keychain_transition: bool,
+}
+
+fn default_retirement_scope() -> String {
+    "continuations".into()
 }
 
 fn result_path(context: &WorkContext) -> PathBuf {
@@ -46,6 +52,16 @@ fn candidates(
         values.extend(store.maintenance_candidates()?);
         values.extend(store.maintenance_operation_candidates()?);
     }
+    Ok(values)
+}
+fn current_candidates(
+    context: &WorkContext,
+    follow: &Option<FollowStore>,
+    presentation: &Option<PresentationStore>,
+) -> Result<Vec<Value>> {
+    let mut values = candidates(follow, presentation)?;
+    values.extend(crate::operation_cache::inspect(&context.state_dir)?);
+    enrich_candidates(context, &mut values)?;
     Ok(values)
 }
 fn apply(
@@ -179,9 +195,24 @@ async fn read_run(
     }
 }
 
+fn cache_has_exact_owner(cache: &Value, owner: &Value) -> bool {
+    cache["kind"] == "operation_cache"
+        && owner["kind"] == "presentation_operation"
+        && control::maintenance_cache_identity(owner).is_ok_and(|(path, digest)| {
+            cache["path"] == path && cache["record"]["digest"] == digest
+        })
+}
 fn candidate_set_digest(values: &[Value]) -> String {
     let mut items = values
         .iter()
+        // The exact owner already identifies this cache's operation. Full cache
+        // bytes remain fenced by dependencyEntries and any recorded pre/post
+        // transition, so an owner repair cannot alter candidate-set identity.
+        .filter(|value| {
+            !values
+                .iter()
+                .any(|owner| cache_has_exact_owner(value, owner))
+        })
         .map(|value| {
             json!([
                 value["kind"],
@@ -336,7 +367,27 @@ fn settle_cache(
             Some(value)
         }
         None => {
-            let cache = control::maintenance_cache_prepare(&context.state_dir, request, receipt)?;
+            let (cache_path, identity) = control::maintenance_cache_identity(request)?;
+            let versioned_pending = if context.state_dir.join(&cache_path).try_exists()? {
+                let source: Value = serde_json::from_slice(&crate::operation_cache::read(
+                    &context.state_dir,
+                    &cache_path,
+                )?)?;
+                ensure!(
+                    source["digest"] == identity && source["method"] == request["method"],
+                    "MANAGED_WORK_CHANGED"
+                );
+                !source["binding"].is_null()
+                    && source["status"] == "pending"
+                    && crate::operation_cache::known_record(&source)
+            } else {
+                false
+            };
+            let cache = if versioned_pending {
+                None
+            } else {
+                control::maintenance_cache_prepare(&context.state_dir, request, receipt)?
+            };
             let patch = control::maintenance_patch_prepare(&context.state_dir, request, receipt)?;
             match (cache, patch) {
                 (Some(mut cache), Some(patch)) => {
@@ -372,6 +423,86 @@ fn settle_cache(
     verify_dependencies(context, &saved)?;
     control::maintenance_cache_apply(&context.state_dir, request, &transition)
 }
+fn enrich_candidates(context: &WorkContext, values: &mut [Value]) -> Result<()> {
+    attach_patch_journals(context, values)?;
+    attach_operation_owners(context, values)
+}
+
+fn attach_operation_owners(context: &WorkContext, values: &mut [Value]) -> Result<()> {
+    let owners = values
+        .iter()
+        .filter(|value| value["kind"] == "presentation_operation")
+        .cloned()
+        .collect::<Vec<_>>();
+    let catalog: Value = serde_json::from_str(include_str!("../../contracts/method-catalog.json"))?;
+    for cache in values
+        .iter_mut()
+        .filter(|value| value["kind"] == "operation_cache" && value["binding"].is_null())
+    {
+        let matches = owners
+            .iter()
+            .filter(|owner| {
+                control::maintenance_cache_identity(owner).is_ok_and(|(path, digest)| {
+                    cache["path"] == path && cache["record"]["digest"] == digest
+                })
+            })
+            .collect::<Vec<_>>();
+        ensure!(matches.len() <= 1, "MANAGED_WORK_RECEIPT_MISMATCH");
+        let Some(owner) = matches.first() else {
+            continue;
+        };
+        let method = owner["method"].as_str().context("MANAGED_WORK_CHANGED")?;
+        let schema = catalog["methods"]
+            .as_array()
+            .context("INTERNAL")?
+            .iter()
+            .find(|entry| entry["name"] == method)
+            .context("INTERNAL")?;
+        let installation = owner["installationId"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&context.expected_identity.installation_id);
+        ensure!(
+            installation == context.expected_identity.installation_id,
+            "AUTH_IDENTITY_CHANGED"
+        );
+        let mut binding = crate::operation_cache::binding(
+            method,
+            owner["operationKey"]
+                .as_str()
+                .context("MANAGED_WORK_CHANGED")?,
+            cache["record"]["digest"]
+                .as_str()
+                .context("MANAGED_WORK_CHANGED")?,
+            &schema["inputSchema"],
+            &owner["params"],
+            crate::operation_cache::BindingOrigin {
+                organization: owner["organizationId"].as_str(),
+                account: owner["accountSubject"].as_str(),
+                installation,
+                control_reference: None,
+            },
+        );
+        if let Some(receipt) = control::interaction_cache_receipt(method, &owner["params"])? {
+            binding["backendSubmissionDigest"] = receipt["params"]["submissionFingerprint"].clone();
+            binding["receipt"] = receipt;
+        }
+        cache["reconciliationSupported"] =
+            json!(crate::operation_cache::raw_reconciliation_supported(
+                method,
+                &binding,
+                cache["runId"].as_str()
+            ));
+        cache["binding"] = binding;
+        cache["organizationId"] = owner["organizationId"].clone();
+        cache["accountSubject"] = owner["accountSubject"].clone();
+        cache["installationId"] = json!(installation);
+        cache["ownerJournalDigest"] = owner["recordDigest"].clone();
+        cache["ownerJournal"] = (*owner).clone();
+    }
+    Ok(())
+}
+
 fn attach_patch_journals(context: &WorkContext, values: &mut [Value]) -> Result<()> {
     for candidate in values.iter_mut().filter(|candidate| {
         candidate["kind"] == "presentation_operation" && candidate["method"] == "workflows.patch"
@@ -409,17 +540,39 @@ fn immutable_json(path: &Path, value: &Value) -> Result<()> {
         bytes.len() <= 16 * 1024 * 1024,
         "MANAGED_WORK_PREVIEW_LIMIT"
     );
+    if std::fs::symlink_metadata(path).is_ok() {
+        ensure!(
+            read_private(path, 16 * 1024 * 1024)? == bytes,
+            "MANAGED_WORK_CHANGED"
+        );
+        return Ok(());
+    }
+    let parent = path.parent().context("UNSAFE_STATE")?;
+    let temporary = parent.join(format!(
+        ".uninstall-work-publication-{}",
+        uuid::Uuid::new_v4()
+    ));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+        .open(&temporary)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
-    File::open(path.parent().unwrap())?.sync_all()?;
+    drop(file);
+    // Both lifecycle and daemon singleton owners are held by callers. A crash
+    // can leave only an unreferenced private temporary, never a partial final
+    // request, transition or settlement that prevents the same intent resuming.
+    ensure!(
+        matches!(std::fs::symlink_metadata(path),Err(error) if error.kind()==std::io::ErrorKind::NotFound),
+        "MANAGED_WORK_CHANGED"
+    );
+    std::fs::rename(&temporary, path)?;
+    File::open(parent)?.sync_all()?;
     Ok(())
 }
+
 fn scoped_requests(context: &WorkContext, values: &[Value]) -> Result<Vec<Value>> {
     let path = context.state_dir.join(format!(
         "uninstall-work-requests-{}.json",
@@ -431,7 +584,9 @@ fn scoped_requests(context: &WorkContext, values: &[Value]) -> Result<Vec<Value>
             saved["schema"] == "app.loomex.runner.uninstall-work-requests/v1"
                 && saved["operationId"] == context.operation_id.to_string()
                 && saved["attemptId"] == context.attempt_id.to_string()
-                && saved["candidateSetDigest"] == candidate_set_digest(values),
+                && saved["candidateSetDigest"] == candidate_set_digest(values)
+                && saved["retirementScope"].as_str().unwrap_or("continuations")
+                    == context.retirement_scope,
             "MANAGED_WORK_CHANGED"
         );
         verify_dependencies(context, &saved)?;
@@ -443,17 +598,33 @@ fn scoped_requests(context: &WorkContext, values: &[Value]) -> Result<Vec<Value>
     let mut requests = values
         .iter()
         .filter(|value| {
-            (value["resolution"]["state"] == "unresolved"
-                || (context.action == "reconcile"
-                    && value["kind"] == "presentation_operation"
-                    && value["method"] == "workflows.patch"
-                    && value["status"] == "completed"
-                    && value["nativePatchJournal"].is_object()
-                    && value["nativePatchResolved"] != true))
+            // A selected presentation owner repairs its exact three-field
+            // legacy source. Do not schedule the same mutable source twice.
+            let paired_legacy = value["kind"] == "operation_cache"
+                && value["record"]
+                    .as_object()
+                    .is_some_and(|record| record.len() == 3)
+                && value["record"]["status"] == "pending"
+                && values.iter().any(|owner| {
+                    cache_has_exact_owner(value, owner)
+                        && owner["resolution"]["state"] == "unresolved"
+                });
+            !paired_legacy
+                && (value["resolution"]["state"] == "unresolved"
+                    || (context.action == "reconcile"
+                        && value["kind"] == "presentation_operation"
+                        && value["method"] == "workflows.patch"
+                        && value["status"] == "completed"
+                        && value["nativePatchJournal"].is_object()
+                        && value["nativePatchResolved"] != true))
                 && (context.action == "reconcile"
-                    || value["kind"] == "follow_session"
-                    || (value["kind"] == "presentation_delivery"
-                        && value["retirementEligible"] == true))
+                    || (context.retirement_scope == "operation-observations"
+                        && value["kind"] == "operation_cache"
+                        && value["retirementEligible"] == true)
+                    || (context.retirement_scope == "continuations"
+                        && (value["kind"] == "follow_session"
+                            || (value["kind"] == "presentation_delivery"
+                                && value["retirementEligible"] == true))))
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -463,7 +634,7 @@ fn scoped_requests(context: &WorkContext, values: &[Value]) -> Result<Vec<Value>
     }
     immutable_json(
         &path,
-        &json!({"schema":"app.loomex.runner.uninstall-work-requests/v1","operationId":context.operation_id,"attemptId":context.attempt_id,"candidateSetDigest":candidate_set_digest(values),"dependenciesDigest":dependencies_digest(&context.state_dir)?,"dependencyEntries":dependency_entries(&context.state_dir)?,"acceptanceDependencies":crate::uninstall_state::maintenance_acceptance_dependencies(&context.state_dir)?,"requests":requests}),
+        &json!({"schema":"app.loomex.runner.uninstall-work-requests/v1","operationId":context.operation_id,"attemptId":context.attempt_id,"candidateSetDigest":candidate_set_digest(values),"retirementScope":context.retirement_scope,"dependenciesDigest":dependencies_digest(&context.state_dir)?,"dependencyEntries":dependency_entries(&context.state_dir)?,"acceptanceDependencies":crate::uninstall_state::maintenance_acceptance_dependencies(&context.state_dir)?,"requests":requests}),
     )?;
     Ok(requests)
 }
@@ -488,6 +659,154 @@ fn record_settlement(
     }
     Ok(())
 }
+fn settle_operation_observation(
+    context: &WorkContext,
+    request: &Value,
+    observation: &Value,
+) -> Result<Value> {
+    let slot = request["legacySlot"]
+        .as_str()
+        .context("MANAGED_WORK_CHANGED")?;
+    let path = context.state_dir.join(format!(
+        "recovery-evidence/operation-canonical-{}.json",
+        state::digest(slot.as_bytes())
+    ));
+    let bytes = crate::operation_cache::read(
+        &context.state_dir,
+        request["path"].as_str().context("MANAGED_WORK_CHANGED")?,
+    )?;
+    ensure!(
+        request["recordDigest"] == state::digest(&bytes),
+        "MANAGED_WORK_CHANGED"
+    );
+    let proof = json!({"schema":"loomex.operation-cache-canonical-observation/v1","legacySlot":slot,"originalCacheSha256":state::digest(&bytes),"method":request["method"],"binding":request["binding"],"ownerJournal":request["ownerJournal"],"operationId":context.operation_id,"attemptId":context.attempt_id,"journalSha256":context.journal_sha256,"receiptSha256":context.receipt_sha256,"observation":observation});
+    crate::uninstall_state::validate_canonical_operation_completion(
+        &request["record"],
+        &proof,
+        slot,
+        &state::digest(&bytes),
+    )?;
+    state::private_dir(path.parent().context("UNSAFE_STATE")?)?;
+    if path.try_exists()? {
+        let existing: Value = serde_json::from_slice(&read_private(&path, 16 * 1024 * 1024)?)?;
+        ensure!(
+            existing["originalCacheSha256"] == proof["originalCacheSha256"]
+                && existing["method"] == proof["method"],
+            "MANAGED_WORK_CHANGED"
+        );
+    } else {
+        let temporary = path
+            .parent()
+            .unwrap()
+            .join(format!(".operation-canonical-{}", uuid::Uuid::new_v4()));
+        immutable_json(&temporary, &proof)?;
+        ensure!(
+            matches!(std::fs::symlink_metadata(&path),Err(error) if error.kind()==std::io::ErrorKind::NotFound),
+            "MANAGED_WORK_CHANGED"
+        );
+        std::fs::rename(temporary, &path)?;
+        File::open(path.parent().unwrap())?.sync_all()?;
+    }
+    let receipt = operation_receipt(context, request)?;
+    ensure!(
+        receipt["state"] == "completed",
+        "MANAGED_WORK_RECEIPT_MISMATCH"
+    );
+    Ok(receipt)
+}
+
+fn operation_receipt(context: &WorkContext, request: &Value) -> Result<Value> {
+    let slot = request["legacySlot"]
+        .as_str()
+        .context("MANAGED_WORK_CHANGED")?;
+    let current = crate::operation_cache::inspect(&context.state_dir)?
+        .into_iter()
+        .find(|value| value["legacySlot"] == slot)
+        .context("MANAGED_WORK_CHANGED")?;
+    ensure!(
+        current["recordDigest"] == request["recordDigest"],
+        "MANAGED_WORK_CHANGED"
+    );
+    Ok(current["resolution"].clone())
+}
+
+/// Publication is private, immutable and crash atomic. The original observation
+/// stays untouched until the independently qualified uninstall inventory runs.
+fn retire_operation(context: &WorkContext, request: &Value, observation: &Value) -> Result<Value> {
+    ensure!(
+        context.action == "retire-local" && context.retirement_scope == "operation-observations",
+        "INVALID_REQUEST"
+    );
+    let relative = request["path"].as_str().context("MANAGED_WORK_CHANGED")?;
+    let bytes = crate::operation_cache::read(&context.state_dir, relative)?;
+    ensure!(
+        request["recordDigest"] == state::digest(&bytes),
+        "MANAGED_WORK_CHANGED"
+    );
+    if crate::operation_cache::verify_record_retired(&context.state_dir, relative, &bytes)? {
+        let slot = request["legacySlot"]
+            .as_str()
+            .context("MANAGED_WORK_CHANGED")?;
+        let evidence: Value = serde_json::from_slice(&crate::operation_cache::read(
+            &context.state_dir,
+            &crate::operation_cache::retirement_relative(slot)?,
+        )?)?;
+        let provenance = &evidence["provenance"];
+        ensure!(
+            provenance["operationId"] == context.operation_id.to_string()
+                && provenance["attemptId"] == context.attempt_id.to_string()
+                && provenance["journalSha256"] == context.journal_sha256
+                && provenance["receiptSha256"] == context.receipt_sha256
+                && provenance["expectedAssessmentSha256"].as_str()
+                    == context.expected_assessment_sha256.as_deref()
+                && provenance["installationId"] == context.expected_identity.installation_id,
+            "MANAGED_WORK_CHANGED"
+        );
+        return operation_receipt(context, request);
+    }
+    ensure!(
+        request["retirementEligible"] == true,
+        "MANAGED_WORK_RECONCILIATION_UNSUPPORTED"
+    );
+    let slot = request["legacySlot"]
+        .as_str()
+        .context("MANAGED_WORK_CHANGED")?;
+    let request_path = context.state_dir.join(format!(
+        "uninstall-work-requests-{}.json",
+        context.attempt_id
+    ));
+    let context_path = context.state_dir.join(format!(
+        "uninstall-work-context-{}.json",
+        context.attempt_id
+    ));
+    let provenance = json!({"operationId":context.operation_id,"attemptId":context.attempt_id,"journalSha256":context.journal_sha256,"receiptSha256":context.receipt_sha256,"expectedAssessmentSha256":context.expected_assessment_sha256,"requestSetSha256":state::digest(&read_private(&request_path,16*1024*1024)?),"contextSha256":state::digest(&read_private(&context_path,262144)?),"installationId":context.expected_identity.installation_id,"retirementScope":context.retirement_scope,"canonicalObservation":observation});
+    let evidence = crate::operation_cache::retirement_evidence(slot, &bytes, &provenance)?;
+    let path = context
+        .state_dir
+        .join(crate::operation_cache::retirement_relative(slot)?);
+    let parent = path.parent().context("UNSAFE_STATE")?;
+    state::private_dir(parent)?;
+    let temporary = parent.join(format!(
+        ".operation-cache-publication-{}",
+        uuid::Uuid::new_v4()
+    ));
+    immutable_json(&temporary, &evidence)?;
+    // The lifecycle and inherited daemon singleton serialize all supported
+    // publishers. Rename publishes a fully synced inode without a two-link
+    // crash window; a preexisting immutable record is never replaced.
+    ensure!(
+        matches!(std::fs::symlink_metadata(&path),Err(error) if error.kind()==std::io::ErrorKind::NotFound),
+        "MANAGED_WORK_CHANGED"
+    );
+    std::fs::rename(&temporary, &path)?;
+    File::open(parent)?.sync_all()?;
+    ensure!(
+        crate::operation_cache::verify_record_retired(&context.state_dir, relative, &bytes)?,
+        "MANAGED_WORK_CHANGED"
+    );
+    operation_receipt(context, request)
+}
+
 fn settled(
     context: &WorkContext,
     index: usize,
@@ -517,6 +836,8 @@ fn settled(
                 && candidate["accountSubject"] == request["accountSubject"]
                 && candidate["installationId"] == request["installationId"]
                 && candidate["recordId"] == request["recordId"]
+                && (request["kind"] != "operation_cache"
+                    || candidate["legacySlot"] == request["legacySlot"])
         })
         .ok_or_else(|| anyhow::anyhow!("MANAGED_WORK_CHANGED"))?;
     let historical_patch = if request["kind"] == "presentation_operation"
@@ -535,8 +856,13 @@ fn settled(
     } else {
         false
     };
+    let operation_observation = request["kind"] == "operation_cache"
+        && context.action == "reconcile"
+        && candidate["recordDigest"] == request["recordDigest"]
+        && value["receipt"]["remoteOutcome"] == "unknown";
     ensure!(
-        candidate["resolution"] == value["receipt"]
+        operation_observation
+            || candidate["resolution"] == value["receipt"]
             || candidate["backendObservation"] == value["receipt"]
             || historical_patch,
         "MANAGED_WORK_CHANGED"
@@ -684,6 +1010,17 @@ fn settle_domain_locally(
     apply(&None, presentation, request, Some(receipt))
 }
 async fn execute(context: &WorkContext, lock: &Arc<File>) -> Result<Value> {
+    let api = Api::from_installation_origin(context.api_origin.as_deref())?;
+    let auth = Auth::new(api.clone())?;
+    auth.retain_store_owner(lock);
+    execute_with_services(context, lock, &api, &auth).await
+}
+async fn execute_with_services(
+    context: &WorkContext,
+    lock: &Arc<File>,
+    api: &Api,
+    auth: &Auth,
+) -> Result<Value> {
     let resuming = context
         .state_dir
         .join(format!(
@@ -698,10 +1035,10 @@ async fn execute(context: &WorkContext, lock: &Arc<File>) -> Result<Value> {
             "MANAGED_WORK_CHANGED"
         );
     }
-    let api = Api::from_installation_origin(context.api_origin.as_deref())?;
-    let auth = Auth::new(api.clone())?;
-    auth.retain_store_owner(lock);
-    authorize_transition(context, &auth, lock).await?;
+    authorize_transition(context, auth, lock).await?;
+    if context.action == "retire-local" && context.retirement_scope == "operation-observations" {
+        auth.maintenance_observation_quiescent().await?;
+    }
     let actual = auth
         .maintenance_identity()
         .await?
@@ -713,9 +1050,14 @@ async fn execute(context: &WorkContext, lock: &Arc<File>) -> Result<Value> {
         "AUTH_IDENTITY_CHANGED"
     );
     let mut values = crate::uninstall_state::maintenance_preview(&context.state_dir)?;
-    attach_patch_journals(context, &mut values)?;
+    enrich_candidates(context, &mut values)?;
     let requests = scoped_requests(context, &values)?;
     for candidate in &requests {
+        if candidate["kind"] == "operation_cache" && candidate["binding"].is_null() {
+            // Legacy slots retain no canonical account/request binding. The
+            // reviewed retirement scope closes only local tracking.
+            continue;
+        }
         let install = candidate["installationId"].as_str().unwrap_or("");
         ensure!(
             install.is_empty() || install == context.expected_identity.installation_id,
@@ -777,7 +1119,8 @@ async fn execute(context: &WorkContext, lock: &Arc<File>) -> Result<Value> {
         );
     }
     ensure!(
-        candidate_set_digest(&values) == candidate_set_digest(&candidates(&follow, &presentation)?),
+        candidate_set_digest(&values)
+            == candidate_set_digest(&current_candidates(context, &follow, &presentation)?),
         "MANAGED_WORK_CHANGED"
     );
     let mut receipts = Vec::new();
@@ -787,15 +1130,35 @@ async fn execute(context: &WorkContext, lock: &Arc<File>) -> Result<Value> {
             receipts.push(receipt);
             continue;
         }
-        let receipt = if context.action == "reconcile" {
+        let receipt = if request["kind"] == "operation_cache" {
+            let observation = domain_reconciliation::read_operation(
+                api,
+                auth,
+                request,
+                &context.expected_identity,
+            )
+            .await?;
+            if matches!(
+                observation["remoteOutcome"].as_str(),
+                Some("terminal" | "completed")
+            ) {
+                settle_operation_observation(context, request, &observation)?
+            } else if context.action == "retire-local" {
+                retire_operation(context, request, &observation)?
+            } else {
+                // The observation describes canonical authority only. Keeping
+                // original bytes makes historical cached queued data immutable.
+                observation
+            }
+        } else if context.action == "reconcile" {
             if request["kind"] == "presentation_operation" {
                 let observation =
                     if let Some(transition) = frozen_cache_transition(context, index, request)? {
                         transition["canonicalReceipt"].clone()
                     } else {
                         match domain_reconciliation::read(
-                            &api,
-                            &auth,
+                            api,
+                            auth,
                             request,
                             &context.expected_identity,
                         )
@@ -819,8 +1182,7 @@ async fn execute(context: &WorkContext, lock: &Arc<File>) -> Result<Value> {
                 // owner revalidates again in its short settlement transaction.
                 settle_domain_locally(context, index, &presentation, request, &observation)?
             } else {
-                let observation =
-                    read_run(&api, &auth, request, &context.expected_identity).await?;
+                let observation = read_run(api, auth, request, &context.expected_identity).await?;
                 apply(&follow, &presentation, request, Some(&observation))?
             }
         } else {
@@ -833,14 +1195,18 @@ async fn execute(context: &WorkContext, lock: &Arc<File>) -> Result<Value> {
     drop(follow);
     drop(presentation);
     ensure!(!domain_pending, "MANAGED_DOMAIN_OUTCOME_PENDING");
-    Ok(json!({"resolvedRecords":receipts.len(),"receipts":receipts}))
+    Ok(json!({"actionCompleted":true,"resolvedRecords":receipts.len(),"receipts":receipts}))
 }
 
 pub async fn run(path: &Path) -> Result<Value> {
     let context: WorkContext = serde_json::from_slice(&read_private(path, 262144)?)?;
     ensure!(
         context.schema == "app.loomex.runner.uninstall-work-context/v1"
-            && matches!(context.action.as_str(), "reconcile" | "retire-local"),
+            && matches!(context.action.as_str(), "reconcile" | "retire-local")
+            && matches!(
+                context.retirement_scope.as_str(),
+                "continuations" | "operation-observations"
+            ),
         "INVALID_REQUEST"
     );
     ensure!(
@@ -959,6 +1325,7 @@ mod tests {
             binary_sha256: "c".repeat(64),
             action: action.into(),
             expected_assessment_sha256: None,
+            retirement_scope: default_retirement_scope(),
             expected_identity: crate::auth::CredentialIdentity {
                 installation_id: Uuid::new_v4().to_string(),
                 device_id: None,
@@ -970,6 +1337,275 @@ mod tests {
     }
     fn observation(run: &Value) -> Value {
         json!({"snapshot":{"execution":{"id":run,"status":"running"},"events":[],"latestSequence":0,"hasMoreEvents":false}})
+    }
+
+    fn seven_operation_fixture(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        state::private_dir(&dir.join("operations")).unwrap();
+        let slots = [
+            (
+                "7d5441529b08a9edb67c3d1ae0f6617481371e2152e1c2227365d9806878f071",
+                "interactions.respond",
+            ),
+            (
+                "3233cdf38f2730dfd5e334f886f498567616a5b4352045cc5ceb6a77962c295c",
+                "interactions.draft.delete",
+            ),
+            (
+                "9e652a558dd62a9f7603ecafac01acad144c16e09a9646066b54996dd10afe04",
+                "interactions.respond",
+            ),
+            ("8f3e5fcd-aacb-4182-9168-c213e47ae91b", "auth.recover"),
+            (
+                "c5ad9fc9749a7ad2593624943ac2ebe5db24e45975af829d06c0d77410e74849",
+                "builder.start",
+            ),
+            (
+                "f76a886f365c51be49b757709a07e3ae982edfa22f8d81e950234753280f22dc",
+                "interactions.respond",
+            ),
+            (
+                "a856fed1096a5dd101617d97f4837ac8fdcc3190d0e10d59301feae94c08373a",
+                "interactions.respond",
+            ),
+        ];
+        slots.into_iter().map(|(slot, method)| {
+            let value = if method == "builder.start" {
+                json!({"digest":"a".repeat(64),"method":method,"executionId":"657523ef-0920-4e2c-b1e5-fc8ef5e9b72b","result":{"executionId":"657523ef-0920-4e2c-b1e5-fc8ef5e9b72b","status":"queued"},"cachedAt":1})
+            } else {
+                json!({"digest":"b".repeat(64),"method":method,"status":"pending"})
+            };
+            let bytes=serde_json::to_vec_pretty(&value).unwrap();
+            state::atomic_write(&dir.join(format!("operations/{slot}.json")),&bytes).unwrap();
+            (slot.into(),bytes)
+        }).collect()
+    }
+
+    #[test]
+    fn exact_seven_legacy_observations_require_fresh_explicit_scope_and_keep_original_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        state::private_dir(root.path()).unwrap();
+        let originals = seven_operation_fixture(root.path());
+        let assessment = crate::uninstall_state::assess_state(root.path()).unwrap();
+        assert!(!assessment.resolved);
+        assert_eq!(assessment.blockers.len(), 1);
+        assert_eq!(
+            assessment.blockers[0].category,
+            crate::uninstall_state::BlockerCategory::OperationCache
+        );
+        assert_eq!(assessment.blockers[0].count, 7);
+        assert!(crate::uninstall_state::inventory_resolved_state(root.path()).is_err());
+        let values = crate::uninstall_state::maintenance_preview(root.path()).unwrap();
+        assert_eq!(values.len(), 7);
+        assert!(
+            values
+                .iter()
+                .all(|value| value["retirementEligible"] == true)
+        );
+        for value in &values {
+            let (reason, reconciliation_supported) = match value["method"].as_str().unwrap() {
+                "interactions.respond" | "interactions.draft.delete" => ("missing_binding", false),
+                "auth.recover" => ("unsupported_family", false),
+                "builder.start" => ("terminal_missing", true),
+                method => panic!("unexpected fixture method {method}"),
+            };
+            assert_eq!(value["safeReason"], reason, "{}", value["method"]);
+            assert_eq!(
+                value["reconciliationSupported"], reconciliation_supported,
+                "{}",
+                value["method"]
+            );
+        }
+        let default = context(root.path(), "retire-local");
+        assert!(
+            scoped_requests(&default, &values).unwrap().is_empty(),
+            "legacy default scope never selects cache observations"
+        );
+        let mut retire = context(root.path(), "retire-local");
+        retire.retirement_scope = "operation-observations".into();
+        retire.expected_assessment_sha256 = Some(assessment.assessment_digest.clone());
+        state::write_json(
+            &root
+                .path()
+                .join(format!("uninstall-work-context-{}.json", retire.attempt_id)),
+            &json!({"fixture":"sealed-context"}),
+        )
+        .unwrap();
+        let requests = scoped_requests(&retire, &values).unwrap();
+        assert_eq!(requests.len(), 7);
+        let observation = json!({"remoteOutcome":"unknown","safeReason":"missing_binding"});
+        // A crash after evidence publication and before the observer checkpoint
+        // resumes the same selected bytes and never changes a pending result.
+        let first = retire_operation(&retire, &requests[0], &observation).unwrap();
+        assert_eq!(first["state"], "local_observation_retired");
+        assert_eq!(
+            retire_operation(&retire, &requests[0], &observation).unwrap(),
+            first
+        );
+        for (index, request) in requests.iter().enumerate() {
+            let receipt = retire_operation(&retire, request, &observation).unwrap();
+            assert_eq!(receipt["state"], "local_observation_retired");
+            record_settlement(&retire, index, request, &receipt).unwrap();
+        }
+        let current = crate::uninstall_state::maintenance_preview(root.path()).unwrap();
+        assert_eq!(scoped_requests(&retire, &current).unwrap(), requests);
+        for (index, request) in requests.iter().enumerate() {
+            assert!(
+                settled(&retire, index, request, &current)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        for (slot, bytes) in originals {
+            assert_eq!(
+                std::fs::read(root.path().join(format!("operations/{slot}.json"))).unwrap(),
+                bytes
+            );
+            assert_eq!(
+                crate::operation_cache::deny_retired_slot(root.path(), &slot)
+                    .unwrap_err()
+                    .to_string(),
+                "OPERATION_CACHE_RETIRED"
+            );
+        }
+        let after = crate::uninstall_state::assess_state(root.path()).unwrap();
+        assert!(after.resolved);
+        assert_ne!(
+            assessment.assessment_digest, after.assessment_digest,
+            "retirement evidence invalidates an earlier review"
+        );
+        let inventory = crate::uninstall_state::inventory_resolved_state(root.path()).unwrap();
+        assert_eq!(
+            inventory
+                .iter()
+                .filter(|path| path.parent() == Some(&root.path().join("operations")))
+                .count(),
+            7
+        );
+        assert!(
+            inventory
+                .iter()
+                .all(|path| !path.starts_with(root.path().join("recovery-evidence")))
+        );
+    }
+
+    #[test]
+    fn native_queued_cache_requires_exact_receipt_and_complete_terminal_observation() {
+        let root = tempfile::tempdir().unwrap();
+        state::private_dir(root.path()).unwrap();
+        state::private_dir(&root.path().join("operations")).unwrap();
+        let ctx = context(root.path(), "reconcile");
+        let slot = "c5ad9fc9749a7ad2593624943ac2ebe5db24e45975af829d06c0d77410e74849";
+        let run = "657523ef-0920-4e2c-b1e5-fc8ef5e9b72b";
+        let session = Uuid::new_v4();
+        let queued = json!({"schemaVersion":"loomex.native-authoring-session/v1","sessionId":session,"builderSessionId":session,"executionId":run,"status":"queued","systemWorkflowKey":"workflow_builder","systemWorkflowVersionId":Uuid::new_v4(),"systemWorkflowDefinitionChecksum":"d".repeat(64),"nextAction":"run_get"});
+        let original=serde_json::to_vec_pretty(&json!({"method":"builder.start","digest":"a".repeat(64),"result":queued,"executionId":run,"cachedAt":1})).unwrap();
+        let path = root.path().join(format!("operations/{slot}.json"));
+        state::atomic_write(&path, &original).unwrap();
+        let request = crate::uninstall_state::maintenance_preview(root.path())
+            .unwrap()
+            .remove(0);
+        assert_eq!(request["cleanupEligible"], false);
+        let receipt = json!({"operation":"builder.start","status":"completed","match":"exact_request_match","cacheRequestDigest":"a".repeat(64),"provenance":"native_authoring_queued_receipt","result":queued});
+        let terminal = json!({"execution":{"id":run,"status":"completed"},"events":[],"hasMoreEvents":false,"latestSequence":12,"result":{"accepted":true}});
+        let observed = json!({"remoteOutcome":"terminal","organizationId":"org","accountSubject":"account","installationId":ctx.expected_identity.installation_id,"canonicalReceipt":receipt,"observation":{"snapshot":terminal,"terminalResult":terminal}});
+        let mut incomplete = observed.clone();
+        incomplete["observation"]["terminalResult"]["hasMoreEvents"] = json!(true);
+        assert!(settle_operation_observation(&ctx, &request, &incomplete).is_err());
+        let proof = root.path().join(format!(
+            "recovery-evidence/operation-canonical-{}.json",
+            state::digest(slot.as_bytes())
+        ));
+        assert!(!proof.exists());
+        let mut wrong = observed.clone();
+        wrong["canonicalReceipt"]["match"] = json!("same_key_only");
+        assert!(settle_operation_observation(&ctx, &request, &wrong).is_err());
+        assert!(!proof.exists());
+        let result = settle_operation_observation(&ctx, &request, &observed).unwrap();
+        assert_eq!(result["state"], "completed");
+        assert!(
+            crate::uninstall_state::assess_state(root.path())
+                .unwrap()
+                .resolved
+        );
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            original,
+            "queued historical receipt remains byte identical"
+        );
+        assert!(
+            crate::operation_cache::deny_retired_slot(root.path(), slot).is_ok(),
+            "canonical terminal observation never invents local retirement"
+        );
+    }
+
+    #[test]
+    fn interrupted_private_evidence_never_grants_cleanup_and_protected_auth_stays_pending() {
+        let root = tempfile::tempdir().unwrap();
+        state::private_dir(root.path()).unwrap();
+        let originals = seven_operation_fixture(root.path());
+        let mut retire = context(root.path(), "retire-local");
+        retire.retirement_scope = "operation-observations".into();
+        retire.expected_assessment_sha256 = Some(
+            crate::uninstall_state::assess_state(root.path())
+                .unwrap()
+                .assessment_digest,
+        );
+        state::write_json(
+            &root
+                .path()
+                .join(format!("uninstall-work-context-{}.json", retire.attempt_id)),
+            &json!({"fixture":"sealed-context"}),
+        )
+        .unwrap();
+        let values = crate::uninstall_state::maintenance_preview(root.path()).unwrap();
+        let requests = scoped_requests(&retire, &values).unwrap();
+        state::private_dir(&root.path().join("recovery-evidence")).unwrap();
+        // A pre-publication partial file has no canonical retirement filename.
+        state::atomic_write(
+            &root
+                .path()
+                .join("recovery-evidence/.operation-cache-publication-interrupted"),
+            b"{",
+        )
+        .unwrap();
+        assert!(
+            !crate::uninstall_state::assess_state(root.path())
+                .unwrap()
+                .resolved
+        );
+        assert!(crate::uninstall_state::inventory_resolved_state(root.path()).is_err());
+        state::write_json(
+            &root.path().join("auth-pending.json"),
+            &json!({"schema":"loomex.auth-pending/v1","status":"pending","private":"untouched"}),
+        )
+        .unwrap();
+        let protected = std::fs::read(root.path().join("auth-pending.json")).unwrap();
+        let observation = json!({"remoteOutcome":"unknown","safeReason":"missing_binding"});
+        for request in &requests {
+            retire_operation(&retire, request, &observation).unwrap();
+        }
+        assert_eq!(
+            std::fs::read(root.path().join("auth-pending.json")).unwrap(),
+            protected
+        );
+        for (slot, bytes) in originals {
+            assert_eq!(
+                std::fs::read(root.path().join(format!("operations/{slot}.json"))).unwrap(),
+                bytes
+            );
+        }
+        // Unknown canonical evidence fails closed even if the source is known.
+        let relative = crate::operation_cache::retirement_relative(
+            requests[0]["legacySlot"].as_str().unwrap(),
+        )
+        .unwrap();
+        state::atomic_write(&root.path().join(relative), b"{").unwrap();
+        assert!(
+            !crate::uninstall_state::assess_state(root.path())
+                .unwrap()
+                .resolved
+        );
+        assert!(crate::uninstall_state::inventory_resolved_state(root.path()).is_err());
     }
 
     #[test]
@@ -1174,11 +1810,18 @@ mod tests {
     }
 
     fn domain_fixture(dir: &Path) -> (Option<PresentationStore>, Value) {
+        domain_fixture_for(dir, "org-a", "user-a")
+    }
+    fn domain_fixture_for(
+        dir: &Path,
+        org: &str,
+        account: &str,
+    ) -> (Option<PresentationStore>, Value) {
         let store = PresentationStore::open(dir).unwrap();
-        let session=store.dispatch("org-a","user-a","presentation.sessions.create",&json!({"kind":"monitor","entityType":"execution","entityId":Uuid::new_v4(),"state":{},"idempotencyKey":Uuid::new_v4()})).unwrap();
+        let session=store.dispatch(org,account,"presentation.sessions.create",&json!({"kind":"monitor","entityType":"execution","entityId":Uuid::new_v4(),"state":{},"idempotencyKey":Uuid::new_v4()})).unwrap();
         let key = Uuid::new_v4();
         let params = json!({"workflowId":Uuid::new_v4(),"expectedVersion":2,"notes":"PRIVATE_DOMAIN_ARGUMENT","idempotencyKey":key});
-        store.dispatch("org-a","user-a","presentation.sessions.update",&json!({"viewSessionId":session["viewSessionId"],"expectedRevision":0,"state":{},"operation":{"method":"workflows.publish","params":params,"idempotencyKey":key,"reconciliation":{"method":"workflow.operations.get","params":{"operation":"workflows.publish","idempotencyKey":key}}},"idempotencyKey":Uuid::new_v4()})).unwrap();
+        store.dispatch(org,account,"presentation.sessions.update",&json!({"viewSessionId":session["viewSessionId"],"expectedRevision":0,"state":{},"operation":{"method":"workflows.publish","params":params,"idempotencyKey":key,"reconciliation":{"method":"workflow.operations.get","params":{"operation":"workflows.publish","idempotencyKey":key}}},"idempotencyKey":Uuid::new_v4()})).unwrap();
         let candidate = store.maintenance_operation_candidates().unwrap().remove(0);
         let (path, identity) = control::maintenance_cache_identity(&candidate).unwrap();
         state::private_dir(&dir.join("operations")).unwrap();
@@ -1302,6 +1945,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn actual_execute_joins_legacy_owner_and_preserves_versioned_pending_on_read_and_retry() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for versioned in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            state::private_dir(root.path()).unwrap();
+            let org = Uuid::new_v4().to_string();
+            let account = Uuid::new_v4().to_string();
+            let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api =
+                Api::for_test_origin(&format!("http://{}", server.local_addr().unwrap())).unwrap();
+            let auth = Auth::test_enrolled(api.clone(), &org, &account);
+            let mut ctx = context(root.path(), "reconcile");
+            ctx.expected_identity = auth.maintenance_identity().await.unwrap().unwrap();
+            let (presentation, candidate) = domain_fixture_for(root.path(), &org, &account);
+            let (relative, digest) = control::maintenance_cache_identity(&candidate).unwrap();
+            if versioned {
+                let binding = crate::operation_cache::binding(
+                    "workflows.publish",
+                    candidate["operationKey"].as_str().unwrap(),
+                    &digest,
+                    &json!({}),
+                    &candidate["params"],
+                    crate::operation_cache::BindingOrigin {
+                        organization: Some(&org),
+                        account: Some(&account),
+                        installation: &ctx.expected_identity.installation_id,
+                        control_reference: None,
+                    },
+                );
+                state::write_json(
+                    &root.path().join(&relative),
+                    &crate::operation_cache::pending(&digest, "workflows.publish", binding),
+                )
+                .unwrap();
+            }
+            let original = std::fs::read(root.path().join(&relative)).unwrap();
+            let response = domain_receipt(&candidate);
+            let response_copy = response.clone();
+            let read = tokio::spawn(async move {
+                let (mut socket, _) = server.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    let mut buffer = [0u8; 4096];
+                    let size = socket.read(&mut buffer).await.unwrap();
+                    assert!(size > 0);
+                    bytes.extend_from_slice(&buffer[..size]);
+                    if let Some(end) = bytes.windows(4).position(|value| value == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&bytes[..end]);
+                        let length = header
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if bytes.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let request = String::from_utf8(bytes).unwrap();
+                assert!(
+                    request
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .contains("/v2/workflow-operations/get/")
+                );
+                assert!(!request.contains("PRIVATE_DOMAIN_ARGUMENT"));
+                let body = serde_json::to_vec(&json!({"data":response_copy,"meta":{}})).unwrap();
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(header.as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+            });
+            drop(presentation);
+            let lock = Arc::new(acquire_singleton(root.path()).unwrap());
+            let result = execute_with_services(&ctx, &lock, &api, &auth)
+                .await
+                .unwrap();
+            read.await.unwrap();
+            assert_eq!(result["actionCompleted"], true);
+            let after = std::fs::read(root.path().join(&relative)).unwrap();
+            if versioned {
+                assert_eq!(
+                    after, original,
+                    "versioned binding and stage cannot be rewritten by legacy owner settlement"
+                );
+            } else {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&after).unwrap()["result"],
+                    response["response"]
+                );
+            }
+            let replay = execute_with_services(&ctx, &lock, &api, &auth)
+                .await
+                .unwrap();
+            assert_eq!(
+                result, replay,
+                "the exact frozen operation and dependency transition resume without a second read or replacement key"
+            );
+            assert_eq!(std::fs::read(root.path().join(&relative)).unwrap(), after);
+        }
+    }
+
+    #[tokio::test]
     async fn domain_exact_receipt_cache_then_store_interruption_resumes_original_attempt() {
         let root = tempfile::tempdir().unwrap();
         state::private_dir(root.path()).unwrap();
@@ -1413,6 +2165,35 @@ mod tests {
     }
 
     #[test]
+    fn immutable_work_publication_ignores_partial_temporary_and_preserves_first_complete_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        state::private_dir(root.path()).unwrap();
+        let partial = root.path().join(".uninstall-work-publication-interrupted");
+        state::atomic_write(&partial, b"{\"schema\":").unwrap();
+        let path = root.path().join("uninstall-work-requests-fixture.json");
+        let expected = json!({"schema":"fixture","requests":[{"recordDigest":"a".repeat(64)}]});
+        immutable_json(&path, &expected).unwrap();
+        let original = read_private(&path, 1024).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&original).unwrap(),
+            expected
+        );
+        immutable_json(&path, &expected).unwrap();
+        assert!(immutable_json(&path, &json!({"schema":"replacement"})).is_err());
+        assert_eq!(read_private(&path, 1024).unwrap(), original);
+        assert_eq!(std::fs::read(partial).unwrap(), b"{\"schema\":");
+        let linked = root.path().join("uninstall-work-requests-symlink.json");
+        std::os::unix::fs::symlink(root.path().join("missing"), &linked).unwrap();
+        assert!(immutable_json(&linked, &expected).is_err());
+        assert!(
+            std::fs::symlink_metadata(linked)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
     fn immutable_attempt_scope_refuses_replacement_and_dependency_drift() {
         let root = tempfile::tempdir().unwrap();
         state::private_dir(root.path()).unwrap();
@@ -1422,6 +2203,14 @@ mod tests {
         ];
         let original = scoped_requests(&ctx, &values).unwrap();
         assert_eq!(scoped_requests(&ctx, &values).unwrap(), original);
+        let mut different_scope = context(root.path(), "retire-local");
+        different_scope.operation_id = ctx.operation_id;
+        different_scope.attempt_id = ctx.attempt_id;
+        different_scope.retirement_scope = "operation-observations".into();
+        assert!(
+            scoped_requests(&different_scope, &values).is_err(),
+            "an immutable reviewed attempt cannot change its retirement scope"
+        );
         let mut changed = values.clone();
         changed[0]["recordDigest"] = json!("b".repeat(64));
         assert!(scoped_requests(&ctx, &changed).is_err());

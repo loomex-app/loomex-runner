@@ -690,6 +690,99 @@ esac
         self.assertFalse((self.state/'runner-args.log').exists());self.assertFalse((self.state/'recovery.log').exists())
         self.assertFalse(self.runner.exists());self.assertFalse(self.plugin.exists())
 
+    def scoped_work_fixture(self, action='inspect', outcome='inspected'):
+        flags=self.work_fixture(action,outcome)
+        for name in ['FIXTURE_RUNNER_PREFLIGHT_JSON','FIXTURE_WORK_RESULT']:
+            value=json.loads(self.env[name]);value['retirementScope']='operation-observations'
+            if name=='FIXTURE_WORK_RESULT':value.update(actionCompleted=outcome=='completed',cleanupEligible=False)
+            self.env[name]=json.dumps(value)
+        return flags+['--retirement-scope','operation-observations']
+
+    def test_uninstall_work_default_scope_is_explicit_on_both_native_calls(self):
+        result=self.invoke(self.work_fixture());self.assertEqual(result.returncode,0,result.stderr)
+        for name in ['runner-preflight-args.log','work.log']:
+            args=(self.state/name).read_text().splitlines()[-1].split()
+            self.assertEqual(args.count('--retirement-scope'),1)
+            self.assertEqual(args[args.index('--retirement-scope')+1],'continuations')
+            self.assertEqual(args[args.index('--expected-old-journal-sha256')+1],'a'*64)
+        report=json.loads(result.stdout)
+        self.assertEqual(report['schema'],'app.loomex.paired-install-result/v3')
+        self.assertEqual(report['retirementScope'],'continuations')
+        self.assertFalse(report['actionCompleted']);self.assertFalse(report['cleanupEligible'])
+
+    def test_operation_scope_forwards_exact_preflight_and_mutation_arguments(self):
+        flags=self.scoped_work_fixture('retire-local','completed')
+        value=json.loads(self.env['FIXTURE_WORK_RESULT']);value.update(operationId='11111111-1111-4111-8111-111111111111',reasonCode='UNINSTALL_WORK_COMPLETED',nextAction='reconcile_managed_work')
+        self.env['FIXTURE_WORK_RESULT']=json.dumps(value)
+        result=self.invoke(flags);self.assertEqual(result.returncode,0,result.stderr)
+        preflight=(self.state/'runner-preflight-args.log').read_text().splitlines()[-1].split()
+        mutation=(self.state/'work.log').read_text().splitlines()[-1].split()
+        for args,action_flag in [(preflight,'--work-action'),(mutation,'--action')]:
+            self.assertEqual(args[args.index(action_flag)+1],'retire-local')
+            self.assertEqual(args[args.index('--retirement-scope')+1],'operation-observations')
+            self.assertEqual(args[args.index('--expected-assessment-sha256')+1],'b'*64)
+            self.assertEqual(args[args.index('--expected-old-journal-sha256')+1],'a'*64)
+            self.assertEqual(args.count('--retirement-scope'),1)
+        report=json.loads(result.stdout)
+        self.assertEqual(report['outcome'],'completed');self.assertTrue(report['actionCompleted'])
+        self.assertFalse(report['cleanupEligible']);self.assertEqual(report['nextAction'],'reconcile_managed_work')
+        self.assertEqual(report['retirementScope'],'operation-observations');self.assert_no_owner()
+
+    def test_scoped_work_refuses_legacy_preflight_or_scope_drift_before_mutation(self):
+        flags=self.scoped_work_fixture();valid=json.loads(self.env['FIXTURE_RUNNER_PREFLIGHT_JSON'])
+        for scope in [None,'continuations','PRIVATE']:
+            value=copy.deepcopy(valid)
+            if scope is None:value.pop('retirementScope')
+            else:value['retirementScope']=scope
+            self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']=json.dumps(value)
+            result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout)
+            self.assertFalse((self.state/'work.log').exists());self.assertFalse((self.root/'cache').exists())
+            self.assertNotIn('PRIVATE',result.stderr)
+
+    def test_scoped_work_requires_fresh_scope_and_completion_evidence(self):
+        flags=self.scoped_work_fixture();valid=json.loads(self.env['FIXTURE_WORK_RESULT'])
+        for key,replacement in [('retirementScope',None),('retirementScope','continuations'),('actionCompleted',None),('actionCompleted',True),('cleanupEligible',None),('cleanupEligible',True)]:
+            value=copy.deepcopy(valid)
+            if replacement is None:value.pop(key)
+            else:value[key]=replacement
+            self.env['FIXTURE_WORK_RESULT']=json.dumps(value)
+            result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout)
+            self.assertNotEqual(json.loads(result.stderr)['outcome'],'completed');self.assert_no_owner()
+
+    def test_retirement_scope_is_limited_to_explicit_inspect_or_retire_modes(self):
+        for flags in [[],self.work_fixture('reconcile'),self.work_fixture()]:
+            for scope in (['continuations','operation-observations'] if not flags or 'reconcile' in flags else ['PRIVATE']):
+                result=self.invoke(flags+['--retirement-scope',scope]);self.assertEqual(result.returncode,1,result.stdout)
+                self.assertFalse((self.state/'preflights.log').exists());self.assertFalse((self.state/'work.log').exists())
+                self.assertNotIn('PRIVATE',result.stderr)
+        flags=self.scoped_work_fixture('retire-local');flags=flags[:flags.index('--expected-assessment-sha256')]+flags[flags.index('--expected-assessment-sha256')+2:]
+        result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout)
+        self.assertFalse((self.state/'preflights.log').exists());self.assert_no_owner()
+
+    def test_unresolved_work_cannot_claim_install_ready_next_action(self):
+        flags=self.work_fixture('reconcile','completed')
+        valid=json.loads(self.env['FIXTURE_WORK_RESULT']);valid.update(operationId='11111111-1111-4111-8111-111111111111',reasonCode='UNINSTALL_WORK_COMPLETED')
+        for next_action in ['none','install_candidate']:
+            value=copy.deepcopy(valid);value['nextAction']=next_action;self.env['FIXTURE_WORK_RESULT']=json.dumps(value)
+            result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout);self.assert_no_owner()
+
+    def test_operation_work_preserves_only_bounded_per_cache_diagnostics(self):
+        flags=self.scoped_work_fixture()
+        value=json.loads(self.env['FIXTURE_WORK_RESULT'])
+        safe={'kind':'operation_cache','recordReference':'c'*64,'recordDigest':'d'*64,'method':'interactions.respond','safeReason':'missing_binding','status':'pending','retirementEligible':True,'cleanupEligible':False,'availableActions':['reconcile','retire-local'],'selected':True}
+        private=dict(safe,operationKey='SECRET KEY',path='SECRET PATH',record={'prompt':'SECRET PAYLOAD'},error='SECRET ERROR')
+        value['preview']={'records':[private],'acceptanceDependencies':[{'secret':'SECRET DEPENDENCY'}]}
+        self.env['FIXTURE_WORK_RESULT']=json.dumps(value)
+        result=self.invoke(flags);self.assertEqual(result.returncode,0,result.stderr)
+        report=json.loads(result.stdout);self.assertEqual(report['preview']['records'],[safe])
+        self.assertNotIn('SECRET',result.stdout);self.assertNotIn('SECRET',result.stderr)
+        value['preview']['records'][0].update(method='PRIVATE METHOD',safeReason='PRIVATE REASON',status='PRIVATE STATUS')
+        self.env['FIXTURE_WORK_RESULT']=json.dumps(value)
+        result=self.invoke(flags);self.assertEqual(result.returncode,0,result.stderr);self.assertNotIn('PRIVATE',result.stdout)
+        value['preview']['records'][0]['availableActions']=['PRIVATE ACTION']
+        self.env['FIXTURE_WORK_RESULT']=json.dumps(value)
+        result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout);self.assertNotIn('PRIVATE',result.stderr)
+
     def test_uninstall_work_stale_retirement_digest_is_preserved_as_blocked(self):
         flags=self.work_fixture('retire-local','blocked')
         value=json.loads(self.env['FIXTURE_WORK_RESULT']);value['reasonCode']='UNINSTALL_WORK_ASSESSMENT_CHANGED'
@@ -768,6 +861,7 @@ esac
             self.env['FIXTURE_WORK_RESULT']=json.dumps(value)
             result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout)
             report=json.loads(result.stderr);self.assertEqual(report['outcome'],'blocked');self.assertEqual(report['reasonCode'],reason)
+            self.assertFalse(report['actionCompleted']);self.assertFalse(report['cleanupEligible'])
             self.assertEqual(report['nextAction'],'inspect_uninstall_work');self.assertNotIn('SECRET',result.stderr);self.assertNotIn('SECRET',result.stdout)
         self.assert_no_owner()
 

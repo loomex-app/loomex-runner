@@ -135,6 +135,171 @@ pub(super) async fn read(
     Ok(receipt)
 }
 
+/// A legacy observation with no original request identity cannot be correlated
+/// by guessing from a filename. Its canonical outcome remains explicitly unknown.
+pub(super) async fn read_operation(
+    api: &Api,
+    auth: &Auth,
+    candidate: &Value,
+    expected: &CredentialIdentity,
+) -> Result<Value> {
+    let binding = &candidate["binding"];
+    let method = candidate["method"]
+        .as_str()
+        .context("MANAGED_WORK_CHANGED")?;
+    let native =
+        matches!(method, "builder.start" | "editor.start") && candidate["runId"].as_str().is_some();
+    let interaction = matches!(
+        method,
+        "interactions.respond"
+            | "interactions.decide"
+            | "interactions.draft.delete"
+            | "interactions.draft.update"
+    );
+    if !native && !interaction && binding.is_null() {
+        return Ok(serde_json::json!({"remoteOutcome":"unknown","safeReason":"missing_binding"}));
+    }
+    let organizations = if let Some(org) = binding["organizationId"].as_str() {
+        vec![org.to_owned()]
+    } else {
+        auth.enrolled_organizations().await?
+    };
+    ensure!(organizations.len() <= 64, "MANAGED_WORK_PREVIEW_LIMIT");
+    let mut matches = Vec::new();
+    let mut lookup_state = "missing_binding";
+    for org in organizations {
+        let before = auth.current_child_identity(&org).await?;
+        ensure!(
+            before.1 == expected.installation_id,
+            "AUTH_IDENTITY_CHANGED"
+        );
+        if !binding.is_null() {
+            ensure!(
+                binding["installationId"] == expected.installation_id
+                    && binding["accountSubject"] == before.0,
+                "AUTH_IDENTITY_CHANGED"
+            );
+        }
+        let credential = auth.credential(&org).await?;
+        ensure!(credential.subject == before.0, "AUTH_IDENTITY_CHANGED");
+        let (route, body) = if native {
+            (
+                "v2/native-authoring-receipts/get/",
+                serde_json::json!({"operation":method,"executionId":candidate["runId"],"cacheReference":candidate["legacySlot"],"accountSubject":before.0,"cacheRequestDigest":candidate["record"]["digest"]}),
+            )
+        } else if interaction {
+            if binding["receipt"]["method"] == "interactions.operations.get" {
+                (
+                    "v2/interaction-operations/get/",
+                    binding["receipt"]["params"].clone(),
+                )
+            } else {
+                (
+                    "v2/interaction-operations/get/",
+                    serde_json::json!({"operation":if method=="interactions.respond"||method=="interactions.decide" {"interaction.resolve"}else{method},"cacheReference":candidate["legacySlot"],"accountSubject":before.0}),
+                )
+            }
+        } else {
+            return Ok(
+                serde_json::json!({"remoteOutcome":"unknown","safeReason":"unsupported_family"}),
+            );
+        };
+        let receipt = match api
+            .request("POST", route, Some(body), Some(&credential), None)
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(_) => {
+                ensure!(
+                    auth.current_child_identity(&org).await? == before,
+                    "AUTH_IDENTITY_CHANGED"
+                );
+                lookup_state = "unavailable";
+                continue;
+            }
+        };
+        lookup_state = match receipt["status"].as_str() {
+            Some("pending") => "pending",
+            Some("not_found") => "not_found",
+            Some("expired") => "expired",
+            Some("completed") => "same_key_only",
+            _ => "unavailable",
+        };
+        ensure!(
+            auth.current_child_identity(&org).await? == before,
+            "AUTH_IDENTITY_CHANGED"
+        );
+        ensure!(
+            receipt["operation"]
+                == (if method == "interactions.respond" || method == "interactions.decide" {
+                    "interaction.resolve"
+                } else {
+                    method
+                }),
+            "MANAGED_WORK_RECEIPT_MISMATCH"
+        );
+        if receipt["status"] != "completed" || receipt["match"] != "exact_request_match" {
+            continue;
+        }
+        if native {
+            ensure!(
+                receipt["provenance"] == "native_authoring_queued_receipt"
+                    && receipt["cacheRequestDigest"] == candidate["record"]["digest"],
+                "MANAGED_WORK_RECEIPT_MISMATCH"
+            );
+            control::verify_native_authoring_start(method, &receipt["result"])?;
+            ensure!(
+                receipt["result"]["executionId"] == candidate["runId"],
+                "MANAGED_WORK_RECEIPT_MISMATCH"
+            );
+            matches.push((org, before.0, receipt));
+        } else {
+            ensure!(
+                receipt["submissionFingerprintVersion"] == "loomex.operation-submission/v1"
+                    && !binding["backendSubmissionDigest"].is_null()
+                    && receipt["submissionFingerprint"] == binding["backendSubmissionDigest"],
+                "MANAGED_WORK_RECEIPT_MISMATCH"
+            );
+            ensure!(
+                receipt["requestId"] == binding["references"]["requestId"],
+                "MANAGED_WORK_RECEIPT_MISMATCH"
+            );
+            matches.push((org, before.0, receipt));
+        }
+    }
+    ensure!(matches.len() <= 1, "MANAGED_WORK_RECEIPT_MISMATCH");
+    if let Some((org, account, receipt)) = matches.pop() {
+        let mut owner = candidate.clone();
+        owner["organizationId"] = serde_json::json!(org);
+        owner["accountSubject"] = serde_json::json!(account);
+        let run = if native {
+            Some(candidate["runId"].clone())
+        } else {
+            receipt["result"]["executionId"]
+                .as_str()
+                .map(|run| serde_json::json!(run))
+        };
+        if let Some(run) = run {
+            owner["runId"] = run;
+            let observation = super::read_run(api, auth, &owner, expected).await?;
+            if !observation["terminalResult"].is_null() {
+                return Ok(
+                    serde_json::json!({"remoteOutcome":"terminal","organizationId":owner["organizationId"],"accountSubject":owner["accountSubject"],"installationId":expected.installation_id,"canonicalReceipt":receipt,"observation":observation}),
+                );
+            }
+        } else if method == "interactions.draft.delete" && receipt["result"]["deleted"].is_boolean()
+        {
+            return Ok(
+                serde_json::json!({"remoteOutcome":"completed","organizationId":owner["organizationId"],"accountSubject":owner["accountSubject"],"installationId":expected.installation_id,"canonicalReceipt":receipt}),
+            );
+        }
+        return Ok(serde_json::json!({"remoteOutcome":"unknown","safeReason":"terminal_missing"}));
+    }
+    Ok(
+        serde_json::json!({"remoteOutcome":"unknown","safeReason":if lookup_state=="missing_binding" && binding.is_null(){"missing_binding"}else{"canonical_pending"},"lookupState":lookup_state}),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

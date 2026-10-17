@@ -245,6 +245,26 @@
     "LIFECYCLE_RECOVERY_REQUIRED": {
       "recovery": "unavailable",
       "outcome": "not_dispatched"
+    },
+    "OPERATION_RECONCILIATION_REQUIRED": {
+      "recovery": "reconcile_outcome",
+      "outcome": "unknown"
+    },
+    "AUTH_RECOVERY_REJECTED": {
+      "recovery": "reconcile_outcome",
+      "outcome": "unknown"
+    },
+    "OPERATION_CACHE_RETIRED": {
+      "recovery": "refresh_authority",
+      "outcome": "rejected"
+    },
+    "AUTH_RECOVERY_BINDING_REQUIRED": {
+      "recovery": "refresh_authority",
+      "outcome": "rejected"
+    },
+    "AUTH_RECOVERY_REFERENCE_MISMATCH": {
+      "recovery": "refresh_authority",
+      "outcome": "rejected"
     }
   }
 }
