@@ -14,6 +14,16 @@ use std::{
 
 const PENDING: &str = "LIFECYCLE_OPERATION_PENDING";
 
+#[path = "managed_acceptance.rs"]
+mod acceptance;
+#[path = "managed_state_assessment.rs"]
+mod assessment;
+pub use assessment::{
+    BlockerCategory, ManagedStateAssessment, ManagedStateBlocker, ManagedStateError, assess_state,
+    error_category, maintenance_acceptance_dependencies, maintenance_preview,
+    maintenance_schema_digest,
+};
+
 fn metadata(path: &Path, directory: bool) -> Result<Option<fs::Metadata>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -38,13 +48,6 @@ fn json(path: &Path) -> Result<Value> {
 }
 fn present(value: &Value) -> bool {
     value.as_str().is_some_and(|value| !value.is_empty())
-}
-fn no_rows(connection: &Connection, query: &str) -> Result<()> {
-    let exists: bool = connection
-        .query_row(query, [], |row| row.get(0))
-        .map_err(|_| anyhow::anyhow!(PENDING))?;
-    ensure!(!exists, "{PENDING}");
-    Ok(())
 }
 
 struct DatabaseSnapshot {
@@ -234,171 +237,10 @@ fn database(
     )
     .map_err(|_| anyhow::anyhow!(PENDING))?;
     connection.pragma_update(None, "query_only", true)?;
-    let version: u32 = connection
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(|_| anyhow::anyhow!(PENDING))?;
-    let tables: BTreeSet<String> = connection
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?
-        .query_map([], |row| row.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    let required: &[&str] = match name {
-        "presentation.sqlite3" => &[
-            "presentation_sessions",
-            "presentation_operations",
-            "presentation_receipts",
-        ],
-        "follow.sqlite3" => &[
-            "follow_sessions",
-            "follow_receipts",
-            "follow_continuations",
-            "follow_hook_diagnostics",
-        ],
-        "recovery.sqlite3" => &[
-            "recovery_records",
-            "recovery_operations",
-            "recovery_receipts",
-        ],
-        _ => unreachable!(),
-    };
-    let mut allowed: BTreeSet<String> = required.iter().map(|value| (*value).into()).collect();
-    if name == "presentation.sqlite3" && version == 2 {
-        allowed.insert("presentation_deliveries".into());
-    }
-    ensure!(
-        (name == "presentation.sqlite3" && matches!(version, 1 | 2)
-            || name != "presentation.sqlite3" && version == 1)
-            && tables == allowed,
-        "{PENDING}"
-    );
-    no_rows(
-        &connection,
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type IN ('trigger','view'))",
-    )?;
-    match name {
-        "presentation.sqlite3" => {
-            no_rows(
-                &connection,
-                "SELECT EXISTS(SELECT 1 FROM presentation_sessions WHERE status IS NULL OR status NOT IN ('active','inactive','resolved'))",
-            )?;
-            no_rows(
-                &connection,
-                "SELECT EXISTS(SELECT 1 FROM presentation_operations WHERE status IS NULL OR status!='completed')",
-            )?;
-            // `active` is also the default for ordinary browser/catalog and
-            // workflow-detail views. It is presentation lifecycle, not evidence
-            // that a remote mutation or delivery remains unresolved.
-            let mut statement = connection.prepare(
-                "SELECT kind,entity_type,status,organization_id,account_subject,state_json FROM presentation_sessions",
-            )?;
-            for row in statement.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Vec<u8>>(5)?,
-                ))
-            })? {
-                let (kind, entity, status, organization, account, bytes) = row?;
-                let state: Value =
-                    serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!(PENDING))?;
-                ensure!(state.is_object(), "{PENDING}");
-                if status == "active" {
-                    ensure!(
-                        disposable_view_kind(&kind, &entity) && !has_pending_view_reference(&state),
-                        "{PENDING}"
-                    );
-                }
-                if let Some(delivery) = state
-                    .get("continuationDelivery")
-                    .filter(|value| !value.is_null())
-                {
-                    if delivery["schemaVersion"] == 2 {
-                        // Current presentation state retains only an identity;
-                        // its authoritative status lives in the delivery table.
-                        ensure!(version == 2 && present(&delivery["identity"]), "{PENDING}");
-                        let resolved: bool = connection.query_row(
-                            "SELECT EXISTS(SELECT 1 FROM presentation_deliveries WHERE organization_id=?1 AND account_subject=?2 AND identity=?3 AND status IN ('acknowledged','rejected'))",
-                            rusqlite::params![organization, account, delivery["identity"].as_str()], |row| row.get(0),
-                        )?;
-                        ensure!(resolved, "{PENDING}");
-                    } else {
-                        // Legacy rows carried their delivery result in state.
-                        ensure!(
-                            matches!(
-                                delivery["status"].as_str(),
-                                Some("acknowledged" | "rejected")
-                            ),
-                            "{PENDING}"
-                        );
-                    }
-                }
-            }
-            if version == 2 {
-                no_rows(
-                    &connection,
-                    "SELECT EXISTS(SELECT 1 FROM presentation_deliveries WHERE status IS NULL OR status NOT IN ('acknowledged','rejected'))",
-                )?;
-            }
-        }
-        "follow.sqlite3" => {
-            no_rows(
-                &connection,
-                "SELECT EXISTS(SELECT 1 FROM follow_sessions WHERE lifecycle IS NULL OR required_action IS NULL OR lifecycle!='terminal' OR required_action!='none' OR terminal_receipt_json IS NULL OR pending_handoff_json IS NOT NULL)",
-            )?;
-            // A run-start/accepted-answer receipt without a matching terminal
-            // follow record remains usable continuation authority.
-            no_rows(
-                &connection,
-                "SELECT EXISTS(SELECT 1 FROM follow_continuations c WHERE NOT EXISTS (SELECT 1 FROM follow_sessions s WHERE s.organization_id=c.organization_id AND s.account_subject=c.account_subject AND s.installation_id=c.installation_id AND s.run_id=c.run_id AND s.lifecycle='terminal' AND s.terminal_receipt_json IS NOT NULL))",
-            )?;
-            let mut runs = connection.prepare("SELECT run_id FROM follow_sessions")?;
-            for run in runs.query_map([], |row| row.get::<_, String>(0))? {
-                terminal_runs.insert(run?);
-            }
-            let mut statement = connection.prepare(
-                "SELECT terminal_receipt_json,recovery_json,cleanup_json FROM follow_sessions",
-            )?;
-            for row in statement.query_map([], |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Option<Vec<u8>>>(1)?,
-                    row.get::<_, Option<Vec<u8>>>(2)?,
-                ))
-            })? {
-                let (terminal, recovery, cleanup) = row?;
-                ensure!(
-                    !serde_json::from_slice::<Value>(&terminal)
-                        .map_err(|_| anyhow::anyhow!(PENDING))?
-                        .is_null(),
-                    "{PENDING}"
-                );
-                for embedded in [recovery, cleanup].into_iter().flatten() {
-                    let value: Value =
-                        serde_json::from_slice(&embedded).map_err(|_| anyhow::anyhow!(PENDING))?;
-                    // No current code issues these fields. Non-null legacy or
-                    // future authority must be reconciled rather than guessed.
-                    ensure!(value.is_null(), "{PENDING}");
-                }
-            }
-        }
-        "recovery.sqlite3" => {
-            no_rows(
-                &connection,
-                "SELECT EXISTS(SELECT 1 FROM recovery_records r WHERE registration_state='not_attempted' AND EXISTS(SELECT 1 FROM recovery_operations o WHERE o.recovery_id=r.recovery_id))",
-            )?;
-            no_rows(
-                &connection,
-                "SELECT EXISTS(SELECT 1 FROM recovery_operations WHERE status IS NULL OR status!='succeeded')",
-            )?;
-            no_rows(
-                &connection,
-                "SELECT EXISTS(SELECT 1 FROM recovery_records WHERE registration_state IS NULL OR lifecycle IS NULL OR current_operation_id IS NOT NULL OR pending_request_id IS NOT NULL OR NOT ((registration_state='removed' AND lifecycle='removed') OR (registration_state='not_attempted' AND lifecycle IN ('unchecked','unavailable') AND automation_id IS NULL)))",
-            )?;
-        }
-        _ => unreachable!(),
-    }
+    let version = assessment::schema(&connection, name)?;
+    let mut report = ManagedStateAssessment::empty();
+    assessment::inspect_rows(&connection, name, version, &mut report, terminal_runs)?;
+    ensure!(report.blockers.is_empty(), "{PENDING}");
     drop(connection);
     snapshot.verify_sources()?;
     paths.extend(family);
@@ -504,6 +346,104 @@ fn terminal_status(result: &Value) -> bool {
         Some("completed" | "failed" | "cancelled" | "canceled" | "deleted" | "succeeded" | "error")
     )
 }
+fn operation_cache_record(
+    dir: &Path,
+    path: &Path,
+    terminal_runs: &BTreeSet<String>,
+    paths: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let record = json(path)?;
+    let method = record["method"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!(PENDING))?;
+    let catalog: Value = serde_json::from_str(include_str!("../contracts/method-catalog.json"))?;
+    let entry = catalog["methods"]
+        .as_array()
+        .and_then(|methods| {
+            methods
+                .iter()
+                .find(|entry| entry["name"] == method && entry["mutating"] == true)
+        })
+        .ok_or_else(|| anyhow::anyhow!(PENDING))?;
+    ensure!(
+        record["digest"].as_str().is_some_and(
+            |digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        ),
+        "{PENDING}"
+    );
+    ensure!(
+        record
+            .get("status")
+            .is_none_or(|status| status == "completed"),
+        "{PENDING}"
+    );
+    if record["expired"] != true {
+        let result = record
+            .get("result")
+            .filter(|result| !result.is_null())
+            .ok_or_else(|| anyhow::anyhow!(PENDING))?;
+        let schema = &entry["outputSchema"];
+        let success = schema["oneOf"]
+            .as_array()
+            .and_then(|schemas| schemas.first())
+            .unwrap_or(schema);
+        // Compatibility authoring outputs intentionally have optional fields.
+        // Their empty required[] schema does not retire an active session.
+        let authoring_session_method = matches!(
+            method,
+            "builder.start"
+                | "editor.start"
+                | "builder.respond"
+                | "editor.respond"
+                | "builder.finalize"
+                | "editor.finalize"
+        );
+        let produces_execution = authoring_session_method
+            || success["required"].as_array().is_some_and(|required| {
+                required
+                    .iter()
+                    .any(|field| field == "execution" || field == "executionId")
+            });
+        if produces_execution {
+            ensure!(
+                record["executionId"]
+                    .as_str()
+                    .is_some_and(|run| uuid::Uuid::parse_str(run).is_ok()),
+                "{PENDING}"
+            );
+        } else {
+            crate::control::validate_params(result, success)
+                .map_err(|_| anyhow::anyhow!(PENDING))?;
+        }
+        if result.get("responseRef").is_some() {
+            ensure!(acceptance::cache_resolved(dir, &record)?, "{PENDING}");
+        }
+        if !record["executionId"].is_null() {
+            let run = record["executionId"]
+                .as_str()
+                .filter(|run| uuid::Uuid::parse_str(run).is_ok())
+                .ok_or_else(|| anyhow::anyhow!(PENDING))?;
+            let result_run = result
+                .pointer("/execution/id")
+                .or_else(|| result.get("executionId"))
+                .or_else(|| result.get("runId"));
+            if let Some(identity) = result_run {
+                ensure!(identity.as_str() == Some(run), "{PENDING}");
+            }
+            let terminal_result =
+                terminal_status(result) && result_run.and_then(Value::as_str) == Some(run);
+            ensure!(
+                terminal_result
+                    || terminal(dir, run, terminal_runs)?
+                    || acceptance::cache_resolved(dir, &record)?,
+                "{PENDING}"
+            );
+        }
+    }
+    paths.push(path.into());
+    Ok(())
+}
+
 fn operation_caches(
     dir: &Path,
     terminal_runs: &BTreeSet<String>,
@@ -528,33 +468,42 @@ fn operation_caches(
             wholly_owned = false;
             continue;
         }
-        let record = json(&entry.path())?;
-        ensure!(
-            present(&record["method"])
-                && record["digest"]
-                    .as_str()
-                    .is_some_and(|digest| digest.len() == 64
-                        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())),
-            "{PENDING}"
-        );
-        if record["expired"] != true {
-            let result = record
-                .get("result")
-                .filter(|result| !result.is_null())
-                .ok_or_else(|| anyhow::anyhow!(PENDING))?;
-            ensure!(result.get("responseRef").is_none(), "{PENDING}");
-            if let Some(run) = record["executionId"].as_str() {
-                ensure!(
-                    terminal_status(result) || terminal(dir, run, terminal_runs)?,
-                    "{PENDING}"
-                );
-            }
-        }
-        paths.push(entry.path());
+        operation_cache_record(dir, &entry.path(), terminal_runs, paths)?;
     }
     if wholly_owned {
         paths.push(root);
     }
+    Ok(())
+}
+fn response_spool_record(
+    dir: &Path,
+    root: &Path,
+    id: &str,
+    terminal_runs: &BTreeSet<String>,
+    paths: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let metadata_path = root.join(format!("{id}.meta.json"));
+    let record = json(&metadata_path)?;
+    if let Some(run) = record["executionId"].as_str() {
+        ensure!(
+            terminal(dir, run, terminal_runs)? || acceptance::spool_resolved(dir, id)?,
+            "{PENDING}"
+        );
+    } else {
+        ensure!(record["executionId"].is_null(), "{PENDING}");
+    }
+    let content = root.join(format!("{id}.json"));
+    let checksum = root.join(format!("{id}.sha256"));
+    ensure!(
+        metadata(&content, false)?.is_some() && metadata(&checksum, false)?.is_some(),
+        "{PENDING}"
+    );
+    ensure!(
+        read_fingerprint(&content, None)?.rsplit(':').next()
+            == Some(fs::read_to_string(&checksum)?.trim()),
+        "{PENDING}"
+    );
+    paths.extend([metadata_path, content, checksum]);
     Ok(())
 }
 fn response_spools(
@@ -583,25 +532,7 @@ fn response_spools(
         }
     }
     for id in ids {
-        let metadata_path = root.join(format!("{id}.meta.json"));
-        let record = json(&metadata_path)?;
-        if let Some(run) = record["executionId"].as_str() {
-            ensure!(terminal(dir, run, terminal_runs)?, "{PENDING}");
-        } else {
-            ensure!(record["executionId"].is_null(), "{PENDING}");
-        }
-        let content = root.join(format!("{id}.json"));
-        let checksum = root.join(format!("{id}.sha256"));
-        ensure!(
-            metadata(&content, false)?.is_some() && metadata(&checksum, false)?.is_some(),
-            "{PENDING}"
-        );
-        ensure!(
-            read_fingerprint(&content, None)?.rsplit(':').next()
-                == Some(fs::read_to_string(&checksum)?.trim()),
-            "{PENDING}"
-        );
-        paths.extend([metadata_path, content, checksum]);
+        response_spool_record(dir, &root, &id, terminal_runs, paths)?;
     }
     if wholly_owned {
         paths.push(root);
@@ -611,7 +542,33 @@ fn response_spools(
 
 /// Absolute paths only. A directory is returned only if every direct child is
 /// also included, so callers can preserve unknown files and remove deepest first.
-pub(super) fn inventory_resolved_state(dir: &Path) -> Result<Vec<PathBuf>> {
+pub fn inventory_resolved_state(dir: &Path) -> Result<Vec<PathBuf>> {
+    let inventory = || -> Result<Vec<PathBuf>> {
+        ensure!(
+            dir.is_absolute()
+                && metadata(dir, true)?.is_some_and(|metadata| metadata.mode() & 0o077 == 0),
+            "UNSAFE_STATE"
+        );
+        let before = assessment::fingerprints(dir)?;
+        let paths = inventory_resolved_state_inner(dir)?;
+        ensure!(
+            before == assessment::fingerprints(dir)?,
+            ManagedStateError::new(BlockerCategory::ObservationDrift)
+        );
+        Ok(paths)
+    };
+    inventory().map_err(|error| {
+        // Preserve the historical display code while making the reason available
+        // without parsing or exposing a database/path exception.
+        let category = assess_state(dir)
+            .ok()
+            .and_then(|assessment| assessment.blockers.first().map(|blocker| blocker.category))
+            .unwrap_or_else(|| error_category(&error));
+        ManagedStateError::new(category).into()
+    })
+}
+
+fn inventory_resolved_state_inner(dir: &Path) -> Result<Vec<PathBuf>> {
     ensure!(
         dir.is_absolute()
             && metadata(dir, true)?.is_some_and(|metadata| metadata.mode() & 0o077 == 0),
@@ -622,6 +579,9 @@ pub(super) fn inventory_resolved_state(dir: &Path) -> Result<Vec<PathBuf>> {
     for database_name in ["presentation.sqlite3", "follow.sqlite3", "recovery.sqlite3"] {
         database(dir, database_name, &mut paths, &mut terminal_runs)?;
     }
+    let mut patch_report = ManagedStateAssessment::empty();
+    assessment::inspect_patch_journals(dir, &mut paths, &mut patch_report)?;
+    ensure!(patch_report.blockers.is_empty(), "{PENDING}");
     let jobs = dir.join("jobs");
     if metadata(&jobs, true)?.is_some() {
         let mut wholly_owned = true;
@@ -655,9 +615,9 @@ mod tests {
     use serde_json::json;
 
     fn stores(dir: &Path) {
-        drop(loomex_runner::presentation::PresentationStore::open(dir).unwrap());
-        drop(loomex_runner::follow::FollowStore::open(dir).unwrap());
-        drop(loomex_runner::recovery::RecoveryStore::open(dir).unwrap());
+        drop(crate::presentation::PresentationStore::open(dir).unwrap());
+        drop(crate::follow::FollowStore::open(dir).unwrap());
+        drop(crate::recovery::RecoveryStore::open(dir).unwrap());
     }
     // Uses the actual production schema; only the safety-relevant values differ
     // between fixtures. Nullable fields stay NULL rather than inventing authority.
@@ -809,8 +769,8 @@ mod tests {
         root: &Path,
         entity_type: &str,
         state: Value,
-    ) -> (loomex_runner::presentation::PresentationStore, Value) {
-        let store = loomex_runner::presentation::PresentationStore::open(root).unwrap();
+    ) -> (crate::presentation::PresentationStore, Value) {
+        let store = crate::presentation::PresentationStore::open(root).unwrap();
         let session = store.dispatch("org", "account", "presentation.sessions.create", &json!({
             "kind":"browser", "entityType":entity_type,
             "entityId":if entity_type == "catalog" { uuid::Uuid::nil() } else { uuid::Uuid::new_v4() },
@@ -1025,7 +985,7 @@ mod tests {
                 ("required_action", text("none")),
                 (
                     "terminal_receipt_json",
-                    bytes(json!({"kind":"run_result","receipt":"verified-local-fact"})),
+                    bytes(json!({"receiptId":uuid::Uuid::new_v4(),"generation":0})),
                 ),
             ],
         );
@@ -1155,7 +1115,7 @@ mod tests {
         let run = uuid::Uuid::new_v4().to_string();
         crate::state::write_json(&path, &json!({"method":"runs.commit","digest":"a".repeat(64),"executionId":run,"result":{"execution":{"status":"queued"}}})).unwrap();
         assert!(inventory_resolved_state(root.path()).is_err());
-        crate::state::write_json(&path, &json!({"method":"runs.commit","digest":"a".repeat(64),"executionId":run,"result":{"execution":{"status":"completed"}}})).unwrap();
+        crate::state::write_json(&path, &json!({"method":"runs.commit","digest":"a".repeat(64),"executionId":run,"result":{"execution":{"id":run,"status":"completed"}}})).unwrap();
         assert!(
             inventory_resolved_state(root.path())
                 .unwrap()
@@ -1224,5 +1184,1206 @@ mod tests {
         fs::remove_file(dir.join("stdout")).unwrap();
         std::os::unix::fs::symlink(root.path().join("outside"), dir.join("stdout")).unwrap();
         assert!(inventory_resolved_state(root.path()).is_err());
+    }
+    fn blocker_count(report: &ManagedStateAssessment, category: BlockerCategory) -> u64 {
+        report
+            .blockers
+            .iter()
+            .find(|entry| entry.category == category)
+            .map(|entry| entry.count)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn assessment_reports_13_ready_and_14_pending_without_stopping_at_first_store() {
+        let root = tempfile::tempdir().unwrap();
+        stores(root.path());
+        let connection = Connection::open(root.path().join("presentation.sqlite3")).unwrap();
+        for index in 0..13 {
+            row(
+                &connection,
+                "presentation_deliveries",
+                &[
+                    ("identity", text(&format!("start:{index}"))),
+                    ("status", text("ready")),
+                ],
+            );
+        }
+        row(
+            &connection,
+            "presentation_operations",
+            &[("status", text("pending"))],
+        );
+        drop(connection);
+        let connection = Connection::open(root.path().join("follow.sqlite3")).unwrap();
+        for index in 0..14 {
+            let run = uuid::Uuid::new_v4().to_string();
+            row(
+                &connection,
+                "follow_sessions",
+                &[
+                    ("follow_session_id", text(&format!("follow-{index}"))),
+                    ("host_task_id", text(&format!("private-task-{index}"))),
+                    ("run_id", text(&run)),
+                    ("lifecycle", text("handoff_pending")),
+                    ("required_action", text("none")),
+                ],
+            );
+            row(
+                &connection,
+                "follow_continuations",
+                &[
+                    ("receipt", text(&format!("receipt-{index}"))),
+                    ("run_id", text(&run)),
+                ],
+            );
+        }
+        drop(connection);
+        let before = snapshot(root.path());
+        let report = assess_state(root.path()).unwrap();
+        assert!(!report.resolved);
+        assert_eq!(
+            blocker_count(&report, BlockerCategory::PresentationDeliveryPending),
+            13
+        );
+        assert_eq!(blocker_count(&report, BlockerCategory::FollowPending), 14);
+        assert_eq!(blocker_count(&report, BlockerCategory::DomainMutation), 1);
+        assert_eq!(snapshot(root.path()), before);
+        assert_eq!(
+            report.assessment_digest,
+            assess_state(root.path()).unwrap().assessment_digest
+        );
+        let safe = serde_json::to_string(&report).unwrap();
+        for sensitive in [
+            "private-task",
+            "receipt-",
+            "fixture-account",
+            "handoff_pending",
+            "SELECT",
+            root.path().to_str().unwrap(),
+        ] {
+            assert!(!safe.contains(sensitive));
+        }
+        assert!(report.blockers.iter().all(|entry| {
+            entry.references.len() <= 32
+                && entry
+                    .references
+                    .iter()
+                    .all(|reference| reference.len() == 64)
+        }));
+    }
+
+    #[test]
+    fn assessment_collects_all_independent_authority_categories_and_cache_records() {
+        let root = tempfile::tempdir().unwrap();
+        stores(root.path());
+        let connection = Connection::open(root.path().join("presentation.sqlite3")).unwrap();
+        row(
+            &connection,
+            "presentation_deliveries",
+            &[("status", text("unknown"))],
+        );
+        drop(connection);
+        let connection = Connection::open(root.path().join("follow.sqlite3")).unwrap();
+        row(
+            &connection,
+            "follow_sessions",
+            &[("lifecycle", text("superseded"))],
+        );
+        drop(connection);
+        let connection = Connection::open(root.path().join("recovery.sqlite3")).unwrap();
+        row(
+            &connection,
+            "recovery_records",
+            &[
+                ("registration_state", text("registered")),
+                ("lifecycle", text("paused")),
+                ("automation_id", text("secret-host-record")),
+            ],
+        );
+        drop(connection);
+        let job = job_fixture(root.path());
+        let mut journal = json(&job.join("journal.json")).unwrap();
+        journal["phase"] = json!("terminal_pending");
+        crate::state::write_json(&job.join("journal.json"), &journal).unwrap();
+        for _ in 0..2 {
+            crate::state::write_json(&root.path().join("operations").join(format!("{}.json", uuid::Uuid::new_v4())), &json!({"method":"interactions.respond","digest":"a".repeat(64),"executionId":uuid::Uuid::new_v4(),"result":{"answer":"private answer","status":"queued"}})).unwrap();
+            crate::state::write_json(
+                &root
+                    .path()
+                    .join("responses")
+                    .join(format!("{}.meta.json", uuid::Uuid::new_v4())),
+                &json!({"executionId":uuid::Uuid::new_v4()}),
+            )
+            .unwrap();
+        }
+        let report = assess_state(root.path()).unwrap();
+        for category in [
+            BlockerCategory::PresentationDeliveryUnknown,
+            BlockerCategory::FollowSupersessionUnverified,
+            BlockerCategory::RecoverySchedule,
+            BlockerCategory::JobOrTerminalDelivery,
+        ] {
+            assert_eq!(blocker_count(&report, category), 1, "{category:?}");
+        }
+        assert_eq!(blocker_count(&report, BlockerCategory::OperationCache), 2);
+        assert_eq!(blocker_count(&report, BlockerCategory::ResponseSpool), 2);
+        let safe = serde_json::to_string(&report).unwrap();
+        assert!(!safe.contains("private answer") && !safe.contains("secret-host-record"));
+    }
+
+    #[test]
+    fn assessment_wal_is_preserved_and_digest_binds_delivery_fences_and_dependencies() {
+        let root = tempfile::tempdir().unwrap();
+        stores(root.path());
+        let connection = Connection::open(root.path().join("presentation.sqlite3")).unwrap();
+        connection
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .unwrap();
+        row(
+            &connection,
+            "presentation_deliveries",
+            &[("status", text("ready"))],
+        );
+        let before = snapshot(root.path());
+        let first = assess_state(root.path()).unwrap();
+        assert_eq!(snapshot(root.path()), before);
+        connection.execute("UPDATE presentation_deliveries SET revision=revision+1,attempt_id='second-attempt'", []).unwrap();
+        let second = assess_state(root.path()).unwrap();
+        assert_ne!(first.assessment_digest, second.assessment_digest);
+        connection
+            .execute(
+                "UPDATE presentation_deliveries SET organization_id='changed-scope'",
+                [],
+            )
+            .unwrap();
+        let third = assess_state(root.path()).unwrap();
+        assert_ne!(second.assessment_digest, third.assessment_digest);
+        let run = uuid::Uuid::new_v4();
+        crate::state::write_json(
+            &root.path().join("tombstones").join(format!("{run}.json")),
+            &json!({"executionId":run,"deletedAt":1}),
+        )
+        .unwrap();
+        assert_ne!(
+            third.assessment_digest,
+            assess_state(root.path()).unwrap().assessment_digest
+        );
+    }
+
+    #[test]
+    fn assessment_unknown_schema_unsafe_state_and_io_failures_are_typed() {
+        let root = tempfile::tempdir().unwrap();
+        stores(root.path());
+        let connection = Connection::open(root.path().join("follow.sqlite3")).unwrap();
+        connection
+            .execute("CREATE TABLE future_authority(value BLOB)", [])
+            .unwrap();
+        drop(connection);
+        let report = assess_state(root.path()).unwrap();
+        assert_eq!(
+            blocker_count(&report, BlockerCategory::UnsupportedSchema),
+            1
+        );
+        let error = inventory_resolved_state(root.path()).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ManagedStateError>().unwrap().category,
+            BlockerCategory::UnsupportedSchema
+        );
+        let root = tempfile::tempdir().unwrap();
+        crate::state::private_dir(root.path()).unwrap();
+        std::os::unix::fs::symlink(
+            root.path().join("outside"),
+            root.path().join("follow.sqlite3"),
+        )
+        .unwrap();
+        assert!(
+            blocker_count(
+                &assess_state(root.path()).unwrap(),
+                BlockerCategory::UnsafeState
+            ) > 0
+        );
+        let root = tempfile::tempdir().unwrap();
+        crate::state::atomic_write(&root.path().join("follow.sqlite3"), b"not a database").unwrap();
+        assert_eq!(
+            blocker_count(
+                &assess_state(root.path()).unwrap(),
+                BlockerCategory::UnreadableState
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn assessment_reference_budget_does_not_truncate_blocker_counts() {
+        let root = tempfile::tempdir().unwrap();
+        crate::state::private_dir(root.path()).unwrap();
+        for _ in 0..40 {
+            crate::state::write_json(&root.path().join("operations").join(format!("{}.json", uuid::Uuid::new_v4())), &json!({"method":"runs.commit","digest":"a".repeat(64),"executionId":uuid::Uuid::new_v4(),"result":{"status":"queued"}})).unwrap();
+        }
+        let report = assess_state(root.path()).unwrap();
+        let blocker = report
+            .blockers
+            .iter()
+            .find(|entry| entry.category == BlockerCategory::OperationCache)
+            .unwrap();
+        assert_eq!(blocker.count, 40);
+        assert_eq!(blocker.references.len(), 32);
+    }
+    fn observation_fixture(run: &str, status: &str) -> Value {
+        json!({"snapshot":{"execution":{"id":run,"status":status},"hasMoreEvents":false},"terminalResult":{"execution":{"id":run,"status":status},"hasMoreEvents":false}})
+    }
+    fn request_fixture(candidate: &Value) -> Value {
+        let mut request = candidate.clone();
+        request["idempotencyKey"] = json!(uuid::Uuid::new_v4());
+        request
+    }
+    fn cache_and_spool_fixture(root: &Path, run: &str) {
+        crate::state::write_json(&root.join("operations").join(format!("{}.json", uuid::Uuid::new_v4())), &json!({"method":"interactions.respond","digest":"a".repeat(64),"executionId":run,"result":{"status":"queued"}})).unwrap();
+        let id = uuid::Uuid::new_v4();
+        let responses = root.join("responses");
+        crate::state::write_json(
+            &responses.join(format!("{id}.meta.json")),
+            &json!({"executionId":run}),
+        )
+        .unwrap();
+        crate::state::atomic_write(&responses.join(format!("{id}.json")), b"{}").unwrap();
+        crate::state::atomic_write(
+            &responses.join(format!("{id}.sha256")),
+            crate::state::digest(b"{}").as_bytes(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn canonical_retirement_does_not_grant_cache_or_spool_terminality() {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::presentation::PresentationStore::open(root.path()).unwrap();
+        let run = uuid::Uuid::new_v4().to_string();
+        let identity = format!("follow:{run}:run_started");
+        store.register_delivery("org", "account", &identity, &json!({"kind":"follow","schemaVersion":"loomex.follow-session.continuation/v1","runId":run,"receipt":"fixture-receipt-authority","trigger":"run_commit"})).unwrap();
+        let candidate = store.maintenance_candidates().unwrap().remove(0);
+        store
+            .maintenance_reconcile(
+                &request_fixture(&candidate),
+                &observation_fixture(&run, "running"),
+            )
+            .unwrap();
+        store
+            .maintenance_retire(&request_fixture(&candidate))
+            .unwrap();
+        cache_and_spool_fixture(root.path(), &run);
+        let running = assess_state(root.path()).unwrap();
+        assert_eq!(
+            blocker_count(&running, BlockerCategory::PresentationDeliveryPending),
+            0
+        );
+        assert_eq!(blocker_count(&running, BlockerCategory::OperationCache), 1);
+        assert_eq!(blocker_count(&running, BlockerCategory::ResponseSpool), 1);
+        assert!(inventory_resolved_state(root.path()).is_err());
+        store
+            .maintenance_reconcile(
+                &request_fixture(&candidate),
+                &observation_fixture(&run, "completed"),
+            )
+            .unwrap();
+        let terminal = assess_state(root.path()).unwrap();
+        assert!(terminal.resolved, "{:?}", terminal.blockers);
+        assert!(inventory_resolved_state(root.path()).is_ok());
+        assert_ne!(running.assessment_digest, terminal.assessment_digest);
+        drop(store);
+        let connection = Connection::open(root.path().join("presentation.sqlite3")).unwrap();
+        connection
+            .execute("UPDATE presentation_deliveries SET revision=revision+1", [])
+            .unwrap();
+        drop(connection);
+        let changed = assess_state(root.path()).unwrap();
+        assert_eq!(
+            blocker_count(&changed, BlockerCategory::PresentationDeliveryPending),
+            1
+        );
+        assert_eq!(blocker_count(&changed, BlockerCategory::OperationCache), 1);
+        assert_eq!(blocker_count(&changed, BlockerCategory::ResponseSpool), 1);
+    }
+
+    #[test]
+    fn follow_retirement_requires_exact_capability_closure_for_continuation_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::follow::FollowStore::open(root.path()).unwrap();
+        let run = uuid::Uuid::new_v4().to_string();
+        let receipt = store
+            .issue_continuation("org", "account", "install", &run, "run_commit", None)
+            .unwrap();
+        store
+            .activate_ui_handoff("org", "account", "install", &run, &receipt, None)
+            .unwrap();
+        let candidate = store.maintenance_candidates().unwrap().remove(0);
+        store
+            .maintenance_reconcile(
+                &request_fixture(&candidate),
+                &observation_fixture(&run, "running"),
+            )
+            .unwrap();
+        store
+            .maintenance_retire(&request_fixture(&candidate))
+            .unwrap();
+        assert!(assess_state(root.path()).unwrap().resolved);
+        assert!(inventory_resolved_state(root.path()).is_ok());
+        drop(store);
+        let connection = Connection::open(root.path().join("follow.sqlite3")).unwrap();
+        connection
+            .execute(
+                "UPDATE follow_retired_capabilities SET receipt='different-capability'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            blocker_count(
+                &assess_state(root.path()).unwrap(),
+                BlockerCategory::FollowPending
+            ),
+            1
+        );
+        assert!(inventory_resolved_state(root.path()).is_err());
+    }
+
+    #[test]
+    fn supersession_requires_canonical_lineage_generation_and_exact_terminal_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        stores(root.path());
+        let connection = Connection::open(root.path().join("follow.sqlite3")).unwrap();
+        let predecessor = uuid::Uuid::new_v4().to_string();
+        let successor = uuid::Uuid::new_v4().to_string();
+        let run = uuid::Uuid::new_v4().to_string();
+        let terminal = json!({"kind":"terminal","receiptId":uuid::Uuid::new_v4(),"generation":2});
+        row(
+            &connection,
+            "follow_sessions",
+            &[
+                ("follow_session_id", text(&predecessor)),
+                ("host_task_id", text("predecessor-task")),
+                ("run_id", text(&run)),
+                ("generation", SqlValue::Integer(1)),
+                ("lifecycle", text("superseded")),
+                ("required_action", text("none")),
+            ],
+        );
+        row(
+            &connection,
+            "follow_sessions",
+            &[
+                ("follow_session_id", text(&successor)),
+                ("host_task_id", text("successor-task")),
+                ("run_id", text(&run)),
+                ("generation", SqlValue::Integer(2)),
+                ("lifecycle", text("terminal")),
+                ("required_action", text("none")),
+                ("terminal_receipt_json", bytes(terminal.clone())),
+            ],
+        );
+        connection
+            .execute(
+                "INSERT INTO follow_lineage VALUES(?1,?2,?3,?4,1,?5,2)",
+                rusqlite::params![
+                    "fixture-organization_id",
+                    "fixture-account_subject",
+                    "fixture-installation_id",
+                    predecessor,
+                    successor
+                ],
+            )
+            .unwrap();
+        let candidate = crate::follow::maintenance_follow_candidates(&connection)
+            .unwrap()
+            .into_iter()
+            .find(|value| value["recordId"] == predecessor)
+            .unwrap();
+        // A fixture receipt issued through the canonical closure writer remains
+        // usable only while its exact independently stored successor proof exists.
+        crate::continuation_resolution::close(
+            &connection,
+            &candidate,
+            &request_fixture(&candidate),
+            "superseded_by_verified_successor",
+            json!({"successorId":successor,"successorGeneration":2,"terminalReceipt":terminal}),
+        )
+        .unwrap();
+        assert!(assess_state(root.path()).unwrap().resolved);
+        assert!(inventory_resolved_state(root.path()).is_ok());
+        connection
+            .execute("UPDATE follow_lineage SET successor_generation=3", [])
+            .unwrap();
+        assert_eq!(
+            blocker_count(
+                &assess_state(root.path()).unwrap(),
+                BlockerCategory::FollowSupersessionUnverified
+            ),
+            1
+        );
+        assert!(inventory_resolved_state(root.path()).is_err());
+    }
+
+    #[test]
+    fn malformed_record_does_not_hide_other_blockers_in_the_same_store() {
+        let root = tempfile::tempdir().unwrap();
+        stores(root.path());
+        let connection = Connection::open(root.path().join("presentation.sqlite3")).unwrap();
+        row(
+            &connection,
+            "presentation_deliveries",
+            &[
+                ("identity", text("malformed")),
+                ("status", text("ready")),
+                ("continuation_json", SqlValue::Blob(b"{".to_vec())),
+            ],
+        );
+        row(
+            &connection,
+            "presentation_deliveries",
+            &[("identity", text("unknown")), ("status", text("unknown"))],
+        );
+        drop(connection);
+        let report = assess_state(root.path()).unwrap();
+        assert_eq!(blocker_count(&report, BlockerCategory::UnreadableState), 1);
+        assert_eq!(
+            blocker_count(&report, BlockerCategory::PresentationDeliveryPending),
+            1
+        );
+        assert_eq!(
+            blocker_count(&report, BlockerCategory::PresentationDeliveryUnknown),
+            1
+        );
+        assert!(inventory_resolved_state(root.path()).is_err());
+    }
+
+    #[test]
+    fn dependency_fingerprints_detect_added_sidecars_and_changed_tombstones() {
+        let root = tempfile::tempdir().unwrap();
+        stores(root.path());
+        let before = assessment::fingerprints(root.path()).unwrap();
+        crate::state::atomic_write(
+            &root.path().join("presentation.sqlite3-journal"),
+            b"new journal",
+        )
+        .unwrap();
+        assert_ne!(before, assessment::fingerprints(root.path()).unwrap());
+        fs::remove_file(root.path().join("presentation.sqlite3-journal")).unwrap();
+        let run = uuid::Uuid::new_v4().to_string();
+        let tombstone = root.path().join("tombstones").join(format!("{run}.json"));
+        crate::state::write_json(&tombstone, &json!({"executionId":run,"deletedAt":1})).unwrap();
+        let first = assessment::fingerprints(root.path()).unwrap();
+        crate::state::write_json(&tombstone, &json!({"executionId":run,"deletedAt":2})).unwrap();
+        assert_ne!(first, assessment::fingerprints(root.path()).unwrap());
+    }
+    #[test]
+    fn exact_retired_acceptance_closes_only_its_known_cache_and_spool_dependencies() {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::follow::FollowStore::open(root.path()).unwrap();
+        let run = uuid::Uuid::new_v4().to_string();
+        let request = uuid::Uuid::new_v4().to_string();
+        let receipt = store
+            .issue_continuation(
+                "org",
+                "account",
+                "install",
+                &run,
+                "accepted_interaction",
+                Some(&request),
+            )
+            .unwrap();
+        store
+            .activate_ui_handoff("org", "account", "install", &run, &receipt, Some(&request))
+            .unwrap();
+        let result = json!({"executionId":run,"executionStatus":"running","requestId":request,"requestStatus":"resolved","error":null,"details":{"followContinuation":{"schemaVersion":"loomex.follow-session.continuation/v1","runId":run,"receipt":receipt,"trigger":"accepted_interaction","requestId":request}}});
+        let operation = root
+            .path()
+            .join("operations")
+            .join(format!("{}.json", uuid::Uuid::new_v4()));
+        crate::state::write_json(&operation, &json!({"method":"interactions.respond","digest":"a".repeat(64),"executionId":run,"result":result})).unwrap();
+        let spool = uuid::Uuid::new_v4().to_string();
+        let content = serde_json::to_vec(&result).unwrap();
+        let responses = root.path().join("responses");
+        crate::state::atomic_write(&responses.join(format!("{spool}.json")), &content).unwrap();
+        crate::state::atomic_write(
+            &responses.join(format!("{spool}.sha256")),
+            crate::state::digest(&content).as_bytes(),
+        )
+        .unwrap();
+        crate::state::write_json(&responses.join(format!("{spool}.meta.json")), &json!({"executionId":run,"ownerScope":{"organizationId":"org","accountSubject":"account"}})).unwrap();
+        let spooled_operation = root
+            .path()
+            .join("operations")
+            .join(format!("{}.json", uuid::Uuid::new_v4()));
+        crate::state::write_json(&spooled_operation, &json!({"method":"interactions.respond","digest":"b".repeat(64),"executionId":run,"result":{"responseRef":spool,"sizeBytes":content.len(),"checksumSha256":crate::state::digest(&content)}})).unwrap();
+        let before = assess_state(root.path()).unwrap();
+        assert_eq!(blocker_count(&before, BlockerCategory::OperationCache), 2);
+        assert_eq!(blocker_count(&before, BlockerCategory::ResponseSpool), 1);
+        // Expire the actual issuance before invoking production sweep.
+        let connection = Connection::open(root.path().join("follow.sqlite3")).unwrap();
+        connection
+            .execute("UPDATE follow_continuations SET expires_at=0", [])
+            .unwrap();
+        drop(connection);
+        store.sweep(crate::state::now()).unwrap();
+        let connection = Connection::open(root.path().join("follow.sqlite3")).unwrap();
+        let surviving: u64 = connection
+            .query_row("SELECT COUNT(*) FROM follow_continuations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(surviving, 1); // Exact identity survives while consumption is expired.
+        drop(connection);
+        assert!(
+            store
+                .issued_continuation(
+                    "org",
+                    "account",
+                    "install",
+                    &run,
+                    "accepted_interaction",
+                    Some(&request)
+                )
+                .unwrap()
+                .is_none()
+        );
+        let dependencies_before = maintenance_acceptance_dependencies(root.path()).unwrap();
+        assert_eq!(dependencies_before.len(), 2);
+        assert!(
+            dependencies_before
+                .iter()
+                .all(|dependency| dependency["retirementEligible"] == true
+                    && dependency["closureResolved"] == false)
+        );
+        let safe = serde_json::to_string(&dependencies_before).unwrap();
+        assert!(!safe.contains(&receipt) && !safe.contains(&run) && !safe.contains(&request));
+        let candidate = store.maintenance_candidates().unwrap().remove(0);
+        store
+            .maintenance_reconcile(
+                &request_fixture(&candidate),
+                &observation_fixture(&run, "running"),
+            )
+            .unwrap();
+        store
+            .maintenance_retire(&request_fixture(&candidate))
+            .unwrap();
+        let after = assess_state(root.path()).unwrap();
+        assert!(after.resolved, "{:?}", after.blockers);
+        assert!(inventory_resolved_state(root.path()).is_ok());
+        let dependencies_after = maintenance_acceptance_dependencies(root.path()).unwrap();
+        assert_eq!(dependencies_after.len(), 2);
+        assert!(
+            dependencies_after
+                .iter()
+                .all(|dependency| dependency["closureResolved"] == true)
+        );
+        for (before, after) in dependencies_before.iter().zip(&dependencies_after) {
+            assert_eq!(before["cacheDigest"], after["cacheDigest"]);
+            assert_eq!(before["scopeReference"], after["scopeReference"]);
+        }
+        // A different accepted mutation on the same active run has no exact
+        // closure and must remain visible after the continuation is retired.
+        let unrelated = root
+            .path()
+            .join("operations")
+            .join(format!("{}.json", uuid::Uuid::new_v4()));
+        crate::state::write_json(&unrelated, &json!({"method":"builder.start","digest":"c".repeat(64),"executionId":run,"result":{"executionId":run,"status":"queued"}})).unwrap();
+        assert_eq!(
+            blocker_count(
+                &assess_state(root.path()).unwrap(),
+                BlockerCategory::OperationCache
+            ),
+            1
+        );
+        assert!(inventory_resolved_state(root.path()).is_err());
+        fs::remove_file(&unrelated).unwrap();
+        let mut wrong_trigger = json(&operation).unwrap();
+        wrong_trigger["result"]["details"]["followContinuation"]["trigger"] = json!("run_commit");
+        crate::state::write_json(&operation, &wrong_trigger).unwrap();
+        assert_eq!(
+            blocker_count(
+                &assess_state(root.path()).unwrap(),
+                BlockerCategory::OperationCache
+            ),
+            1
+        );
+        crate::state::write_json(&operation, &json!({"method":"interactions.respond","digest":"a".repeat(64),"executionId":run,"result":result})).unwrap();
+        let mut forged = json(&operation).unwrap();
+        forged["result"]["details"]["followContinuation"]["receipt"] =
+            json!("different-accepted-receipt");
+        crate::state::write_json(&operation, &forged).unwrap();
+        assert_eq!(
+            blocker_count(
+                &assess_state(root.path()).unwrap(),
+                BlockerCategory::OperationCache
+            ),
+            1
+        );
+        crate::state::write_json(&responses.join(format!("{spool}.meta.json")), &json!({"executionId":run,"ownerScope":{"organizationId":"different-org","accountSubject":"account"}})).unwrap();
+        let wrong_scope = assess_state(root.path()).unwrap();
+        assert_eq!(
+            blocker_count(&wrong_scope, BlockerCategory::OperationCache),
+            2
+        );
+        assert_eq!(
+            blocker_count(&wrong_scope, BlockerCategory::ResponseSpool),
+            1
+        );
+    }
+
+    #[test]
+    fn maintenance_preview_is_read_only_and_io_errors_have_a_safe_category() {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::follow::FollowStore::open(root.path()).unwrap();
+        let run = uuid::Uuid::new_v4().to_string();
+        let receipt = store
+            .issue_continuation("org", "account", "install", &run, "run_commit", None)
+            .unwrap();
+        store
+            .activate_ui_handoff("org", "account", "install", &run, &receipt, None)
+            .unwrap();
+        let before = assessment::fingerprints(root.path()).unwrap();
+        let preview = maintenance_preview(root.path()).unwrap();
+        assert_eq!(preview.len(), 1);
+        assert_eq!(before, assessment::fingerprints(root.path()).unwrap());
+        let serialized = serde_json::to_string(&preview).unwrap();
+        assert!(!serialized.contains("hostSessionId") && !serialized.contains("hostTaskId"));
+        let io = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "private filesystem detail",
+        ));
+        assert_eq!(error_category(&io), BlockerCategory::UnreadableState);
+        let safe = ManagedStateError::new(error_category(&io));
+        assert_eq!(safe.to_string(), PENDING);
+    }
+    #[test]
+    fn schema_digest_ignores_data_and_sidecars_but_detects_legacy_store_migration() {
+        let root = tempfile::tempdir().unwrap();
+        stores(root.path());
+        let original = maintenance_schema_digest(root.path()).unwrap();
+        let connection = Connection::open(root.path().join("presentation.sqlite3")).unwrap();
+        connection
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .unwrap();
+        row(
+            &connection,
+            "presentation_deliveries",
+            &[("status", text("ready"))],
+        );
+        assert_eq!(original, maintenance_schema_digest(root.path()).unwrap());
+        drop(connection);
+        let connection = Connection::open(root.path().join("follow.sqlite3")).unwrap();
+        connection.execute_batch("DROP TABLE continuation_resolutions; DROP TABLE continuation_observations; DROP TABLE follow_lineage; DROP TABLE follow_retired_capabilities; DROP TABLE follow_capability_bindings; DROP TABLE follow_generation_transitions; PRAGMA user_version=1;").unwrap();
+        drop(connection);
+        let legacy = maintenance_schema_digest(root.path()).unwrap();
+        let store = crate::follow::FollowStore::open(root.path()).unwrap();
+        assert_ne!(legacy, maintenance_schema_digest(root.path()).unwrap());
+        drop(store);
+    }
+    #[test]
+    fn malformed_or_stale_terminal_receipts_cannot_qualify_queued_cache() {
+        for receipt in [
+            Value::Null,
+            json!([]),
+            json!("terminal"),
+            json!({"receiptId":uuid::Uuid::new_v4(),"generation":1}),
+            json!({"receiptId":"invalid","generation":2}),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            stores(root.path());
+            let run = uuid::Uuid::new_v4().to_string();
+            let connection = Connection::open(root.path().join("follow.sqlite3")).unwrap();
+            row(
+                &connection,
+                "follow_sessions",
+                &[
+                    ("run_id", text(&run)),
+                    ("generation", SqlValue::Integer(2)),
+                    ("lifecycle", text("terminal")),
+                    ("required_action", text("none")),
+                    ("terminal_receipt_json", bytes(receipt)),
+                ],
+            );
+            drop(connection);
+            crate::state::write_json(&root.path().join("operations").join(format!("{}.json", uuid::Uuid::new_v4())), &json!({"method":"builder.start","digest":"a".repeat(64),"executionId":run,"result":{"executionId":run,"status":"queued"}})).unwrap();
+            let report = assess_state(root.path()).unwrap();
+            assert_eq!(blocker_count(&report, BlockerCategory::FollowPending), 1);
+            assert_eq!(blocker_count(&report, BlockerCategory::OperationCache), 1);
+            assert!(!report.resolved);
+            assert!(inventory_resolved_state(root.path()).is_err());
+        }
+    }
+
+    #[test]
+    fn malformed_sqlite_row_types_do_not_hide_later_pending_rows() {
+        let root = tempfile::tempdir().unwrap();
+        stores(root.path());
+        let connection = Connection::open(root.path().join("presentation.sqlite3")).unwrap();
+        row(
+            &connection,
+            "presentation_sessions",
+            &[
+                ("view_session_id", text("a-malformed")),
+                ("kind", text("browser")),
+                ("entity_type", text("catalog")),
+                ("status", text("active")),
+                ("state_json", text("{}")),
+            ],
+        );
+        row(
+            &connection,
+            "presentation_sessions",
+            &[
+                ("view_session_id", text("z-pending")),
+                ("kind", text("interaction")),
+                ("entity_type", text("request")),
+                ("status", text("active")),
+                ("state_json", bytes(json!({"requestId":"private-request"}))),
+            ],
+        );
+        row(
+            &connection,
+            "presentation_deliveries",
+            &[
+                ("identity", text("bad-type")),
+                ("status", text("ready")),
+                ("continuation_json", text("{}")),
+            ],
+        );
+        row(
+            &connection,
+            "presentation_deliveries",
+            &[
+                ("identity", text("later-delivery")),
+                ("status", text("unknown")),
+            ],
+        );
+        drop(connection);
+        let connection = Connection::open(root.path().join("follow.sqlite3")).unwrap();
+        row(
+            &connection,
+            "follow_sessions",
+            &[
+                ("follow_session_id", text("bad-follow")),
+                ("host_task_id", text("bad-type")),
+                ("lifecycle", text("terminal")),
+                ("required_action", text("none")),
+                ("terminal_receipt_json", text("{}")),
+            ],
+        );
+        row(
+            &connection,
+            "follow_sessions",
+            &[
+                ("follow_session_id", text("later-follow")),
+                ("host_task_id", text("later-type")),
+                ("lifecycle", text("handoff_pending")),
+                ("required_action", text("none")),
+            ],
+        );
+        drop(connection);
+        let report = assess_state(root.path()).unwrap();
+        assert_eq!(blocker_count(&report, BlockerCategory::DomainMutation), 1);
+        assert_eq!(
+            blocker_count(&report, BlockerCategory::PresentationDeliveryPending),
+            1
+        );
+        assert_eq!(
+            blocker_count(&report, BlockerCategory::PresentationDeliveryUnknown),
+            1
+        );
+        assert_eq!(blocker_count(&report, BlockerCategory::FollowPending), 1);
+        assert!(blocker_count(&report, BlockerCategory::UnreadableState) >= 3);
+        assert_eq!(
+            blocker_count(&report, BlockerCategory::UnsupportedSchema),
+            0
+        );
+        let safe = serde_json::to_string(&report).unwrap();
+        assert!(
+            !safe.contains("private-request")
+                && !safe.contains("bad-follow")
+                && !safe.contains("bad-type")
+        );
+        assert!(inventory_resolved_state(root.path()).is_err());
+    }
+    #[test]
+    fn unknown_or_unbound_cached_mutations_and_mismatched_terminal_identity_block() {
+        for record in [
+            json!({"method":"builder.start","digest":"a".repeat(64),"executionId":null,"result":{"status":"queued"}}),
+            json!({"method":"builder.start","digest":"a".repeat(64),"executionId":"not-a-run","result":{"status":"queued"}}),
+            json!({"method":"future.mutate","digest":"a".repeat(64),"executionId":null,"result":{"status":"completed"}}),
+            json!({"method":"runs.commit","digest":"a".repeat(64),"executionId":uuid::Uuid::new_v4(),"result":{"execution":{"id":uuid::Uuid::new_v4(),"status":"completed"}}}),
+            json!({"method":"runs.commit","digest":"a".repeat(64),"executionId":uuid::Uuid::new_v4(),"result":{"status":"completed"}}),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            crate::state::private_dir(root.path()).unwrap();
+            crate::state::write_json(
+                &root
+                    .path()
+                    .join("operations")
+                    .join(format!("{}.json", uuid::Uuid::new_v4())),
+                &record,
+            )
+            .unwrap();
+            let report = assess_state(root.path()).unwrap();
+            assert_eq!(blocker_count(&report, BlockerCategory::OperationCache), 1);
+            assert!(inventory_resolved_state(root.path()).is_err());
+        }
+        let root = tempfile::tempdir().unwrap();
+        crate::state::private_dir(root.path()).unwrap();
+        crate::state::write_json(&root.path().join("operations").join(format!("{}.json", uuid::Uuid::new_v4())), &json!({"method":"interactions.draft.delete","digest":"a".repeat(64),"executionId":null,"result":{"requestId":uuid::Uuid::new_v4(),"deleted":true,"revision":1}})).unwrap();
+        assert!(assess_state(root.path()).unwrap().resolved);
+        assert!(inventory_resolved_state(root.path()).is_ok());
+    }
+    #[test]
+    fn pending_compatibility_authoring_caches_cannot_hide_in_optional_output_fields() {
+        for method in [
+            "builder.respond",
+            "editor.respond",
+            "builder.finalize",
+            "editor.finalize",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            crate::state::private_dir(root.path()).unwrap();
+            let record = json!({"method":method,"digest":"a".repeat(64),"executionId":null,"result":{
+                "builderSession":{"id":uuid::Uuid::new_v4(),"status":"waiting_for_human"},
+                "humanRequest":{"id":uuid::Uuid::new_v4(),"status":"pending"},"status":"waiting_for_human"
+            }});
+            crate::state::write_json(
+                &root
+                    .path()
+                    .join("operations")
+                    .join(format!("{}.json", uuid::Uuid::new_v4())),
+                &record,
+            )
+            .unwrap();
+            let report = assess_state(root.path()).unwrap();
+            assert_eq!(
+                blocker_count(&report, BlockerCategory::OperationCache),
+                1,
+                "{method}"
+            );
+            assert!(!report.resolved);
+            assert!(inventory_resolved_state(root.path()).is_err());
+        }
+        let root = tempfile::tempdir().unwrap();
+        crate::state::private_dir(root.path()).unwrap();
+        crate::state::write_json(&root.path().join("operations").join(format!("{}.json", uuid::Uuid::new_v4())), &json!({"method":"workflows.create","digest":"a".repeat(64),"executionId":null,"result":{"workflowId":uuid::Uuid::new_v4(),"name":"Fixture metadata","slug":"fixture-metadata"}})).unwrap();
+        assert!(assess_state(root.path()).unwrap().resolved);
+        assert!(inventory_resolved_state(root.path()).is_ok());
+    }
+    #[test]
+    fn readonly_preview_captures_domain_operations_and_binds_native_patch_dependencies() {
+        let root = tempfile::tempdir().unwrap();
+        stores(root.path());
+        let connection = Connection::open(root.path().join("presentation.sqlite3")).unwrap();
+        row(
+            &connection,
+            "presentation_operations",
+            &[
+                ("method", text("workflows.publish")),
+                (
+                    "params_json",
+                    bytes(json!({"workflowId":uuid::Uuid::new_v4(),"expectedVersion":1})),
+                ),
+                ("status", text("pending")),
+            ],
+        );
+        row(
+            &connection,
+            "presentation_deliveries",
+            &[("status", text("ready"))],
+        );
+        drop(connection);
+        let before = assessment::fingerprints(root.path()).unwrap();
+        let preview = maintenance_preview(root.path()).unwrap();
+        assert_eq!(before, assessment::fingerprints(root.path()).unwrap());
+        assert_eq!(
+            preview
+                .iter()
+                .filter(|candidate| candidate["kind"] == "presentation_operation")
+                .count(),
+            1
+        );
+        assert_eq!(
+            preview
+                .iter()
+                .filter(|candidate| candidate["kind"] == "presentation_delivery")
+                .count(),
+            1
+        );
+        assert_eq!(
+            blocker_count(
+                &assess_state(root.path()).unwrap(),
+                BlockerCategory::DomainMutation
+            ),
+            1
+        );
+        let baseline = assess_state(root.path()).unwrap().assessment_digest;
+        let patch = root
+            .path()
+            .join("workflow-patches")
+            .join(format!("{}.json", "a".repeat(64)));
+        crate::state::write_json(
+            &patch,
+            &json!({"phase":"submitted","updateDigest":"b".repeat(64)}),
+        )
+        .unwrap();
+        let submitted = assess_state(root.path()).unwrap().assessment_digest;
+        assert_ne!(baseline, submitted);
+        crate::state::write_json(
+            &patch,
+            &json!({"phase":"submitted","updateDigest":"c".repeat(64)}),
+        )
+        .unwrap();
+        assert_ne!(
+            submitted,
+            assess_state(root.path()).unwrap().assessment_digest
+        );
+        let dependencies = assessment::fingerprints(root.path()).unwrap();
+        crate::state::write_json(&root.path().join(format!("uninstall-work-cache-{}-0.json", uuid::Uuid::new_v4())), &json!({"schema":"app.loomex.runner.uninstall-work-cache-transition/v1","privateOwnerContext":true})).unwrap();
+        assert_eq!(dependencies, assessment::fingerprints(root.path()).unwrap());
+    }
+    fn native_patch_fixture(workflow: &str) -> Value {
+        let body = json!({"definition":{"nodes":[]},"expectedVersion":2});
+        json!({"identity":"a".repeat(64),"workflowId":workflow,"expectedVersion":2,"expectedDefinitionChecksum":"b".repeat(64),"updateDigest":crate::state::json_digest(&body["definition"]),"payloadDigest":crate::state::json_digest(&body),"updateBody":body,"status":"submitted"})
+    }
+
+    #[test]
+    fn standalone_native_patch_pending_unknown_and_malformed_state_cannot_be_discarded() {
+        let root = tempfile::tempdir().unwrap();
+        crate::state::private_dir(root.path()).unwrap();
+        let workflow = uuid::Uuid::new_v4().to_string();
+        let path = root
+            .path()
+            .join("workflow-patches")
+            .join(format!("{}.json", "a".repeat(64)));
+        let pending = native_patch_fixture(&workflow);
+        crate::state::write_json(&path, &pending).unwrap();
+        let report = assess_state(root.path()).unwrap();
+        assert_eq!(blocker_count(&report, BlockerCategory::DomainMutation), 1);
+        assert!(!report.resolved);
+        assert!(inventory_resolved_state(root.path()).is_err());
+        let mut unknown = pending;
+        unknown["status"] = json!("future-completion");
+        crate::state::write_json(&path, &unknown).unwrap();
+        assert_eq!(
+            blocker_count(
+                &assess_state(root.path()).unwrap(),
+                BlockerCategory::DomainMutation
+            ),
+            1
+        );
+        crate::state::atomic_write(&path, b"{").unwrap();
+        assert_eq!(
+            blocker_count(
+                &assess_state(root.path()).unwrap(),
+                BlockerCategory::UnreadableState
+            ),
+            1
+        );
+        crate::state::write_json(&path, &json!({"identity":"a".repeat(64),"workflowId":workflow,"status":"rejected","code":"WORKFLOW_PATCH_INVALID"})).unwrap();
+        assert!(assess_state(root.path()).unwrap().resolved);
+        let inventory = inventory_resolved_state(root.path()).unwrap();
+        assert!(
+            inventory.contains(&path) && inventory.contains(&root.path().join("workflow-patches"))
+        );
+        crate::state::atomic_write(
+            &root.path().join("workflow-patches").join("unowned-note"),
+            b"retain",
+        )
+        .unwrap();
+        let report = assess_state(root.path()).unwrap();
+        assert_eq!(
+            blocker_count(&report, BlockerCategory::UnsupportedSchema),
+            1
+        );
+        assert_eq!(blocker_count(&report, BlockerCategory::DomainMutation), 0);
+        assert!(!report.resolved);
+        assert!(inventory_resolved_state(root.path()).is_err());
+        let unknown = root.path().join("workflow-patches").join("unowned-note");
+        assert_eq!(fs::read(&unknown).unwrap(), b"retain");
+        fs::remove_file(&unknown).unwrap();
+        std::os::unix::fs::symlink(root.path().join("outside-authority"), &unknown).unwrap();
+        let unsafe_report = assess_state(root.path()).unwrap();
+        assert!(blocker_count(&unsafe_report, BlockerCategory::UnsafeState) > 0);
+        assert_eq!(
+            blocker_count(&unsafe_report, BlockerCategory::UnsupportedSchema),
+            0
+        );
+        assert_eq!(
+            blocker_count(&unsafe_report, BlockerCategory::DomainMutation),
+            0
+        );
+        let error = inventory_resolved_state(root.path()).unwrap_err();
+        assert_eq!(error_category(&error), BlockerCategory::UnsafeState);
+    }
+
+    #[test]
+    fn standalone_native_patch_requires_exact_shared_owner_receipt_before_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::presentation::PresentationStore::open(root.path()).unwrap();
+        let workflow = uuid::Uuid::new_v4().to_string();
+        let original_key = uuid::Uuid::new_v4().to_string();
+        let params = json!({"workflowId":workflow,"expectedVersion":2,"expectedDefinitionChecksum":"b".repeat(64),"operations":[{"nodeKey":"node","op":"replace","path":"/prompt","value":"PRIVATE PATCH CONTENT"}],"idempotencyKey":original_key});
+        let session = store.dispatch("org", "account", "presentation.sessions.create", &json!({"kind":"monitor","entityType":"execution","entityId":uuid::Uuid::new_v4(),"state":{},"idempotencyKey":uuid::Uuid::new_v4()})).unwrap();
+        store.dispatch("org", "account", "presentation.sessions.update", &json!({"viewSessionId":session["viewSessionId"],"expectedRevision":0,"state":{},"operation":{"method":"workflows.patch","params":params,"idempotencyKey":original_key,"reconciliation":{"method":"workflow.operations.get","params":{"operation":"workflows.update","idempotencyKey":original_key}}},"idempotencyKey":uuid::Uuid::new_v4()})).unwrap();
+        let mut candidate = store.maintenance_operation_candidates().unwrap().remove(0);
+        candidate["idempotencyKey"] = json!(uuid::Uuid::new_v4());
+        let mut original = native_patch_fixture(&workflow);
+        original["identity"] = json!(crate::state::json_digest(
+            &json!({"organizationId":"org","accountSubject":"account","workflowId":workflow,"expectedVersion":2,"expectedDefinitionChecksum":"b".repeat(64),"operations":params["operations"],"idempotencyKey":original_key})
+        ));
+        candidate["nativePatchJournal"] = original.clone();
+        let receipt = json!({"operation":"workflows.update","idempotencyKey":original_key,"status":"completed","response":{"workflow":{"id":workflow},"draft":{"definition":original["updateBody"]["definition"],"notes":"preserved historical notes"}}});
+        store
+            .maintenance_operation_settle(&candidate, &receipt)
+            .unwrap();
+        let mut resolved = original.clone();
+        resolved["maintenanceResolution"] = json!({"schema":"loomex.native-patch-reconciliation/v1","originalJournalDigest":crate::state::json_digest(&original),"candidate":candidate,"canonicalReceipt":receipt,"receiptDigest":crate::state::json_digest(&receipt)});
+        drop(store);
+        let standalone = tempfile::tempdir().unwrap();
+        crate::state::private_dir(standalone.path()).unwrap();
+        let name = crate::state::json_digest(
+            &json!({"organizationId":"org","accountSubject":"account","idempotencyKey":original_key}),
+        );
+        let path = standalone
+            .path()
+            .join("workflow-patches")
+            .join(format!("{name}.json"));
+        crate::state::write_json(&path, &resolved).unwrap();
+        assert!(assess_state(standalone.path()).unwrap().resolved);
+        assert!(
+            inventory_resolved_state(standalone.path())
+                .unwrap()
+                .contains(&path)
+        );
+        let relocated = standalone
+            .path()
+            .join("workflow-patches")
+            .join(format!("{}.json", "f".repeat(64)));
+        fs::rename(&path, &relocated).unwrap();
+        assert!(
+            blocker_count(
+                &assess_state(standalone.path()).unwrap(),
+                BlockerCategory::UnsafeState
+            ) > 0
+        );
+        assert!(inventory_resolved_state(standalone.path()).is_err());
+        fs::rename(&relocated, &path).unwrap();
+        let baseline = assess_state(standalone.path()).unwrap().assessment_digest;
+        resolved["maintenanceResolution"]["canonicalReceipt"]["response"]["workflow"]["id"] =
+            json!(uuid::Uuid::new_v4());
+        crate::state::write_json(&path, &resolved).unwrap();
+        let drift = assess_state(standalone.path()).unwrap();
+        assert_ne!(baseline, drift.assessment_digest);
+        assert_eq!(blocker_count(&drift, BlockerCategory::UnreadableState), 1);
+        assert!(inventory_resolved_state(standalone.path()).is_err());
+        assert!(
+            !serde_json::to_string(&drift)
+                .unwrap()
+                .contains("PRIVATE PATCH CONTENT")
+        );
+    }
+    #[test]
+    fn authenticated_native_patch_acknowledgement_qualifies_only_exact_scope_key_and_body() {
+        for canonical in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            crate::state::private_dir(root.path()).unwrap();
+            let org = uuid::Uuid::new_v4().to_string();
+            let account = uuid::Uuid::new_v4().to_string();
+            let workflow = uuid::Uuid::new_v4().to_string();
+            let key = uuid::Uuid::new_v4().to_string();
+            let request = json!({"workflowId":workflow,"expectedVersion":2,"expectedDefinitionChecksum":"b".repeat(64),"operations":[{"nodeKey":"node","op":"replace","path":"/prompt","value":"PRIVATE ACK CONTENT"}],"idempotencyKey":key});
+            let mut original = native_patch_fixture(&workflow);
+            original["identity"] = json!(crate::state::json_digest(
+                &json!({"organizationId":org,"accountSubject":account,"workflowId":workflow,"expectedVersion":2,"expectedDefinitionChecksum":"b".repeat(64),"operations":request["operations"],"idempotencyKey":key})
+            ));
+            let response = json!({"workflow":{"id":workflow},"draft":{"definition":original["updateBody"]["definition"],"notes":"historical accepted response"}});
+            let receipt = json!({"operation":"workflows.update","idempotencyKey":key,"status":"completed","response":response});
+            let acknowledged = crate::control::native_patch_acknowledgement(
+                &serde_json::to_vec(&original).unwrap(),
+                &org,
+                &account,
+                "fixture-installation",
+                &request,
+                &response,
+                canonical.then_some(&receipt),
+            )
+            .unwrap();
+            assert_eq!(acknowledged["status"], "submitted");
+            assert_eq!(
+                acknowledged["nativeAcknowledgement"]
+                    .get("canonicalReceipt")
+                    .is_some(),
+                canonical
+            );
+            let stem = crate::state::json_digest(
+                &json!({"organizationId":org,"accountSubject":account,"idempotencyKey":key}),
+            );
+            let path = root
+                .path()
+                .join("workflow-patches")
+                .join(format!("{stem}.json"));
+            crate::state::write_json(&path, &acknowledged).unwrap();
+            assert!(assess_state(root.path()).unwrap().resolved);
+            assert!(
+                inventory_resolved_state(root.path())
+                    .unwrap()
+                    .contains(&path)
+            );
+            for field in [
+                "originalJournalSha256",
+                "organizationId",
+                "operationKey",
+                "responseDigest",
+            ] {
+                let mut wrong = acknowledged.clone();
+                wrong["nativeAcknowledgement"][field] =
+                    if field.ends_with("Digest") || field.ends_with("Sha256") {
+                        json!("f".repeat(64))
+                    } else {
+                        json!(uuid::Uuid::new_v4())
+                    };
+                crate::state::write_json(&path, &wrong).unwrap();
+                let report = assess_state(root.path()).unwrap();
+                assert_eq!(
+                    blocker_count(&report, BlockerCategory::UnreadableState),
+                    1,
+                    "{field}"
+                );
+                assert_eq!(blocker_count(&report, BlockerCategory::DomainMutation), 0);
+                assert!(inventory_resolved_state(root.path()).is_err());
+                assert!(
+                    !serde_json::to_string(&report)
+                        .unwrap()
+                        .contains("PRIVATE ACK CONTENT")
+                );
+            }
+            let mut wrong_body = acknowledged.clone();
+            wrong_body["updateBody"]["definition"] = json!({"changed":true});
+            crate::state::write_json(&path, &wrong_body).unwrap();
+            assert_eq!(
+                blocker_count(
+                    &assess_state(root.path()).unwrap(),
+                    BlockerCategory::UnreadableState
+                ),
+                1
+            );
+            assert!(inventory_resolved_state(root.path()).is_err());
+            crate::state::write_json(&path, &acknowledged).unwrap();
+            let relocated = root
+                .path()
+                .join("workflow-patches")
+                .join(format!("{}.json", "f".repeat(64)));
+            fs::rename(&path, &relocated).unwrap();
+            assert!(
+                blocker_count(
+                    &assess_state(root.path()).unwrap(),
+                    BlockerCategory::UnsafeState
+                ) > 0
+            );
+            assert!(inventory_resolved_state(root.path()).is_err());
+        }
     }
 }

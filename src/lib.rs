@@ -1,5 +1,6 @@
 pub mod api;
 pub mod auth;
+mod continuation_resolution;
 pub mod control;
 pub mod executor;
 pub mod fingerprint;
@@ -13,5 +14,6 @@ pub mod progress;
 pub mod recovery;
 pub mod retention;
 pub mod state;
+pub mod uninstall_state;
 pub mod workflow_patch;
 pub mod workspace_set;

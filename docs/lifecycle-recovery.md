@@ -29,7 +29,7 @@ It checks both selected component owners before activation. Healthy partial
 installation is preserved: plugin or registration failure does not roll back a
 healthy runner. Retry the same release set and component installation bases.
 
-The paired CLI result uses `app.loomex.paired-install-result/v2`. Exit 0 means
+The paired CLI result uses `app.loomex.paired-install-result/v3`. Exit 0 means
 completion, exit 3 means a verified pending lifecycle operation, and exit 1 means
 blocked or unconfirmed. A known active-work or service-stop pause is not a new
 health failure. Inspect the exact operation, finish the indicated native resume,
@@ -53,8 +53,8 @@ different pending package.
 
 ## Current uninstall and stopped retries
 
-Run the installed release's `scripts/uninstall.sh`, retaining explicitly selected
-installation/state/LaunchAgent paths. The native owner records the operation,
+Run the verified installed release's `bin/loomex-lifecycle-bootstrap uninstall`,
+retaining explicitly selected installation/state/LaunchAgent paths. The native owner records the operation,
 drain identity, service-stop evidence, remote revocation and local cleanup stages.
 
 If the service has exited before the first idle acknowledgement, recovery must
@@ -113,7 +113,7 @@ The native recovery entrypoint remains available independently:
 
 ```sh
 LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 \
-  bash /path/to/new-release/scripts/uninstall.sh recover-uninstall /path/to/new-release \
+  /path/to/new-release/loomex-lifecycle-bootstrap recover-uninstall /path/to/new-release \
   --expected-old-journal-sha256 REVIEWED_ORIGINAL_JOURNAL_SHA256 \
   --allow-unsigned-development
 ```
@@ -132,6 +132,50 @@ with the historical journal unchanged. It retains the original operation, old
 intent evidence and old-controller fence. Uncertain or later-stage work cannot
 be reset this way. Never edit the saved intent or substitute a digest on an
 ambiguous retry.
+
+## Inspect and reconcile retained managed work
+
+A historical prepared uninstall may retain deliveries and follow sessions while
+its older daemon is drained. The verified new bootstrap provides a release-bound
+maintenance route without starting a daemon or adopting an uninstall. Inspect the
+exact historical owner first with the same reviewed paired release:
+
+```sh
+LOOMEX_ALLOW_UNSAFE_DEV_INSTALL=1 /path/to/verified/loomex-install-darwin-arm64 \
+  --offline /path/to/verified/release-set \
+  --manifest-sha256 REVIEWED_RELEASE_SET_SHA256 \
+  --allow-unsigned-development \
+  --uninstall-work inspect \
+  --expected-old-journal-sha256 REVIEWED_ORIGINAL_JOURNAL_SHA256
+```
+
+Inspection checks the runner and plugin owners and host prerequisites, then emits
+an assessment digest, bounded blocker counts and hashed references. It writes no
+persistent cache or installed state. Historical owner references report the journal
+schema, digest, phase and whether adoption started; an absent operation ID remains
+null. It does not invent a new operation to describe historical ownership.
+
+Use `--uninstall-work reconcile` with the same release and journal binding to ask
+the verified owner for supported reconciliation. This mode can inspect eligible
+retained work even when deletion is blocked. Remote observations and explicit
+delivery evidence determine resolution. Unavailable or ambiguous observations stay
+protected; clean-reinstall approval supplies no missing acknowledgement.
+
+When supported reconciliation cannot resolve retained local continuation records,
+review the inspect assessment and its scope before explicitly authorizing local
+retirement. Preview and retain the current assessment using `inspect`; only after
+that review use `--uninstall-work retire-local` with the same arguments plus
+`--expected-assessment-sha256 REVIEWED_ASSESSMENT_SHA256`. The native owner rechecks
+the exact assessment under its locks and rejects drift. Retirement records local
+supersession evidence; it does not claim workflow completion, remote cancellation,
+delivery acknowledgement, schedule removal or credential revocation. Uncertain
+operations, recovery schedules, response spools and domain mutations remain blockers.
+
+Every `--uninstall-work` invocation ends after the selected maintenance action.
+It never uninstalls, installs, activates the plugin, registers it with Codex, or
+continues into clean reinstall. After verified resolution, independently retry the
+explicit historical recovery command above. Error categories distinguish unresolved
+work, unsupported schema, unsafe state, unreadable state and observation drift.
 
 ## Signing, concurrency and qualification
 

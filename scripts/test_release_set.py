@@ -45,6 +45,11 @@ def fixture(root,installer,profile=None):
             put(envelope/'loomex-lifecycle-bootstrap',r'''#!/bin/bash
 set -euo pipefail
 mode="$1";shift
+if [[ "$mode" == uninstall-work ]]; then
+ echo "$*" >> "$FIXTURE_STATE/work.log"
+ echo "$FIXTURE_WORK_RESULT"
+ exit "${FIXTURE_WORK_EXIT:-0}"
+fi
 if [[ "$mode" == recover-uninstall ]]; then
  echo recover >> "$FIXTURE_STATE/recovery.log"
  if [[ "${FIXTURE_RECOVERY_RESULT:-}" != "" ]]; then echo "$FIXTURE_RECOVERY_RESULT";exit 1;fi
@@ -58,6 +63,8 @@ if [[ "$mode" == recover-uninstall ]]; then
 fi
 [[ "$mode" == preflight ]]
 echo runner >> "$FIXTURE_STATE/preflights.log"
+echo "$*" >> "$FIXTURE_STATE/runner-preflight-args.log"
+if [[ "${FIXTURE_RUNNER_PREFLIGHT_JSON:-}" != "" ]]; then echo "$FIXTURE_RUNNER_PREFLIGHT_JSON";exit "${FIXTURE_RUNNER_PREFLIGHT_EXIT:-0}";fi
 if [[ "${FIXTURE_RUNNER_PREFLIGHT_FAIL:-}" == 1 ]]; then echo 'SECRET runner detail' >&2; exit 40; fi
 recovery=false; old=""
 while (($#)); do case "$1" in --recovery-uninstall) recovery=true;shift;; --expected-old-journal-sha256) old="$2";shift 2;; *) shift;; esac;done
@@ -107,6 +114,7 @@ shift
 base=""; release=""; expected=""
 while (($#)); do case "$1" in --install-base) base="$2";shift 2;; --release) release="$2";shift 2;; --expected-release-path) expected="$2";shift 2;; *) shift;; esac; done
 echo plugin >> "$FIXTURE_STATE/preflights.log"
+if [[ "${FIXTURE_PLUGIN_PREFLIGHT_JSON:-}" != "" ]]; then echo "$FIXTURE_PLUGIN_PREFLIGHT_JSON";exit "${FIXTURE_PLUGIN_PREFLIGHT_EXIT:-0}";fi
 if [[ "${FIXTURE_PLUGIN_PREFLIGHT_FAIL:-}" == 1 ]]; then echo 'SECRET plugin detail' >&2; exit 41; fi
 restore=false
 if [[ -f "$base/pending" ]]; then
@@ -549,7 +557,7 @@ esac
         self.env['FIXTURE_ACTIVATION']=json.dumps({'schema':'app.loomex.runner.bootstrap-activation/v1','outcome':'pending','reasonCode':'ACTIVE_WORK_PENDING','operationId':'fixture-operation','nextAction':'resume_native_operation'})
         self.env['FIXTURE_HEALTH_FAIL']='1'
         result=self.invoke();self.assertEqual(result.returncode,3,result.stderr)
-        report=json.loads(result.stdout);self.assertEqual(report['schema'],'app.loomex.paired-install-result/v2')
+        report=json.loads(result.stdout);self.assertEqual(report['schema'],'app.loomex.paired-install-result/v3')
         self.assertEqual(report['outcome'],'pending');self.assertEqual(report['operationId'],'fixture-operation')
         self.assertEqual(report['nextAction'],'resume_native_operation');self.assertFalse(self.plugin.exists())
         self.assertEqual(report['completion']['plugin'],'not-attempted')
@@ -660,6 +668,181 @@ esac
         report=json.loads(result.stdout);self.assertEqual(report['operationId'],'fixture-recovery')
         self.assertEqual(report['nextAction'],'resume_bootstrap_uninstall');self.assert_no_owner()
         self.assertTrue((self.state/'old-journal').exists());self.assertFalse(self.plugin.exists())
+
+    def work_fixture(self, action='inspect', outcome='inspected'):
+        owner={'owner':'bootstrap_uninstall','journalSchema':'app.loomex.runner.bootstrap-uninstall/v1','journalSha256':'a'*64,'phase':'prepared','adoptionStarted':False}
+        assessment={'schema':'app.loomex.runner.managed-state-assessment/v1','assessmentDigest':'b'*64,'resolved':False,'blockers':[{'category':'presentation_delivery_pending','count':13,'references':['c'*64]},{'category':'follow_pending','count':14,'references':['d'*64]}]}
+        self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']=json.dumps({'schema':'app.loomex.runner.install-preflight/v2','artifact':{'eligible':True},'activation':{'eligible':False},'uninstallWorkEligibility':{'eligible':True},'ownerReference':owner,'assessment':assessment})
+        self.env['FIXTURE_WORK_RESULT']=json.dumps({'schema':'app.loomex.runner.bootstrap-uninstall-work/v1','action':action,'outcome':outcome,'operationId':None,'ownerReference':owner,'assessment':assessment,'reasonCode':'UNINSTALL_WORK_INSPECTED' if outcome=='inspected' else 'MANAGED_WORK_UNRESOLVED','nextAction':'reconcile_managed_work'})
+        flags=['--uninstall-work',action,'--expected-old-journal-sha256','a'*64]
+        if action=='retire-local':flags+=['--expected-assessment-sha256','b'*64]
+        return flags
+
+    def test_uninstall_work_inspection_preserves_historical_null_operation_and_13_14_chain(self):
+        result=self.invoke(self.work_fixture())
+        self.assertEqual(result.returncode,0,result.stderr)
+        report=json.loads(result.stdout)
+        self.assertIsNone(report['operationId'])
+        self.assertFalse(report['ownerReference']['adoptionStarted'])
+        self.assertEqual([v['count'] for v in report['assessment']['blockers']],[13,14])
+        self.assertEqual((self.state/'preflights.log').read_text().splitlines(),['runner','plugin'])
+        self.assertFalse((self.root/'cache').exists());self.assert_no_owner()
+        self.assertFalse((self.state/'runner-args.log').exists());self.assertFalse((self.state/'recovery.log').exists())
+        self.assertFalse(self.runner.exists());self.assertFalse(self.plugin.exists())
+
+    def test_uninstall_work_stale_retirement_digest_is_preserved_as_blocked(self):
+        flags=self.work_fixture('retire-local','blocked')
+        value=json.loads(self.env['FIXTURE_WORK_RESULT']);value['reasonCode']='UNINSTALL_WORK_ASSESSMENT_CHANGED'
+        self.env['FIXTURE_WORK_RESULT']=json.dumps(value);self.env['FIXTURE_WORK_EXIT']='1'
+        result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout)
+        report=json.loads(result.stderr);self.assertEqual(report['reasonCode'],'UNINSTALL_WORK_ASSESSMENT_CHANGED')
+        self.assertIn('--expected-assessment-sha256 '+'b'*64,(self.state/'work.log').read_text())
+        self.assertTrue((self.root/'cache').exists());self.assert_no_owner()
+
+    def test_typed_preflight_categories_are_preserved_without_private_owner_data(self):
+        for reason in ['MANAGED_WORK_UNRESOLVED','OWNER_SCHEMA_UNSUPPORTED','OWNER_STATE_UNSAFE','OWNER_STATE_UNREADABLE','OWNER_STATE_DRIFT','OWNER_SIGNATURE_REJECTED','OWNER_AUTHORIZATION_REQUIRED']:
+            self.work_fixture()
+            value=json.loads(self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']);value.update(reasonCode=reason,nextAction='reconcile_managed_work',secret='SECRET')
+            self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']=json.dumps(value);self.env['FIXTURE_RUNNER_PREFLIGHT_EXIT']='1'
+            result=self.invoke(['--preflight-only']);self.assertEqual(result.returncode,1,result.stdout)
+            report=json.loads(result.stderr);self.assertEqual(report['reasonCode'],reason)
+            self.assertNotIn('SECRET',result.stderr);self.assertFalse((self.root/'cache').exists());self.assert_no_owner()
+
+    def test_uninstall_work_verified_pending_has_exit_three_without_installation(self):
+        flags=self.work_fixture('reconcile','pending')
+        value=json.loads(self.env['FIXTURE_WORK_RESULT']);value.update(operationId='11111111-1111-4111-8111-111111111111',reasonCode='UNINSTALL_WORK_MAINTENANCE_PENDING',nextAction='resume_uninstall_work')
+        self.env['FIXTURE_WORK_RESULT']=json.dumps(value);self.env['FIXTURE_WORK_EXIT']='3'
+        result=self.invoke(flags);self.assertEqual(result.returncode,3,result.stderr)
+        report=json.loads(result.stdout);self.assertEqual(report['nextAction'],'resume_uninstall_work')
+        self.assertEqual(report['operationId'],'11111111-1111-4111-8111-111111111111');self.assert_no_owner()
+        self.assertFalse((self.state/'recovery.log').exists());self.assertFalse(self.runner.exists());self.assertFalse(self.plugin.exists())
+
+    def test_uninstall_work_response_requires_fresh_proof_after_valid_preflight(self):
+        for outcome in ['completed','pending']:
+            flags=self.work_fixture('reconcile',outcome)
+            valid=json.loads(self.env['FIXTURE_WORK_RESULT']);valid.update(operationId='11111111-1111-4111-8111-111111111111',reasonCode='UNINSTALL_WORK_COMPLETED' if outcome=='completed' else 'UNINSTALL_WORK_MAINTENANCE_PENDING',nextAction='inspect_uninstall_work' if outcome=='completed' else 'resume_uninstall_work')
+            preflight=json.loads(self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']);preflight['recoveryOwnership']={'operationId':'22222222-2222-4222-8222-222222222222'}
+            self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']=json.dumps(preflight)
+            self.env['FIXTURE_WORK_EXIT']='0' if outcome=='completed' else '3'
+            mutations=[('ownerReference','missing'),('ownerReference',None),('ownerReference',{'private':'SECRET'}),('assessment','missing'),('assessment',None),('assessment',{'private':'SECRET'}),('operationId','missing'),('operationId',None),('operationId',{'private':'SECRET'}),('operationId','invalid-operation')]
+            for key,replacement in mutations:
+                with self.subTest(outcome=outcome,key=key,replacement=replacement):
+                    result_value=copy.deepcopy(valid)
+                    if replacement=='missing':result_value.pop(key)
+                    else:result_value[key]=replacement
+                    self.env['FIXTURE_WORK_RESULT']=json.dumps(result_value)
+                    result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout)
+                    report=json.loads(result.stderr);self.assertNotIn(report['outcome'],['completed','pending'])
+                    self.assertNotIn('SECRET',result.stderr);self.assert_no_owner()
+            self.env['FIXTURE_WORK_RESULT']=json.dumps(valid)
+            result=self.invoke(flags);self.assertEqual(result.returncode,0 if outcome=='completed' else 3,result.stderr)
+            self.assertEqual(json.loads(result.stdout)['operationId'],valid['operationId'])
+        self.assertFalse((self.state/'runner-args.log').exists());self.assertFalse((self.state/'recovery.log').exists())
+
+    def test_uninstall_work_inspection_cannot_inherit_missing_proof(self):
+        flags=self.work_fixture();valid=json.loads(self.env['FIXTURE_WORK_RESULT'])
+        for key in ['ownerReference','assessment','operationId']:
+            value=copy.deepcopy(valid);value.pop(key);self.env['FIXTURE_WORK_RESULT']=json.dumps(value)
+            result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout)
+        self.assertFalse((self.root/'cache').exists());self.assert_no_owner()
+
+    def test_uninstall_work_fresh_owner_must_match_original_binding(self):
+        flags=self.work_fixture();value=json.loads(self.env['FIXTURE_WORK_RESULT']);value['ownerReference']['journalSha256']='f'*64
+        self.env['FIXTURE_WORK_RESULT']=json.dumps(value)
+        result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout);self.assert_no_owner()
+
+    def test_uninstall_work_already_adopted_operation_cannot_change(self):
+        flags=self.work_fixture('reconcile','pending')
+        value=json.loads(self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']);value['ownerReference'].update(adoptionStarted=True,operationId='22222222-2222-4222-8222-222222222222')
+        self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']=json.dumps(value)
+        value=json.loads(self.env['FIXTURE_WORK_RESULT']);value.update(operationId='11111111-1111-4111-8111-111111111111',reasonCode='UNINSTALL_WORK_MAINTENANCE_PENDING',nextAction='resume_uninstall_work')
+        self.env['FIXTURE_WORK_RESULT']=json.dumps(value);self.env['FIXTURE_WORK_EXIT']='3'
+        result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout);self.assert_no_owner()
+
+    def test_uninstall_work_refusal_codes_and_null_unavailable_assessment_are_preserved(self):
+        flags=self.work_fixture('reconcile','blocked');valid=json.loads(self.env['FIXTURE_WORK_RESULT']);valid['nextAction']='inspect_uninstall_work'
+        self.env['FIXTURE_WORK_EXIT']='1'
+        for reason in ['UNINSTALL_WORK_AUDIT_LIMIT','UNINSTALL_WORK_PREVIEW_LIMIT','UNINSTALL_WORK_REVIEW_UNAVAILABLE','UNINSTALL_WORK_IDENTITY_CHANGED','UNINSTALL_WORK_RECONCILIATION_REQUIRED','UNINSTALL_WORK_OBSERVATION_INCOMPLETE','UNINSTALL_WORK_DOMAIN_OUTCOME_PENDING','UNINSTALL_WORK_RECEIPT_MISMATCH','UNINSTALL_WORK_RECONCILIATION_UNSUPPORTED']:
+            value=copy.deepcopy(valid);value.update(reasonCode=reason,private='SECRET',nativeDiagnostic={'private':'SECRET'})
+            if reason=='UNINSTALL_WORK_REVIEW_UNAVAILABLE':value['assessment']=None
+            self.env['FIXTURE_WORK_RESULT']=json.dumps(value)
+            result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout)
+            report=json.loads(result.stderr);self.assertEqual(report['outcome'],'blocked');self.assertEqual(report['reasonCode'],reason)
+            self.assertEqual(report['nextAction'],'inspect_uninstall_work');self.assertNotIn('SECRET',result.stderr);self.assertNotIn('SECRET',result.stdout)
+        self.assert_no_owner()
+
+    def test_ordinary_install_preflight_cannot_use_maintenance_eligibility(self):
+        for flags in [[],['--preflight-only'],self.recovery_flags()]:
+            self.work_fixture();result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout)
+            self.assertEqual(json.loads(result.stderr)['phase'],'runner-preflight');self.assert_no_owner()
+        self.assertFalse((self.root/'cache').exists());self.assertFalse((self.state/'work.log').exists())
+
+    def test_work_preflight_requires_work_eligibility_and_plugin_activation_eligibility(self):
+        flags=self.work_fixture();value=json.loads(self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']);value['activation']['eligible']=True;value['uninstallWorkEligibility']['eligible']=False
+        self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']=json.dumps(value)
+        result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout)
+        self.assertEqual(json.loads(result.stderr)['phase'],'runner-preflight')
+        flags=self.work_fixture();self.env['FIXTURE_PLUGIN_PREFLIGHT_JSON']=json.dumps({'schema':'app.loomex.plugin.install-preflight/v1','artifact':{'eligible':True},'activation':{'eligible':False},'uninstallWorkEligibility':{'eligible':True}})
+        result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout)
+        self.assertEqual(json.loads(result.stderr)['phase'],'plugin-preflight')
+        self.assertFalse((self.state/'work.log').exists());self.assertFalse((self.root/'cache').exists());self.assert_no_owner()
+
+    def test_mutating_work_forwards_only_explicit_transition_authorization(self):
+        for action in ['reconcile','retire-local']:
+            for transition in ['eligible','needs_explicit_transition']:
+                with self.subTest(action=action,transition=transition):
+                    flags=self.work_fixture(action,'pending')
+                    value=json.loads(self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']);value['uninstallWorkEligibility']['signingTransition']=transition
+                    self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']=json.dumps(value)
+                    value=json.loads(self.env['FIXTURE_WORK_RESULT']);value.update(operationId='11111111-1111-4111-8111-111111111111',reasonCode='UNINSTALL_WORK_MAINTENANCE_PENDING',nextAction='resume_uninstall_work')
+                    self.env['FIXTURE_WORK_RESULT']=json.dumps(value);self.env['FIXTURE_WORK_EXIT']='3'
+                    result=self.invoke(flags+['--authorize-keychain-transition']);self.assertEqual(result.returncode,3,result.stderr)
+                    self.assertIn('--authorize-keychain-transition',(self.state/'runner-preflight-args.log').read_text().splitlines()[-1])
+                    self.assertIn('--authorize-keychain-transition',(self.state/'work.log').read_text().splitlines()[-1])
+                    report=json.loads(result.stdout);self.assertEqual(report['outcome'],'pending');self.assertEqual(report['operationId'],value['operationId'])
+                    self.assertEqual(report['nextAction'],'resume_uninstall_work');self.assertEqual(report['ownerReference']['journalSha256'],'a'*64)
+        self.assert_no_owner();self.assertFalse((self.state/'runner-args.log').exists());self.assertFalse((self.state/'recovery.log').exists())
+
+    def test_mutating_work_never_adds_native_transition_authorization(self):
+        for action in ['reconcile','retire-local']:
+            for transition in ['eligible','needs_explicit_transition']:
+                flags=self.work_fixture(action,'blocked')
+                value=json.loads(self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']);value['uninstallWorkEligibility']['signingTransition']=transition
+                self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']=json.dumps(value)
+                value=json.loads(self.env['FIXTURE_WORK_RESULT']);value.update(reasonCode='OWNER_AUTHORIZATION_REQUIRED',nextAction='inspect_uninstall_work')
+                self.env['FIXTURE_WORK_RESULT']=json.dumps(value);self.env['FIXTURE_WORK_EXIT']='1'
+                result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout)
+                self.assertNotIn('--authorize-keychain-transition',(self.state/'runner-preflight-args.log').read_text().splitlines()[-1])
+                self.assertNotIn('--authorize-keychain-transition',(self.state/'work.log').read_text().splitlines()[-1])
+        self.assert_no_owner();self.assertFalse((self.state/'runner-args.log').exists());self.assertFalse((self.state/'recovery.log').exists())
+
+    def test_inspection_rejects_transition_authorization_before_any_native_call(self):
+        flags=self.work_fixture()
+        result=self.invoke(flags+['--authorize-keychain-transition']);self.assertEqual(result.returncode,1,result.stdout)
+        self.assertFalse((self.state/'preflights.log').exists());self.assertFalse((self.state/'runner-preflight-args.log').exists())
+        self.assertFalse((self.state/'work.log').exists());self.assertFalse((self.root/'cache').exists());self.assert_no_owner()
+
+    def test_explicit_work_transition_requires_supported_native_preflight_enum(self):
+        for transition in [None,'unexpected-private-value']:
+            flags=self.work_fixture('reconcile','pending')
+            value=json.loads(self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']);value['uninstallWorkEligibility']['signingTransition']=transition
+            self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']=json.dumps(value)
+            result=self.invoke(flags+['--authorize-keychain-transition']);self.assertEqual(result.returncode,1,result.stdout)
+            self.assertEqual(json.loads(result.stderr)['phase'],'runner-preflight')
+            self.assertFalse((self.state/'work.log').exists());self.assertFalse((self.root/'cache').exists());self.assert_no_owner()
+            self.assertNotIn('unexpected-private-value',result.stderr)
+
+    def test_uninstall_work_refuses_mixed_install_and_recovery_modes(self):
+        for extra in [['--recover-uninstall'],['--verify-only'],['--preflight-only'],['--runner-only'],['--authorize-keychain-transition']]:
+            result=self.invoke(self.work_fixture()+extra);self.assertEqual(result.returncode,1,result.stdout)
+            self.assertFalse((self.state/'work.log').exists());self.assert_no_owner()
+
+    def test_uninstall_work_plugin_or_host_failure_precedes_native_work(self):
+        flags=self.work_fixture();self.env['FIXTURE_PLUGIN_PREFLIGHT_FAIL']='1'
+        self.assertEqual(self.invoke(flags).returncode,1);self.assertFalse((self.state/'work.log').exists())
+        self.env.pop('FIXTURE_PLUGIN_PREFLIGHT_FAIL');self.fake_codex(collision=True)
+        self.assertEqual(self.invoke(flags).returncode,1);self.assertFalse((self.state/'work.log').exists())
+        self.assertFalse((self.root/'cache').exists());self.assert_no_owner()
 
     def test_cache_conflicts_are_preserved_and_refused(self):
         self.env['FIXTURE_PLUGIN_FAIL']='1';self.assertEqual(self.invoke().returncode,1)

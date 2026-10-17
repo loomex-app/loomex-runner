@@ -8382,6 +8382,446 @@
                   "string",
                   "null"
                 ]
+              },
+              "resolution": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "state": {
+                        "const": "unresolved"
+                      }
+                    },
+                    "required": [
+                      "state"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "schemaVersion": {
+                        "const": "loomex.continuation-resolution/v1"
+                      },
+                      "state": {
+                        "const": "retired_by_owner"
+                      },
+                      "receiptId": {
+                        "type": "string",
+                        "format": "uuid"
+                      },
+                      "idempotencyKey": {
+                        "type": "string",
+                        "format": "uuid"
+                      },
+                      "candidate": {
+                        "type": "object",
+                        "properties": {
+                          "kind": {
+                            "const": "presentation_delivery"
+                          },
+                          "retirementEligible": {
+                            "type": "boolean"
+                          },
+                          "organizationId": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 512
+                          },
+                          "accountSubject": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 512
+                          },
+                          "installationId": {
+                            "const": ""
+                          },
+                          "recordId": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 384
+                          },
+                          "runId": {
+                            "oneOf": [
+                              {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 512
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "revision": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "generation": {
+                            "type": "null"
+                          },
+                          "attemptId": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "status": {
+                            "type": "string",
+                            "enum": [
+                              "ready",
+                              "sending",
+                              "not_sent",
+                              "acknowledged",
+                              "rejected",
+                              "unknown"
+                            ]
+                          },
+                          "recordDigest": {
+                            "type": "string",
+                            "pattern": "^[a-f0-9]{64}$"
+                          },
+                          "resolution": {
+                            "type": "object",
+                            "properties": {
+                              "state": {
+                                "const": "unresolved"
+                              }
+                            },
+                            "required": [
+                              "state"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "backendObservation": {
+                            "oneOf": [
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "schemaVersion": {
+                                    "const": "loomex.continuation-observation/v1"
+                                  },
+                                  "runId": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 512
+                                  },
+                                  "recordDigest": {
+                                    "type": "string",
+                                    "pattern": "^[a-f0-9]{64}$"
+                                  },
+                                  "status": {
+                                    "type": "string",
+                                    "enum": [
+                                      "queued",
+                                      "running",
+                                      "waiting_for_human",
+                                      "waiting",
+                                      "pending",
+                                      "active",
+                                      "paused",
+                                      "completed",
+                                      "failed",
+                                      "cancelled",
+                                      "canceled",
+                                      "deleted",
+                                      "succeeded",
+                                      "error"
+                                    ]
+                                  },
+                                  "terminal": {
+                                    "type": "boolean"
+                                  },
+                                  "observationDigest": {
+                                    "type": "string",
+                                    "pattern": "^[a-f0-9]{64}$"
+                                  },
+                                  "observedAt": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  }
+                                },
+                                "required": [
+                                  "schemaVersion",
+                                  "runId",
+                                  "recordDigest",
+                                  "status",
+                                  "terminal",
+                                  "observationDigest",
+                                  "observedAt"
+                                ],
+                                "additionalProperties": false
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "retirementEligible",
+                          "organizationId",
+                          "accountSubject",
+                          "installationId",
+                          "recordId",
+                          "runId",
+                          "revision",
+                          "generation",
+                          "attemptId",
+                          "status",
+                          "recordDigest",
+                          "resolution",
+                          "backendObservation"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "evidence": {
+                        "type": "object",
+                        "properties": {
+                          "reasonCode": {
+                            "const": "OWNER_RETIRED_LOCAL_CONTINUATION"
+                          }
+                        },
+                        "required": [
+                          "reasonCode"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "resolvedAt": {
+                        "type": "integer",
+                        "minimum": 0
+                      }
+                    },
+                    "required": [
+                      "schemaVersion",
+                      "state",
+                      "receiptId",
+                      "idempotencyKey",
+                      "candidate",
+                      "evidence",
+                      "resolvedAt"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "schemaVersion": {
+                        "const": "loomex.continuation-resolution/v1"
+                      },
+                      "state": {
+                        "const": "verified_terminal"
+                      },
+                      "receiptId": {
+                        "type": "string",
+                        "format": "uuid"
+                      },
+                      "idempotencyKey": {
+                        "type": "string",
+                        "format": "uuid"
+                      },
+                      "candidate": {
+                        "type": "object",
+                        "properties": {
+                          "kind": {
+                            "const": "presentation_delivery"
+                          },
+                          "retirementEligible": {
+                            "type": "boolean"
+                          },
+                          "organizationId": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 512
+                          },
+                          "accountSubject": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 512
+                          },
+                          "installationId": {
+                            "const": ""
+                          },
+                          "recordId": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 384
+                          },
+                          "runId": {
+                            "oneOf": [
+                              {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 512
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "revision": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "generation": {
+                            "type": "null"
+                          },
+                          "attemptId": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "status": {
+                            "type": "string",
+                            "enum": [
+                              "ready",
+                              "sending",
+                              "not_sent",
+                              "acknowledged",
+                              "rejected",
+                              "unknown"
+                            ]
+                          },
+                          "recordDigest": {
+                            "type": "string",
+                            "pattern": "^[a-f0-9]{64}$"
+                          },
+                          "resolution": {
+                            "type": "object",
+                            "properties": {
+                              "state": {
+                                "const": "unresolved"
+                              }
+                            },
+                            "required": [
+                              "state"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "backendObservation": {
+                            "oneOf": [
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "schemaVersion": {
+                                    "const": "loomex.continuation-observation/v1"
+                                  },
+                                  "runId": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 512
+                                  },
+                                  "recordDigest": {
+                                    "type": "string",
+                                    "pattern": "^[a-f0-9]{64}$"
+                                  },
+                                  "status": {
+                                    "type": "string",
+                                    "enum": [
+                                      "queued",
+                                      "running",
+                                      "waiting_for_human",
+                                      "waiting",
+                                      "pending",
+                                      "active",
+                                      "paused",
+                                      "completed",
+                                      "failed",
+                                      "cancelled",
+                                      "canceled",
+                                      "deleted",
+                                      "succeeded",
+                                      "error"
+                                    ]
+                                  },
+                                  "terminal": {
+                                    "type": "boolean"
+                                  },
+                                  "observationDigest": {
+                                    "type": "string",
+                                    "pattern": "^[a-f0-9]{64}$"
+                                  },
+                                  "observedAt": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  }
+                                },
+                                "required": [
+                                  "schemaVersion",
+                                  "runId",
+                                  "recordDigest",
+                                  "status",
+                                  "terminal",
+                                  "observationDigest",
+                                  "observedAt"
+                                ],
+                                "additionalProperties": false
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "retirementEligible",
+                          "organizationId",
+                          "accountSubject",
+                          "installationId",
+                          "recordId",
+                          "runId",
+                          "revision",
+                          "generation",
+                          "attemptId",
+                          "status",
+                          "recordDigest",
+                          "resolution",
+                          "backendObservation"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "evidence": {
+                        "type": "object",
+                        "properties": {
+                          "runId": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 512
+                          },
+                          "observationDigest": {
+                            "type": "string",
+                            "pattern": "^[a-f0-9]{64}$"
+                          }
+                        },
+                        "required": [
+                          "runId",
+                          "observationDigest"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "resolvedAt": {
+                        "type": "integer",
+                        "minimum": 0
+                      }
+                    },
+                    "required": [
+                      "schemaVersion",
+                      "state",
+                      "receiptId",
+                      "idempotencyKey",
+                      "candidate",
+                      "evidence",
+                      "resolvedAt"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "continuationEligible": {
+                "type": "boolean"
               }
             },
             "required": [
@@ -8600,6 +9040,446 @@
                   "string",
                   "null"
                 ]
+              },
+              "resolution": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "state": {
+                        "const": "unresolved"
+                      }
+                    },
+                    "required": [
+                      "state"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "schemaVersion": {
+                        "const": "loomex.continuation-resolution/v1"
+                      },
+                      "state": {
+                        "const": "retired_by_owner"
+                      },
+                      "receiptId": {
+                        "type": "string",
+                        "format": "uuid"
+                      },
+                      "idempotencyKey": {
+                        "type": "string",
+                        "format": "uuid"
+                      },
+                      "candidate": {
+                        "type": "object",
+                        "properties": {
+                          "kind": {
+                            "const": "presentation_delivery"
+                          },
+                          "retirementEligible": {
+                            "type": "boolean"
+                          },
+                          "organizationId": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 512
+                          },
+                          "accountSubject": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 512
+                          },
+                          "installationId": {
+                            "const": ""
+                          },
+                          "recordId": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 384
+                          },
+                          "runId": {
+                            "oneOf": [
+                              {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 512
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "revision": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "generation": {
+                            "type": "null"
+                          },
+                          "attemptId": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "status": {
+                            "type": "string",
+                            "enum": [
+                              "ready",
+                              "sending",
+                              "not_sent",
+                              "acknowledged",
+                              "rejected",
+                              "unknown"
+                            ]
+                          },
+                          "recordDigest": {
+                            "type": "string",
+                            "pattern": "^[a-f0-9]{64}$"
+                          },
+                          "resolution": {
+                            "type": "object",
+                            "properties": {
+                              "state": {
+                                "const": "unresolved"
+                              }
+                            },
+                            "required": [
+                              "state"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "backendObservation": {
+                            "oneOf": [
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "schemaVersion": {
+                                    "const": "loomex.continuation-observation/v1"
+                                  },
+                                  "runId": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 512
+                                  },
+                                  "recordDigest": {
+                                    "type": "string",
+                                    "pattern": "^[a-f0-9]{64}$"
+                                  },
+                                  "status": {
+                                    "type": "string",
+                                    "enum": [
+                                      "queued",
+                                      "running",
+                                      "waiting_for_human",
+                                      "waiting",
+                                      "pending",
+                                      "active",
+                                      "paused",
+                                      "completed",
+                                      "failed",
+                                      "cancelled",
+                                      "canceled",
+                                      "deleted",
+                                      "succeeded",
+                                      "error"
+                                    ]
+                                  },
+                                  "terminal": {
+                                    "type": "boolean"
+                                  },
+                                  "observationDigest": {
+                                    "type": "string",
+                                    "pattern": "^[a-f0-9]{64}$"
+                                  },
+                                  "observedAt": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  }
+                                },
+                                "required": [
+                                  "schemaVersion",
+                                  "runId",
+                                  "recordDigest",
+                                  "status",
+                                  "terminal",
+                                  "observationDigest",
+                                  "observedAt"
+                                ],
+                                "additionalProperties": false
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "retirementEligible",
+                          "organizationId",
+                          "accountSubject",
+                          "installationId",
+                          "recordId",
+                          "runId",
+                          "revision",
+                          "generation",
+                          "attemptId",
+                          "status",
+                          "recordDigest",
+                          "resolution",
+                          "backendObservation"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "evidence": {
+                        "type": "object",
+                        "properties": {
+                          "reasonCode": {
+                            "const": "OWNER_RETIRED_LOCAL_CONTINUATION"
+                          }
+                        },
+                        "required": [
+                          "reasonCode"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "resolvedAt": {
+                        "type": "integer",
+                        "minimum": 0
+                      }
+                    },
+                    "required": [
+                      "schemaVersion",
+                      "state",
+                      "receiptId",
+                      "idempotencyKey",
+                      "candidate",
+                      "evidence",
+                      "resolvedAt"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "schemaVersion": {
+                        "const": "loomex.continuation-resolution/v1"
+                      },
+                      "state": {
+                        "const": "verified_terminal"
+                      },
+                      "receiptId": {
+                        "type": "string",
+                        "format": "uuid"
+                      },
+                      "idempotencyKey": {
+                        "type": "string",
+                        "format": "uuid"
+                      },
+                      "candidate": {
+                        "type": "object",
+                        "properties": {
+                          "kind": {
+                            "const": "presentation_delivery"
+                          },
+                          "retirementEligible": {
+                            "type": "boolean"
+                          },
+                          "organizationId": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 512
+                          },
+                          "accountSubject": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 512
+                          },
+                          "installationId": {
+                            "const": ""
+                          },
+                          "recordId": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 384
+                          },
+                          "runId": {
+                            "oneOf": [
+                              {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 512
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "revision": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "generation": {
+                            "type": "null"
+                          },
+                          "attemptId": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "status": {
+                            "type": "string",
+                            "enum": [
+                              "ready",
+                              "sending",
+                              "not_sent",
+                              "acknowledged",
+                              "rejected",
+                              "unknown"
+                            ]
+                          },
+                          "recordDigest": {
+                            "type": "string",
+                            "pattern": "^[a-f0-9]{64}$"
+                          },
+                          "resolution": {
+                            "type": "object",
+                            "properties": {
+                              "state": {
+                                "const": "unresolved"
+                              }
+                            },
+                            "required": [
+                              "state"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "backendObservation": {
+                            "oneOf": [
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "schemaVersion": {
+                                    "const": "loomex.continuation-observation/v1"
+                                  },
+                                  "runId": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 512
+                                  },
+                                  "recordDigest": {
+                                    "type": "string",
+                                    "pattern": "^[a-f0-9]{64}$"
+                                  },
+                                  "status": {
+                                    "type": "string",
+                                    "enum": [
+                                      "queued",
+                                      "running",
+                                      "waiting_for_human",
+                                      "waiting",
+                                      "pending",
+                                      "active",
+                                      "paused",
+                                      "completed",
+                                      "failed",
+                                      "cancelled",
+                                      "canceled",
+                                      "deleted",
+                                      "succeeded",
+                                      "error"
+                                    ]
+                                  },
+                                  "terminal": {
+                                    "type": "boolean"
+                                  },
+                                  "observationDigest": {
+                                    "type": "string",
+                                    "pattern": "^[a-f0-9]{64}$"
+                                  },
+                                  "observedAt": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  }
+                                },
+                                "required": [
+                                  "schemaVersion",
+                                  "runId",
+                                  "recordDigest",
+                                  "status",
+                                  "terminal",
+                                  "observationDigest",
+                                  "observedAt"
+                                ],
+                                "additionalProperties": false
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "retirementEligible",
+                          "organizationId",
+                          "accountSubject",
+                          "installationId",
+                          "recordId",
+                          "runId",
+                          "revision",
+                          "generation",
+                          "attemptId",
+                          "status",
+                          "recordDigest",
+                          "resolution",
+                          "backendObservation"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "evidence": {
+                        "type": "object",
+                        "properties": {
+                          "runId": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 512
+                          },
+                          "observationDigest": {
+                            "type": "string",
+                            "pattern": "^[a-f0-9]{64}$"
+                          }
+                        },
+                        "required": [
+                          "runId",
+                          "observationDigest"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "resolvedAt": {
+                        "type": "integer",
+                        "minimum": 0
+                      }
+                    },
+                    "required": [
+                      "schemaVersion",
+                      "state",
+                      "receiptId",
+                      "idempotencyKey",
+                      "candidate",
+                      "evidence",
+                      "resolvedAt"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "continuationEligible": {
+                "type": "boolean"
               }
             },
             "required": [
@@ -8833,6 +9713,446 @@
                   "string",
                   "null"
                 ]
+              },
+              "resolution": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "state": {
+                        "const": "unresolved"
+                      }
+                    },
+                    "required": [
+                      "state"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "schemaVersion": {
+                        "const": "loomex.continuation-resolution/v1"
+                      },
+                      "state": {
+                        "const": "retired_by_owner"
+                      },
+                      "receiptId": {
+                        "type": "string",
+                        "format": "uuid"
+                      },
+                      "idempotencyKey": {
+                        "type": "string",
+                        "format": "uuid"
+                      },
+                      "candidate": {
+                        "type": "object",
+                        "properties": {
+                          "kind": {
+                            "const": "presentation_delivery"
+                          },
+                          "retirementEligible": {
+                            "type": "boolean"
+                          },
+                          "organizationId": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 512
+                          },
+                          "accountSubject": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 512
+                          },
+                          "installationId": {
+                            "const": ""
+                          },
+                          "recordId": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 384
+                          },
+                          "runId": {
+                            "oneOf": [
+                              {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 512
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "revision": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "generation": {
+                            "type": "null"
+                          },
+                          "attemptId": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "status": {
+                            "type": "string",
+                            "enum": [
+                              "ready",
+                              "sending",
+                              "not_sent",
+                              "acknowledged",
+                              "rejected",
+                              "unknown"
+                            ]
+                          },
+                          "recordDigest": {
+                            "type": "string",
+                            "pattern": "^[a-f0-9]{64}$"
+                          },
+                          "resolution": {
+                            "type": "object",
+                            "properties": {
+                              "state": {
+                                "const": "unresolved"
+                              }
+                            },
+                            "required": [
+                              "state"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "backendObservation": {
+                            "oneOf": [
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "schemaVersion": {
+                                    "const": "loomex.continuation-observation/v1"
+                                  },
+                                  "runId": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 512
+                                  },
+                                  "recordDigest": {
+                                    "type": "string",
+                                    "pattern": "^[a-f0-9]{64}$"
+                                  },
+                                  "status": {
+                                    "type": "string",
+                                    "enum": [
+                                      "queued",
+                                      "running",
+                                      "waiting_for_human",
+                                      "waiting",
+                                      "pending",
+                                      "active",
+                                      "paused",
+                                      "completed",
+                                      "failed",
+                                      "cancelled",
+                                      "canceled",
+                                      "deleted",
+                                      "succeeded",
+                                      "error"
+                                    ]
+                                  },
+                                  "terminal": {
+                                    "type": "boolean"
+                                  },
+                                  "observationDigest": {
+                                    "type": "string",
+                                    "pattern": "^[a-f0-9]{64}$"
+                                  },
+                                  "observedAt": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  }
+                                },
+                                "required": [
+                                  "schemaVersion",
+                                  "runId",
+                                  "recordDigest",
+                                  "status",
+                                  "terminal",
+                                  "observationDigest",
+                                  "observedAt"
+                                ],
+                                "additionalProperties": false
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "retirementEligible",
+                          "organizationId",
+                          "accountSubject",
+                          "installationId",
+                          "recordId",
+                          "runId",
+                          "revision",
+                          "generation",
+                          "attemptId",
+                          "status",
+                          "recordDigest",
+                          "resolution",
+                          "backendObservation"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "evidence": {
+                        "type": "object",
+                        "properties": {
+                          "reasonCode": {
+                            "const": "OWNER_RETIRED_LOCAL_CONTINUATION"
+                          }
+                        },
+                        "required": [
+                          "reasonCode"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "resolvedAt": {
+                        "type": "integer",
+                        "minimum": 0
+                      }
+                    },
+                    "required": [
+                      "schemaVersion",
+                      "state",
+                      "receiptId",
+                      "idempotencyKey",
+                      "candidate",
+                      "evidence",
+                      "resolvedAt"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "schemaVersion": {
+                        "const": "loomex.continuation-resolution/v1"
+                      },
+                      "state": {
+                        "const": "verified_terminal"
+                      },
+                      "receiptId": {
+                        "type": "string",
+                        "format": "uuid"
+                      },
+                      "idempotencyKey": {
+                        "type": "string",
+                        "format": "uuid"
+                      },
+                      "candidate": {
+                        "type": "object",
+                        "properties": {
+                          "kind": {
+                            "const": "presentation_delivery"
+                          },
+                          "retirementEligible": {
+                            "type": "boolean"
+                          },
+                          "organizationId": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 512
+                          },
+                          "accountSubject": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 512
+                          },
+                          "installationId": {
+                            "const": ""
+                          },
+                          "recordId": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 384
+                          },
+                          "runId": {
+                            "oneOf": [
+                              {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 512
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "revision": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "generation": {
+                            "type": "null"
+                          },
+                          "attemptId": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "status": {
+                            "type": "string",
+                            "enum": [
+                              "ready",
+                              "sending",
+                              "not_sent",
+                              "acknowledged",
+                              "rejected",
+                              "unknown"
+                            ]
+                          },
+                          "recordDigest": {
+                            "type": "string",
+                            "pattern": "^[a-f0-9]{64}$"
+                          },
+                          "resolution": {
+                            "type": "object",
+                            "properties": {
+                              "state": {
+                                "const": "unresolved"
+                              }
+                            },
+                            "required": [
+                              "state"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "backendObservation": {
+                            "oneOf": [
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "schemaVersion": {
+                                    "const": "loomex.continuation-observation/v1"
+                                  },
+                                  "runId": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 512
+                                  },
+                                  "recordDigest": {
+                                    "type": "string",
+                                    "pattern": "^[a-f0-9]{64}$"
+                                  },
+                                  "status": {
+                                    "type": "string",
+                                    "enum": [
+                                      "queued",
+                                      "running",
+                                      "waiting_for_human",
+                                      "waiting",
+                                      "pending",
+                                      "active",
+                                      "paused",
+                                      "completed",
+                                      "failed",
+                                      "cancelled",
+                                      "canceled",
+                                      "deleted",
+                                      "succeeded",
+                                      "error"
+                                    ]
+                                  },
+                                  "terminal": {
+                                    "type": "boolean"
+                                  },
+                                  "observationDigest": {
+                                    "type": "string",
+                                    "pattern": "^[a-f0-9]{64}$"
+                                  },
+                                  "observedAt": {
+                                    "type": "integer",
+                                    "minimum": 0
+                                  }
+                                },
+                                "required": [
+                                  "schemaVersion",
+                                  "runId",
+                                  "recordDigest",
+                                  "status",
+                                  "terminal",
+                                  "observationDigest",
+                                  "observedAt"
+                                ],
+                                "additionalProperties": false
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "retirementEligible",
+                          "organizationId",
+                          "accountSubject",
+                          "installationId",
+                          "recordId",
+                          "runId",
+                          "revision",
+                          "generation",
+                          "attemptId",
+                          "status",
+                          "recordDigest",
+                          "resolution",
+                          "backendObservation"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "evidence": {
+                        "type": "object",
+                        "properties": {
+                          "runId": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 512
+                          },
+                          "observationDigest": {
+                            "type": "string",
+                            "pattern": "^[a-f0-9]{64}$"
+                          }
+                        },
+                        "required": [
+                          "runId",
+                          "observationDigest"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "resolvedAt": {
+                        "type": "integer",
+                        "minimum": 0
+                      }
+                    },
+                    "required": [
+                      "schemaVersion",
+                      "state",
+                      "receiptId",
+                      "idempotencyKey",
+                      "candidate",
+                      "evidence",
+                      "resolvedAt"
+                    ],
+                    "additionalProperties": false
+                  }
+                ]
+              },
+              "continuationEligible": {
+                "type": "boolean"
               }
             },
             "required": [
@@ -12216,6 +13536,7 @@
     "workflows.canonical-authoring-contract/v1",
     "workflows.patch.notes-preserve/v1",
     "workflows.runtime-draft-mutations/v1",
-    "workflow.queue-observation/v1"
+    "workflow.queue-observation/v1",
+    "presentation.continuation-resolution/v1"
   ]
 }

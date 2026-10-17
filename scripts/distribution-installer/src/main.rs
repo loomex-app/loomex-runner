@@ -605,41 +605,233 @@ fn run_owner(script: &Path, release: &Path, args: &[String]) -> Result<()> {
     );
     Ok(())
 }
-// Keep owner output private: it can contain paths, account details or arbitrary errors.
-fn owner_preflight(cmd: &mut Command, schema: &str, completion: &mut Completion) -> Result<Value> {
-    // Preflight owners return typed rejection JSON with nonzero exit status.
-    // Never expose arbitrary stdout/stderr or interpret prose as authority.
+// Owners are authority for their state; only bounded typed diagnostics cross this boundary.
+fn bounded_owner_reference(v: &Value) -> Result<Option<Value>> {
+    if v.is_null() {
+        return Ok(None);
+    }
+    ensure!(
+        v["owner"] == "bootstrap_uninstall",
+        "unsupported reference owner"
+    );
+    let schema = v["journalSchema"]
+        .as_str()
+        .context("owner journal schema missing")?;
+    let phase = v["phase"].as_str().context("owner phase missing")?;
+    let sha = v["journalSha256"]
+        .as_str()
+        .context("owner journal digest missing")?;
+    ensure!(
+        matches!(
+            schema,
+            "app.loomex.runner.bootstrap-uninstall/v1" | "app.loomex.runner.bootstrap-uninstall/v2"
+        ) && hex_string(sha, 64),
+        "unsupported owner reference"
+    );
+    ensure!(
+        matches!(
+            phase,
+            "prepared"
+                | "idle_verified"
+                | "stop_intent"
+                | "stopped"
+                | "revocation_pending"
+                | "revoked"
+                | "cleanup"
+                | "terminal"
+        ),
+        "unsupported owner phase"
+    );
+    let adoption = v["adoptionStarted"]
+        .as_bool()
+        .context("owner adoption missing")?;
+    Ok(Some(
+        serde_json::json!({"owner":"bootstrap_uninstall","journalSchema":schema,"journalSha256":sha,"phase":phase,"adoptionStarted":adoption}),
+    ))
+}
+fn bounded_assessment(v: &Value) -> Result<Option<Value>> {
+    if v.is_null() {
+        return Ok(None);
+    }
+    ensure!(
+        v["schema"] == "app.loomex.runner.managed-state-assessment/v1",
+        "unsupported assessment schema"
+    );
+    let digest = v["assessmentDigest"]
+        .as_str()
+        .context("assessment digest missing")?;
+    ensure!(hex_string(digest, 64), "invalid assessment digest");
+    let resolved = v["resolved"]
+        .as_bool()
+        .context("assessment resolution missing")?;
+    let blockers = v["blockers"]
+        .as_array()
+        .context("assessment blockers missing")?;
+    ensure!(blockers.len() <= 32, "too many assessment categories");
+    let mut bounded = Vec::new();
+    for blocker in blockers {
+        let category = blocker["category"]
+            .as_str()
+            .context("assessment category missing")?;
+        ensure!(
+            matches!(
+                category,
+                "presentation_delivery_pending"
+                    | "presentation_delivery_unknown"
+                    | "follow_pending"
+                    | "follow_supersession_unverified"
+                    | "domain_mutation"
+                    | "job_or_terminal_delivery"
+                    | "recovery_schedule"
+                    | "operation_cache"
+                    | "response_spool"
+                    | "unsupported_schema"
+                    | "unsafe_state"
+                    | "unreadable_state"
+                    | "observation_drift"
+            ),
+            "unsupported assessment category"
+        );
+        let count = blocker["count"]
+            .as_u64()
+            .context("assessment count missing")?;
+        let refs = blocker["references"]
+            .as_array()
+            .context("assessment references missing")?;
+        ensure!(
+            refs.len() <= 32
+                && refs
+                    .iter()
+                    .all(|r| r.as_str().is_some_and(|r| hex_string(r, 64))),
+            "invalid assessment references"
+        );
+        bounded.push(serde_json::json!({"category":category,"count":count,"references":refs}));
+    }
+    Ok(Some(
+        serde_json::json!({"schema":"app.loomex.runner.managed-state-assessment/v1","assessmentDigest":digest,"resolved":resolved,"blockers":bounded}),
+    ))
+}
+fn known_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "ACTIVATION_COMPLETED"
+            | "RECOVERY_COMPLETED"
+            | "ACTIVE_WORK_PENDING"
+            | "SERVICE_STOP_PENDING"
+            | "MANAGED_WORK_UNRESOLVED"
+            | "ACTIVATION_BLOCKED"
+            | "ACTIVATION_UNCONFIRMED"
+            | "RECOVERY_BLOCKED"
+            | "RECOVERY_UNCONFIRMED"
+            | "OWNER_SCHEMA_UNSUPPORTED"
+            | "OWNER_STATE_UNSAFE"
+            | "OWNER_STATE_UNREADABLE"
+            | "OWNER_STATE_DRIFT"
+            | "OWNER_SIGNATURE_REJECTED"
+            | "OWNER_AUTHORIZATION_REQUIRED"
+            | "OWNER_BINDING_MISMATCH"
+            | "OWNER_STATE_INVALID"
+            | "MANAGED_STATE_UNSAFE"
+            | "MANAGED_STATE_UNREADABLE"
+            | "MANAGED_STATE_SCHEMA_UNSUPPORTED"
+            | "MANAGED_STATE_OBSERVATION_DRIFT"
+            | "UNINSTALL_WORK_INSPECTED"
+            | "UNINSTALL_WORK_COMPLETED"
+            | "UNINSTALL_WORK_BINDING_CHANGED"
+            | "UNINSTALL_WORK_PHASE_UNSUPPORTED"
+            | "UNINSTALL_WORK_QUIESCENCE_REQUIRED"
+            | "UNINSTALL_WORK_MAINTENANCE_PENDING"
+            | "UNINSTALL_WORK_ASSESSMENT_CHANGED"
+            | "UNINSTALL_WORK_NATIVE_FAILED"
+            | "UNINSTALL_WORK_BLOCKED"
+            | "UNINSTALL_WORK_AUDIT_LIMIT"
+            | "UNINSTALL_WORK_PREVIEW_LIMIT"
+            | "UNINSTALL_WORK_REVIEW_UNAVAILABLE"
+            | "UNINSTALL_WORK_OBSERVATION_INCOMPLETE"
+            | "UNINSTALL_WORK_RECONCILIATION_REQUIRED"
+            | "UNINSTALL_WORK_IDENTITY_CHANGED"
+            | "UNINSTALL_WORK_DOMAIN_OUTCOME_PENDING"
+            | "UNINSTALL_WORK_RECEIPT_MISMATCH"
+            | "UNINSTALL_WORK_RECONCILIATION_UNSUPPORTED"
+            | "ASSESSMENT_STALE"
+    )
+}
+fn known_next(next: &str) -> bool {
+    matches!(
+        next,
+        "none"
+            | "install_candidate"
+            | "resume_native_operation"
+            | "resume_bootstrap_uninstall"
+            | "recover_uninstall"
+            | "inspect_lifecycle_status"
+            | "reconcile_managed_work"
+            | "resume_original_uninstall_owner"
+            | "inspect_protected_ownership"
+            | "resume_plugin_operation"
+            | "inspect_uninstall_work"
+            | "resume_uninstall_work"
+    )
+}
+fn retain_diagnostics(value: &Value, completion: &mut Completion) -> Result<()> {
+    if let Some(reason) = value["reasonCode"].as_str().filter(|r| known_reason(r)) {
+        completion.reason_code = reason.into();
+    }
+    if value.get("operationId").is_some_and(Value::is_null) {
+        completion.operation_id = None;
+    }
+    let observation = &value["recoveryOwnership"];
+    if let Some(id) = value["operationId"]
+        .as_str()
+        .or_else(|| observation["operationId"].as_str())
+        .filter(|id| valid_operation_id(id))
+    {
+        completion.operation_id = Some(id.into());
+    }
+    if let Some(next) = value["nextAction"]
+        .as_str()
+        .or_else(|| observation["nextAction"].as_str())
+        .filter(|n| known_next(n))
+    {
+        completion.next_action = next.into();
+    }
+    if let Some(reference) = value.get("ownerReference") {
+        completion.owner_reference = bounded_owner_reference(reference)?;
+    }
+    if let Some(assessment) = value
+        .get("assessment")
+        .or_else(|| value.get("managedStateAssessment"))
+    {
+        completion.assessment = bounded_assessment(assessment)?;
+    }
+    Ok(())
+}
+fn owner_preflight(
+    cmd: &mut Command,
+    schema: &str,
+    work_mode: bool,
+    completion: &mut Completion,
+) -> Result<Value> {
     let out = cmd.output()?;
     let value: Value = serde_json::from_slice(&out.stdout).context("unsupported owner response")?;
     ensure!(
-        value["schema"] == schema,
+        value["schema"] == schema
+            || (schema == "app.loomex.runner.install-preflight/v1"
+                && value["schema"] == "app.loomex.runner.install-preflight/v2"),
         "unsupported owner preflight schema"
     );
-    if schema == "app.loomex.runner.install-preflight/v1" {
-        let observation = &value["recoveryOwnership"];
-        if let Some(id) = observation["operationId"]
-            .as_str()
-            .filter(|id| valid_operation_id(id))
-        {
-            completion.operation_id = Some(id.into());
-        }
-        if let Some(next) = observation["nextAction"].as_str().filter(|next| {
-            matches!(
-                *next,
-                "recover_uninstall"
-                    | "resume_bootstrap_uninstall"
-                    | "resume_native_operation"
-                    | "resume_original_uninstall_owner"
-                    | "inspect_protected_ownership"
-            )
-        }) {
-            completion.next_action = next.into();
-        }
-    }
+    retain_diagnostics(&value, completion)?;
+    let eligible = if work_mode {
+        ensure!(
+            schema == "app.loomex.runner.install-preflight/v1",
+            "only native work preflight can authorize maintenance"
+        );
+        value["uninstallWorkEligibility"]["eligible"] == true
+    } else {
+        value["activation"]["eligible"] == true
+    };
     ensure!(
-        out.status.success()
-            && value["artifact"]["eligible"] == true
-            && value["activation"]["eligible"] == true,
+        out.status.success() && value["artifact"]["eligible"] == true && eligible,
         "ineligible owner preflight response"
     );
     Ok(value)
@@ -649,6 +841,7 @@ fn preflight_owners(
     plugin: Option<&Path>,
     runner_args: &[String],
     plugin_args: &[String],
+    work_mode: bool,
     completion: &mut Completion,
 ) -> Result<(Value, Option<Value>)> {
     completion.phase = "runner-preflight";
@@ -658,6 +851,7 @@ fn preflight_owners(
             .arg(runner)
             .args(runner_args),
         "app.loomex.runner.install-preflight/v1",
+        work_mode,
         completion,
     )?;
     let plugin = if let Some(plugin) = plugin {
@@ -670,6 +864,7 @@ fn preflight_owners(
                 .arg(plugin)
                 .args(plugin_args),
             "app.loomex.plugin.install-preflight/v1",
+            false,
             completion,
         )?)
     } else {
@@ -690,11 +885,13 @@ struct Completion {
     plugin: &'static str,
     host_registration: &'static str,
     guidance: Option<String>,
+    owner_reference: Option<Value>,
+    assessment: Option<Value>,
 }
 impl Default for Completion {
     fn default() -> Self {
         Self {
-            schema: "app.loomex.paired-install-result/v2",
+            schema: "app.loomex.paired-install-result/v3",
             phase: "artifact-verification",
             outcome: "blocked",
             operation_id: None,
@@ -704,6 +901,8 @@ impl Default for Completion {
             plugin: "not-attempted",
             host_registration: "not-attempted",
             guidance: None,
+            owner_reference: None,
+            assessment: None,
         }
     }
 }
@@ -717,6 +916,9 @@ fn failure_report(c: &Completion) -> Value {
         }
         "runner-activation" | "runner-health" | "runner-recovery" => {
             "Runner activation or recovery is unconfirmed. Resolve the native lifecycle owner before retrying this exact release set."
+        }
+        "runner-uninstall-work" => {
+            "Retained uninstall work requires its verified native maintenance owner. Review the bounded assessment and retry the same release and journal binding."
         }
         "plugin-activation" => {
             "Plugin installation is incomplete; the healthy runner remains installed. Retry this exact release set to resume the plugin owner."
@@ -737,7 +939,7 @@ fn failure_report(c: &Completion) -> Value {
             "Release-set verification failed. Review the exact artifacts and invocation before retrying."
         }
     };
-    serde_json::json!({"schema":c.schema,"ok":false,"outcome":c.outcome,"operationId":c.operation_id,"nextAction":c.next_action,"reasonCode":c.reason_code,"category":"PAIRED_INSTALL_REJECTED","phase":c.phase,"completion":c,"message":message})
+    serde_json::json!({"schema":c.schema,"ok":false,"outcome":c.outcome,"operationId":c.operation_id,"nextAction":c.next_action,"reasonCode":c.reason_code,"ownerReference":c.owner_reference,"assessment":c.assessment,"category":"PAIRED_INSTALL_REJECTED","phase":c.phase,"completion":c,"message":message})
 }
 fn valid_operation_id(id: &str) -> bool {
     !id.is_empty()
@@ -751,7 +953,13 @@ fn native_activation(cmd: &mut Command, completion: &mut Completion) -> Result<b
     let v: Value =
         serde_json::from_slice(&out.stdout).context("unsupported native activation response")?;
     ensure!(
-        v["schema"] == "app.loomex.runner.bootstrap-activation/v1",
+        matches!(
+            v["schema"].as_str(),
+            Some(
+                "app.loomex.runner.bootstrap-activation/v1"
+                    | "app.loomex.runner.bootstrap-activation/v2"
+            )
+        ),
         "unsupported native activation schema"
     );
     let outcome = v["outcome"].as_str().context("native outcome missing")?;
@@ -759,35 +967,9 @@ fn native_activation(cmd: &mut Command, completion: &mut Completion) -> Result<b
     let next = v["nextAction"]
         .as_str()
         .context("native next action missing")?;
-    ensure!(
-        matches!(
-            reason,
-            "ACTIVATION_COMPLETED"
-                | "RECOVERY_COMPLETED"
-                | "ACTIVE_WORK_PENDING"
-                | "SERVICE_STOP_PENDING"
-                | "MANAGED_WORK_UNRESOLVED"
-                | "ACTIVATION_BLOCKED"
-                | "ACTIVATION_UNCONFIRMED"
-                | "RECOVERY_BLOCKED"
-                | "RECOVERY_UNCONFIRMED"
-        ),
-        "unknown native reason"
-    );
-    ensure!(
-        matches!(
-            next,
-            "none"
-                | "install_candidate"
-                | "resume_native_operation"
-                | "resume_bootstrap_uninstall"
-                | "recover_uninstall"
-                | "inspect_lifecycle_status"
-                | "reconcile_managed_work"
-                | "resume_original_uninstall_owner"
-        ),
-        "unknown native next action"
-    );
+    ensure!(known_reason(reason), "unknown native reason");
+    ensure!(known_next(next), "unknown native next action");
+    retain_diagnostics(&v, completion)?;
     completion.operation_id = match &v["operationId"] {
         Value::Null => None,
         Value::String(id) if valid_operation_id(id) => Some(id.clone()),
@@ -830,8 +1012,154 @@ fn native_activation(cmd: &mut Command, completion: &mut Completion) -> Result<b
         _ => bail!("unsupported native outcome"),
     }
 }
+fn work_operation_id(value: &Value) -> Result<Option<String>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::String(id) => {
+            let parts: Vec<_> = id.split('-').collect();
+            ensure!(
+                parts.len() == 5
+                    && parts
+                        .iter()
+                        .zip([8, 4, 4, 4, 12])
+                        .all(|(part, len)| hex_string(part, len)),
+                "unsupported uninstall work operation identity"
+            );
+            Ok(Some(id.clone()))
+        }
+        _ => bail!("unsupported uninstall work operation identity"),
+    }
+}
+fn uninstall_work_result(
+    cmd: &mut Command,
+    action: &str,
+    preflight: &Value,
+    completion: &mut Completion,
+) -> Result<()> {
+    let out = cmd.output()?;
+    let value: Value =
+        serde_json::from_slice(&out.stdout).context("unsupported uninstall work response")?;
+    ensure!(
+        value["schema"] == "app.loomex.runner.bootstrap-uninstall-work/v1"
+            && value["action"] == action,
+        "unsupported uninstall work schema or action"
+    );
+    let reason = value["reasonCode"]
+        .as_str()
+        .context("uninstall work reason missing")?;
+    let next = value["nextAction"]
+        .as_str()
+        .context("uninstall work action missing")?;
+    ensure!(
+        known_reason(reason) && known_next(next),
+        "unsupported uninstall work diagnostic"
+    );
+    let outcome = value["outcome"]
+        .as_str()
+        .context("uninstall work outcome missing")?;
+    let rejected = matches!(outcome, "blocked" | "unconfirmed");
+    // Preflight facts remain useful failure diagnostics, but are never evidence
+    // that this invocation completed or owns a pending native operation.
+    let reference = bounded_owner_reference(
+        value
+            .get("ownerReference")
+            .context("uninstall work owner missing")?,
+    )?;
+    let assessment = bounded_assessment(
+        value
+            .get("assessment")
+            .context("uninstall work assessment missing")?,
+    )?;
+    let operation = work_operation_id(
+        value
+            .get("operationId")
+            .context("uninstall work operation missing")?,
+    )?;
+    if let Some(reference) = &reference {
+        let expected = bounded_owner_reference(&preflight["ownerReference"])?
+            .context("uninstall work preflight owner missing")?;
+        for key in ["owner", "journalSchema", "journalSha256", "phase"] {
+            ensure!(
+                reference[key] == expected[key],
+                "uninstall work owner binding changed"
+            );
+        }
+        if !rejected && action != "inspect" && expected["adoptionStarted"] == true {
+            let prior = preflight["ownerReference"]
+                .get("operationId")
+                .or_else(|| preflight.get("operationId"))
+                .context("adopted uninstall work operation missing")?;
+            ensure!(
+                operation.is_some() && work_operation_id(prior)? == operation,
+                "adopted uninstall work operation changed"
+            );
+        }
+    }
+    ensure!(
+        rejected || (reference.is_some() && assessment.is_some()),
+        "unverified uninstall work owner or assessment"
+    );
+    match outcome {
+        "inspected" => {
+            ensure!(
+                action == "inspect" && reason == "UNINSTALL_WORK_INSPECTED" && out.status.success(),
+                "uninstall work inspection differs"
+            );
+        }
+        "completed" => {
+            ensure!(
+                action != "inspect"
+                    && reason == "UNINSTALL_WORK_COMPLETED"
+                    && out.status.success()
+                    && operation.is_some(),
+                "uninstall work completion differs"
+            );
+        }
+        "pending" => {
+            ensure!(
+                action != "inspect"
+                    && reason == "UNINSTALL_WORK_MAINTENANCE_PENDING"
+                    && out.status.code() == Some(3)
+                    && operation.is_some()
+                    && next == "resume_uninstall_work",
+                "unverified uninstall work pending"
+            );
+        }
+        "blocked" | "unconfirmed" => {
+            ensure!(
+                out.status.code() == Some(1),
+                "uninstall work refusal exit differs"
+            );
+        }
+        _ => bail!("unsupported uninstall work outcome"),
+    }
+    completion.operation_id = operation;
+    completion.reason_code = reason.into();
+    completion.next_action = next.into();
+    if reference.is_some() {
+        completion.owner_reference = reference;
+    }
+    if assessment.is_some() {
+        completion.assessment = assessment;
+    }
+    match outcome {
+        "inspected" | "completed" => completion.outcome = "completed",
+        "pending" => completion.outcome = "pending",
+        "blocked" => {
+            completion.outcome = "blocked";
+            bail!("uninstall work blocked");
+        }
+        "unconfirmed" => {
+            completion.outcome = "unconfirmed";
+            bail!("uninstall work unconfirmed");
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
 fn result_report(c: &Completion) -> Value {
-    serde_json::json!({"schema":c.schema,"ok":c.outcome == "completed","outcome":c.outcome,"operationId":c.operation_id,"nextAction":c.next_action,"reasonCode":c.reason_code,"phase":c.phase,"completion":c})
+    serde_json::json!({"schema":c.schema,"ok":c.outcome == "completed","outcome":c.outcome,"operationId":c.operation_id,"nextAction":c.next_action,"reasonCode":c.reason_code,"ownerReference":c.owner_reference,"assessment":c.assessment,"phase":c.phase,"completion":c})
 }
 // Resolve existing aliases component by component while retaining normalized
 // missing suffixes. This reads metadata only and never creates an install root.
@@ -1249,6 +1577,8 @@ fn install(completion: &mut Completion) -> Result<()> {
     let mut preflight_only = false;
     let mut authorize_keychain_transition = false;
     let mut recover_uninstall = false;
+    let mut uninstall_work: Option<String> = None;
+    let mut assessment_sha: Option<String> = None;
     let mut old_journal_sha = None;
     let mut replace_candidate = false;
     let mut recovery_intent_sha = None;
@@ -1264,7 +1594,9 @@ fn install(completion: &mut Completion) -> Result<()> {
             | "--plugin-install-base"
             | "--cache-dir"
             | "--expected-old-journal-sha256"
-            | "--expected-recovery-intent-sha256" => {
+            | "--expected-recovery-intent-sha256"
+            | "--uninstall-work"
+            | "--expected-assessment-sha256" => {
                 let value = args.get(i + 1).context("missing option value")?.clone();
                 match args[i].as_str() {
                     "--manifest" => manifest = Some(value),
@@ -1273,6 +1605,8 @@ fn install(completion: &mut Completion) -> Result<()> {
                     "--cache-dir" => cache = Some(PathBuf::from(value)),
                     "--expected-old-journal-sha256" => old_journal_sha = Some(value),
                     "--expected-recovery-intent-sha256" => recovery_intent_sha = Some(value),
+                    "--uninstall-work" => uninstall_work = Some(value),
+                    "--expected-assessment-sha256" => assessment_sha = Some(value),
                     key => bases.push((key.to_owned(), value)),
                 }
                 i += 2;
@@ -1329,9 +1663,34 @@ fn install(completion: &mut Completion) -> Result<()> {
     let expected = expected.context("an independently reviewed --manifest-sha256 is required")?;
     ensure!(hex_string(&expected, 64), "invalid manifest digest");
     ensure!(
-        recover_uninstall == old_journal_sha.is_some(),
+        (recover_uninstall || uninstall_work.is_some()) == old_journal_sha.is_some(),
         "recovery requires explicit old journal digest"
     );
+    if let Some(action) = &uninstall_work {
+        ensure!(
+            matches!(action.as_str(), "inspect" | "reconcile" | "retire-local"),
+            "unsupported uninstall work action"
+        );
+        ensure!(
+            !recover_uninstall
+                && !verify_only
+                && !preflight_only
+                && !replace_candidate
+                && !runner_only,
+            "uninstall work is a separate paired recovery mode"
+        );
+        ensure!(
+            action != "inspect" || !authorize_keychain_transition,
+            "inspection cannot authorize a native credential transition"
+        );
+    }
+    ensure!(
+        assessment_sha.is_some() == (uninstall_work.as_deref() == Some("retire-local")),
+        "local retirement requires the reviewed assessment digest only"
+    );
+    if let Some(sha) = &assessment_sha {
+        ensure!(hex_string(sha, 64), "invalid assessment digest");
+    }
     if let Some(sha) = &old_journal_sha {
         ensure!(hex_string(sha, 64), "invalid old journal digest");
     }
@@ -1396,7 +1755,7 @@ fn install(completion: &mut Completion) -> Result<()> {
     if verify_only {
         println!(
             "{}",
-            serde_json::json!({"schema":"app.loomex.paired-install-result/v2","ok":true,"outcome":"completed","operationId":null,"nextAction":"none","reasonCode":"ARTIFACT_VERIFIED","mode":"verify-only","artifactIntegrity":true,"installedEligibilityVerified":false})
+            serde_json::json!({"schema":"app.loomex.paired-install-result/v3","ok":true,"outcome":"completed","operationId":null,"nextAction":"none","reasonCode":"ARTIFACT_VERIFIED","mode":"verify-only","artifactIntegrity":true,"installedEligibilityVerified":false})
         );
         return Ok(());
     }
@@ -1471,10 +1830,10 @@ fn install(completion: &mut Completion) -> Result<()> {
         ]);
     }
     let mut recovery_args = runner_args.clone();
-    if recover_uninstall {
+    if recover_uninstall || uninstall_work.is_some() {
         recovery_args.extend([
             "--expected-old-journal-sha256".into(),
-            old_journal_sha.unwrap(),
+            old_journal_sha.clone().unwrap(),
         ]);
         if replace_candidate {
             recovery_args.extend([
@@ -1484,7 +1843,24 @@ fn install(completion: &mut Completion) -> Result<()> {
             ]);
         }
         preflight_runner_args = recovery_args.clone();
-        preflight_runner_args.push("--recovery-uninstall".into());
+        if let Some(action) = &uninstall_work {
+            recovery_args.extend(["--action".into(), action.clone()]);
+            if let Some(sha) = &assessment_sha {
+                recovery_args.extend(["--expected-assessment-sha256".into(), sha.clone()]);
+            }
+            preflight_runner_args = runner_args.clone();
+            preflight_runner_args.extend([
+                "--expected-old-journal-sha256".into(),
+                old_journal_sha.clone().unwrap(),
+                "--work-action".into(),
+                action.clone(),
+            ]);
+            if let Some(sha) = &assessment_sha {
+                preflight_runner_args.extend(["--expected-assessment-sha256".into(), sha.clone()]);
+            }
+        } else {
+            preflight_runner_args.push("--recovery-uninstall".into());
+        }
         if incomplete_cache {
             preflight_runner_args.extend([
                 "--expected-release-path".into(),
@@ -1497,8 +1873,19 @@ fn install(completion: &mut Completion) -> Result<()> {
         (!runner_only).then(|| root.join("plugin")).as_deref(),
         &preflight_runner_args,
         &preflight_plugin_args,
+        uninstall_work.is_some(),
         completion,
     )?;
+    if uninstall_work.is_some() && authorize_keychain_transition {
+        completion.phase = "runner-preflight";
+        ensure!(
+            matches!(
+                native["uninstallWorkEligibility"]["signingTransition"].as_str(),
+                Some("eligible" | "needs_explicit_transition")
+            ),
+            "native work preflight did not verify the transition prerequisite"
+        );
+    }
     if recover_uninstall {
         ensure!(
             native["recoveryEligibility"]["eligible"] == true
@@ -1520,6 +1907,39 @@ fn install(completion: &mut Completion) -> Result<()> {
     completion.phase = "host-preflight";
     if !runner_only && has_codex {
         check_marketplace(codex.as_deref().unwrap(), &plugin_base)?;
+    }
+    if let Some(action) = &uninstall_work {
+        completion.phase = "runner-uninstall-work";
+        completion.outcome = "unconfirmed";
+        completion.reason_code = "RECOVERY_UNCONFIRMED".into();
+        // Mutating retries need the same immutable release path; inspection only
+        // observes staged exact bytes and never repairs or creates a cache.
+        let work_runner = if action == "inspect" {
+            if incomplete_cache {
+                recovery_args.extend([
+                    "--expected-release-path".into(),
+                    cache.join("runner").to_string_lossy().into_owned(),
+                ]);
+            }
+            root.join("runner")
+        } else {
+            completion.phase = "cache-persistence";
+            persist_cache(stage.path(), &cache)?;
+            completion.phase = "runner-uninstall-work";
+            cache.join("runner")
+        };
+        uninstall_work_result(
+            Command::new(work_runner.join("loomex-lifecycle-bootstrap"))
+                .arg("uninstall-work")
+                .arg(&work_runner)
+                .args(&recovery_args)
+                .arg("--json"),
+            action,
+            &native,
+            completion,
+        )?;
+        println!("{}", result_report(completion));
+        return Ok(());
     }
     if preflight_only {
         completion.outcome = if restore_required {
@@ -1579,6 +1999,7 @@ fn install(completion: &mut Completion) -> Result<()> {
             (!runner_only).then_some(plugin.as_path()),
             &runner_args,
             &plugin_args,
+            false,
             completion,
         )?;
         completion.phase = "host-preflight";
@@ -1708,6 +2129,36 @@ mod tests {
             },
             installer: a("loomex-install", tag),
         }
+    }
+    #[test]
+    fn bounded_diagnostics_preserve_historical_reference_without_fabricating_operation() {
+        let value = serde_json::json!({"reasonCode":"MANAGED_WORK_UNRESOLVED","nextAction":"reconcile_managed_work","operationId":null,"ownerReference":{"owner":"bootstrap_uninstall","journalSchema":"app.loomex.runner.bootstrap-uninstall/v1","journalSha256":"a".repeat(64),"phase":"prepared","adoptionStarted":false,"secret":"SECRET"},"assessment":{"schema":"app.loomex.runner.managed-state-assessment/v1","assessmentDigest":"b".repeat(64),"resolved":false,"blockers":[{"category":"presentation_delivery_pending","count":13,"references":["c".repeat(64)],"secret":"SECRET"},{"category":"follow_pending","count":14,"references":[]}]}});
+        let mut completion = Completion::default();
+        retain_diagnostics(&value, &mut completion).unwrap();
+        assert!(completion.operation_id.is_none());
+        assert_eq!(completion.reason_code, "MANAGED_WORK_UNRESOLVED");
+        retain_diagnostics(
+            &serde_json::json!({"schema":"app.loomex.plugin.install-preflight/v1"}),
+            &mut completion,
+        )
+        .unwrap();
+        assert!(completion.owner_reference.is_some());
+        assert!(completion.assessment.is_some());
+        let public = serde_json::to_string(&failure_report(&completion)).unwrap();
+        assert!(!public.contains("SECRET"));
+        assert_eq!(
+            completion.owner_reference.unwrap()["adoptionStarted"],
+            false
+        );
+        assert_eq!(completion.assessment.unwrap()["blockers"][1]["count"], 14);
+    }
+    #[test]
+    fn diagnostics_reject_arbitrary_assessment_categories_and_unbounded_references() {
+        let mut value = serde_json::json!({"schema":"app.loomex.runner.managed-state-assessment/v1","assessmentDigest":"a".repeat(64),"resolved":false,"blockers":[{"category":"PRIVATE","count":1,"references":[]}]});
+        assert!(bounded_assessment(&value).is_err());
+        value["blockers"][0]["category"] = serde_json::json!("follow_pending");
+        value["blockers"][0]["references"] = serde_json::json!(vec!["b".repeat(64); 33]);
+        assert!(bounded_assessment(&value).is_err());
     }
     #[test]
     fn pair_and_preview_fail_closed() {
@@ -1927,7 +2378,7 @@ mod tests {
                 .arg("fixture")
                 .arg(output);
             assert_eq!(
-                owner_preflight(&mut cmd, "fixture", &mut Completion::default()).is_ok(),
+                owner_preflight(&mut cmd, "fixture", false, &mut Completion::default()).is_ok(),
                 output.contains(r#""activation":{"eligible":true}"#)
             );
         }
@@ -1942,6 +2393,7 @@ mod tests {
             owner_preflight(
                 &mut cmd,
                 "app.loomex.runner.install-preflight/v1",
+                false,
                 &mut completion
             )
             .is_err()

@@ -110,6 +110,7 @@
     "method:workspaces.grant",
     "method:workspaces.list",
     "method:workspaces.revoke",
+    "presentation.continuation-resolution/v1",
     "presentation.delivery/v2",
     "presentation.sessions.restore/v1",
     "presentation.sessions/v1",
@@ -129,7 +130,7 @@
       "path": "contracts/backend-routes.json"
     },
     "methodCatalog": {
-      "digest": "sha256:40fba737c02efe416135c5f7e736e64d4080b576125cce067522005f7894a284",
+      "digest": "sha256:7826a0672ceb10d3ddf9c4e8196a7eb38203ef0bdd53fd66239924a0cfba30a3",
       "path": "contracts/method-catalog.json"
     }
   },
@@ -760,7 +761,7 @@
       "inputSchemaDigest": "sha256:e5f3efa3772df7305d11d0b8acfeac7c0185645b7e11d61a2d243fd4daa19308",
       "mutating": true,
       "name": "presentation.delivery.begin",
-      "outputSchemaDigest": "sha256:2ce3a4eedaffe0ef95e0829014ee1865b94a5c41453dc1b7483705e3fb11c818",
+      "outputSchemaDigest": "sha256:6cf12763f0037d4c1b74b80a20639aea4f53665ae246bb9b00b588663cdb5ef1",
       "routeIds": [],
       "transportRetry": "never_after_send"
     },
@@ -770,7 +771,7 @@
       "inputSchemaDigest": "sha256:fcc94b18aee592af0b348c5a548060ec8fd2ec3c58846e7cf794c87acce47cbe",
       "mutating": false,
       "name": "presentation.delivery.get",
-      "outputSchemaDigest": "sha256:2ce3a4eedaffe0ef95e0829014ee1865b94a5c41453dc1b7483705e3fb11c818",
+      "outputSchemaDigest": "sha256:6cf12763f0037d4c1b74b80a20639aea4f53665ae246bb9b00b588663cdb5ef1",
       "routeIds": [],
       "transportRetry": "before_response_once"
     },
@@ -780,7 +781,7 @@
       "inputSchemaDigest": "sha256:88da5a864b6f14cd95ea4468c51a43d108d923198f053d97e35e54dbf0b54fa2",
       "mutating": true,
       "name": "presentation.delivery.settle",
-      "outputSchemaDigest": "sha256:2ce3a4eedaffe0ef95e0829014ee1865b94a5c41453dc1b7483705e3fb11c818",
+      "outputSchemaDigest": "sha256:6cf12763f0037d4c1b74b80a20639aea4f53665ae246bb9b00b588663cdb5ef1",
       "routeIds": [],
       "transportRetry": "never_after_send"
     },
@@ -1698,7 +1699,7 @@
   "schemaVersion": "loomex.runner.compatibility-manifest/v1",
   "summary": {
     "backendRouteCount": 73,
-    "capabilityCount": 121,
+    "capabilityCount": 122,
     "methodClassifications": {
       "backend-auth": 7,
       "backend-proxy": 55,

@@ -61,7 +61,7 @@ impl PresentationStore {
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        ensure!(version <= 2, "UNSUPPORTED_STATE_VERSION");
+        ensure!(version <= 3, "UNSUPPORTED_STATE_VERSION");
         connection.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS presentation_sessions (
@@ -124,9 +124,10 @@ impl PresentationStore {
               updated_at INTEGER NOT NULL,
               PRIMARY KEY(organization_id, account_subject, identity)
             );
-            PRAGMA user_version = 2;
+            PRAGMA user_version = 3;
             ",
         )?;
+        crate::continuation_resolution::initialize(&connection)?;
         for candidate in [
             path,
             dir.join("presentation.sqlite3-wal"),
@@ -224,6 +225,19 @@ impl PresentationStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if crate::continuation_resolution::projection(
+            &tx,
+            "presentation_delivery",
+            scope.organization,
+            scope.account,
+            "",
+            identity,
+        )?["state"]
+            != "unresolved"
+        {
+            tx.commit()?;
+            return Ok(());
+        }
         let current: Option<(u64, String, Option<String>)> = tx
             .query_row(
                 "SELECT revision,status,attempt_id FROM presentation_deliveries WHERE organization_id=?1 AND account_subject=?2 AND identity=?3",
@@ -302,7 +316,19 @@ impl PresentationStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        crate::continuation_resolution::eligible(
+            &tx,
+            "presentation_delivery",
+            scope.organization,
+            scope.account,
+            "",
+            identity,
+        )?;
         if let Some(value) = receipt(&tx, scope, "presentation.delivery.begin", key, &digest)? {
+            // Re-project additive closure metadata only after the current
+            // eligibility fence. Preserve the historical mutation fields and
+            // immutable stored receipt bytes, including pre-extension receipts.
+            let value = delivery_resolution_projection(&tx, scope, identity, value)?;
             tx.commit()?;
             return Ok(value);
         }
@@ -359,7 +385,19 @@ impl PresentationStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        crate::continuation_resolution::eligible(
+            &tx,
+            "presentation_delivery",
+            scope.organization,
+            scope.account,
+            "",
+            identity,
+        )?;
         if let Some(value) = receipt(&tx, scope, "presentation.delivery.settle", key, &digest)? {
+            // Re-project additive closure metadata only after the current
+            // eligibility fence. Preserve the historical mutation fields and
+            // immutable stored receipt bytes, including pre-extension receipts.
+            let value = delivery_resolution_projection(&tx, scope, identity, value)?;
             tx.commit()?;
             return Ok(value);
         }
@@ -392,6 +430,74 @@ impl PresentationStore {
             &result,
             now,
         )?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Exact local records for owner-reviewed maintenance. No host session identifiers are exposed.
+    pub fn maintenance_candidates(&self) -> Result<Vec<Value>> {
+        let c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
+        maintenance_delivery_candidates(&c)
+    }
+
+    pub fn maintenance_retire(&self, request: &Value) -> Result<Value> {
+        self.maintenance_close(
+            request,
+            "retired_by_owner",
+            json!({"reasonCode":"OWNER_RETIRED_LOCAL_CONTINUATION"}),
+        )
+    }
+
+    /// The caller supplies a completely retrieved authoritative run/result observation.
+    pub fn maintenance_reconcile(&self, request: &Value, observation: &Value) -> Result<Value> {
+        let mut c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let candidate = maintenance_delivery_candidates(&tx)?
+            .into_iter()
+            .find(|v| {
+                v["organizationId"] == request["organizationId"]
+                    && v["accountSubject"] == request["accountSubject"]
+                    && v["recordId"] == request["recordId"]
+            })
+            .context("MANAGED_WORK_CHANGED")?;
+        crate::continuation_resolution::matches(&candidate, request)?;
+        let result = crate::continuation_resolution::observe(&tx, &candidate, observation)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    fn maintenance_close(&self, request: &Value, state: &str, evidence: Value) -> Result<Value> {
+        let mut c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let candidate = maintenance_delivery_candidates(&tx)?
+            .into_iter()
+            .find(|v| {
+                v["organizationId"] == request["organizationId"]
+                    && v["accountSubject"] == request["accountSubject"]
+                    && v["recordId"] == request["recordId"]
+            })
+            .context("MANAGED_WORK_CHANGED")?;
+        crate::continuation_resolution::matches(&candidate, request)?;
+        ensure!(
+            candidate["retirementEligible"] == true,
+            "MANAGED_WORK_RETIREMENT_UNSUPPORTED"
+        );
+        let observed = crate::continuation_resolution::observation(&tx, &candidate)?;
+        ensure!(
+            observed["recordDigest"] == candidate["recordDigest"],
+            "MANAGED_WORK_RECONCILIATION_REQUIRED"
+        );
+        let result =
+            crate::continuation_resolution::close(&tx, &candidate, request, state, evidence)?;
         tx.commit()?;
         Ok(result)
     }
@@ -606,76 +712,125 @@ impl PresentationStore {
     }
 
     fn operation_settle(&self, scope: Scope<'_>, p: &Value) -> Result<Value> {
-        let session = required_uuid(p, "viewSessionId")?;
-        let operation = required_uuid(p, "operationId")?;
-        let key = required_uuid(p, "idempotencyKey")?;
-        let status = required(p, "status")?;
-        ensure!(
-            ["completed", "ambiguous"].contains(&status),
-            "INVALID_REQUEST"
-        );
-        let reference = p.get("resultReference").cloned().unwrap_or(Value::Null);
-        if !reference.is_null() {
-            validate_presentation_json(&reference)?;
-        }
-        let digest = crate::state::json_digest(p);
         let mut connection = self
             .connection
             .lock()
             .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(value) = receipt(&tx, scope, "presentation.operations.settle", key, &digest)? {
-            tx.commit()?;
-            return Ok(value);
-        }
-        let current: Option<String> = tx.query_row(
-            "SELECT status FROM presentation_operations WHERE operation_id=?1 AND view_session_id=?2 AND organization_id=?3 AND account_subject=?4",
-            params![operation, session, scope.organization, scope.account], |row| row.get(0),
-        ).optional()?;
-        let current = current.context("OPERATION_NOT_FOUND")?;
+        let result = settle_operation(&tx, scope, p)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Private maintenance data. Exact arguments may contain prompts or capabilities.
+    pub fn maintenance_operation_candidates(&self) -> Result<Vec<Value>> {
+        let c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
+        maintenance_operation_candidates(&c)
+    }
+
+    /// Apply a completely read owner-checked receipt through the ordinary settlement owner.
+    pub fn maintenance_operation_settle(
+        &self,
+        request: &Value,
+        canonical_receipt: &Value,
+    ) -> Result<Value> {
         ensure!(
-            ["pending", "ambiguous"].contains(&current.as_str()),
-            "OPERATION_SETTLED"
+            request["recordDigest"] == operation_binding_digest(request),
+            "MANAGED_WORK_CHANGED"
         );
-        let now = crate::state::now();
-        let expires = (status == "completed").then_some(now.saturating_add(RETENTION_SECONDS));
-        tx.execute(
-            "UPDATE presentation_operations SET status=?1,result_reference_json=?2,updated_at=?3,expires_at=?4 WHERE operation_id=?5",
-            params![status, (!reference.is_null()).then(|| encode(&reference)).transpose()?, now, expires, operation],
-        )?;
-        // A session may have been retired while its exact operation was still
-        // awaiting reconciliation.  Pending and ambiguous operations must
-        // clear any old retirement deadline; a completed operation starts a
-        // fresh 30-day restore window only for an already inactive/resolved
-        // session.  This prevents a delayed settlement from being swept by a
-        // deadline armed before the operation was known to be final.
-        match status {
-            "completed" => {
-                tx.execute(
-                    "UPDATE presentation_sessions SET expires_at=CASE WHEN status IN ('inactive','resolved') THEN ?1 ELSE NULL END WHERE view_session_id=?2 AND organization_id=?3 AND account_subject=?4",
-                    params![now.saturating_add(RETENTION_SECONDS), session, scope.organization, scope.account],
-                )?;
-            }
-            "ambiguous" => {
-                tx.execute(
-                    "UPDATE presentation_sessions SET expires_at=NULL WHERE view_session_id=?1 AND organization_id=?2 AND account_subject=?3",
-                    params![session, scope.organization, scope.account],
-                )?;
-            }
-            _ => unreachable!("status validated above"),
+        verify_maintenance_operation_receipt(request, canonical_receipt)?;
+        let scope = Scope {
+            organization: required(request, "organizationId")?,
+            account: required(request, "accountSubject")?,
+        };
+        let key = required_uuid(request, "idempotencyKey")?;
+        let summary = maintenance_operation_summary(request, canonical_receipt)?;
+        let p = json!({"viewSessionId":request["viewSessionId"],"operationId":request["operationId"],"status":"completed","idempotencyKey":key,
+            "resultReference":{"maintenanceDomainReceipt":summary}});
+        let mut c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(cached) = receipt(
+            &tx,
+            scope,
+            "presentation.operations.maintenance_reconcile",
+            key,
+            &crate::state::json_digest(&p),
+        )? {
+            tx.commit()?;
+            return Ok(cached);
         }
-        let result = json!({"operationId":operation,"viewSessionId":session,"status":status,"updatedAt":now,"resultReference":reference});
-        save_receipt(
+        // The shared owner's exact receipt is authoritative after an interrupted
+        // maintenance checkpoint; replay cannot mutate a newer journal.
+        if let Some(cached) = receipt(
             &tx,
             scope,
             "presentation.operations.settle",
             key,
-            &digest,
-            &result,
-            now,
-        )?;
+            &crate::state::json_digest(&p),
+        )? {
+            tx.commit()?;
+            return Ok(cached["resultReference"]["maintenanceDomainReceipt"].clone());
+        }
+        let current = maintenance_operation_candidates(&tx)?
+            .into_iter()
+            .find(|v| {
+                v["operationId"] == request["operationId"]
+                    && v["viewSessionId"] == request["viewSessionId"]
+                    && v["organizationId"] == request["organizationId"]
+                    && v["accountSubject"] == request["accountSubject"]
+            })
+            .context("MANAGED_WORK_CHANGED")?;
+        for field in [
+            "kind",
+            "installationId",
+            "recordId",
+            "operationId",
+            "viewSessionId",
+            "revision",
+            "generation",
+            "attemptId",
+            "method",
+            "params",
+            "operationKey",
+            "reconciliation",
+            "recordDigest",
+            "status",
+        ] {
+            ensure!(
+                current.get(field) == request.get(field),
+                "MANAGED_WORK_CHANGED"
+            );
+        }
+        ensure!(
+            current["reconciliationSupported"] == true,
+            "MANAGED_WORK_RECONCILIATION_UNSUPPORTED"
+        );
+        if current["status"] == "completed" {
+            ensure!(current["method"] == "workflows.patch", "OPERATION_SETTLED");
+            // Ordinary patch completion already owns this operation's result.
+            // Only record the new canonical maintenance proof; preserve every
+            // historical row field, including its original result and expiry.
+            save_receipt(
+                &tx,
+                scope,
+                "presentation.operations.maintenance_reconcile",
+                key,
+                &crate::state::json_digest(&p),
+                &summary,
+                crate::state::now(),
+            )?;
+            tx.commit()?;
+            return Ok(summary);
+        }
+        settle_operation(&tx, scope, &p)?;
         tx.commit()?;
-        Ok(result)
+        Ok(summary)
     }
 
     pub fn delete_entities(
@@ -727,6 +882,363 @@ impl PresentationStore {
     }
 }
 
+/// Full journal authority for the maintenance child; never export as a public report.
+pub fn maintenance_operation_candidates(c: &Connection) -> Result<Vec<Value>> {
+    let mut stmt=c.prepare("SELECT o.organization_id,o.account_subject,o.operation_id,o.view_session_id,s.revision,o.method,o.params_json,o.operation_key,o.reconciliation_json,o.status,o.created_at,o.result_reference_json FROM presentation_operations o JOIN presentation_sessions s ON s.view_session_id=o.view_session_id AND s.organization_id=o.organization_id AND s.account_subject=o.account_subject ORDER BY o.operation_id")?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, u64>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Vec<u8>>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, Vec<u8>>(8)?,
+                r.get::<_, String>(9)?,
+                r.get::<_, u64>(10)?,
+                r.get::<_, Option<Vec<u8>>>(11)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter().map(|(org,account,id,session,revision,method,bytes,key,reconcile,status,created,reference)| {
+        let params=decode(&bytes)?;let reconciliation=decode(&reconcile)?;
+        let mut candidate=json!({"kind":"presentation_operation","organizationId":org,"accountSubject":account,"installationId":"","recordId":id,"operationId":id,"viewSessionId":session,"revision":revision,"generation":null,"attemptId":null,"method":method,"params":params,"operationKey":key,"reconciliation":reconciliation,"createdAt":created});
+        candidate["recordDigest"]=json!(operation_binding_digest(&candidate));
+        candidate["reconciliationSupported"]=json!(maintenance_operation_plan(&candidate).is_ok());
+        candidate["status"]=json!(status);
+        candidate["resultReference"]=reference.map(|v|decode(&v)).transpose()?.unwrap_or(Value::Null);
+        candidate["resolution"]=if status=="completed" && candidate["resultReference"]["maintenanceDomainReceipt"]["recordDigest"]==candidate["recordDigest"] {candidate["resultReference"]["maintenanceDomainReceipt"].clone()}else{json!({"state":if status=="completed" {"reconciled"}else{"unresolved"}})};
+        Ok(candidate)
+    }).collect()
+}
+
+fn operation_binding_digest(candidate: &Value) -> String {
+    let mut binding = serde_json::Map::new();
+    for key in [
+        "kind",
+        "organizationId",
+        "accountSubject",
+        "installationId",
+        "recordId",
+        "operationId",
+        "viewSessionId",
+        "revision",
+        "generation",
+        "attemptId",
+        "method",
+        "params",
+        "operationKey",
+        "reconciliation",
+        "createdAt",
+    ] {
+        binding.insert(key.into(), candidate[key].clone());
+    }
+    crate::state::json_digest(&Value::Object(binding))
+}
+
+pub(crate) fn maintenance_operation_summary(candidate: &Value, receipt: &Value) -> Result<Value> {
+    Ok(
+        json!({"schemaVersion":"loomex.domain-operation-reconciliation/v1","state":"reconciled","kind":"presentation_operation","recordDigest":candidate["recordDigest"],"operationReference":crate::state::json_digest(&candidate["operationId"]),"scopeReference":crate::state::json_digest(&json!([candidate["organizationId"],candidate["accountSubject"],candidate["installationId"]])),"originalKeyReference":crate::state::json_digest(&candidate["operationKey"]),"method":candidate["method"],"status":"completed","receiptDigest":crate::state::json_digest(receipt),"responseDigest":crate::state::json_digest(&receipt["response"])}),
+    )
+}
+
+fn maintenance_operation_descriptor(candidate: &Value) -> Result<(&str, &str)> {
+    let method = required(candidate, "method")?;
+    let (route, operation) = match method {
+        "workflows.patch" => ("workflow.operations.get", "workflows.update"),
+        "workflows.create" | "workflows.update" | "workflows.publish" | "builder.start"
+        | "editor.start" => ("workflow.operations.get", method),
+        "persona.roles.create" => ("personas.operations.get", "role.create"),
+        "personas.create" => ("personas.operations.get", "person.create"),
+        "personas.chat_context.create" => ("personas.operations.get", "chat_context.create"),
+        "personas.memory.write" => ("personas.operations.get", "memory.write"),
+        "personas.memory.update" => ("personas.operations.get", "memory.update"),
+        _ => bail!("MANAGED_WORK_RECONCILIATION_UNSUPPORTED"),
+    };
+    let key = required_uuid(candidate, "operationKey")?;
+    validate_operation(
+        &json!({"method":method,"params":candidate["params"],"idempotencyKey":key,"reconciliation":candidate["reconciliation"]}),
+    )?;
+    ensure!(
+        candidate["params"]["idempotencyKey"] == key
+            && candidate["reconciliation"]
+                == json!({"method":route,"params":{"operation":operation,"idempotencyKey":key}}),
+        "MANAGED_WORK_RECONCILIATION_UNSUPPORTED"
+    );
+    Ok((route, operation))
+}
+
+/// The only allowed maintenance read for an exact original mutation journal.
+pub(crate) fn maintenance_operation_plan(candidate: &Value) -> Result<Value> {
+    let (route, operation) = maintenance_operation_descriptor(candidate)?;
+    let catalog: Value = serde_json::from_str(include_str!("../contracts/method-catalog.json"))?;
+    let methods = catalog["methods"].as_array().context("INTERNAL")?;
+    let mutation = methods
+        .iter()
+        .find(|entry| entry["name"] == candidate["method"])
+        .context("MANAGED_WORK_RECONCILIATION_UNSUPPORTED")?;
+    crate::control::validate_params(&candidate["params"], &mutation["inputSchema"])
+        .map_err(|_| anyhow::anyhow!("MANAGED_WORK_RECEIPT_MISMATCH"))?;
+    if let Some(org) = candidate["params"].get("organizationId") {
+        ensure!(
+            org == &candidate["organizationId"],
+            "MANAGED_WORK_RECEIPT_MISMATCH"
+        );
+    }
+    let params = json!({"operation":operation,"idempotencyKey":candidate["operationKey"]});
+    Ok(json!({"method":route,"params":params}))
+}
+
+pub(crate) fn verify_native_patch_journal(candidate: &Value, response: &Value) -> Result<()> {
+    let p = &candidate["params"];
+    let record = &candidate["nativePatchJournal"];
+    let notes = p.get("notes").and_then(Value::as_str);
+    let common = json!({"organizationId":candidate["organizationId"],"accountSubject":candidate["accountSubject"],"workflowId":p["workflowId"],"expectedVersion":p["expectedVersion"],"expectedDefinitionChecksum":p["expectedDefinitionChecksum"],"operations":p["operations"],"idempotencyKey":candidate["operationKey"]});
+    let legacy = notes.is_none() && record["identity"] == crate::state::json_digest(&common);
+    let mut current = common;
+    current["requestedNotes"] = notes.map(Value::from).unwrap_or(Value::Null);
+    ensure!(
+        record["identity"] == crate::state::json_digest(&current) || legacy,
+        "MANAGED_WORK_RECEIPT_MISMATCH"
+    );
+    ensure!(
+        record["status"] == "submitted"
+            && record["workflowId"] == p["workflowId"]
+            && record["expectedVersion"] == p["expectedVersion"]
+            && record["expectedDefinitionChecksum"] == p["expectedDefinitionChecksum"],
+        "MANAGED_WORK_RECEIPT_MISMATCH"
+    );
+    let body = &record["updateBody"];
+    let fields = body.as_object().context("MANAGED_WORK_RECEIPT_MISMATCH")?;
+    let (notes_provided, expected_notes) = if legacy {
+        ensure!(
+            record.get("notesProvided").is_none() && record.get("expectedNotes").is_none(),
+            "MANAGED_WORK_RECEIPT_MISMATCH"
+        );
+        (false, None)
+    } else {
+        (
+            record["notesProvided"]
+                .as_bool()
+                .context("MANAGED_WORK_RECEIPT_MISMATCH")?,
+            Some(
+                record["expectedNotes"]
+                    .as_str()
+                    .context("MANAGED_WORK_RECEIPT_MISMATCH")?,
+            ),
+        )
+    };
+    ensure!(
+        notes_provided == notes.is_some()
+            && (!notes_provided || expected_notes == notes)
+            && fields.len() == if notes_provided { 3 } else { 2 },
+        "MANAGED_WORK_RECEIPT_MISMATCH"
+    );
+    ensure!(
+        body["expectedVersion"] == p["expectedVersion"]
+            && body["definition"].is_object()
+            && crate::state::json_digest(&body["definition"]) == record["updateDigest"]
+            && crate::state::json_digest(body) == record["payloadDigest"]
+            && (!notes_provided || body["notes"].as_str() == expected_notes),
+        "MANAGED_WORK_RECEIPT_MISMATCH"
+    );
+    ensure!(
+        response["workflow"]["id"] == p["workflowId"]
+            && response["draft"]["definition"].is_object()
+            && crate::state::json_digest(&response["draft"]["definition"])
+                == record["updateDigest"]
+            && response["draft"]["notes"].is_string()
+            && expected_notes.is_none_or(|notes| response["draft"]["notes"] == notes),
+        "MANAGED_WORK_RECEIPT_MISMATCH"
+    );
+    Ok(())
+}
+
+/// Validate a verified maintenance receipt attached to the original native
+/// patch journal. The marker preserves submitted state and carries no replay authority.
+pub(crate) fn maintenance_native_patch_resolved(record: &Value) -> Result<bool> {
+    let Some(marker) = record.get("maintenanceResolution") else {
+        return Ok(false);
+    };
+    let fields = marker
+        .as_object()
+        .context("MANAGED_WORK_RECEIPT_MISMATCH")?;
+    ensure!(
+        fields.len() == 5
+            && [
+                "schema",
+                "originalJournalDigest",
+                "candidate",
+                "canonicalReceipt",
+                "receiptDigest"
+            ]
+            .iter()
+            .all(|key| fields.contains_key(*key))
+            && marker["schema"] == "loomex.native-patch-reconciliation/v1",
+        "MANAGED_WORK_RECEIPT_MISMATCH"
+    );
+    let mut original = record.clone();
+    original
+        .as_object_mut()
+        .context("MANAGED_WORK_RECEIPT_MISMATCH")?
+        .remove("maintenanceResolution");
+    let candidate = &marker["candidate"];
+    let receipt = &marker["canonicalReceipt"];
+    ensure!(
+        candidate["kind"] == "presentation_operation"
+            && candidate["method"] == "workflows.patch"
+            && marker["originalJournalDigest"] == crate::state::json_digest(&original)
+            && candidate["nativePatchJournal"] == original
+            && candidate["recordDigest"] == operation_binding_digest(candidate)
+            && marker["receiptDigest"] == crate::state::json_digest(receipt),
+        "MANAGED_WORK_RECEIPT_MISMATCH"
+    );
+    verify_maintenance_operation_receipt(candidate, receipt)?;
+    Ok(true)
+}
+
+fn validate_catalog_result(method: &str, result: &Value) -> Result<()> {
+    ensure!(
+        result.is_object() && result.get("responseRef").is_none(),
+        "MANAGED_WORK_RECEIPT_MISMATCH"
+    );
+    let catalog: Value = serde_json::from_str(include_str!("../contracts/method-catalog.json"))?;
+    let output = &catalog["methods"]
+        .as_array()
+        .context("INTERNAL")?
+        .iter()
+        .find(|v| v["name"] == method)
+        .context("INTERNAL")?["outputSchema"];
+    let variants = output["oneOf"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_else(|| std::slice::from_ref(output));
+    ensure!(
+        variants
+            .iter()
+            .filter(
+                |schema| schema.get("required").and_then(Value::as_array).is_some()
+                    && schema["properties"].get("responseRef").is_none()
+            )
+            .any(|schema| crate::control::validate_params(result, schema).is_ok()),
+        "MANAGED_WORK_RECEIPT_MISMATCH"
+    );
+    Ok(())
+}
+
+pub(crate) fn verify_maintenance_operation_receipt(
+    candidate: &Value,
+    receipt: &Value,
+) -> Result<()> {
+    let plan = maintenance_operation_plan(candidate)?;
+    let route = plan["method"].as_str().context("INTERNAL")?;
+    let operation = plan["params"]["operation"].as_str().context("INTERNAL")?;
+    ensure!(
+        receipt["operation"] == operation
+            && receipt["status"] == "completed"
+            && receipt["response"].is_object()
+            && receipt.get("responseRef").is_none(),
+        "MANAGED_WORK_RECEIPT_MISMATCH"
+    );
+    if route == "personas.operations.get" {
+        crate::control::verify_persona_receipt(&candidate["reconciliation"]["params"], receipt)
+            .map_err(|_| anyhow::anyhow!("MANAGED_WORK_RECEIPT_MISMATCH"))?;
+    } else {
+        validate_catalog_result(route, receipt)?;
+        ensure!(
+            receipt["idempotencyKey"] == candidate["operationKey"],
+            "MANAGED_WORK_RECEIPT_MISMATCH"
+        );
+    }
+    let method = required(candidate, "method")?;
+    validate_catalog_result(method, &receipt["response"])?;
+    if ["builder.start", "editor.start"].contains(&method) {
+        crate::control::verify_native_authoring_start(method, &receipt["response"])
+            .map_err(|_| anyhow::anyhow!("MANAGED_WORK_RECEIPT_MISMATCH"))?;
+    }
+    crate::control::verify_persona_creation(method, &candidate["params"], &receipt["response"])
+        .map_err(|_| anyhow::anyhow!("MANAGED_WORK_RECEIPT_MISMATCH"))?;
+    if method == "workflows.patch" {
+        verify_native_patch_journal(candidate, &receipt["response"])?;
+    }
+    if ["workflows.update", "workflows.publish", "workflows.patch"].contains(&method) {
+        ensure!(
+            receipt["response"]["workflow"]["id"] == candidate["params"]["workflowId"],
+            "MANAGED_WORK_RECEIPT_MISMATCH"
+        );
+    }
+    Ok(())
+}
+
+fn settle_operation(c: &Connection, scope: Scope<'_>, p: &Value) -> Result<Value> {
+    let session = required_uuid(p, "viewSessionId")?;
+    let operation = required_uuid(p, "operationId")?;
+    let key = required_uuid(p, "idempotencyKey")?;
+    let status = required(p, "status")?;
+    ensure!(
+        ["completed", "ambiguous"].contains(&status),
+        "INVALID_REQUEST"
+    );
+    let reference = p.get("resultReference").cloned().unwrap_or(Value::Null);
+    if !reference.is_null() {
+        validate_presentation_json(&reference)?;
+    }
+    let digest = crate::state::json_digest(p);
+    if let Some(value) = receipt(c, scope, "presentation.operations.settle", key, &digest)? {
+        return Ok(value);
+    }
+    let current: Option<String> = c.query_row(
+            "SELECT status FROM presentation_operations WHERE operation_id=?1 AND view_session_id=?2 AND organization_id=?3 AND account_subject=?4",
+            params![operation, session, scope.organization, scope.account], |row| row.get(0),
+        ).optional()?;
+    let current = current.context("OPERATION_NOT_FOUND")?;
+    ensure!(
+        ["pending", "ambiguous"].contains(&current.as_str()),
+        "OPERATION_SETTLED"
+    );
+    let now = crate::state::now();
+    let expires = (status == "completed").then_some(now.saturating_add(RETENTION_SECONDS));
+    c.execute(
+            "UPDATE presentation_operations SET status=?1,result_reference_json=?2,updated_at=?3,expires_at=?4 WHERE operation_id=?5",
+            params![status, (!reference.is_null()).then(|| encode(&reference)).transpose()?, now, expires, operation],
+        )?;
+    // A session may have been retired while its exact operation was still
+    // awaiting reconciliation.  Pending and ambiguous operations must
+    // clear any old retirement deadline; a completed operation starts a
+    // fresh 30-day restore window only for an already inactive/resolved
+    // session.  This prevents a delayed settlement from being swept by a
+    // deadline armed before the operation was known to be final.
+    match status {
+        "completed" => {
+            c.execute(
+                    "UPDATE presentation_sessions SET expires_at=CASE WHEN status IN ('inactive','resolved') THEN ?1 ELSE NULL END WHERE view_session_id=?2 AND organization_id=?3 AND account_subject=?4",
+                    params![now.saturating_add(RETENTION_SECONDS), session, scope.organization, scope.account],
+                )?;
+        }
+        "ambiguous" => {
+            c.execute(
+                    "UPDATE presentation_sessions SET expires_at=NULL WHERE view_session_id=?1 AND organization_id=?2 AND account_subject=?3",
+                    params![session, scope.organization, scope.account],
+                )?;
+        }
+        _ => unreachable!("status validated above"),
+    }
+    let result = json!({"operationId":operation,"viewSessionId":session,"status":status,"updatedAt":now,"resultReference":reference});
+    save_receipt(
+        c,
+        scope,
+        "presentation.operations.settle",
+        key,
+        &digest,
+        &result,
+        now,
+    )?;
+    Ok(result)
+}
+
 fn session_projection(connection: &Connection, scope: Scope<'_>, id: &str) -> Result<Value> {
     connection.query_row(
         "SELECT kind,entity_type,entity_id,revision,state_json,status,created_at,updated_at,expires_at FROM presentation_sessions WHERE view_session_id=?1 AND organization_id=?2 AND account_subject=?3",
@@ -743,8 +1255,40 @@ fn session_projection(connection: &Connection, scope: Scope<'_>, id: &str) -> Re
     ).optional()?.context("VIEW_SESSION_NOT_FOUND")
 }
 
+/// Read-only canonical snapshot projection, also used by strict uninstall assessment.
+pub fn maintenance_delivery_candidates(c: &Connection) -> Result<Vec<Value>> {
+    let mut stmt=c.prepare("SELECT organization_id,account_subject,identity,continuation_json,revision,status,attempt_id,error_code,created_at,updated_at FROM presentation_deliveries ORDER BY organization_id,account_subject,identity")?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Vec<u8>>(3)?,
+                r.get::<_, u64>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, u64>(8)?,
+                r.get::<_, u64>(9)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter().map(|(org,account,id,bytes,revision,status,attempt,error,created,updated)| {
+        let continuation=decode(&bytes)?;
+        let mut v=json!({"kind":"presentation_delivery","retirementEligible":continuation["kind"]=="follow","organizationId":org,"accountSubject":account,"installationId":"","recordId":id,"runId":continuation["runId"],"revision":revision,"generation":null,"attemptId":attempt,"status":status,"recordDigest":crate::state::json_digest(&json!([continuation,revision,status,attempt,error,created,updated]))});
+        v["resolution"]=crate::continuation_resolution::projection(c,"presentation_delivery",&org,&account,"",&id)?;
+        v["backendObservation"]=crate::continuation_resolution::observation(c,&v)?;
+        Ok(v)
+    }).collect()
+}
+
+pub fn maintenance_resolved(c: &Connection, candidate: &Value) -> Result<bool> {
+    crate::continuation_resolution::resolved(c, candidate)
+}
+
 fn delivery_projection(connection: &Connection, scope: Scope<'_>, identity: &str) -> Result<Value> {
-    connection
+    let result = connection
         .query_row(
             "SELECT continuation_json,revision,status,attempt_id FROM presentation_deliveries WHERE organization_id=?1 AND account_subject=?2 AND identity=?3",
             params![scope.organization, scope.account, identity],
@@ -761,7 +1305,26 @@ fn delivery_projection(connection: &Connection, scope: Scope<'_>, identity: &str
             },
         )
         .optional()?
-        .context("DELIVERY_NOT_READY")
+        .context("DELIVERY_NOT_READY")?;
+    delivery_resolution_projection(connection, scope, identity, result)
+}
+
+fn delivery_resolution_projection(
+    connection: &Connection,
+    scope: Scope<'_>,
+    identity: &str,
+    mut result: Value,
+) -> Result<Value> {
+    result["resolution"] = crate::continuation_resolution::projection(
+        connection,
+        "presentation_delivery",
+        scope.organization,
+        scope.account,
+        "",
+        identity,
+    )?;
+    result["continuationEligible"] = json!(result["resolution"]["state"] == "unresolved");
+    Ok(result)
 }
 
 /// Narrow, versioned projection for UI re-entry.  Keep this separate from
@@ -1330,6 +1893,450 @@ mod tests {
             "requestId":Uuid::new_v4(),
             "requestStatus":"resolved",
         })
+    }
+
+    fn domain_journal(
+        store: &PresentationStore,
+        method: &str,
+        params: Value,
+        route: &str,
+        operation: &str,
+    ) -> Value {
+        let session = create(store);
+        let key = params["idempotencyKey"].clone();
+        store.update(scope(),&json!({"viewSessionId":session["viewSessionId"],"expectedRevision":0,"state":{},"operation":{"method":method,"params":params,"idempotencyKey":key,"reconciliation":{"method":route,"params":{"operation":operation,"idempotencyKey":key}}},"idempotencyKey":Uuid::new_v4()})).unwrap();
+        let mut request = store.maintenance_operation_candidates().unwrap().remove(0);
+        request["idempotencyKey"] = json!(Uuid::new_v4());
+        request
+    }
+    fn publish_receipt(request: &Value) -> Value {
+        json!({"operation":"workflows.publish","idempotencyKey":request["operationKey"],"status":"completed","response":{"workflow":{"id":request["params"]["workflowId"]},"version":{"id":Uuid::new_v4(),"number":2}}})
+    }
+
+    #[test]
+    fn maintenance_patch_receipt_requires_original_native_journal_target_and_payload() {
+        let t = tempfile::tempdir().unwrap();
+        let store = PresentationStore::open(t.path()).unwrap();
+        let params = json!({"workflowId":Uuid::new_v4(),"expectedVersion":2,"expectedDefinitionChecksum":"a".repeat(64),"operations":[{"nodeKey":"node","op":"replace","path":"/prompt","value":"private replacement"}],"idempotencyKey":Uuid::new_v4()});
+        let mut candidate = domain_journal(
+            &store,
+            "workflows.patch",
+            params,
+            "workflow.operations.get",
+            "workflows.update",
+        );
+        let body = json!({"definition":{"nodes":[{"key":"node","prompt":"private replacement"}]},"expectedVersion":2});
+        let identity = crate::state::json_digest(
+            &json!({"organizationId":candidate["organizationId"],"accountSubject":candidate["accountSubject"],"workflowId":candidate["params"]["workflowId"],"expectedVersion":2,"expectedDefinitionChecksum":"a".repeat(64),"operations":candidate["params"]["operations"],"requestedNotes":null,"idempotencyKey":candidate["operationKey"]}),
+        );
+        let journal = json!({"identity":identity,"workflowId":candidate["params"]["workflowId"],"expectedVersion":2,"expectedDefinitionChecksum":"a".repeat(64),"updateBody":body,"updateDigest":crate::state::json_digest(&body["definition"]),"payloadDigest":crate::state::json_digest(&body),"notesProvided":false,"expectedNotes":"original notes","status":"submitted"});
+        let receipt = json!({"operation":"workflows.update","idempotencyKey":candidate["operationKey"],"status":"completed","response":{"workflow":{"id":candidate["params"]["workflowId"]},"draft":{"definition":body["definition"],"notes":"original notes"}}});
+        assert_eq!(
+            maintenance_operation_plan(&candidate).unwrap(),
+            json!({"method":"workflow.operations.get","params":{"operation":"workflows.update","idempotencyKey":candidate["operationKey"]}})
+        );
+        assert!(
+            store
+                .maintenance_operation_settle(&candidate, &receipt)
+                .is_err()
+        );
+        candidate["nativePatchJournal"] = journal;
+        for field in ["identity", "workflowId", "updateDigest", "payloadDigest"] {
+            let mut wrong = candidate.clone();
+            wrong["nativePatchJournal"][field] = json!("wrong");
+            assert!(
+                store
+                    .maintenance_operation_settle(&wrong, &receipt)
+                    .is_err()
+            );
+        }
+        let mut wrong = receipt.clone();
+        wrong["response"]["draft"]["definition"] = json!({"nodes":[]});
+        assert!(
+            store
+                .maintenance_operation_settle(&candidate, &wrong)
+                .is_err()
+        );
+        let mut native = candidate["nativePatchJournal"].clone();
+        assert!(!maintenance_native_patch_resolved(&native).unwrap());
+        native["maintenanceResolution"] = json!({"schema":"loomex.native-patch-reconciliation/v1","originalJournalDigest":crate::state::json_digest(&candidate["nativePatchJournal"]),"candidate":candidate,"canonicalReceipt":receipt,"receiptDigest":crate::state::json_digest(&receipt)});
+        assert!(maintenance_native_patch_resolved(&native).unwrap());
+        let mut changed = native.clone();
+        changed["maintenanceResolution"]["receiptDigest"] = json!("wrong");
+        assert!(maintenance_native_patch_resolved(&changed).is_err());
+        let mut changed = native.clone();
+        changed["updateDigest"] = json!("wrong");
+        assert!(maintenance_native_patch_resolved(&changed).is_err());
+        let mut changed = native.clone();
+        changed["maintenanceResolution"]["candidate"]["params"]["idempotencyKey"] =
+            json!(Uuid::new_v4());
+        assert!(maintenance_native_patch_resolved(&changed).is_err());
+        let mut changed = native;
+        changed["maintenanceResolution"] = json!({});
+        assert!(maintenance_native_patch_resolved(&changed).is_err());
+        let settled = store
+            .maintenance_operation_settle(&candidate, &receipt)
+            .unwrap();
+        assert_eq!(settled["state"], "reconciled");
+        assert_eq!(settled["method"], "workflows.patch");
+        assert!(!settled.to_string().contains("private replacement"));
+        let historical = tempfile::tempdir().unwrap();
+        let second = PresentationStore::open(historical.path()).unwrap();
+        let mut historical_request = domain_journal(
+            &second,
+            "workflows.patch",
+            candidate["params"].clone(),
+            "workflow.operations.get",
+            "workflows.update",
+        );
+        historical_request["nativePatchJournal"] = candidate["nativePatchJournal"].clone();
+        second.operation_settle(scope(),&json!({"viewSessionId":historical_request["viewSessionId"],"operationId":historical_request["operationId"],"status":"completed","resultReference":{"originalResult":"preserve historical outcome"},"idempotencyKey":Uuid::new_v4()})).unwrap();
+        let original=second.operation_get(scope(),&json!({"viewSessionId":historical_request["viewSessionId"],"operationId":historical_request["operationId"]})).unwrap();
+        let mut completed = second.maintenance_operation_candidates().unwrap().remove(0);
+        completed["nativePatchJournal"] = historical_request["nativePatchJournal"].clone();
+        completed["idempotencyKey"] = json!(Uuid::new_v4());
+        let proof = second
+            .maintenance_operation_settle(&completed, &receipt)
+            .unwrap();
+        assert_eq!(
+            proof,
+            maintenance_operation_summary(&completed, &receipt).unwrap()
+        );
+        assert_eq!(
+            second
+                .maintenance_operation_settle(&completed, &receipt)
+                .unwrap(),
+            proof
+        );
+        assert_eq!(second.operation_get(scope(),&json!({"viewSessionId":completed["viewSessionId"],"operationId":completed["operationId"]})).unwrap(),original);
+    }
+
+    #[test]
+    fn maintenance_domain_summary_never_contains_private_arguments_responses_or_keys() {
+        let t = tempfile::tempdir().unwrap();
+        let store = PresentationStore::open(t.path()).unwrap();
+        let request = domain_journal(
+            &store,
+            "workflows.publish",
+            json!({"workflowId":Uuid::new_v4(),"expectedVersion":1,"notes":"PRIVATE_ARGUMENT_SENTINEL","idempotencyKey":Uuid::new_v4()}),
+            "workflow.operations.get",
+            "workflows.publish",
+        );
+        let mut receipt = publish_receipt(&request);
+        receipt["response"]["workflow"]["name"] = json!("PRIVATE_RESPONSE_SENTINEL");
+        let summary = store
+            .maintenance_operation_settle(&request, &receipt)
+            .unwrap();
+        let candidate = store.maintenance_operation_candidates().unwrap().remove(0);
+        assert_eq!(candidate["resolution"], summary);
+        let encoded = serde_json::to_string(&summary).unwrap();
+        for forbidden in [
+            "PRIVATE_ARGUMENT_SENTINEL",
+            "PRIVATE_RESPONSE_SENTINEL",
+            request["operationKey"].as_str().unwrap(),
+            request["operationId"].as_str().unwrap(),
+            request["viewSessionId"].as_str().unwrap(),
+            request["accountSubject"].as_str().unwrap(),
+        ] {
+            assert!(!encoded.contains(forbidden));
+        }
+        assert_eq!(
+            summary["receiptDigest"],
+            crate::state::json_digest(&receipt)
+        );
+    }
+
+    #[test]
+    fn maintenance_domain_descriptor_never_replays_unsupported_mutations() {
+        let t = tempfile::tempdir().unwrap();
+        let store = PresentationStore::open(t.path()).unwrap();
+        let session = create(&store);
+        store.update(scope(),&json!({"viewSessionId":session["viewSessionId"],"expectedRevision":0,"state":{},"operation":{"method":"runs.commit","params":{"preparationId":Uuid::new_v4(),"confirmationKey":"PRIVATE_CAPABILITY"},"idempotencyKey":Uuid::new_v4()},"idempotencyKey":Uuid::new_v4()})).unwrap();
+        let mut candidate = store.maintenance_operation_candidates().unwrap().remove(0);
+        assert_eq!(candidate["reconciliationSupported"], false);
+        candidate["idempotencyKey"] = json!(Uuid::new_v4());
+        assert!(
+            store
+                .maintenance_operation_settle(
+                    &candidate,
+                    &json!({"status":"completed","response":{}})
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.maintenance_operation_candidates().unwrap()[0]["status"],
+            "pending"
+        );
+    }
+
+    #[test]
+    fn maintenance_domain_receipt_settlement_uses_exact_journal_and_replays_owner_receipt() {
+        let t = tempfile::tempdir().unwrap();
+        let store = PresentationStore::open(t.path()).unwrap();
+        let request = domain_journal(
+            &store,
+            "workflows.publish",
+            json!({"workflowId":Uuid::new_v4(),"expectedVersion":1,"idempotencyKey":Uuid::new_v4()}),
+            "workflow.operations.get",
+            "workflows.publish",
+        );
+        let receipt = publish_receipt(&request);
+        let settled = store
+            .maintenance_operation_settle(&request, &receipt)
+            .unwrap();
+        assert_eq!(settled["status"], "completed");
+        assert_eq!(
+            store
+                .maintenance_operation_settle(&request, &receipt)
+                .unwrap(),
+            settled
+        );
+        let mut changed = request.clone();
+        changed["params"]["notes"] = json!("changed after settlement");
+        assert!(
+            store
+                .maintenance_operation_settle(&changed, &receipt)
+                .is_err()
+        );
+        let current = store.maintenance_operation_candidates().unwrap().remove(0);
+        assert_eq!(current["recordDigest"], request["recordDigest"]);
+        assert_eq!(current["resolution"]["state"], "reconciled");
+        assert_eq!(current["operationKey"], request["operationKey"]);
+        let journal=store.operation_get(scope(),&json!({"viewSessionId":request["viewSessionId"],"operationId":request["operationId"]})).unwrap();
+        assert_eq!(journal["params"], request["params"]);
+        assert_eq!(
+            journal["resultReference"]["maintenanceDomainReceipt"]["responseDigest"],
+            crate::state::json_digest(&receipt["response"])
+        );
+        assert!(store.operation_settle(scope(),&json!({"viewSessionId":request["viewSessionId"],"operationId":request["operationId"],"status":"completed","idempotencyKey":Uuid::new_v4()})).is_err());
+    }
+
+    #[test]
+    fn maintenance_domain_receipt_never_settles_wrong_pending_or_spooled_outcome() {
+        let t = tempfile::tempdir().unwrap();
+        let store = PresentationStore::open(t.path()).unwrap();
+        let request = domain_journal(
+            &store,
+            "workflows.publish",
+            json!({"workflowId":Uuid::new_v4(),"expectedVersion":1,"idempotencyKey":Uuid::new_v4()}),
+            "workflow.operations.get",
+            "workflows.publish",
+        );
+        let valid = publish_receipt(&request);
+        for (field, value) in [
+            ("operation", json!("workflows.update")),
+            ("idempotencyKey", json!(Uuid::new_v4())),
+            ("status", json!("pending")),
+            ("status", json!("not_found")),
+            ("response", json!({})),
+            ("responseRef", json!(Uuid::new_v4())),
+        ] {
+            let mut wrong = valid.clone();
+            wrong[field] = value;
+            assert!(
+                store
+                    .maintenance_operation_settle(&request, &wrong)
+                    .is_err()
+            );
+        }
+        let mut wrong = valid;
+        wrong["response"]["workflow"]["id"] = json!(Uuid::new_v4());
+        assert!(
+            store
+                .maintenance_operation_settle(&request, &wrong)
+                .is_err()
+        );
+        assert_eq!(
+            store.maintenance_operation_candidates().unwrap()[0]["status"],
+            "pending"
+        );
+    }
+
+    #[test]
+    fn maintenance_domain_journal_revision_arguments_and_scope_are_fenced() {
+        for changed in ["revision", "params", "operationKey", "accountSubject"] {
+            let t = tempfile::tempdir().unwrap();
+            let store = PresentationStore::open(t.path()).unwrap();
+            let mut request = domain_journal(
+                &store,
+                "workflows.publish",
+                json!({"workflowId":Uuid::new_v4(),"expectedVersion":1,"idempotencyKey":Uuid::new_v4()}),
+                "workflow.operations.get",
+                "workflows.publish",
+            );
+            let receipt = publish_receipt(&request);
+            let c = store.connection.lock().unwrap();
+            match changed {
+                "revision" => {
+                    c.execute("UPDATE presentation_sessions SET revision=revision+1", [])
+                        .unwrap();
+                }
+                "params" => {
+                    let mut changed = request["params"].clone();
+                    changed["expectedVersion"] = json!(2);
+                    c.execute(
+                        "UPDATE presentation_operations SET params_json=?1",
+                        params![serde_json::to_vec(&changed).unwrap()],
+                    )
+                    .unwrap();
+                }
+                "operationKey" => {
+                    c.execute(
+                        "UPDATE presentation_operations SET operation_key=?1",
+                        params![Uuid::new_v4().to_string()],
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    request["accountSubject"] = json!("another-account");
+                }
+            }
+            drop(c);
+            assert!(
+                store
+                    .maintenance_operation_settle(&request, &receipt)
+                    .is_err()
+            );
+            assert_eq!(
+                store.maintenance_operation_candidates().unwrap()[0]["status"],
+                "pending"
+            );
+        }
+    }
+
+    #[test]
+    fn maintenance_persona_receipt_uses_existing_strict_shape_validation() {
+        let t = tempfile::tempdir().unwrap();
+        let store = PresentationStore::open(t.path()).unwrap();
+        let request = domain_journal(
+            &store,
+            "personas.memory.write",
+            json!({"personId":Uuid::new_v4(),"conversationId":Uuid::new_v4(),"chatId":Uuid::new_v4(),"arguments":{"content":"private durable fact"},"idempotencyKey":Uuid::new_v4()}),
+            "personas.operations.get",
+            "memory.write",
+        );
+        let mut receipt = json!({"operation":"memory.write","key":request["operationKey"],"status":"completed","requestDigest":"bad","response":{"result":{"candidateId":Uuid::new_v4()}}});
+        assert!(
+            store
+                .maintenance_operation_settle(&request, &receipt)
+                .is_err()
+        );
+        receipt["requestDigest"] = json!("a".repeat(64));
+        assert_eq!(
+            store
+                .maintenance_operation_settle(&request, &receipt)
+                .unwrap()["status"],
+            "completed"
+        );
+    }
+
+    #[test]
+    fn maintenance_native_authoring_receipt_only_settles_acceptance_journal() {
+        let t = tempfile::tempdir().unwrap();
+        let store = PresentationStore::open(t.path()).unwrap();
+        let request = domain_journal(
+            &store,
+            "builder.start",
+            json!({"prompt":"private workflow idea","idempotencyKey":Uuid::new_v4()}),
+            "workflow.operations.get",
+            "builder.start",
+        );
+        let session = Uuid::new_v4();
+        let receipt = json!({"operation":"builder.start","idempotencyKey":request["operationKey"],"status":"completed","response":{"schemaVersion":"loomex.native-authoring-session/v1","sessionId":session,"builderSessionId":session,"executionId":Uuid::new_v4(),"status":"queued","systemWorkflowKey":"workflow_builder","systemWorkflowVersionId":Uuid::new_v4(),"systemWorkflowDefinitionChecksum":"a".repeat(64),"nextAction":"run_get"}});
+        assert_eq!(
+            store
+                .maintenance_operation_settle(&request, &receipt)
+                .unwrap()["status"],
+            "completed"
+        );
+        assert!(store.maintenance_candidates().unwrap().is_empty());
+        let encoded = serde_json::to_string(
+            &store.maintenance_operation_candidates().unwrap()[0]["resultReference"],
+        )
+        .unwrap();
+        assert!(!encoded.contains("private workflow idea"));
+        assert!(!encoded.contains("terminal"));
+    }
+
+    #[test]
+    fn terminal_backend_fact_preserves_unknown_delivery_until_explicit_retirement() {
+        let t = tempfile::tempdir().unwrap();
+        let store = PresentationStore::open(t.path()).unwrap();
+        let run = Uuid::new_v4().to_string();
+        let identity = format!("follow:{run}:run_started");
+        store
+            .register_delivery("org-a", "user-a", &identity, &delivery_continuation(&run))
+            .unwrap();
+        let attempt = Uuid::new_v4();
+        let begin = json!({"identity":identity,"expectedRevision":0,"attemptId":attempt,"idempotencyKey":Uuid::new_v4()});
+        store.delivery_begin(scope(), &begin).unwrap();
+        let settle = json!({"identity":identity,"expectedRevision":1,"attemptId":attempt,"status":"unknown","idempotencyKey":Uuid::new_v4()});
+        store.delivery_settle(scope(), &settle).unwrap();
+        let candidate = store.maintenance_candidates().unwrap().remove(0);
+        let mut request = candidate.clone();
+        request["idempotencyKey"] = json!(Uuid::new_v4());
+        let observation = json!({"snapshot":{"execution":{"id":run,"status":"completed"},"hasMoreEvents":false},"terminalResult":{"execution":{"id":run,"status":"completed"},"hasMoreEvents":false}});
+        store.maintenance_reconcile(&request, &observation).unwrap();
+        let projected = store
+            .delivery_get(scope(), &json!({"identity":identity}))
+            .unwrap();
+        assert_eq!(projected["status"], "unknown");
+        assert_eq!(projected["resolution"]["state"], "unresolved");
+        let closed = store.maintenance_retire(&request).unwrap();
+        assert_eq!(closed, store.maintenance_retire(&request).unwrap());
+        let projected = store
+            .delivery_get(scope(), &json!({"identity":identity}))
+            .unwrap();
+        assert_eq!(projected["status"], "unknown");
+        assert_eq!(projected["attemptId"], attempt.to_string());
+        assert_eq!(projected["continuationEligible"], false);
+        assert!(store.delivery_begin(scope(), &begin).is_err());
+        assert!(store.delivery_settle(scope(), &settle).is_err());
+        store
+            .import_legacy_delivery("org-a", "user-a", &identity)
+            .unwrap();
+        let registered =
+            store.register_delivery("org-a", "user-a", &identity, &delivery_continuation(&run));
+        assert!(registered.is_err()); // different request identity cannot replace authority
+        let c = store.connection.lock().unwrap();
+        assert!(maintenance_resolved(&c, &candidate).unwrap());
+    }
+
+    #[test]
+    fn retirement_rejects_stale_attempt_and_does_not_rearm_after_sweep() {
+        let t = tempfile::tempdir().unwrap();
+        let store = PresentationStore::open(t.path()).unwrap();
+        let run = Uuid::new_v4().to_string();
+        let identity = format!("follow:{run}:run_started");
+        let continuation = delivery_continuation(&run);
+        store
+            .register_delivery("org-a", "user-a", &identity, &continuation)
+            .unwrap();
+        let candidate = store.maintenance_candidates().unwrap().remove(0);
+        let mut request = candidate.clone();
+        request["idempotencyKey"] = json!(Uuid::new_v4());
+        store.maintenance_reconcile(&request,&json!({"snapshot":{"execution":{"id":run,"status":"running"},"hasMoreEvents":false}})).unwrap();
+        store.delivery_begin(scope(),&json!({"identity":identity,"expectedRevision":0,"attemptId":Uuid::new_v4(),"idempotencyKey":Uuid::new_v4()})).unwrap();
+        assert_eq!(
+            store.maintenance_retire(&request).unwrap_err().to_string(),
+            "MANAGED_WORK_CHANGED"
+        );
+        let candidate = store.maintenance_candidates().unwrap().remove(0);
+        let mut request = candidate.clone();
+        request["idempotencyKey"] = json!(Uuid::new_v4());
+        store.maintenance_reconcile(&request,&json!({"snapshot":{"execution":{"id":run,"status":"running"},"hasMoreEvents":false}})).unwrap();
+        store.maintenance_retire(&request).unwrap();
+        store
+            .sweep(crate::state::now() + RETENTION_SECONDS * 2)
+            .unwrap();
+        drop(store);
+        let store = PresentationStore::open(t.path()).unwrap();
+        assert_eq!(
+            store
+                .register_delivery("org-a", "user-a", &identity, &continuation)
+                .unwrap()["continuationEligible"],
+            false
+        );
     }
 
     #[test]

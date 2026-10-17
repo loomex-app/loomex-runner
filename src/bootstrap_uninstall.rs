@@ -13,6 +13,11 @@ use std::os::{
 
 const SCHEMA: &str = "app.loomex.runner.bootstrap-uninstall/v2";
 const OLD_SCHEMA: &str = "app.loomex.runner.bootstrap-uninstall/v1";
+#[path = "bootstrap_uninstall/work.rs"]
+mod work;
+pub(super) use work::{
+    WorkRefusal, run_work, valid_work_digest, work_owner_reference, work_preflight,
+};
 
 fn regular_bytes(path: &Path) -> Result<Vec<u8>> {
     use std::io::Read;
@@ -1577,7 +1582,7 @@ async fn validate_recovery_candidate(
     old: &Value,
     manifest: &Value,
     payload: &Path,
-) -> Result<()> {
+) -> Result<SigningTransition> {
     let version = manifest["version"]
         .as_str()
         .context("recovery version missing")?;
@@ -1642,15 +1647,24 @@ async fn validate_recovery_candidate(
         );
     }
     let previous_requirement = signing_requirement(&previous)?;
-    signing_transition(
-        previous_requirement.as_deref(),
-        candidate_requirement.as_deref(),
-        digest_file(&previous)? == digest_file(&candidate)?,
-        args.authorize_keychain_transition,
-    )?;
+    let transition = if args.work_action.is_some() {
+        work_signing_transition(
+            previous_requirement.as_deref(),
+            candidate_requirement.as_deref(),
+            digest_file(&previous)? == digest_file(&candidate)?,
+            args.authorize_keychain_transition,
+        )?
+    } else {
+        signing_transition(
+            previous_requirement.as_deref(),
+            candidate_requirement.as_deref(),
+            digest_file(&previous)? == digest_file(&candidate)?,
+            args.authorize_keychain_transition,
+        )?
+    };
     // Both inspections are non-authorizing. Foreground native authorization
     // runs only after the mutator has adopted the qualified candidate binding.
-    Ok(())
+    Ok(transition)
 }
 
 fn checkpoint_prepared_stopped(
@@ -1795,6 +1809,7 @@ async fn recover_old(paths: &lifecycle::Paths, args: &Arguments, old: Value) -> 
         "bootstrap-uninstall-recovery-release-{old_digest}.json"
     ));
     let manifest_sha = digest_file(&release.join("manifest.json"))?;
+    work::require_recovery_binding(paths, &old_digest, &release, &manifest)?;
     let replacement = args.replace_pre_adoption_candidate;
     let (intent, release_intent) =
         recovery_release_selection(paths, args, id, &old_digest, &manifest_sha, &release);
@@ -1904,6 +1919,7 @@ async fn cleanup(
         synthetic || (revocation_satisfied(journal) && journal["protectedStoreRemoved"] == true),
         "uninstall bound credential cleanup is incomplete"
     );
+    work::cleanup_resources(paths, journal)?;
     journal["phase"] = json!("cleanup");
     save(paths, journal)?;
     let owned = journal_owned(journal);
@@ -2213,6 +2229,7 @@ fn owned_state_namespace(relative: &Path) -> bool {
                 | "pending-update.json"
                 | "jobs"
                 | "operations"
+                | "workflow-patches"
                 | "responses"
                 | "presentation.sqlite3"
                 | "presentation.sqlite3-wal"
@@ -2241,6 +2258,9 @@ fn owned_state_namespace(relative: &Path) -> bool {
             Uuid::parse_str(key).is_ok()
                 || (key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()))
         }),
+        ["workflow-patches", name] => name
+            .strip_suffix(".json")
+            .is_some_and(|key| key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit())),
         ["responses", name] => name
             .strip_suffix(".meta.json")
             .or_else(|| name.strip_suffix(".sha256"))
@@ -2336,10 +2356,10 @@ fn remove_state_entries(paths: &lifecycle::Paths, journal: &mut Value) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    struct Fixture {
+    pub(super) struct Fixture {
         _root: tempfile::TempDir,
-        paths: lifecycle::Paths,
-        journal: Value,
+        pub(super) paths: lifecycle::Paths,
+        pub(super) journal: Value,
         target: PathBuf,
         quarantine: PathBuf,
     }
@@ -2386,7 +2406,7 @@ mod tests {
             quarantine,
         }
     }
-    fn historical_fixture() -> Fixture {
+    pub(super) fn historical_fixture() -> Fixture {
         let mut fixture = fixture();
         fs::rename(&fixture.quarantine, &fixture.target).unwrap();
         fs::write(fixture.target.join("bin/deleted"), b"deleted").unwrap();
@@ -3124,6 +3144,38 @@ mod tests {
             .await
             .unwrap();
         assert!(!job.exists());
+    }
+    #[test]
+    fn native_patch_inventory_capture_and_removal_stays_in_exact_owned_namespace() {
+        let mut fixture = fixture();
+        let path = fixture
+            .paths
+            .state_dir
+            .join("workflow-patches")
+            .join(format!("{}.json", "a".repeat(64)));
+        let workflow = Uuid::new_v4();
+        let body = json!({"definition":{},"expectedVersion":0});
+        state::write_json(&path,&json!({"identity":"b".repeat(64),"workflowId":workflow,"status":"submitted","expectedVersion":0,"expectedDefinitionChecksum":"c".repeat(64),"updateDigest":state::json_digest(&body["definition"]),"payloadDigest":state::json_digest(&body),"updateBody":body})).unwrap();
+        assert!(capture_state_entries(&fixture.paths).is_err());
+        assert!(path.exists());
+        state::write_json(&path,&json!({"identity":"b".repeat(64),"workflowId":workflow,"status":"rejected","code":"WORKFLOW_VERSION_CONFLICT"})).unwrap();
+        fixture.journal["stateEntries"] = capture_state_entries(&fixture.paths).unwrap();
+        assert!(
+            fixture.journal["stateEntries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["path"] == format!("workflow-patches/{}.json", "a".repeat(64)))
+        );
+        assert!(!owned_state_namespace(Path::new(
+            "workflow-patches/unknown.json"
+        )));
+        assert!(!owned_state_namespace(Path::new(
+            "workflow-patches/../state.json"
+        )));
+        remove_state_entries(&fixture.paths, &mut fixture.journal).unwrap();
+        assert!(!path.exists());
+        assert!(!fixture.paths.state_dir.join("workflow-patches").exists());
     }
     #[test]
     fn new_unowned_state_child_blocks_whole_state_deletion_before_any_owned_file() {

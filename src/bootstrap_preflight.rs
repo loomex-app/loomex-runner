@@ -19,16 +19,39 @@ fn version_is_safe(version: &str) -> bool {
 }
 
 fn read_optional_record(path: &Path) -> Result<Option<Value>> {
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-        Ok(metadata) => {
-            if !metadata.is_file() || metadata.file_type().is_symlink() {
-                bail!("unsafe installation metadata")
-            }
-            Ok(Some(state::read_json(path)?))
-        }
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let before = match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(metadata) => metadata,
+    };
+    let typed = |category| uninstall_state::ManagedStateError::new(category);
+    if !before.is_file() || before.file_type().is_symlink() {
+        return Err(typed(uninstall_state::BlockerCategory::UnsafeState).into());
     }
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let opened = file.metadata()?;
+    if opened.dev() != before.dev() || opened.ino() != before.ino() {
+        return Err(typed(uninstall_state::BlockerCategory::ObservationDrift).into());
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes)?;
+    let after = file.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    if before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+        || opened.dev() != named.dev()
+        || opened.ino() != named.ino()
+    {
+        return Err(typed(uninstall_state::BlockerCategory::ObservationDrift).into());
+    }
+    let record = serde_json::from_slice(&bytes)
+        .map_err(|_| typed(uninstall_state::BlockerCategory::UnsupportedSchema))?;
+    Ok(Some(record))
 }
 
 fn transition_eligibility(
@@ -62,13 +85,17 @@ pub(super) fn development_signing(payload: &Path) -> Result<Option<String>> {
         let mut canonical = serde_json::to_vec(&value)?;
         canonical.push(b'\n');
         if bytes != canonical || value["schema"] != "app.loomex.runner.development-signing/v1" {
-            bail!("development signing manifest is invalid")
+            return Err(anyhow::anyhow!("development signing manifest is invalid")
+                .context(OwnerDiagnostic::SignatureRejected));
         }
         let requirements = value["requirements"]
             .as_object()
             .context("development signing requirements are missing")?;
         if requirements.len() != 3 {
-            bail!("development signing requirements are incomplete")
+            return Err(
+                anyhow::anyhow!("development signing requirements are incomplete")
+                    .context(OwnerDiagnostic::SignatureRejected),
+            );
         }
         for name in ["loomex", "loomex-runner", "loomex-lifecycle-bootstrap"] {
             let actual = signing_requirement(&payload.join("bin").join(name))?;
@@ -79,17 +106,26 @@ pub(super) fn development_signing(payload: &Path) -> Result<Option<String>> {
             if actual.as_deref() != Some(expected)
                 || !expected.contains(&format!("identifier \"app.loomex.runner.{name}\""))
             {
-                bail!("development signing requirement does not match package")
+                return Err(anyhow::anyhow!(
+                    "development signing requirement does not match package"
+                )
+                .context(OwnerDiagnostic::SignatureRejected));
             }
         }
     } else {
         if candidate_requirement.is_some() {
-            bail!("signed development package lacks signing manifest")
+            return Err(
+                anyhow::anyhow!("signed development package lacks signing manifest")
+                    .context(OwnerDiagnostic::SignatureRejected),
+            );
         }
         // Validate every shipped executable even for an ad-hoc package.
         for name in ["loomex", "loomex-lifecycle-bootstrap"] {
             if signing_requirement(&payload.join("bin").join(name))?.is_some() {
-                bail!("signed development package lacks signing manifest")
+                return Err(
+                    anyhow::anyhow!("signed development package lacks signing manifest")
+                        .context(OwnerDiagnostic::SignatureRejected),
+                );
             }
         }
     }
@@ -114,7 +150,10 @@ fn installed_signing(
         Err(error) => Err(error.into()),
         Ok(metadata) => {
             if !metadata.file_type().is_symlink() {
-                bail!("unsafe runner current pointer")
+                return Err(uninstall_state::ManagedStateError::new(
+                    uninstall_state::BlockerCategory::UnsafeState,
+                )
+                .into());
             }
             let previous = current.join("bin/loomex-runner");
             let requirement = signing_requirement(&previous)?;
@@ -198,7 +237,10 @@ fn installed_eligibility(
     match fs::symlink_metadata(&current) {
         Ok(metadata) => {
             if !metadata.file_type().is_symlink() {
-                bail!("unsafe runner current pointer")
+                return Err(uninstall_state::ManagedStateError::new(
+                    uninstall_state::BlockerCategory::UnsafeState,
+                )
+                .into());
             }
             let target = fs::canonicalize(&current)?;
             let inventory = owned
@@ -236,7 +278,10 @@ fn installed_eligibility(
     match fs::symlink_metadata(&package.target) {
         Ok(metadata) => {
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                bail!("unsafe installed candidate version")
+                return Err(uninstall_state::ManagedStateError::new(
+                    uninstall_state::BlockerCategory::UnsafeState,
+                )
+                .into());
             }
             inventory(
                 &package.target,
@@ -266,7 +311,8 @@ fn installed_eligibility(
 
 pub(super) fn verify_envelope(release: &Path, payload: &Path, manifest: &Value) -> Result<()> {
     if manifest["bootstrap"]["file"] != "loomex-lifecycle-bootstrap" {
-        bail!("release bootstrap binding is invalid")
+        return Err(anyhow::anyhow!("release bootstrap binding is invalid")
+            .context(OwnerDiagnostic::BindingMismatch));
     }
     let envelope = release.join("loomex-lifecycle-bootstrap");
     let metadata = fs::symlink_metadata(&envelope)?;
@@ -277,7 +323,10 @@ pub(super) fn verify_envelope(release: &Path, payload: &Path, manifest: &Value) 
         || manifest["bootstrap"]["sha256"].as_str() != Some(state::digest(&bytes).as_str())
         || bytes != fs::read(payload.join("bin/loomex-lifecycle-bootstrap"))?
     {
-        bail!("release bootstrap envelope does not match payload")
+        return Err(
+            anyhow::anyhow!("release bootstrap envelope does not match payload")
+                .context(OwnerDiagnostic::BindingMismatch),
+        );
     }
     Ok(())
 }
@@ -308,7 +357,8 @@ pub(super) async fn verify_artifact(
         .context("production release requires --public-key")?;
     let signature = release.join("manifest.sig");
     if !signature.is_file() {
-        bail!("production release signature is missing")
+        return Err(anyhow::anyhow!("production release signature is missing")
+            .context(OwnerDiagnostic::SignatureRejected));
     }
     let output = tokio::process::Command::new("/usr/bin/openssl")
         .args(["dgst", "-sha256", "-verify"])
@@ -320,7 +370,8 @@ pub(super) async fn verify_artifact(
         .output()
         .await?;
     if !output.status.success() {
-        bail!("release signature verification failed")
+        return Err(anyhow::anyhow!("release signature verification failed")
+            .context(OwnerDiagnostic::SignatureRejected));
     }
     let archive = release.join(
         manifest["payload"]["file"]
@@ -332,7 +383,8 @@ pub(super) async fn verify_artifact(
             .as_str()
             .context("release digest is missing")?
     {
-        bail!("release payload digest mismatch")
+        return Err(anyhow::anyhow!("release payload digest mismatch")
+            .context(OwnerDiagnostic::BindingMismatch));
     }
     Ok(())
 }
@@ -367,6 +419,7 @@ pub(super) async fn extract_artifact(
 async fn inspect(args: &Arguments, report: &mut Value) -> Result<()> {
     let paths = paths(args)?;
     report["recoveryOwnership"] = bootstrap_uninstall::recovery_ownership(&paths);
+    report["ownerReference"] = bootstrap_uninstall::work_owner_reference(&paths);
     let release = fs::canonicalize(args.release.as_ref().context("release is required")?)?;
     let manifest = read_manifest(&release)?;
     verify_artifact(&release, &manifest, args).await?;
@@ -392,7 +445,8 @@ async fn inspect(args: &Arguments, report: &mut Value) -> Result<()> {
         || project["version"] != version
         || project["platform"] != "darwin-arm64"
     {
-        bail!("release project metadata mismatch")
+        return Err(anyhow::anyhow!("release project metadata mismatch")
+            .context(OwnerDiagnostic::BindingMismatch));
     }
     let (origin, requirement) = if manifest["developmentOnly"] == true {
         let origin =
@@ -407,12 +461,25 @@ async fn inspect(args: &Arguments, report: &mut Value) -> Result<()> {
                 .stdin(Stdio::null())
                 .output()?;
             if !output.status.success() {
-                bail!("production code signature is invalid")
+                return Err(anyhow::anyhow!("production code signature is invalid")
+                    .context(OwnerDiagnostic::SignatureRejected));
             }
         }
         (None, None)
     };
     report["artifact"] = json!({"eligible":true,"version":version,"manifestSha256":state::digest(&fs::read(release.join("manifest.json"))?)});
+    if args.work_action.is_some() {
+        let work = bootstrap_uninstall::work_preflight(&paths, args, &release, &manifest, &payload)
+            .await?;
+        report["ownerReference"] = work["ownerReference"].clone();
+        report["assessment"] = work
+            .get("assessment")
+            .unwrap_or(&work["managedStateAssessment"])
+            .clone();
+        publish_work_eligibility(report, &work)?;
+        report["eligible"] = json!(true);
+        return Ok(());
+    }
     if args.recovery_uninstall {
         let pending =
             bootstrap_uninstall::recovery_preflight(&paths, args, &release, &manifest, &payload)
@@ -467,6 +534,23 @@ async fn inspect(args: &Arguments, report: &mut Value) -> Result<()> {
     Ok(())
 }
 
+fn publish_work_eligibility(report: &mut Value, work: &Value) -> Result<()> {
+    let signing = work["signingTransition"].as_str();
+    if !matches!(signing, Some("eligible" | "needs_explicit_transition"))
+        || work["eligible"] != true
+        || work["readOnly"] != true
+        || work["accessAttempted"] != false
+        || work["nativeAccessVerified"] != false
+    {
+        return Err(
+            anyhow::anyhow!("uninstall work preflight contract is unconfirmed")
+                .context(OwnerDiagnostic::BindingMismatch),
+        );
+    }
+    report["uninstallWorkEligibility"] = json!({"eligible":true,"readOnly":true,"signingTransition":signing,"accessAttempted":false,"nativeAccessVerified":false});
+    Ok(())
+}
+
 fn publish_recovery_eligibility(report: &mut Value, cache_restore_required: bool) -> Result<()> {
     // Candidate/historical binding checks cannot override an authoritative
     // ownership refusal. Keep the bounded diagnostic facts unchanged.
@@ -493,7 +577,7 @@ fn ensure_no_pending_uninstall(ownership: &Value) -> Result<()> {
 
 pub(super) async fn run(args: super::Arguments) -> Result<()> {
     let mut report = json!({
-        "schema":"app.loomex.runner.install-preflight/v1", "readOnly":true,"eligible":false,
+        "schema":"app.loomex.runner.install-preflight/v2", "readOnly":true,"eligible":false,
         "recoveryOwnership":{"status":"blocked","operationId":null,"phase":null,"journalSha256":null,"nextAction":"inspect_protected_ownership","reasonCode":"OWNERSHIP_UNCONFIRMED"},
         "recoveryEligibility":{"eligible":false,"readOnly":true},"cacheRestoreRequired":false,
         "artifact":{"eligible":false}, "activation":{"eligible":false},
@@ -501,13 +585,19 @@ pub(super) async fn run(args: super::Arguments) -> Result<()> {
         "credentialPrerequisite":{"status":"not_verified","nativeAccessVerified":false,"accessAttempted":false},
         "snapshot":{"lockAcquired":false,"requiresInstallRevalidation":true}
     });
-    if inspect(&args, &mut report).await.is_err() {
-        let category = if report["artifact"]["eligible"] == true {
-            "installation_state_invalid"
-        } else {
-            "artifact_validation_failed"
-        };
-        report["error"] = json!({"category":category,"message":"Installation preflight could not verify eligibility."});
+    if let Err(error) = inspect(&args, &mut report).await {
+        let diagnostic = preflight_failure(&error);
+        report["error"] = diagnostic.clone();
+        report["reasonCode"] = diagnostic["reasonCode"].clone();
+        report["nextAction"] = diagnostic["nextAction"].clone();
+        // Assessment is diagnostic only; it never substitutes for the owner checks.
+        if report["artifact"]["eligible"] == true {
+            if let Ok(paths) = paths(&args) {
+                if let Ok(assessment) = uninstall_state::assess_state(&paths.state_dir) {
+                    report["assessment"] = serde_json::to_value(assessment)?;
+                }
+            }
+        }
         println!("{}", serde_json::to_string(&report)?);
         bail!("installation preflight could not verify eligibility");
     }
@@ -521,6 +611,88 @@ pub(super) async fn run(args: super::Arguments) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn work_preflight_transition_is_bounded_and_never_claims_native_authorization() {
+        for signing in ["eligible", "needs_explicit_transition"] {
+            let mut report = json!({});
+            let mut work = json!({"eligible":true,"readOnly":true,"signingTransition":signing,"accessAttempted":false,"nativeAccessVerified":false,"private":"SECRET"});
+            publish_work_eligibility(&mut report, &work).unwrap();
+            assert_eq!(
+                report["uninstallWorkEligibility"]["signingTransition"],
+                signing
+            );
+            assert_eq!(
+                report["uninstallWorkEligibility"]["nativeAccessVerified"],
+                false
+            );
+            assert_eq!(report["uninstallWorkEligibility"]["accessAttempted"], false);
+            assert!(!report.to_string().contains("SECRET"));
+            work["nativeAccessVerified"] = json!(true);
+            assert!(publish_work_eligibility(&mut report, &work).is_err());
+        }
+        assert!(publish_work_eligibility(&mut json!({}),&json!({"eligible":true,"readOnly":true,"signingTransition":"unknown","accessAttempted":false,"nativeAccessVerified":false})).is_err());
+    }
+    #[test]
+    fn optional_metadata_preserves_unsafe_schema_and_io_categories() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("metadata.json");
+        assert!(read_optional_record(&path).unwrap().is_none());
+        fs::write(&path, b"invalid private JSON").unwrap();
+        let error = read_optional_record(&path).unwrap_err();
+        assert_eq!(
+            uninstall_state::error_category(&error),
+            uninstall_state::BlockerCategory::UnsupportedSchema
+        );
+        assert!(
+            !serde_json::to_string(&preflight_failure(&error))
+                .unwrap()
+                .contains("private")
+        );
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(root.path().join("missing"), &path).unwrap();
+        let error = read_optional_record(&path).unwrap_err();
+        assert_eq!(
+            uninstall_state::error_category(&error),
+            uninstall_state::BlockerCategory::UnsafeState
+        );
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"{}").unwrap();
+        assert_eq!(read_optional_record(&path).unwrap(), Some(json!({})));
+        let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied).into();
+        assert_eq!(
+            uninstall_state::error_category(&error),
+            uninstall_state::BlockerCategory::UnreadableState
+        );
+    }
+    #[test]
+    fn preflight_mapper_keeps_managed_state_failures_separate() {
+        for (category, expected) in [
+            (
+                uninstall_state::BlockerCategory::UnsupportedSchema,
+                "OWNER_SCHEMA_UNSUPPORTED",
+            ),
+            (
+                uninstall_state::BlockerCategory::UnsafeState,
+                "OWNER_STATE_UNSAFE",
+            ),
+            (
+                uninstall_state::BlockerCategory::UnreadableState,
+                "OWNER_STATE_UNREADABLE",
+            ),
+            (
+                uninstall_state::BlockerCategory::ObservationDrift,
+                "OWNER_STATE_DRIFT",
+            ),
+            (
+                uninstall_state::BlockerCategory::FollowPending,
+                "MANAGED_WORK_UNRESOLVED",
+            ),
+        ] {
+            let error = anyhow::Error::new(uninstall_state::ManagedStateError::new(category))
+                .context(ManagedWorkBlocked);
+            assert_eq!(preflight_failure(&error)["reasonCode"], expected);
+        }
+    }
     #[tokio::test]
     async fn ownership_is_reported_before_missing_candidate_validation_without_writes() {
         let root = tempfile::tempdir().unwrap();

@@ -136,7 +136,12 @@ jobs:
           echo "PLUGIN_ARCHIVE=$RUNNER_TEMP/plugin-public/loomex-plugin-${plugin_version}-darwin-arm64.tar.gz" >> "$GITHUB_ENV"
       - name: Build one self-contained native installer
         run: |
-          CARGO_TARGET_DIR="$RUNNER_TEMP/installer-target" cargo build --locked --release --target aarch64-apple-darwin --manifest-path scripts/distribution-installer/Cargo.toml
+          set -euo pipefail
+          build_root="$PWD"
+          canonical_build_root="$(cd "$build_root" && pwd -P)"
+          remap_flags="${RUSTFLAGS:-} --remap-path-prefix=$canonical_build_root=/loomex/src --remap-path-prefix=$build_root=/loomex/src --remap-path-prefix=${HOME:?}=/loomex/home"
+          remap_cflags="${CFLAGS:-} -ffile-prefix-map=$canonical_build_root=/loomex/src -ffile-prefix-map=$build_root=/loomex/src -ffile-prefix-map=${HOME:?}=/loomex/home"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/installer-target" RUSTFLAGS="$remap_flags" CFLAGS="$remap_cflags" cargo build --locked --release --target aarch64-apple-darwin --manifest-path scripts/distribution-installer/Cargo.toml
           cp "$RUNNER_TEMP/installer-target/aarch64-apple-darwin/release/loomex-install" "$RUNNER_TEMP/loomex-install-darwin-arm64"
       - name: Create exact paired public release-set assets
         env:

@@ -21,8 +21,7 @@ use uuid::Uuid;
 mod bootstrap_preflight;
 #[path = "bootstrap_uninstall.rs"]
 mod bootstrap_uninstall;
-#[path = "uninstall_state.rs"]
-mod uninstall_state;
+use loomex_runner::uninstall_state;
 
 fn main() {
     if let Err(error) = entry() {
@@ -60,13 +59,15 @@ struct Arguments {
     expected_recovery_intent_sha256: Option<String>,
     recovery_uninstall: bool,
     expected_release_path: Option<PathBuf>,
+    work_action: Option<String>,
+    expected_assessment_sha256: Option<String>,
     json: bool,
     activation: std::sync::Arc<std::sync::Mutex<ActivationFacts>>,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: loomex-lifecycle-bootstrap install RELEASE [--public-key FILE | --allow-unsigned-development (--development-api-origin LOOPBACK_URL | --preview-api-origin HTTPS_URL)] [--authorize-keychain-transition] [--settled-abandonment UUID] [--provider-executable PROVIDER=/absolute/path] [--install-base DIR --state-dir DIR --launch-agents-dir DIR]\n       loomex-lifecycle-bootstrap uninstall [--install-base DIR --state-dir DIR --launch-agents-dir DIR]\n       loomex-lifecycle-bootstrap preflight RELEASE [install options]\n       loomex-lifecycle-bootstrap recover-uninstall RELEASE --expected-old-journal-sha256 SHA256 [--replace-pre-adoption-candidate --expected-recovery-intent-sha256 SHA256] [--json] [release verification and path options]\n       recovery inspection: preflight RELEASE --recovery-uninstall --expected-old-journal-sha256 SHA256 [--expected-release-path STABLE_RELEASE] [replacement options]"
+        "usage: loomex-lifecycle-bootstrap install RELEASE [--public-key FILE | --allow-unsigned-development (--development-api-origin LOOPBACK_URL | --preview-api-origin HTTPS_URL)] [--authorize-keychain-transition] [--settled-abandonment UUID] [--provider-executable PROVIDER=/absolute/path] [--install-base DIR --state-dir DIR --launch-agents-dir DIR]\n       loomex-lifecycle-bootstrap uninstall [--install-base DIR --state-dir DIR --launch-agents-dir DIR]\n       loomex-lifecycle-bootstrap preflight RELEASE [install options]\n       loomex-lifecycle-bootstrap recover-uninstall RELEASE --expected-old-journal-sha256 SHA256 [--replace-pre-adoption-candidate --expected-recovery-intent-sha256 SHA256] [--json] [release verification and path options]\n       loomex-lifecycle-bootstrap uninstall-work RELEASE --action inspect|reconcile|retire-local --expected-old-journal-sha256 SHA256 [--expected-assessment-sha256 SHA256 (retire-local)] [--json] [release verification and path options]\n       work inspection: preflight RELEASE --work-action ACTION --expected-old-journal-sha256 SHA256 [--expected-assessment-sha256 SHA256]\n       recovery inspection: preflight RELEASE --recovery-uninstall --expected-old-journal-sha256 SHA256 [--expected-release-path STABLE_RELEASE] [replacement options]"
     );
     std::process::exit(2)
 }
@@ -81,7 +82,7 @@ fn parse() -> (String, Arguments) {
     let mut parsed = Arguments::default();
     if matches!(
         command.as_str(),
-        "install" | "preflight" | "recover-uninstall"
+        "install" | "preflight" | "recover-uninstall" | "uninstall-work"
     ) {
         parsed.release = Some(PathBuf::from(values.next().unwrap_or_else(|| usage())));
     }
@@ -97,8 +98,10 @@ fn parse() -> (String, Arguments) {
                 );
             }
             "--expected-old-journal-sha256" => {
-                if !matches!(command.as_str(), "recover-uninstall" | "preflight")
-                    || parsed.expected_old_journal_sha256.is_some()
+                if !matches!(
+                    command.as_str(),
+                    "recover-uninstall" | "preflight" | "uninstall-work"
+                ) || parsed.expected_old_journal_sha256.is_some()
                 {
                     usage();
                 }
@@ -111,8 +114,40 @@ fn parse() -> (String, Arguments) {
                 );
             }
             "--json" => parsed.json = true,
+            "--action" if command == "uninstall-work" && parsed.work_action.is_none() => {
+                parsed.work_action = Some(
+                    values
+                        .next()
+                        .unwrap_or_else(|| usage())
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            "--work-action" if command == "preflight" && parsed.work_action.is_none() => {
+                parsed.work_action = Some(
+                    values
+                        .next()
+                        .unwrap_or_else(|| usage())
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            "--expected-assessment-sha256"
+                if matches!(command.as_str(), "uninstall-work" | "preflight")
+                    && parsed.expected_assessment_sha256.is_none() =>
+            {
+                parsed.expected_assessment_sha256 = Some(
+                    values
+                        .next()
+                        .unwrap_or_else(|| usage())
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
             "--recovery-uninstall" if command == "preflight" => parsed.recovery_uninstall = true,
-            "--expected-release-path" if command == "preflight" => {
+            "--expected-release-path"
+                if matches!(command.as_str(), "preflight" | "uninstall-work") =>
+            {
                 parsed.expected_release_path =
                     Some(PathBuf::from(values.next().unwrap_or_else(|| usage())));
             }
@@ -139,7 +174,7 @@ fn parse() -> (String, Arguments) {
             "--authorize-keychain-transition" => {
                 if !matches!(
                     command.as_str(),
-                    "install" | "preflight" | "recover-uninstall"
+                    "install" | "preflight" | "recover-uninstall" | "uninstall-work"
                 ) || parsed.authorize_keychain_transition
                 {
                     usage();
@@ -158,7 +193,7 @@ fn parse() -> (String, Arguments) {
             "--preview-api-origin" => {
                 if !matches!(
                     command.as_str(),
-                    "install" | "preflight" | "recover-uninstall"
+                    "install" | "preflight" | "recover-uninstall" | "uninstall-work"
                 ) || parsed.preview_api_origin.is_some()
                 {
                     usage();
@@ -198,6 +233,28 @@ fn parse() -> (String, Arguments) {
 }
 
 fn valid_recovery_arguments(command: &str, args: &Arguments) -> bool {
+    if command == "uninstall-work" || (command == "preflight" && args.work_action.is_some()) {
+        return matches!(
+            args.work_action.as_deref(),
+            Some("inspect" | "reconcile" | "retire-local")
+        ) && args
+            .expected_old_journal_sha256
+            .as_deref()
+            .is_some_and(bootstrap_uninstall::valid_work_digest)
+            && (args.work_action.as_deref() == Some("retire-local"))
+                == args.expected_assessment_sha256.is_some()
+            && args
+                .expected_assessment_sha256
+                .as_deref()
+                .is_none_or(bootstrap_uninstall::valid_work_digest)
+            && (command == "preflight"
+                || args.expected_release_path.is_none()
+                || args.work_action.as_deref() == Some("inspect"))
+            && !args.replace_pre_adoption_candidate
+            && !args.recovery_uninstall
+            && !(args.work_action.as_deref() == Some("inspect")
+                && args.authorize_keychain_transition);
+    }
     args.replace_pre_adoption_candidate == args.expected_recovery_intent_sha256.is_some()
         && (!args.recovery_uninstall || args.expected_old_journal_sha256.is_some())
         && (command != "preflight"
@@ -326,6 +383,9 @@ fn stable_development_requirement(requirement: &str, name: &str) -> bool {
 }
 
 fn signing_requirement(binary: &Path) -> Result<Option<String>> {
+    signing_requirement_inner(binary).context(OwnerDiagnostic::SignatureRejected)
+}
+fn signing_requirement_inner(binary: &Path) -> Result<Option<String>> {
     let verified = std::process::Command::new("/usr/bin/codesign")
         .args(["--verify", "--strict"])
         .arg(binary)
@@ -381,6 +441,11 @@ fn signing_requirement(binary: &Path) -> Result<Option<String>> {
 }
 
 async fn credential_probe(binary: &Path, interactive: bool) -> Result<()> {
+    credential_probe_inner(binary, interactive)
+        .await
+        .context(OwnerDiagnostic::AuthorizationRequired)
+}
+async fn credential_probe_inner(binary: &Path, interactive: bool) -> Result<()> {
     let flag = if interactive {
         "--credential-store-authorize"
     } else {
@@ -422,8 +487,21 @@ fn signing_transition(
         (None, Some(_)) if authorize_transition => {
             Ok(SigningTransition::ForegroundAuthorizationRequired)
         }
-        _ => bail!("development signing identity changed; upgrade refused"),
+        _ => Err(
+            anyhow::anyhow!("development signing identity changed; upgrade refused")
+                .context(OwnerDiagnostic::SignatureRejected),
+        ),
     }
+}
+
+fn work_signing_transition(
+    previous: Option<&str>,
+    candidate: Option<&str>,
+    same: bool,
+    authorize: bool,
+) -> Result<SigningTransition> {
+    signing_transition(previous, candidate, same, false)
+        .or_else(|_| signing_transition(previous, candidate, same, authorize))
 }
 
 async fn verify_development_signing(
@@ -1386,6 +1464,8 @@ fn json_output_requested() -> bool {
 struct ActivationFacts {
     operation_id: Option<Uuid>,
     dispatch_uncertain: bool,
+    owner_reference: Option<Value>,
+    assessment: Option<Value>,
 }
 fn select_activation(args: &Arguments, id: Uuid) {
     args.activation.lock().unwrap().operation_id = Some(id);
@@ -1410,7 +1490,7 @@ fn select_install_activation(
     }
 }
 fn activation_record(facts: &ActivationFacts, outcome: &str, reason: &str, next: &str) -> Value {
-    json!({"schema":"app.loomex.runner.bootstrap-activation/v1","outcome":outcome,"operationId":facts.operation_id.map(|id|id.to_string()),"reasonCode":reason,"nextAction":next})
+    json!({"schema":"app.loomex.runner.bootstrap-activation/v2","outcome":outcome,"operationId":facts.operation_id.map(|id|id.to_string()),"reasonCode":reason,"nextAction":next,"ownerReference":facts.owner_reference,"assessment":facts.assessment})
 }
 fn emit_activation(args: &Arguments, outcome: &str, reason: &str, next: &str) -> Result<()> {
     println!(
@@ -1429,6 +1509,27 @@ fn activation_error_record(
     error: &anyhow::Error,
     recovery: bool,
 ) -> Value {
+    if error.downcast_ref::<OwnerDiagnostic>().is_some() {
+        let diagnostic = preflight_failure(error);
+        return activation_record(
+            facts,
+            "blocked",
+            diagnostic["reasonCode"].as_str().unwrap(),
+            diagnostic["nextAction"].as_str().unwrap(),
+        );
+    }
+    if error
+        .downcast_ref::<uninstall_state::ManagedStateError>()
+        .is_some()
+    {
+        let diagnostic = preflight_failure(error);
+        return activation_record(
+            facts,
+            "blocked",
+            diagnostic["reasonCode"].as_str().unwrap(),
+            diagnostic["nextAction"].as_str().unwrap(),
+        );
+    }
     if error.downcast_ref::<PendingActivation>().is_some() {
         return activation_record(
             facts,
@@ -1470,6 +1571,62 @@ fn activation_error_record(
         "inspect_lifecycle_status",
     )
 }
+
+/// Fixed diagnostic projection shared by preflight and activation. Never copy
+/// arbitrary underlying error text, native paths, SQL, or backend payloads.
+fn preflight_failure(error: &anyhow::Error) -> Value {
+    if let Some(error) = error.downcast_ref::<OwnerDiagnostic>() {
+        let reason = match error {
+            OwnerDiagnostic::SignatureRejected => "OWNER_SIGNATURE_REJECTED",
+            OwnerDiagnostic::AuthorizationRequired => "OWNER_AUTHORIZATION_REQUIRED",
+            OwnerDiagnostic::BindingMismatch => "OWNER_BINDING_MISMATCH",
+        };
+        return json!({"category":"owner_validation","reasonCode":reason,"nextAction":"inspect_lifecycle_status","message":"The exact lifecycle owner could not authorize this recovery."});
+    }
+    if let Some(error) = error.downcast_ref::<bootstrap_uninstall::WorkRefusal>() {
+        return json!({"category":"uninstall_work","reasonCode":error.0,"nextAction":if error.0=="UNINSTALL_WORK_MAINTENANCE_PENDING" {"resume_uninstall_work"} else {"inspect_uninstall_work"},"message":"The retained uninstall work requires its exact maintenance owner."});
+    }
+    if let Some(error) = error.downcast_ref::<uninstall_state::ManagedStateError>() {
+        use uninstall_state::BlockerCategory::*;
+        let (category, reason) = match error.category {
+            UnsafeState => ("unsafe_state", "OWNER_STATE_UNSAFE"),
+            UnsupportedSchema => ("unsupported_schema", "OWNER_SCHEMA_UNSUPPORTED"),
+            UnreadableState => ("unreadable_state", "OWNER_STATE_UNREADABLE"),
+            ObservationDrift => ("observation_drift", "OWNER_STATE_DRIFT"),
+            _ => ("managed_state", "MANAGED_WORK_UNRESOLVED"),
+        };
+        return json!({"category":category,"reasonCode":reason,"nextAction":"inspect_uninstall_work","message":"Retained managed state requires review before uninstall."});
+    }
+    if error.downcast_ref::<std::io::Error>().is_some() {
+        return json!({"category":"unreadable_state","reasonCode":"OWNER_STATE_UNREADABLE","nextAction":"inspect_lifecycle_status","message":"The lifecycle owner could not read required state."});
+    }
+    if error.downcast_ref::<serde_json::Error>().is_some() {
+        return json!({"category":"unsupported_schema","reasonCode":"OWNER_SCHEMA_UNSUPPORTED","nextAction":"inspect_lifecycle_status","message":"The lifecycle owner could not validate the retained schema."});
+    }
+    if error.downcast_ref::<ManagedWorkBlocked>().is_some() {
+        return json!({"category":"managed_state","reasonCode":"MANAGED_WORK_UNRESOLVED","nextAction":"inspect_uninstall_work","message":"Retained managed work requires review before uninstall."});
+    }
+    if error
+        .downcast_ref::<OriginalUninstallOwnerRequired>()
+        .is_some()
+    {
+        return json!({"category":"uninstall_owner","reasonCode":"RECOVERY_BLOCKED","nextAction":"resume_original_uninstall_owner","message":"Resume the original uninstall owner."});
+    }
+    json!({"category":"lifecycle","reasonCode":"RECOVERY_BLOCKED","nextAction":"inspect_lifecycle_status","message":"The lifecycle recovery could not be qualified."})
+}
+
+#[derive(Debug)]
+enum OwnerDiagnostic {
+    SignatureRejected,
+    AuthorizationRequired,
+    BindingMismatch,
+}
+impl std::fmt::Display for OwnerDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The lifecycle owner requires verified authority.")
+    }
+}
+impl std::error::Error for OwnerDiagnostic {}
 #[derive(Debug)]
 struct DefinitiveActivationBlock;
 impl std::fmt::Display for DefinitiveActivationBlock {
@@ -1538,13 +1695,25 @@ impl std::error::Error for PendingActivation {}
 
 async fn run() -> Result<()> {
     let (command, args) = parse();
-    let structured = args.json && command != "preflight";
+    if matches!(command.as_str(), "recover-uninstall" | "uninstall") {
+        if let Ok(paths) = paths(&args) {
+            let owner = bootstrap_uninstall::work_owner_reference(&paths);
+            let assessment = uninstall_state::assess_state(&paths.state_dir)
+                .ok()
+                .and_then(|assessment| serde_json::to_value(assessment).ok());
+            let mut facts = args.activation.lock().unwrap();
+            facts.owner_reference = (!owner.is_null()).then_some(owner);
+            facts.assessment = assessment;
+        }
+    }
+    let structured = args.json && !matches!(command.as_str(), "preflight" | "uninstall-work");
     let activation = args.activation.clone();
     let recovery = command == "recover-uninstall";
     let result = match command.as_str() {
         "install" => install(args).await,
         "uninstall" => uninstall(args).await,
         "recover-uninstall" => bootstrap_uninstall::run(args, true).await,
+        "uninstall-work" => bootstrap_uninstall::run_work(args).await,
         "preflight" => bootstrap_preflight::run(args).await,
         _ => usage(),
     };
@@ -1624,6 +1793,7 @@ mod pending_stop_tests {
         let uncertain = ActivationFacts {
             operation_id: Some(Uuid::new_v4()),
             dispatch_uncertain: true,
+            ..Default::default()
         };
         assert_eq!(
             activation_error_record(&uncertain, &anyhow::anyhow!("observation lost"), true)["outcome"],
@@ -1653,6 +1823,7 @@ mod pending_stop_tests {
         let facts = ActivationFacts {
             operation_id: Some(operation.id),
             dispatch_uncertain: false,
+            ..Default::default()
         };
         let output = activation_record(
             &facts,
@@ -1662,11 +1833,11 @@ mod pending_stop_tests {
         );
         assert_eq!(
             output["schema"],
-            "app.loomex.runner.bootstrap-activation/v1"
+            "app.loomex.runner.bootstrap-activation/v2"
         );
         assert_eq!(output["outcome"], "pending");
         assert_eq!(output["operationId"], operation.id.to_string());
-        assert_eq!(output.as_object().unwrap().len(), 5);
+        assert_eq!(output.as_object().unwrap().len(), 7);
         assert!(!output.to_string().contains("PRIVATE ERROR TEXT"));
     }
     #[test]

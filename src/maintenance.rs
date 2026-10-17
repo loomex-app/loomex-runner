@@ -16,6 +16,8 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+mod work;
+pub use work::run as run_uninstall_work;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

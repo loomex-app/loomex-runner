@@ -123,6 +123,7 @@ const LEGACY_CHECKPOINTS: &[&str] = &[
 ];
 const PENDING_UPDATE_RETIREMENT_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v9";
 const UNINSTALL_FENCE_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v8";
+const UNINSTALL_WORK_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v10";
 const LOCK_NAME: &str = "lifecycle.lock";
 const OPERATION_NAME: &str = "lifecycle-operation.json";
 const NATIVE_EXECUTABLES: &[&str] = &["/bin/launchctl"];
@@ -326,7 +327,7 @@ impl Operation {
         }
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.schema == PENDING_UPDATE_RETIREMENT_SCHEMA {
             let retirement = self
                 .pending_update_retirement
@@ -385,14 +386,16 @@ impl Operation {
             self.pending_update_retirement.is_none(),
             "pending update retirement schema mismatch"
         );
-        if self.schema == UNINSTALL_FENCE_SCHEMA {
+        if self.schema == UNINSTALL_FENCE_SCHEMA || self.schema == UNINSTALL_WORK_SCHEMA {
             let fence = self
                 .uninstall_fence
                 .as_ref()
                 .context("invalid uninstall fence")?;
             ensure!(
                 self.kind == OperationKind::Uninstall
-                    && self.phase == "bootstrap_owned"
+                    && ((self.schema == UNINSTALL_FENCE_SCHEMA && self.phase == "bootstrap_owned")
+                        || (self.schema == UNINSTALL_WORK_SCHEMA
+                            && self.phase == "work_maintenance"))
                     && self.package.is_none()
                     && self.previous_target.is_none()
                     && self.resources.is_none()
@@ -2492,6 +2495,16 @@ pub fn begin_uninstall_fence_locked(paths: &Paths, id: Uuid, journal_sha256: &st
         original_operation_sha256: digest,
         original_operation_snapshot: snapshot,
     });
+    save_operation(paths, &operation)
+}
+
+/// Exclusive observation/retirement owner; the historical uninstall bytes stay
+/// unchanged. Older controllers reject this phase before touching credentials.
+pub fn begin_uninstall_work_locked(paths: &Paths, id: Uuid, digest: &str) -> Result<()> {
+    begin_uninstall_fence_locked(paths, id, digest)?;
+    let mut operation: Operation = state::read_json(&paths.operation())?;
+    operation.schema = UNINSTALL_WORK_SCHEMA.into();
+    operation.phase = "work_maintenance".into();
     save_operation(paths, &operation)
 }
 

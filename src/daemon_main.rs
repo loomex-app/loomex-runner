@@ -13,6 +13,23 @@ fn main() {
     }
 }
 fn entry() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--maintenance-uninstall-work") {
+        let context = std::env::args_os()
+            .nth(2)
+            .ok_or_else(|| anyhow::anyhow!("INVALID_REQUEST"))?;
+        if std::env::args_os().nth(3).is_some() {
+            anyhow::bail!("INVALID_REQUEST")
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        let result = runtime.block_on(loomex_runner::maintenance::run_uninstall_work(
+            std::path::Path::new(&context),
+        ));
+        drop(runtime);
+        println!("{}", result?);
+        return Ok(());
+    }
     if std::env::args()
         .nth(1)
         .is_some_and(|a| a == "--maintenance-offline-logout")

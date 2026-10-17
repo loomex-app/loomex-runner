@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     os::unix::fs::{MetadataExt, PermissionsExt},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Mutex,
 };
 use uuid::Uuid;
@@ -21,13 +21,14 @@ use uuid::Uuid;
 /// handoff-pending session never expires automatically; only a terminal
 /// session with its required result receipt gets the 30-day retirement window.
 const RETENTION_SECONDS: u64 = 30 * 24 * 60 * 60;
-const SCHEMA_VERSION: u64 = 1;
+const SCHEMA_VERSION: u64 = 2;
 const MAX_JSON_BYTES: usize = 128 * 1024;
 const MAX_MONITORING_RECORDS: usize = 32;
 const MAX_HOOK_DIAGNOSTICS: usize = 8;
 
 pub struct FollowStore {
     connection: Mutex<Connection>,
+    directory: PathBuf,
 }
 
 #[derive(Debug)]
@@ -162,7 +163,23 @@ impl FollowStore {
           );
           CREATE INDEX IF NOT EXISTS follow_hook_diagnostics_run
             ON follow_hook_diagnostics(organization_id, account_subject, installation_id, run_id, observed_at DESC);
-          PRAGMA user_version = 1;")?;
+          PRAGMA user_version = 2;")?;
+        crate::continuation_resolution::initialize(&connection)?;
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS follow_lineage (
+          organization_id TEXT NOT NULL, account_subject TEXT NOT NULL, installation_id TEXT NOT NULL,
+          predecessor_id TEXT NOT NULL, predecessor_generation INTEGER NOT NULL,
+          successor_id TEXT NOT NULL, successor_generation INTEGER NOT NULL,
+          PRIMARY KEY(organization_id,account_subject,installation_id,predecessor_id,predecessor_generation));
+          CREATE TABLE IF NOT EXISTS follow_generation_transitions (
+          organization_id TEXT NOT NULL, account_subject TEXT NOT NULL, installation_id TEXT NOT NULL,
+          follow_session_id TEXT NOT NULL, from_generation INTEGER NOT NULL,to_generation INTEGER NOT NULL,
+          from_json BLOB NOT NULL,to_anchor_json BLOB NOT NULL,
+          PRIMARY KEY(organization_id,account_subject,installation_id,follow_session_id,from_generation));
+          CREATE TABLE IF NOT EXISTS follow_capability_bindings (follow_session_id TEXT NOT NULL, generation INTEGER NOT NULL, receipt TEXT NOT NULL, PRIMARY KEY(follow_session_id,generation,receipt));
+          CREATE TABLE IF NOT EXISTS follow_retired_capabilities (
+          organization_id TEXT NOT NULL, account_subject TEXT NOT NULL, installation_id TEXT NOT NULL,
+          receipt TEXT NOT NULL, run_id TEXT NOT NULL, trigger TEXT NOT NULL, request_id TEXT,
+          PRIMARY KEY(organization_id,account_subject,installation_id,receipt));")?;
         // Older releases represented an app-originated handoff as `active`.
         // Those records lack a native host-session identity and must not retain
         // workspace-derived Stop authority after this semantic change. Keep the
@@ -184,7 +201,15 @@ impl FollowStore {
         }
         let store = Self {
             connection: Mutex::new(connection),
+            directory: dir.to_path_buf(),
         };
+        {
+            let c = store
+                .connection
+                .lock()
+                .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
+            backfill_capability_bindings(&c)?;
+        }
         store.sweep(crate::state::now())?;
         Ok(store)
     }
@@ -220,6 +245,15 @@ impl FollowStore {
         if let Some(request_id) = request_id {
             Uuid::parse_str(request_id).map_err(|_| anyhow::anyhow!("INVALID_REQUEST"))?;
         }
+        {
+            let c = self
+                .connection
+                .lock()
+                .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
+            let retired: bool=c.query_row("SELECT EXISTS(SELECT 1 FROM follow_retired_capabilities WHERE organization_id=?1 AND account_subject=?2 AND installation_id=?3 AND run_id=?4 AND trigger=?5 AND request_id IS ?6)",params![org,account,installation,run,trigger,request_id],|r|r.get(0))?;
+            ensure!(!retired, "CONTINUATION_RESOLVED");
+        }
+        self.presentation_eligible(org, account, run, trigger, request_id, None)?;
         let receipt = URL_SAFE_NO_PAD.encode(Uuid::new_v4().as_bytes());
         let now = crate::state::now();
         let connection = self
@@ -256,6 +290,12 @@ impl FollowStore {
         request_id: Option<&str>,
     ) -> Result<Option<String>> {
         Uuid::parse_str(run).map_err(|_| anyhow::anyhow!("INVALID_REQUEST"))?;
+        if self
+            .presentation_eligible(org, account, run, trigger, request_id, None)
+            .is_err()
+        {
+            return Ok(None);
+        }
         let now = crate::state::now();
         let connection = self
             .connection
@@ -266,7 +306,7 @@ impl FollowStore {
                 "SELECT receipt FROM follow_continuations
                  WHERE organization_id = ?1 AND account_subject = ?2
                    AND installation_id = ?3 AND run_id = ?4 AND trigger = ?5
-                   AND request_id IS ?6 AND expires_at > ?7
+                   AND request_id IS ?6 AND expires_at > ?7 AND NOT EXISTS(SELECT 1 FROM follow_retired_capabilities r WHERE r.receipt=follow_continuations.receipt AND r.organization_id=follow_continuations.organization_id AND r.account_subject=follow_continuations.account_subject AND r.installation_id=follow_continuations.installation_id)
                  ORDER BY created_at DESC LIMIT 1",
                 params![org, account, installation, run, trigger, request_id, now],
                 |row| row.get(0),
@@ -364,6 +404,17 @@ impl FollowStore {
         if let Some(request_id) = request_id {
             Uuid::parse_str(request_id).map_err(|_| anyhow::anyhow!("INVALID_REQUEST"))?;
         }
+        self.verify_continuation(
+            Scope {
+                organization: org,
+                account,
+                installation,
+            },
+            &Continuation {
+                run: run.into(),
+                receipt: receipt.into(),
+            },
+        )?;
         // The opaque receipt is runner-issued. Its deterministic UUID makes a
         // duplicate mutation delivery replay the original activation instead
         // of resetting the generation and losing an in-flight wait.
@@ -396,6 +447,7 @@ impl FollowStore {
         };
         let existing = self.get(scope, &json!({"binding":public_binding(&binding)}))?;
         if existing["found"] == true
+            && existing["session"]["resolution"]["state"] == "unresolved"
             && existing["session"]["anchor"]["receiptId"] == key
             && existing["session"]["anchor"]["requestId"]
                 == request_id.map(Value::from).unwrap_or(Value::Null)
@@ -412,6 +464,7 @@ impl FollowStore {
             &json!({
                 "binding":public_binding(&binding),
                 "anchor":anchor,
+                "continuationReceipt":receipt,
                 "expectedGeneration":generation,
                 "idempotencyKey":key,
             }),
@@ -628,7 +681,7 @@ impl FollowStore {
                     scope,
                     &json!({
                         "binding":public_binding(&binding),
-                        "anchor":{"kind":"explicit_follow","receiptId":idempotency_key},
+                        "anchor":{"kind":"explicit_follow","receiptId":idempotency_key},"continuationReceipt":continuation.receipt,
                         "expectedGeneration":generation,"idempotencyKey":idempotency_key
                     }),
                 )?;
@@ -742,7 +795,11 @@ impl FollowStore {
         if let Some(run) = p.pointer("/tool/association/runId").and_then(Value::as_str) {
             let binding = lifecycle_binding(session, run)?;
             let found = self.get(scope, &json!({"binding":public_binding(&binding)}))?;
-            if found["found"] == true && found["session"]["lifecycle"] == "active" {
+            if found["found"] == true
+                && found["session"]["lifecycle"] == "active"
+                && found["session"]["resolution"]["state"] == "unresolved"
+                && found["session"]["continuationEligible"] == true
+            {
                 return Ok(Some(binding));
             }
             // A status/detail read can carry a valid run association, but it
@@ -777,11 +834,23 @@ impl FollowStore {
             .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing_native = find(&tx, scope, native)?;
+        if let Some(existing) = &existing_native {
+            crate::continuation_resolution::eligible(
+                &tx,
+                "follow_session",
+                scope.organization,
+                scope.account,
+                scope.installation,
+                existing["followSessionId"]
+                    .as_str()
+                    .context("INVALID_REQUEST")?,
+            )?;
+        }
         let mut statement = tx.prepare(
             "SELECT host_task_id FROM follow_sessions
              WHERE organization_id=?1 AND account_subject=?2 AND installation_id=?3
                AND host_id='codex-ui' AND host_session_id='unbound' AND run_id=?4
-               AND lifecycle='handoff_pending'",
+               AND lifecycle='handoff_pending' AND NOT EXISTS (SELECT 1 FROM continuation_resolutions r WHERE r.kind='follow_session' AND r.organization_id=follow_sessions.organization_id AND r.account_subject=follow_sessions.account_subject AND r.installation_id=follow_sessions.installation_id AND r.record_id=follow_sessions.follow_session_id)",
         )?;
         let tasks = statement
             .query_map(
@@ -809,6 +878,10 @@ impl FollowStore {
             run: native.run.clone(),
         };
         let pending_session = find(&tx, scope, &pending)?.context("FOLLOW_SESSION_NOT_FOUND")?;
+        if !self.session_presentation_eligible(scope, &pending_session)? {
+            tx.commit()?;
+            return Ok(None);
+        }
         ensure!(
             matches!(
                 pending_session["anchor"]["kind"].as_str(),
@@ -838,6 +911,19 @@ impl FollowStore {
                 .context("FOLLOW_SESSION_NOT_FOUND")?
                 .checked_add(1)
                 .context("INVALID_REQUEST")?;
+            tx.execute(
+                "INSERT INTO follow_generation_transitions VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    scope.organization,
+                    scope.account,
+                    scope.installation,
+                    existing["followSessionId"].as_str(),
+                    existing["generation"].as_u64(),
+                    generation,
+                    serde_json::to_vec(&existing)?,
+                    serde_json::to_vec(&pending_session["anchor"])?
+                ],
+            )?;
             reset_generation(&mut existing, generation, &pending_session["anchor"], now);
             existing["lifecycle"] = json!("active");
             existing["pendingHandoffReceipt"] = Value::Null;
@@ -861,13 +947,27 @@ impl FollowStore {
             "UPDATE follow_sessions SET lifecycle='superseded', required_action='none', updated_at=?1, expires_at=NULL
              WHERE organization_id=?2 AND account_subject=?3 AND installation_id=?4
                AND host_id='codex-ui' AND host_session_id='unbound' AND host_task_id=?5 AND run_id=?6
-               AND lifecycle='handoff_pending'",
+               AND lifecycle='handoff_pending' AND NOT EXISTS (SELECT 1 FROM continuation_resolutions r WHERE r.kind='follow_session' AND r.organization_id=follow_sessions.organization_id AND r.account_subject=follow_sessions.account_subject AND r.installation_id=follow_sessions.installation_id AND r.record_id=follow_sessions.follow_session_id)",
             params![
                 now, scope.organization, scope.account, scope.installation,
                 pending.task, pending.run,
             ],
         )?;
         ensure!(changed == 1, "FOLLOW_SESSION_NOT_FOUND");
+        let successor = find(&tx, scope, native)?.context("FOLLOW_SESSION_NOT_FOUND")?;
+        tx.execute(
+            "INSERT INTO follow_lineage VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                scope.organization,
+                scope.account,
+                scope.installation,
+                pending_session["followSessionId"].as_str(),
+                pending_session["generation"].as_u64(),
+                successor["followSessionId"].as_str(),
+                successor["generation"].as_u64()
+            ],
+        )?;
+        tx.execute("INSERT OR IGNORE INTO follow_capability_bindings SELECT ?1,?2,receipt FROM follow_capability_bindings WHERE follow_session_id=?3 AND generation=?4",params![successor["followSessionId"].as_str(),successor["generation"].as_u64(),pending_session["followSessionId"].as_str(),pending_session["generation"].as_u64()])?;
         tx.commit()?;
         Ok(Some(native.clone()))
     }
@@ -890,6 +990,19 @@ impl FollowStore {
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )?.collect::<rusqlite::Result<Vec<_>>>()?;
         if rows.len() == 1 && rows[0].1 == "active" {
+            let b = Binding {
+                host: "codex".into(),
+                host_session: id.clone(),
+                task: task.into(),
+                run: rows[0].0.clone(),
+            };
+            let current = find(&connection, scope, &b)?.context("FOLLOW_SESSION_NOT_FOUND")?;
+            if current["resolution"]["state"] != "unresolved"
+                || !self.session_presentation_eligible(scope, &current)?
+            {
+                return Ok(None);
+            }
+
             return Ok(Some(Binding {
                 host: "codex".into(),
                 host_session: id,
@@ -912,7 +1025,13 @@ impl FollowStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
         match find(&connection, scope, &binding)? {
-            Some(session) => Ok(json!({"found": true, "session": session})),
+            Some(mut session) => {
+                session["continuationEligible"] = json!(
+                    self.session_presentation_eligible(scope, &session)?
+                        && session["resolution"]["state"] == "unresolved"
+                );
+                Ok(json!({"found": true, "session": session}))
+            }
             None => Ok(json!({"found": false, "binding": public_binding(&binding)})),
         }
     }
@@ -929,6 +1048,18 @@ impl FollowStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(current) = find(&tx, scope, &binding)? {
+            crate::continuation_resolution::eligible(
+                &tx,
+                "follow_session",
+                scope.organization,
+                scope.account,
+                scope.installation,
+                current["followSessionId"]
+                    .as_str()
+                    .context("INVALID_REQUEST")?,
+            )?;
+        }
         if let Some(result) = receipt(&tx, scope, "follow.session.activate", key, &digest)? {
             tx.commit()?;
             return Ok(result);
@@ -960,6 +1091,16 @@ impl FollowStore {
                 session
             }
         };
+        if let Some(receipt) = p["continuationReceipt"].as_str() {
+            tx.execute(
+                "INSERT OR IGNORE INTO follow_capability_bindings VALUES(?1,?2,?3)",
+                params![
+                    session["followSessionId"].as_str(),
+                    session["generation"].as_u64(),
+                    receipt
+                ],
+            )?;
+        }
         let result = json!({"session": session});
         save_receipt(
             &tx,
@@ -988,6 +1129,18 @@ impl FollowStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(current) = find(&tx, scope, &binding)? {
+            crate::continuation_resolution::eligible(
+                &tx,
+                "follow_session",
+                scope.organization,
+                scope.account,
+                scope.installation,
+                current["followSessionId"]
+                    .as_str()
+                    .context("INVALID_REQUEST")?,
+            )?;
+        }
         if let Some(result) = receipt(&tx, scope, "follow.session.decide", key, &digest)? {
             tx.commit()?;
             return Ok(result);
@@ -1050,6 +1203,7 @@ impl FollowStore {
         decision["generation"] = json!(generation);
         decision["revision"] = session["revision"].clone();
         write(&tx, scope, &session)?;
+        resolve_predecessors(&tx, &session)?;
         let result = json!({"decision": decision, "session": session});
         save_receipt(
             &tx,
@@ -1064,13 +1218,217 @@ impl FollowStore {
         Ok(result)
     }
 
-    fn sweep(&self, at: u64) -> Result<()> {
+    fn presentation_eligible(
+        &self,
+        org: &str,
+        account: &str,
+        run: &str,
+        trigger: &str,
+        request: Option<&str>,
+        receipt: Option<&str>,
+    ) -> Result<()> {
+        let path = self.directory.join("presentation.sqlite3");
+        if !path.exists() {
+            return Ok(());
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        ensure!(
+            metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.nlink() == 1
+                && metadata.mode() & 0o077 == 0,
+            "UNSAFE_STATE"
+        );
+        let c = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let identity = if trigger == "accepted_interaction" {
+            format!(
+                "follow:{run}:{}",
+                request.context("FOLLOW_RECEIPT_INVALID")?
+            )
+        } else {
+            format!("follow:{run}:run_started")
+        };
+        let exists:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='presentation_deliveries')",[],|r|r.get(0))?;
+        if !exists {
+            return Ok(());
+        }
+        let row:Option<Vec<u8>>=c.query_row("SELECT continuation_json FROM presentation_deliveries WHERE organization_id=?1 AND account_subject=?2 AND identity=?3",params![org,account,identity],|r|r.get(0)).optional()?;
+        if let Some(bytes) = row {
+            let continuation: Value = serde_json::from_slice(&bytes)?;
+            if receipt.is_none() || continuation["receipt"].as_str() == receipt {
+                crate::continuation_resolution::eligible(
+                    &c,
+                    "presentation_delivery",
+                    org,
+                    account,
+                    "",
+                    &identity,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn session_presentation_eligible(&self, scope: Scope<'_>, session: &Value) -> Result<bool> {
+        let c = Connection::open_with_flags(
+            self.directory.join("follow.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let mut stmt=c.prepare("SELECT receipt FROM follow_capability_bindings WHERE follow_session_id=?1 AND generation=?2")?;
+        let receipts = stmt
+            .query_map(
+                params![
+                    session["followSessionId"].as_str(),
+                    session["generation"].as_u64()
+                ],
+                |r| r.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let path = self.directory.join("presentation.sqlite3");
+        if !path.exists() {
+            return Ok(true);
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        ensure!(
+            metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.nlink() == 1
+                && metadata.mode() & 0o077 == 0,
+            "UNSAFE_STATE"
+        );
+        let p = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let exists:bool=p.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='presentation_deliveries')",[],|r|r.get(0))?;
+        if !exists {
+            return Ok(true);
+        }
+        let mut stmt=p.prepare("SELECT identity,continuation_json FROM presentation_deliveries WHERE organization_id=?1 AND account_subject=?2")?;
+        let rows = stmt
+            .query_map(params![scope.organization, scope.account], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut proven_lineage = !receipts.is_empty();
+        let mut closed_scoped_run = false;
+        for (identity, bytes) in rows {
+            let continuation: Value = serde_json::from_slice(&bytes)?;
+            let historic_exact = continuation["runId"] == session["runId"]
+                && continuation["receipt"].as_str().is_some_and(|receipt| {
+                    session["anchor"]["receiptId"] == capability_key(receipt)
+                });
+            let recorded_exact = receipts.iter().any(|r| continuation["receipt"] == *r);
+            proven_lineage |= historic_exact;
+            let closed = crate::continuation_resolution::projection(
+                &p,
+                "presentation_delivery",
+                scope.organization,
+                scope.account,
+                "",
+                &identity,
+            )?["state"]
+                != "unresolved";
+            if (recorded_exact || historic_exact) && closed {
+                return Ok(false);
+            }
+            closed_scoped_run |= closed
+                && continuation["kind"] == "follow"
+                && continuation["runId"] == session["runId"];
+        }
+        // An old direct native anchor identifies a host event rather than a
+        // capability. A closed delivery for this scoped run cannot prove which
+        // receipt it used, so preserve that uncertainty by denying automatic
+        // continuation. A fresh explicit prompt records its own generation's
+        // exact capability binding and can independently establish new intent.
+        Ok(proven_lineage || !closed_scoped_run)
+    }
+
+    pub fn maintenance_candidates(&self) -> Result<Vec<Value>> {
+        let c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
+        maintenance_follow_candidates(&c)
+    }
+    pub fn maintenance_retire(&self, request: &Value) -> Result<Value> {
+        self.maintenance_close(
+            request,
+            "retired_by_owner",
+            json!({"reasonCode":"OWNER_RETIRED_LOCAL_CONTINUATION"}),
+        )
+    }
+    pub fn maintenance_reconcile(&self, request: &Value, observation: &Value) -> Result<Value> {
+        let mut c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let candidate = maintenance_follow_candidates(&tx)?
+            .into_iter()
+            .find(|v| {
+                v["recordId"] == request["recordId"]
+                    && v["organizationId"] == request["organizationId"]
+                    && v["accountSubject"] == request["accountSubject"]
+                    && v["installationId"] == request["installationId"]
+            })
+            .context("MANAGED_WORK_CHANGED")?;
+        crate::continuation_resolution::matches(&candidate, request)?;
+        if let Some(existing) = crate::continuation_resolution::replay(&tx, &candidate, request)? {
+            tx.commit()?;
+            return Ok(existing);
+        }
+        let fact = crate::continuation_resolution::observe(&tx, &candidate, observation)?;
+        let result = if fact["terminal"] == true {
+            let closed = crate::continuation_resolution::close(
+                &tx,
+                &candidate,
+                request,
+                "verified_terminal",
+                json!({"runId":request["runId"],"observationDigest":fact["observationDigest"]}),
+            )?;
+            invalidate_capabilities(&tx, &candidate)?;
+            closed
+        } else {
+            fact
+        };
+        tx.commit()?;
+        Ok(result)
+    }
+    fn maintenance_close(&self, request: &Value, state: &str, evidence: Value) -> Result<Value> {
+        let mut c = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let candidate = maintenance_follow_candidates(&tx)?
+            .into_iter()
+            .find(|v| {
+                v["recordId"] == request["recordId"]
+                    && v["organizationId"] == request["organizationId"]
+                    && v["accountSubject"] == request["accountSubject"]
+                    && v["installationId"] == request["installationId"]
+            })
+            .context("MANAGED_WORK_CHANGED")?;
+        crate::continuation_resolution::matches(&candidate, request)?;
+        let observed = crate::continuation_resolution::observation(&tx, &candidate)?;
+        ensure!(
+            observed["recordDigest"] == candidate["recordDigest"],
+            "MANAGED_WORK_RECONCILIATION_REQUIRED"
+        );
+        let result =
+            crate::continuation_resolution::close(&tx, &candidate, request, state, evidence)?;
+        invalidate_capabilities(&tx, &candidate)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub(crate) fn sweep(&self, at: u64) -> Result<()> {
         let connection = self
             .connection
             .lock()
             .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
         connection.execute(
-            "DELETE FROM follow_sessions WHERE expires_at IS NOT NULL AND expires_at <= ?1 AND lifecycle='terminal' AND required_action='none' AND terminal_receipt_json IS NOT NULL",
+            "DELETE FROM follow_sessions WHERE expires_at IS NOT NULL AND expires_at <= ?1 AND lifecycle='terminal' AND required_action='none' AND terminal_receipt_json IS NOT NULL AND follow_session_id NOT IN (SELECT record_id FROM continuation_resolutions) AND follow_session_id NOT IN (SELECT successor_id FROM follow_lineage)",
             params![at],
         )?;
         connection.execute(
@@ -1078,7 +1436,7 @@ impl FollowStore {
             params![at],
         )?;
         connection.execute(
-            "DELETE FROM follow_continuations WHERE expires_at <= ?1",
+            "DELETE FROM follow_continuations WHERE expires_at <= ?1 AND NOT EXISTS(SELECT 1 FROM follow_capability_bindings b WHERE b.receipt=follow_continuations.receipt)",
             params![at],
         )?;
         connection.execute(
@@ -1119,10 +1477,20 @@ impl FollowStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("INTERNAL"))?;
         let found = connection.query_row(
-            "SELECT 1 FROM follow_continuations WHERE receipt=?1 AND organization_id=?2 AND account_subject=?3 AND installation_id=?4 AND run_id=?5 AND expires_at>?6",
+            "SELECT 1 FROM follow_continuations WHERE receipt=?1 AND organization_id=?2 AND account_subject=?3 AND installation_id=?4 AND run_id=?5 AND expires_at>?6 AND NOT EXISTS(SELECT 1 FROM follow_retired_capabilities r WHERE r.receipt=follow_continuations.receipt AND r.organization_id=follow_continuations.organization_id AND r.account_subject=follow_continuations.account_subject AND r.installation_id=follow_continuations.installation_id)",
             params![receipt, scope.organization, scope.account, scope.installation, continuation.run, crate::state::now()], |_| Ok(()),
         ).optional()?;
         ensure!(found.is_some(), "FOLLOW_RECEIPT_INVALID");
+        let (trigger,request):(String,Option<String>)=connection.query_row("SELECT trigger,request_id FROM follow_continuations WHERE receipt=?1 AND organization_id=?2 AND account_subject=?3 AND installation_id=?4",params![receipt,scope.organization,scope.account,scope.installation],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        drop(connection);
+        self.presentation_eligible(
+            scope.organization,
+            scope.account,
+            &continuation.run,
+            &trigger,
+            request.as_deref(),
+            Some(receipt),
+        )?;
         Ok(())
     }
 }
@@ -1814,8 +2182,326 @@ fn decode(bytes: &[u8]) -> rusqlite::Result<Value> {
         )
     })
 }
+fn capability_key(receipt: &str) -> String {
+    let mut bytes: [u8; 16] = Sha256::digest(receipt.as_bytes())[..16].try_into().unwrap();
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes).to_string()
+}
+fn backfill_capability_bindings(c: &Connection) -> Result<()> {
+    let mut stmt=c.prepare("SELECT s.follow_session_id,s.generation,s.anchor_digest,c.receipt FROM follow_sessions s JOIN follow_continuations c ON c.organization_id=s.organization_id AND c.account_subject=s.account_subject AND c.installation_id=s.installation_id AND c.run_id=s.run_id")?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, u64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for (id, generation, anchor, receipt) in rows {
+        if serde_json::from_str::<Value>(&anchor)
+            .ok()
+            .is_some_and(|a| a["receiptId"] == capability_key(&receipt))
+        {
+            c.execute(
+                "INSERT OR IGNORE INTO follow_capability_bindings VALUES(?1,?2,?3)",
+                params![id, generation, receipt],
+            )?;
+        }
+    }
+    Ok(())
+}
+/// Exact identity metadata remains available after capability expiry, until local work is resolved.
+pub fn maintenance_acceptance_capabilities(c: &Connection) -> Result<Vec<Value>> {
+    let mut stmt=c.prepare("SELECT organization_id,account_subject,installation_id,run_id,receipt,trigger,request_id FROM follow_continuations")?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter().map(|(org,account,install,run,receipt,trigger,request)|Ok(json!({"organizationId":org,"accountSubject":account,"installationId":install,"runId":run,"receipt":receipt,"trigger":trigger,"requestId":request,"resolved":maintenance_continuation_resolved(c,&org,&account,&install,&run,&receipt)?}))).collect()
+}
+/// Verify a monotonic, immutable chain of exact accepted-request generation transitions.
+pub(crate) fn maintenance_generation_path(
+    c: &Connection,
+    successor: &Value,
+    from: u64,
+    to: u64,
+) -> Result<bool> {
+    if from == 0 {
+        return Ok(false);
+    }
+    if from == to {
+        return Ok(true);
+    }
+    if from > to || to - from > 4096 {
+        return Ok(false);
+    }
+    let exists:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='follow_generation_transitions')",[],|r|r.get(0))?;
+    if !exists {
+        return Ok(false);
+    }
+    for generation in from..to {
+        let row:Option<(u64,Vec<u8>,Vec<u8>)>=c.query_row("SELECT to_generation,from_json,to_anchor_json FROM follow_generation_transitions WHERE organization_id=?1 AND account_subject=?2 AND installation_id=?3 AND follow_session_id=?4 AND from_generation=?5",params![successor["organizationId"].as_str(),successor["accountSubject"].as_str(),successor["installationId"].as_str(),successor["followSessionId"].as_str(),generation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        let Some((next, bytes, anchor)) = row else {
+            return Ok(false);
+        };
+        let old: Value = serde_json::from_slice(&bytes)?;
+        let anchor: Value = serde_json::from_slice(&anchor)?;
+        if next != generation + 1
+            || old["generation"] != generation
+            || old["lifecycle"] != "input_pending"
+            || old["requiredAction"] != "none"
+            || old["pendingHandoffReceipt"]["generation"] != generation
+            || old["pendingHandoffReceipt"]["requestId"] != anchor["requestId"]
+            || anchor["kind"] != "accepted_interaction"
+            || anchor["requestId"]
+                .as_str()
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .is_none()
+        {
+            return Ok(false);
+        }
+        let mut sources=c.prepare("SELECT p.anchor_digest FROM follow_lineage l JOIN follow_sessions p ON p.follow_session_id=l.predecessor_id AND p.generation=l.predecessor_generation AND p.organization_id=l.organization_id AND p.account_subject=l.account_subject AND p.installation_id=l.installation_id WHERE l.organization_id=?1 AND l.account_subject=?2 AND l.installation_id=?3 AND l.successor_id=?4 AND l.successor_generation=?5 AND p.run_id=?6")?;
+        let anchors = sources
+            .query_map(
+                params![
+                    successor["organizationId"].as_str(),
+                    successor["accountSubject"].as_str(),
+                    successor["installationId"].as_str(),
+                    successor["followSessionId"].as_str(),
+                    next,
+                    successor["runId"].as_str()
+                ],
+                |r| r.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if anchors
+            .iter()
+            .filter(|v| {
+                serde_json::from_str::<Value>(v)
+                    .ok()
+                    .is_some_and(|v| v == anchor)
+            })
+            .count()
+            != 1
+        {
+            return Ok(false);
+        }
+        for key in [
+            "organizationId",
+            "accountSubject",
+            "installationId",
+            "followSessionId",
+            "runId",
+        ] {
+            if old[key] != successor[key] {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Canonical read-only projection for maintenance and uninstall snapshot assessment.
+pub fn maintenance_follow_candidates(c: &Connection) -> Result<Vec<Value>> {
+    let mut stmt=c.prepare("SELECT organization_id,account_subject,installation_id,host_id,host_session_id,host_task_id,run_id FROM follow_sessions ORDER BY follow_session_id")?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter().map(|(org,account,install,host,host_session,task,run)| {
+        let scope=Scope{organization:&org,account:&account,installation:&install};
+        let mut full=find(c,scope,&Binding{host,host_session,task,run:run.clone()})?.context("FOLLOW_SESSION_NOT_FOUND")?;
+        let resolution=full.as_object_mut().context("INVALID_REQUEST")?.remove("resolution").unwrap_or(json!({"state":"unresolved"}));
+        let mut candidate=json!({"kind":"follow_session","organizationId":org,"accountSubject":account,"installationId":install,"recordId":full["followSessionId"],"runId":run,"revision":full["revision"],"generation":full["generation"],"attemptId":null,"lifecycle":full["lifecycle"],"recordDigest":crate::state::json_digest(&full),"resolution":resolution});
+        candidate["backendObservation"]=crate::continuation_resolution::observation(c,&candidate)?;
+        Ok(candidate)
+    }).collect()
+}
+pub fn maintenance_resolved(c: &Connection, candidate: &Value) -> Result<bool> {
+    crate::continuation_resolution::resolved(c, candidate)
+}
+pub fn maintenance_continuation_resolved(
+    c: &Connection,
+    org: &str,
+    account: &str,
+    install: &str,
+    run: &str,
+    receipt: &str,
+) -> Result<bool> {
+    let exists:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='follow_retired_capabilities')",[],|r|r.get(0))?;
+    if !exists {
+        return Ok(false);
+    }
+    let retired:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM follow_retired_capabilities r WHERE r.organization_id=?1 AND r.account_subject=?2 AND r.installation_id=?3 AND r.run_id=?4 AND r.receipt=?5 AND EXISTS(SELECT 1 FROM follow_continuations c WHERE c.organization_id=r.organization_id AND c.account_subject=r.account_subject AND c.installation_id=r.installation_id AND c.run_id=r.run_id AND c.receipt=r.receipt AND c.trigger=r.trigger AND c.request_id IS r.request_id))",params![org,account,install,run,receipt],|r|r.get(0))?;
+    if !retired {
+        return Ok(false);
+    }
+    for candidate in maintenance_follow_candidates(c)? {
+        if candidate["organizationId"] != org
+            || candidate["accountSubject"] != account
+            || candidate["installationId"] != install
+            || candidate["runId"] != run
+            || !maintenance_resolved(c, &candidate)?
+        {
+            continue;
+        }
+        let bound:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM follow_capability_bindings WHERE follow_session_id=?1 AND generation=?2 AND receipt=?3)",params![candidate["recordId"].as_str(),candidate["generation"].as_u64(),receipt],|r|r.get(0))?;
+        if bound {
+            return Ok(true);
+        }
+        // Only UI receipt-derived anchors carry historical exact capability proof.
+        let anchor_text: String = c.query_row(
+            "SELECT anchor_digest FROM follow_sessions WHERE follow_session_id=?1",
+            params![candidate["recordId"].as_str()],
+            |r| r.get(0),
+        )?;
+        let anchor: Value = serde_json::from_str(&anchor_text)?;
+        let mut bytes: [u8; 16] = Sha256::digest(receipt.as_bytes())[..16].try_into().unwrap();
+        bytes[6] = (bytes[6] & 0x0f) | 0x80;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        if anchor["receiptId"] == Uuid::from_bytes(bytes).to_string() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn invalidate_capabilities(c: &Connection, candidate: &Value) -> Result<()> {
+    let org = candidate["organizationId"]
+        .as_str()
+        .context("INVALID_REQUEST")?;
+    let account = candidate["accountSubject"]
+        .as_str()
+        .context("INVALID_REQUEST")?;
+    let install = candidate["installationId"]
+        .as_str()
+        .context("INVALID_REQUEST")?;
+    let anchor_text:String=c.query_row("SELECT anchor_digest FROM follow_sessions WHERE follow_session_id=?1 AND organization_id=?2 AND account_subject=?3 AND installation_id=?4",params![candidate["recordId"].as_str(),org,account,install],|r|r.get(0))?;
+    let anchor: Value = serde_json::from_str(&anchor_text)?;
+    let mut stmt=c.prepare("SELECT receipt,run_id,trigger,request_id FROM follow_continuations WHERE organization_id=?1 AND account_subject=?2 AND installation_id=?3 AND run_id=?4")?;
+    let rows = stmt
+        .query_map(
+            params![org, account, install, candidate["runId"].as_str()],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for (receipt, run, trigger, request) in rows {
+        let mut bytes: [u8; 16] = Sha256::digest(receipt.as_bytes())[..16].try_into().unwrap();
+        bytes[6] = (bytes[6] & 0x0f) | 0x80;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        let bound:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM follow_capability_bindings WHERE follow_session_id=?1 AND generation=?2 AND receipt=?3)",params![candidate["recordId"].as_str(),candidate["generation"].as_u64(),receipt],|r|r.get(0))?;
+        if bound || anchor["receiptId"] == Uuid::from_bytes(bytes).to_string() {
+            c.execute(
+                "INSERT OR IGNORE INTO follow_retired_capabilities VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![org, account, install, receipt, run, trigger, request],
+            )?;
+        }
+    }
+    Ok(())
+}
+fn resolve_predecessors(c: &Connection, successor: &Value) -> Result<()> {
+    if successor["lifecycle"] != "terminal"
+        || successor["requiredAction"] != "none"
+        || successor["terminalReceipt"].is_null()
+        || !successor["pendingHandoffReceipt"].is_null()
+    {
+        return Ok(());
+    }
+    let mut stmt=c.prepare("SELECT predecessor_id,predecessor_generation,successor_generation FROM follow_lineage WHERE organization_id=?1 AND account_subject=?2 AND installation_id=?3 AND successor_id=?4")?;
+    let links = stmt
+        .query_map(
+            params![
+                successor["organizationId"].as_str(),
+                successor["accountSubject"].as_str(),
+                successor["installationId"].as_str(),
+                successor["followSessionId"].as_str()
+            ],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, u64>(1)?,
+                    r.get::<_, u64>(2)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    let candidates = maintenance_follow_candidates(c)?;
+    for (id, generation, lineage_generation) in links {
+        if !maintenance_generation_path(
+            c,
+            successor,
+            lineage_generation,
+            successor["generation"]
+                .as_u64()
+                .context("INVALID_REQUEST")?,
+        )? {
+            continue;
+        }
+        if let Some(candidate) = candidates.iter().find(|v| {
+            v["recordId"] == id
+                && v["generation"] == generation
+                && v["lifecycle"] == "superseded"
+                && v["resolution"]["state"] == "unresolved"
+        }) {
+            let mut request = candidate.clone();
+            request["idempotencyKey"] = json!(Uuid::new_v4());
+            crate::continuation_resolution::close(
+                c,
+                candidate,
+                &request,
+                "superseded_by_verified_successor",
+                json!({"successorId":successor["followSessionId"],"successorGeneration":successor["generation"],"lineageSuccessorGeneration":lineage_generation,"terminalReceipt":successor["terminalReceipt"]}),
+            )?;
+            invalidate_capabilities(c, candidate)?;
+        }
+    }
+    Ok(())
+}
+
 fn find(connection: &Connection, scope: Scope<'_>, b: &Binding) -> Result<Option<Value>> {
-    connection.query_row("SELECT follow_session_id,anchor_digest,schema_version,generation,revision,mode,lifecycle,event_cursor,pending_handoff_json,terminal_receipt_json,recovery_json,cleanup_json,action_progress_json,required_action,missed_action_count,hook_count,last_error,created_at,updated_at,expires_at FROM follow_sessions WHERE organization_id=?1 AND account_subject=?2 AND installation_id=?3 AND host_id=?4 AND host_session_id=?5 AND host_task_id=?6 AND run_id=?7",params![scope.organization,scope.account,scope.installation,b.host,b.host_session,b.task,b.run],|r|{let action:Vec<u8>=r.get(12)?;Ok(json!({"followSessionId":r.get::<_,String>(0)?,"organizationId":scope.organization,"accountSubject":scope.account,"installationId":scope.installation,"hostId":b.host,"hostSessionId":b.host_session,"hostTaskId":b.task,"runId":b.run,"anchor":serde_json::from_str::<Value>(&r.get::<_,String>(1)?).unwrap_or(Value::Null),"schemaVersion":r.get::<_,u64>(2)?,"generation":r.get::<_,u64>(3)?,"revision":r.get::<_,u64>(4)?,"mode":r.get::<_,String>(5)?,"lifecycle":r.get::<_,String>(6)?,"eventCursor":r.get::<_,Option<u64>>(7)?,"pendingHandoffReceipt":opt_json(r.get(8)?)?,"terminalReceipt":opt_json(r.get(9)?)?,"recovery":opt_json(r.get(10)?)?,"cleanup":opt_json(r.get(11)?)?,"actionProgress":decode(&action)?,"requiredAction":r.get::<_,String>(13)?,"missedActionCount":r.get::<_,u64>(14)?,"hookCount":r.get::<_,u64>(15)?,"lastError":r.get::<_,Option<String>>(16)?,"createdAt":r.get::<_,u64>(17)?,"updatedAt":r.get::<_,u64>(18)?,"expiresAt":r.get::<_,Option<u64>>(19)?}))}).optional().map_err(Into::into)
+    let mut result: Option<Value> = connection.query_row("SELECT follow_session_id,anchor_digest,schema_version,generation,revision,mode,lifecycle,event_cursor,pending_handoff_json,terminal_receipt_json,recovery_json,cleanup_json,action_progress_json,required_action,missed_action_count,hook_count,last_error,created_at,updated_at,expires_at FROM follow_sessions WHERE organization_id=?1 AND account_subject=?2 AND installation_id=?3 AND host_id=?4 AND host_session_id=?5 AND host_task_id=?6 AND run_id=?7",params![scope.organization,scope.account,scope.installation,b.host,b.host_session,b.task,b.run],|r|{let action:Vec<u8>=r.get(12)?;Ok(json!({"followSessionId":r.get::<_,String>(0)?,"organizationId":scope.organization,"accountSubject":scope.account,"installationId":scope.installation,"hostId":b.host,"hostSessionId":b.host_session,"hostTaskId":b.task,"runId":b.run,"anchor":serde_json::from_str::<Value>(&r.get::<_,String>(1)?).unwrap_or(Value::Null),"schemaVersion":r.get::<_,u64>(2)?,"generation":r.get::<_,u64>(3)?,"revision":r.get::<_,u64>(4)?,"mode":r.get::<_,String>(5)?,"lifecycle":r.get::<_,String>(6)?,"eventCursor":r.get::<_,Option<u64>>(7)?,"pendingHandoffReceipt":opt_json(r.get(8)?)?,"terminalReceipt":opt_json(r.get(9)?)?,"recovery":opt_json(r.get(10)?)?,"cleanup":opt_json(r.get(11)?)?,"actionProgress":decode(&action)?,"requiredAction":r.get::<_,String>(13)?,"missedActionCount":r.get::<_,u64>(14)?,"hookCount":r.get::<_,u64>(15)?,"lastError":r.get::<_,Option<String>>(16)?,"createdAt":r.get::<_,u64>(17)?,"updatedAt":r.get::<_,u64>(18)?,"expiresAt":r.get::<_,Option<u64>>(19)?}))}).optional()?;
+    if let Some(v) = result.as_mut() {
+        v["resolution"] = crate::continuation_resolution::projection(
+            connection,
+            "follow_session",
+            scope.organization,
+            scope.account,
+            scope.installation,
+            v["followSessionId"].as_str().context("INVALID_REQUEST")?,
+        )?;
+    }
+    Ok(result)
 }
 fn opt_json(bytes: Option<Vec<u8>>) -> rusqlite::Result<Value> {
     match bytes {
@@ -1929,6 +2615,620 @@ mod tests {
     ) -> Value {
         store.decide(scope(),&json!({"binding":b,"generation":s["generation"],"expectedRevision":s["revision"],"signal":signal,"actionProgress":{"kind":kind,"attempted":attempted},"idempotencyKey":Uuid::new_v4()})).unwrap()
     }
+    fn maintenance_request(candidate: &Value) -> Value {
+        let mut v = candidate.clone();
+        v["idempotencyKey"] = json!(Uuid::new_v4());
+        v
+    }
+    fn maintenance_observation(run: &str, status: &str) -> Value {
+        json!({"snapshot":{"execution":{"id":run,"status":status},"hasMoreEvents":false},"terminalResult":{"execution":{"id":run,"status":status},"hasMoreEvents":false}})
+    }
+
+    #[test]
+    fn legacy_direct_native_unknown_lineage_cannot_continue_retired_run_automatically() {
+        let t = tempfile::tempdir().unwrap();
+        let follow = FollowStore::open(t.path()).unwrap();
+        let presentation = crate::presentation::PresentationStore::open(t.path()).unwrap();
+        let run = Uuid::new_v4().to_string();
+        let receipt = follow
+            .issue_continuation("org", "account", "install", &run, "run_commit", None)
+            .unwrap();
+        let identity = format!("follow:{run}:run_started");
+        presentation.register_delivery("org","account",&identity,&json!({"kind":"follow","schemaVersion":"loomex.follow-session.continuation/v1","runId":run,"receipt":receipt,"trigger":"run_commit","requestId":null})).unwrap();
+        let mut start = hook("UserPromptSubmit", "legacy-direct");
+        start["continuation"] = json!({"schemaVersion":"loomex.follow-session.continuation/v1","runId":run,"source":"generated_markdown","receipt":receipt});
+        follow
+            .dispatch(
+                "org",
+                "account",
+                "install",
+                "follow.session.lifecycle",
+                &start,
+            )
+            .unwrap();
+        let other = Uuid::new_v4();
+        let mut unrelated = hook("UserPromptSubmit", "unrelated");
+        unrelated["continuation"] = runner_issued_continuation(&follow, &other);
+        follow
+            .dispatch(
+                "org",
+                "account",
+                "install",
+                "follow.session.lifecycle",
+                &unrelated,
+            )
+            .unwrap();
+        {
+            let c = follow.connection.lock().unwrap();
+            c.execute("DELETE FROM follow_capability_bindings", [])
+                .unwrap();
+            c.execute(
+                "DELETE FROM follow_continuations WHERE run_id=?1",
+                params![run],
+            )
+            .unwrap();
+            c.pragma_update(None, "user_version", 1).unwrap();
+        }
+        drop(follow);
+        let candidate = presentation.maintenance_candidates().unwrap().remove(0);
+        let request = maintenance_request(&candidate);
+        presentation
+            .maintenance_reconcile(&request, &maintenance_observation(&run, "running"))
+            .unwrap();
+        presentation.maintenance_retire(&request).unwrap();
+        let migrated = FollowStore::open(t.path()).unwrap();
+        assert!(
+            migrated
+                .lifecycle_target("org", "account", "install", &hook("Stop", "legacy-direct"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            migrated
+                .lifecycle_target("org", "account", "install", &hook("Stop", "unrelated"))
+                .unwrap()
+                .is_some()
+        );
+        let new_request = Uuid::new_v4().to_string();
+        let fresh = migrated
+            .issue_continuation(
+                "org",
+                "account",
+                "install",
+                &run,
+                "accepted_interaction",
+                Some(&new_request),
+            )
+            .unwrap();
+        let mut explicit = hook("UserPromptSubmit", "legacy-direct");
+        explicit["continuation"] = json!({"schemaVersion":"loomex.follow-session.continuation/v1","runId":run,"source":"generated_markdown","receipt":fresh});
+        migrated
+            .dispatch(
+                "org",
+                "account",
+                "install",
+                "follow.session.lifecycle",
+                &explicit,
+            )
+            .unwrap();
+        assert!(
+            migrated
+                .lifecycle_target("org", "account", "install", &hook("Stop", "legacy-direct"))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn accepted_request_generation_chain_resolves_all_exact_predecessors() {
+        let t = tempfile::tempdir().unwrap();
+        let store = FollowStore::open(t.path()).unwrap();
+        let run = Uuid::new_v4().to_string();
+        let receipt = store
+            .issue_continuation("org", "account", "install", &run, "run_commit", None)
+            .unwrap();
+        store
+            .activate_ui_handoff("org", "account", "install", &run, &receipt, None)
+            .unwrap();
+        let native = Binding {
+            host: "codex".into(),
+            host_session: "native".into(),
+            task: "unverified".into(),
+            run: run.clone(),
+        };
+        let binding = public_binding(&native);
+        store
+            .promote_pending_ui_handoff(scope(), &native)
+            .unwrap()
+            .unwrap();
+        for _ in 0..2 {
+            let current =
+                store.get(scope(), &json!({"binding":binding})).unwrap()["session"].clone();
+            let request = Uuid::new_v4().to_string();
+            decide(
+                &store,
+                &binding,
+                &current,
+                json!({"kind":"input","requestId":request,"receiptId":Uuid::new_v4()}),
+                true,
+                "handoff",
+            );
+            let receipt = store
+                .issue_continuation(
+                    "org",
+                    "account",
+                    "install",
+                    &run,
+                    "accepted_interaction",
+                    Some(&request),
+                )
+                .unwrap();
+            store
+                .activate_ui_handoff("org", "account", "install", &run, &receipt, Some(&request))
+                .unwrap();
+            store
+                .promote_pending_ui_handoff(scope(), &native)
+                .unwrap()
+                .unwrap();
+        }
+        let current = store.get(scope(), &json!({"binding":binding})).unwrap()["session"].clone();
+        assert_eq!(current["generation"], 3);
+        decide(
+            &store,
+            &binding,
+            &current,
+            json!({"kind":"terminal","receiptId":Uuid::new_v4()}),
+            true,
+            "result_read",
+        );
+        let candidates = store.maintenance_candidates().unwrap();
+        let predecessors: Vec<_> = candidates
+            .iter()
+            .filter(|v| v["lifecycle"] == "superseded")
+            .collect();
+        assert_eq!(predecessors.len(), 3);
+        {
+            let c = store.connection.lock().unwrap();
+            for candidate in &predecessors {
+                assert!(maintenance_resolved(&c, candidate).unwrap());
+            }
+        }
+        assert!(crate::uninstall_state::inventory_resolved_state(t.path()).is_ok());
+        let first = predecessors
+            .iter()
+            .find(|v| v["resolution"]["evidence"]["lineageSuccessorGeneration"] == 1)
+            .unwrap();
+        let c = store.connection.lock().unwrap();
+        let original: Vec<u8> = c
+            .query_row(
+                "SELECT to_anchor_json FROM follow_generation_transitions WHERE from_generation=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut wrong: Value = serde_json::from_slice(&original).unwrap();
+        wrong["requestId"] = json!(Uuid::new_v4());
+        c.execute(
+            "UPDATE follow_generation_transitions SET to_anchor_json=?1 WHERE from_generation=1",
+            params![serde_json::to_vec(&wrong).unwrap()],
+        )
+        .unwrap();
+        assert!(!maintenance_resolved(&c, first).unwrap());
+        c.execute("UPDATE follow_generation_transitions SET to_anchor_json=?1,to_generation=3 WHERE from_generation=1",params![original]).unwrap();
+        assert!(!maintenance_resolved(&c, first).unwrap());
+        drop(c);
+        assert!(crate::uninstall_state::inventory_resolved_state(t.path()).is_err());
+    }
+
+    #[test]
+    fn legacy_promoted_anchor_denies_retired_presentation_without_binding_rows() {
+        let t = tempfile::tempdir().unwrap();
+        let follow = FollowStore::open(t.path()).unwrap();
+        let presentation = crate::presentation::PresentationStore::open(t.path()).unwrap();
+        let run = Uuid::new_v4().to_string();
+        let receipt = follow
+            .issue_continuation("org", "account", "install", &run, "run_commit", None)
+            .unwrap();
+        let identity = format!("follow:{run}:run_started");
+        presentation.register_delivery("org","account",&identity,&json!({"kind":"follow","schemaVersion":"loomex.follow-session.continuation/v1","runId":run,"receipt":receipt,"trigger":"run_commit","requestId":null})).unwrap();
+        follow
+            .activate_ui_handoff("org", "account", "install", &run, &receipt, None)
+            .unwrap();
+        let native = Binding {
+            host: "codex".into(),
+            host_session: "native".into(),
+            task: "unverified".into(),
+            run: run.clone(),
+        };
+        follow
+            .promote_pending_ui_handoff(scope(), &native)
+            .unwrap()
+            .unwrap();
+        {
+            let c = follow.connection.lock().unwrap();
+            c.execute("DELETE FROM follow_capability_bindings", [])
+                .unwrap();
+            c.execute("DELETE FROM follow_continuations", []).unwrap();
+            c.pragma_update(None, "user_version", 1).unwrap();
+        }
+        drop(follow);
+        let candidate = presentation.maintenance_candidates().unwrap().remove(0);
+        let request = maintenance_request(&candidate);
+        presentation
+            .maintenance_reconcile(&request, &maintenance_observation(&run, "running"))
+            .unwrap();
+        presentation.maintenance_retire(&request).unwrap();
+        let migrated = FollowStore::open(t.path()).unwrap();
+        assert!(
+            migrated
+                .lifecycle_target("org", "account", "install", &hook("Stop", "native"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn expired_capability_identity_survives_sweep_before_retirement_and_fences_reissue() {
+        let t = tempfile::tempdir().unwrap();
+        let store = FollowStore::open(t.path()).unwrap();
+        let run = Uuid::new_v4().to_string();
+        let receipt = store
+            .issue_continuation("org", "account", "install", &run, "run_commit", None)
+            .unwrap();
+        store
+            .activate_ui_handoff("org", "account", "install", &run, &receipt, None)
+            .unwrap();
+        store
+            .sweep(crate::state::now() + RETENTION_SECONDS + 1)
+            .unwrap();
+        let candidate = store.maintenance_candidates().unwrap().remove(0);
+        let request = maintenance_request(&candidate);
+        store
+            .maintenance_reconcile(&request, &maintenance_observation(&run, "running"))
+            .unwrap();
+        store.maintenance_retire(&request).unwrap();
+        assert_eq!(
+            store
+                .issue_continuation("org", "account", "install", &run, "run_commit", None)
+                .unwrap_err()
+                .to_string(),
+            "CONTINUATION_RESOLVED"
+        );
+    }
+
+    #[test]
+    fn terminal_reconciliation_replay_preserves_original_observation_proof() {
+        let t = tempfile::tempdir().unwrap();
+        let store = FollowStore::open(t.path()).unwrap();
+        let run = Uuid::new_v4().to_string();
+        let receipt = store
+            .issue_continuation("org", "account", "install", &run, "run_commit", None)
+            .unwrap();
+        store
+            .activate_ui_handoff("org", "account", "install", &run, &receipt, None)
+            .unwrap();
+        let candidate = store.maintenance_candidates().unwrap().remove(0);
+        let request = maintenance_request(&candidate);
+        let first = maintenance_observation(&run, "completed");
+        let closed = store.maintenance_reconcile(&request, &first).unwrap();
+        let mut second = first.clone();
+        second["snapshot"]["latestSequence"] = json!(123);
+        assert_eq!(
+            store.maintenance_reconcile(&request, &second).unwrap(),
+            closed
+        );
+        let c = store.connection.lock().unwrap();
+        assert!(maintenance_resolved(&c, &candidate).unwrap());
+        drop(c);
+        assert!(crate::uninstall_state::inventory_resolved_state(t.path()).is_ok());
+    }
+
+    #[test]
+    fn retirement_of_one_exact_pending_handoff_does_not_guess_or_retire_its_peer() {
+        let t = tempfile::tempdir().unwrap();
+        let store = FollowStore::open(t.path()).unwrap();
+        let run = Uuid::new_v4().to_string();
+        let a = store
+            .issue_continuation("org", "account", "install", &run, "run_commit", None)
+            .unwrap();
+        let b = store
+            .issue_continuation("org", "account", "install", &run, "run_commit", None)
+            .unwrap();
+        for receipt in [&a, &b] {
+            store
+                .activate_ui_handoff("org", "account", "install", &run, receipt, None)
+                .unwrap();
+        }
+        let native = Binding {
+            host: "codex".into(),
+            host_session: "session".into(),
+            task: "unverified".into(),
+            run: run.clone(),
+        };
+        assert!(
+            store
+                .promote_pending_ui_handoff(scope(), &native)
+                .unwrap()
+                .is_none()
+        );
+        let candidate = store
+            .maintenance_candidates()
+            .unwrap()
+            .into_iter()
+            .find(|v| {
+                let c = store.connection.lock().unwrap();
+                let anchor: String = c
+                    .query_row(
+                        "SELECT anchor_digest FROM follow_sessions WHERE follow_session_id=?1",
+                        params![v["recordId"].as_str()],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                serde_json::from_str::<Value>(&anchor).unwrap()["receiptId"] == receipt_key(&a)
+            })
+            .unwrap();
+        let request = maintenance_request(&candidate);
+        store
+            .maintenance_reconcile(&request, &maintenance_observation(&run, "running"))
+            .unwrap();
+        store.maintenance_retire(&request).unwrap();
+        assert!(
+            store
+                .promote_pending_ui_handoff(scope(), &native)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .verify_continuation(
+                    scope(),
+                    &Continuation {
+                        run: run.clone(),
+                        receipt: a
+                    }
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .verify_continuation(scope(), &Continuation { run, receipt: b })
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn presentation_retirement_fences_promoted_hook_even_after_capability_expiry() {
+        let t = tempfile::tempdir().unwrap();
+        let follow = FollowStore::open(t.path()).unwrap();
+        let presentation = crate::presentation::PresentationStore::open(t.path()).unwrap();
+        let run = Uuid::new_v4().to_string();
+        let receipt = follow
+            .issue_continuation("org", "account", "install", &run, "run_commit", None)
+            .unwrap();
+        let identity = format!("follow:{run}:run_started");
+        let continuation = json!({"kind":"follow","schemaVersion":"loomex.follow-session.continuation/v1","runId":run,"receipt":receipt,"trigger":"run_commit","requestId":null});
+        presentation
+            .register_delivery("org", "account", &identity, &continuation)
+            .unwrap();
+        follow
+            .activate_ui_handoff("org", "account", "install", &run, &receipt, None)
+            .unwrap();
+        let native = Binding {
+            host: "codex".into(),
+            host_session: "native".into(),
+            task: "unverified".into(),
+            run: run.clone(),
+        };
+        follow
+            .promote_pending_ui_handoff(scope(), &native)
+            .unwrap()
+            .unwrap();
+        let candidate = presentation.maintenance_candidates().unwrap().remove(0);
+        let request = maintenance_request(&candidate);
+        presentation
+            .maintenance_reconcile(&request, &maintenance_observation(&run, "running"))
+            .unwrap();
+        presentation.maintenance_retire(&request).unwrap();
+        assert!(
+            follow
+                .issue_continuation("org", "account", "install", &run, "run_commit", None)
+                .is_err()
+        );
+        assert!(
+            follow
+                .verify_continuation(
+                    scope(),
+                    &Continuation {
+                        run: run.clone(),
+                        receipt: receipt.clone()
+                    }
+                )
+                .is_err()
+        );
+        follow
+            .sweep(crate::state::now() + RETENTION_SECONDS + 1)
+            .unwrap();
+        let stop = hook("Stop", "native");
+        assert!(
+            follow
+                .lifecycle_target("org", "account", "install", &stop)
+                .unwrap()
+                .is_none()
+        );
+        let decision = follow
+            .dispatch(
+                "org",
+                "account",
+                "install",
+                "follow.session.lifecycle",
+                &stop,
+            )
+            .unwrap();
+        assert_eq!(decision["decision"], "allow");
+    }
+
+    #[test]
+    fn promoted_terminal_successor_resolves_only_proven_predecessor() {
+        let t = tempfile::tempdir().unwrap();
+        let store = FollowStore::open(t.path()).unwrap();
+        let run = Uuid::new_v4().to_string();
+        let receipt = store
+            .issue_continuation("org", "account", "install", &run, "run_commit", None)
+            .unwrap();
+        store
+            .activate_ui_handoff("org", "account", "install", &run, &receipt, None)
+            .unwrap();
+        let native = Binding {
+            host: "codex".into(),
+            host_session: "native".into(),
+            task: "unverified".into(),
+            run: run.clone(),
+        };
+        store
+            .promote_pending_ui_handoff(scope(), &native)
+            .unwrap()
+            .unwrap();
+        let before = store
+            .get(scope(), &json!({"binding":public_binding(&native)}))
+            .unwrap();
+        let native_binding = public_binding(&native);
+        decide(
+            &store,
+            &native_binding,
+            &before["session"],
+            json!({"kind":"terminal","receiptId":Uuid::new_v4()}),
+            true,
+            "result_read",
+        );
+        let candidates = store.maintenance_candidates().unwrap();
+        let predecessor = candidates
+            .iter()
+            .find(|v| v["lifecycle"] == "superseded")
+            .unwrap();
+        let c = store.connection.lock().unwrap();
+        assert!(maintenance_resolved(&c, predecessor).unwrap());
+        assert!(
+            maintenance_continuation_resolved(&c, "org", "account", "install", &run, &receipt)
+                .unwrap()
+        );
+        assert_eq!(
+            predecessor["resolution"]["state"],
+            "superseded_by_verified_successor"
+        );
+        drop(c);
+        assert!(crate::uninstall_state::inventory_resolved_state(t.path()).is_ok());
+        let c = store.connection.lock().unwrap();
+        c.execute("DELETE FROM follow_lineage", []).unwrap();
+        assert!(!maintenance_resolved(&c, predecessor).unwrap());
+    }
+
+    #[test]
+    fn retirement_is_exact_durable_and_invalidates_hooks_receipts_and_reissue() {
+        let t = tempfile::tempdir().unwrap();
+        let store = FollowStore::open(t.path()).unwrap();
+        let run = Uuid::new_v4().to_string();
+        let receipt = store
+            .issue_continuation("org", "account", "install", &run, "run_commit", None)
+            .unwrap();
+        store
+            .activate_ui_handoff("org", "account", "install", &run, &receipt, None)
+            .unwrap();
+        let candidate = store.maintenance_candidates().unwrap().remove(0);
+        let request = maintenance_request(&candidate);
+        assert_eq!(
+            store.maintenance_retire(&request).unwrap_err().to_string(),
+            "MANAGED_WORK_RECONCILIATION_REQUIRED"
+        );
+        store
+            .maintenance_reconcile(
+                &maintenance_request(&candidate),
+                &maintenance_observation(&run, "running"),
+            )
+            .unwrap();
+        let closed = store.maintenance_retire(&request).unwrap();
+        assert_eq!(closed, store.maintenance_retire(&request).unwrap());
+        assert!(
+            store
+                .activate_ui_handoff("org", "account", "install", &run, &receipt, None)
+                .is_err()
+        );
+        assert!(
+            store
+                .issue_continuation("org", "account", "install", &run, "run_commit", None)
+                .is_err()
+        );
+        assert!(
+            store
+                .issued_continuation("org", "account", "install", &run, "run_commit", None)
+                .unwrap()
+                .is_none()
+        );
+        let native = Binding {
+            host: "codex".into(),
+            host_session: "late".into(),
+            task: "unverified".into(),
+            run: run.clone(),
+        };
+        assert!(
+            store
+                .promote_pending_ui_handoff(scope(), &native)
+                .unwrap()
+                .is_none()
+        );
+        store
+            .sweep(crate::state::now() + RETENTION_SECONDS + 1)
+            .unwrap();
+        let c = store.connection.lock().unwrap();
+        assert!(maintenance_resolved(&c, &candidate).unwrap());
+        drop(c);
+        drop(store);
+        let store = FollowStore::open(t.path()).unwrap();
+        assert_eq!(
+            store.maintenance_candidates().unwrap()[0]["lifecycle"],
+            "handoff_pending"
+        );
+        assert!(
+            store
+                .issue_continuation("org", "account", "install", &run, "run_commit", None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn historical_unknown_lineage_expiry_and_stale_preview_do_not_resolve() {
+        let t = tempfile::tempdir().unwrap();
+        let store = FollowStore::open(t.path()).unwrap();
+        let b = binding();
+        let activated = activate(&store, &b, 0);
+        let candidate = store.maintenance_candidates().unwrap().remove(0);
+        let request = maintenance_request(&candidate);
+        let run = b["runId"].as_str().unwrap();
+        store
+            .maintenance_reconcile(
+                &maintenance_request(&candidate),
+                &maintenance_observation(run, "running"),
+            )
+            .unwrap();
+        let c = store.connection.lock().unwrap();
+        c.execute(
+            "UPDATE follow_sessions SET lifecycle='superseded',revision=revision+1",
+            [],
+        )
+        .unwrap();
+        drop(c);
+        assert_eq!(
+            store.maintenance_retire(&request).unwrap_err().to_string(),
+            "MANAGED_WORK_CHANGED"
+        );
+        store
+            .sweep(crate::state::now() + RETENTION_SECONDS * 2)
+            .unwrap();
+        let now = store.maintenance_candidates().unwrap().remove(0);
+        let c = store.connection.lock().unwrap();
+        assert!(!maintenance_resolved(&c, &now).unwrap());
+        assert_eq!(activated["generation"], 1);
+    }
+
     #[test]
     fn activation_is_scoped_and_anchor_gated() {
         let t = tempfile::tempdir().unwrap();

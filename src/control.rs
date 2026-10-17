@@ -39,6 +39,7 @@ pub const MAX_FRAME: usize = 1_048_576;
 pub const VALIDATION_ERRORS_CAPABILITY: &str = "error.validation-issues/v1";
 tokio::task_local! {
     static QUEUE_OBSERVATION_CLIENT: bool;
+    static CONTINUATION_RESOLUTION_CLIENT: bool;
 }
 pub const REQUIRED_SEMANTICS: [&str; 5] = [
     "execution.host_user/v1",
@@ -70,6 +71,8 @@ struct MutationKey {
 }
 struct PatchSubmission<'a> {
     org: &'a str,
+    owner: (&'a str, &'a str),
+    params: &'a Value,
     workflow_id: &'a str,
     key: &'a str,
     identity: &'a str,
@@ -426,12 +429,11 @@ impl Daemon {
         } else {
             None
         };
-        let identity = state::json_digest(
-            &json!({"method":method,"params":params,"organizationId":scope,"accountSubject":scoped_account}),
-        );
+        let identity =
+            operation_cache_identity(method, &params, scope.as_deref(), scoped_account.as_deref());
         let journal_key = key.map(|key| {
             if account_scoped_method(method) {
-                state::json_digest(&json!({"organizationId":scope,"accountSubject":scoped_account,"idempotencyKey":key}))
+                operation_cache_scoped_key(scope.as_deref(), scoped_account.as_deref(), key)
             } else {
                 key.to_owned()
             }
@@ -442,6 +444,9 @@ impl Daemon {
         // result and could authorize a second host scheduling mutation.  Keep
         // the generic cache for other operations, but always route recovery
         // methods through their durable, safe replay projection.
+        // Delivery mutations likewise have exact scoped PresentationStore
+        // receipts and must recheck closure before reading any replay receipt.
+        // Historical generic cache files remain preserved, but are never read.
         // Start issue and approval have runner-owned lifecycle records rather
         // than generic operation-cache entries. A lost response must be
         // reconciled against that exact record; it never authorizes a replay.
@@ -452,6 +457,8 @@ impl Daemon {
                     | "runs.start_handoff.issue"
                     | "runs.start_handoff.approve"
                     | "runs.start_handoff.approve_headless"
+                    | "presentation.delivery.begin"
+                    | "presentation.delivery.settle"
             ))
         .then(|| {
             journal_key
@@ -621,8 +628,13 @@ impl Daemon {
                     "AUTH_IDENTITY_CHANGED"
                 );
             }
-            let result =
-                self.spool_response(&params, result, scope.as_deref(), scoped_account.as_deref())?;
+            let result = self.spool_response_for_method(
+                method,
+                &params,
+                result,
+                scope.as_deref(),
+                scoped_account.as_deref(),
+            )?;
             if let Some(path) = operation.as_ref() {
                 let execution = params
                     .get("runId")
@@ -676,8 +688,13 @@ impl Daemon {
                 .cloned();
             // Spooling remains inside writer coverage; socket delivery below is not
             // counted once no more local files or backend state can be changed.
-            let result =
-                self.spool_response(&params, result, scope.as_deref(), scoped_account.as_deref())?;
+            let result = self.spool_response_for_method(
+                method,
+                &params,
+                result,
+                scope.as_deref(),
+                scoped_account.as_deref(),
+            )?;
             if let Some(path) = operation.as_ref() {
                 state::write_json(
                     path,
@@ -693,8 +710,19 @@ impl Daemon {
             Ok(result)
         }
     }
+    #[cfg(test)]
     fn spool_response(
         &self,
+        params: &Value,
+        result: Value,
+        organization: Option<&str>,
+        account: Option<&str>,
+    ) -> Result<Value> {
+        self.spool_response_for_method("", params, result, organization, account)
+    }
+    fn spool_response_for_method(
+        &self,
+        method: &str,
         params: &Value,
         mut result: Value,
         organization: Option<&str>,
@@ -709,6 +737,23 @@ impl Daemon {
         {
             if let Some(object) = result.as_object_mut() {
                 object.remove("queueObservation");
+            }
+        }
+        if method.starts_with("presentation.delivery.")
+            && !CONTINUATION_RESOLUTION_CLIENT
+                .try_with(|enabled| *enabled)
+                .unwrap_or(true)
+        {
+            // Never expose the old ready/status surface for a locally closed
+            // continuation. This projection precedes immutable spool bytes.
+            ensure!(
+                result["continuationEligible"] == true
+                    && result["resolution"]["state"] == "unresolved",
+                "COMPATIBILITY_ERROR"
+            );
+            if let Some(object) = result.as_object_mut() {
+                object.remove("resolution");
+                object.remove("continuationEligible");
             }
         }
         let bytes = serde_json::to_vec(&result)?;
@@ -3313,6 +3358,8 @@ impl Daemon {
             })
             .transpose()?;
         let account = self.auth.credential(org).await?.subject;
+        let owner = self.auth.current_child_identity(org).await?;
+        ensure!(owner.0 == account, "AUTH_IDENTITY_CHANGED");
         let identity = state::json_digest(&json!({
             "organizationId":org,"accountSubject":account,"workflowId":workflow_id,
             "expectedVersion":expected_revision,"expectedDefinitionChecksum":expected_checksum,
@@ -3386,6 +3433,22 @@ impl Daemon {
                     && state::json_digest(&Value::Object(body.clone())) == record["payloadDigest"],
                 "BACKEND_PROTOCOL_ERROR"
             );
+            if native_patch_acknowledged(&record)? {
+                let ack = &record["nativeAcknowledgement"];
+                ensure!(
+                    ack["organizationId"] == org
+                        && ack["accountSubject"] == account
+                        && ack["installationId"] == owner.1
+                        && ack["originalRequest"] == *p
+                        && self.auth.current_child_identity(org).await? == owner,
+                    "AUTH_IDENTITY_CHANGED"
+                );
+                return Ok(ack["response"].clone());
+            }
+            ensure!(
+                self.auth.current_child_identity(org).await? == owner,
+                "AUTH_IDENTITY_CHANGED"
+            );
             // First reconcile the original key. A backend `not_found` is the
             // only condition under which the exact journaled update may be
             // resent with that same key and byte-equivalent JSON payload.
@@ -3398,6 +3461,10 @@ impl Daemon {
                     None,
                 )
                 .await?;
+            ensure!(
+                self.auth.current_child_identity(org).await? == owner,
+                "AUTH_IDENTITY_CHANGED"
+            );
             if receipt["status"] == "completed" {
                 let result = receipt
                     .get("response")
@@ -3415,12 +3482,23 @@ impl Daemon {
                         && expected_notes.is_none_or(|notes| result["draft"]["notes"] == notes),
                     "IDEMPOTENCY_CONFLICT"
                 );
+                persist_native_patch_acknowledgement(
+                    &path,
+                    org,
+                    &account,
+                    &owner.1,
+                    p,
+                    result,
+                    Some(&receipt),
+                )?;
                 return Ok(result.clone());
             }
             if receipt["status"] == "not_found" {
                 return self
                     .submit_workflow_patch_exact(PatchSubmission {
                         org,
+                        owner: (&owner.0, &owner.1),
+                        params: p,
                         workflow_id,
                         key,
                         identity: record["identity"]
@@ -3507,6 +3585,8 @@ impl Daemon {
         )?;
         self.submit_workflow_patch_exact(PatchSubmission {
             org,
+            owner: (&owner.0, &owner.1),
+            params: p,
             workflow_id,
             key,
             identity: &identity,
@@ -3518,6 +3598,11 @@ impl Daemon {
     }
 
     async fn submit_workflow_patch_exact(&self, patch: PatchSubmission<'_>) -> Result<Value> {
+        ensure!(
+            self.auth.current_child_identity(patch.org).await?
+                == (patch.owner.0.to_owned(), patch.owner.1.to_owned()),
+            "AUTH_IDENTITY_CHANGED"
+        );
         let result = self
             .backend(
                 patch.org,
@@ -3527,6 +3612,11 @@ impl Daemon {
                 Some(patch.key),
             )
             .await;
+        ensure!(
+            self.auth.current_child_identity(patch.org).await?
+                == (patch.owner.0.to_owned(), patch.owner.1.to_owned()),
+            "AUTH_IDENTITY_CHANGED"
+        );
         if let Err(error) = &result {
             if let Some(api) = error.downcast_ref::<ApiError>() {
                 if api
@@ -3552,6 +3642,15 @@ impl Daemon {
                     .is_none_or(|notes| result["draft"]["notes"] == notes),
             "BACKEND_PROTOCOL_ERROR"
         );
+        persist_native_patch_acknowledgement(
+            patch.path,
+            patch.org,
+            patch.owner.0,
+            patch.owner.1,
+            patch.params,
+            &result,
+            None,
+        )?;
         Ok(result)
     }
 }
@@ -3736,7 +3835,7 @@ fn rejected_preparation_commit(record: &Value) -> bool {
         && authorization["bindingDigest"] == record["bindingDigest"]
 }
 
-fn verify_native_authoring_start(method: &str, result: &Value) -> Result<()> {
+pub(crate) fn verify_native_authoring_start(method: &str, result: &Value) -> Result<()> {
     let catalog: Value = serde_json::from_str(include_str!("../contracts/method-catalog.json"))?;
     let schema = &catalog["methods"]
         .as_array()
@@ -3754,6 +3853,505 @@ fn verify_native_authoring_start(method: &str, result: &Value) -> Result<()> {
     );
     Ok(())
 }
+fn operation_cache_identity(
+    method: &str,
+    params: &Value,
+    organization: Option<&str>,
+    account: Option<&str>,
+) -> String {
+    state::json_digest(
+        &json!({"method":method,"params":params,"organizationId":organization,"accountSubject":account}),
+    )
+}
+fn operation_cache_scoped_key(
+    organization: Option<&str>,
+    account: Option<&str>,
+    key: &str,
+) -> String {
+    state::json_digest(
+        &json!({"organizationId":organization,"accountSubject":account,"idempotencyKey":key}),
+    )
+}
+/// Native mutation acknowledgement is separate from a canonical operation
+/// receipt. Direct authenticated responses never manufacture receipt evidence.
+pub(crate) fn native_patch_acknowledgement(
+    original: &[u8],
+    org: &str,
+    account: &str,
+    installation: &str,
+    request: &Value,
+    response: &Value,
+    canonical: Option<&Value>,
+) -> Result<Value> {
+    let record: Value = serde_json::from_slice(original)?;
+    ensure!(
+        record.get("nativeAcknowledgement").is_none()
+            && record.get("maintenanceResolution").is_none(),
+        "MANAGED_WORK_CHANGED"
+    );
+    let mut acknowledged = record.clone();
+    let mut ack = json!({"schema":"loomex.native-patch-acknowledgement/v1","provenance":if canonical.is_some(){"canonical_operation_receipt"}else{"authenticated_mutation_response"},"originalJournal":String::from_utf8(original.to_vec())?,"originalJournalSha256":state::digest(original),"submissionIdentity":record["identity"],"payloadDigest":record["payloadDigest"],"workflowId":record["workflowId"],"organizationId":org,"accountSubject":account,"installationId":installation,"operationKey":request["idempotencyKey"],"originalRequest":request,"requestDigest":state::json_digest(request),"response":response,"responseDigest":state::json_digest(response)});
+    if let Some(receipt) = canonical {
+        ack["canonicalReceipt"] = receipt.clone();
+    }
+    acknowledged["nativeAcknowledgement"] = ack;
+    ensure!(
+        native_patch_acknowledged(&acknowledged)?,
+        "MANAGED_WORK_RECEIPT_MISMATCH"
+    );
+    Ok(acknowledged)
+}
+pub(crate) fn native_patch_acknowledged(record: &Value) -> Result<bool> {
+    let Some(ack) = record.get("nativeAcknowledgement") else {
+        return Ok(false);
+    };
+    let fields = ack.as_object().context("MANAGED_WORK_RECEIPT_MISMATCH")?;
+    let canonical = ack["provenance"] == "canonical_operation_receipt";
+    ensure!(
+        ack["schema"] == "loomex.native-patch-acknowledgement/v1"
+            && (canonical || ack["provenance"] == "authenticated_mutation_response")
+            && fields.len() == if canonical { 16 } else { 15 },
+        "MANAGED_WORK_RECEIPT_MISMATCH"
+    );
+    let original = ack["originalJournal"]
+        .as_str()
+        .context("MANAGED_WORK_RECEIPT_MISMATCH")?;
+    ensure!(
+        original.len() <= 16 * 1024 * 1024
+            && ack["originalJournalSha256"] == state::digest(original.as_bytes()),
+        "MANAGED_WORK_RECEIPT_MISMATCH"
+    );
+    let native: Value = serde_json::from_str(original)?;
+    let mut actual = record.clone();
+    actual
+        .as_object_mut()
+        .context("MANAGED_WORK_RECEIPT_MISMATCH")?
+        .remove("nativeAcknowledgement");
+    ensure!(
+        actual == native
+            && native.get("nativeAcknowledgement").is_none()
+            && native.get("maintenanceResolution").is_none()
+            && ack["submissionIdentity"] == native["identity"]
+            && ack["payloadDigest"] == native["payloadDigest"]
+            && ack["workflowId"] == native["workflowId"]
+            && ack["requestDigest"] == state::json_digest(&ack["originalRequest"])
+            && ack["responseDigest"] == state::json_digest(&ack["response"])
+            && ack["operationKey"] == ack["originalRequest"]["idempotencyKey"]
+            && ack["organizationId"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty())
+            && ack["accountSubject"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty())
+            && ack["installationId"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty()),
+        "MANAGED_WORK_RECEIPT_MISMATCH"
+    );
+    let candidate = json!({"kind":"presentation_operation","organizationId":ack["organizationId"],"accountSubject":ack["accountSubject"],"installationId":"","method":"workflows.patch","params":ack["originalRequest"],"operationKey":ack["operationKey"],"reconciliation":{"method":"workflow.operations.get","params":{"operation":"workflows.update","idempotencyKey":ack["operationKey"]}},"nativePatchJournal":native});
+    crate::presentation::maintenance_operation_plan(&candidate)?;
+    crate::presentation::verify_native_patch_journal(&candidate, &ack["response"])?;
+    if canonical {
+        ensure!(
+            ack["canonicalReceipt"]["response"] == ack["response"],
+            "MANAGED_WORK_RECEIPT_MISMATCH"
+        );
+        crate::presentation::verify_maintenance_operation_receipt(
+            &candidate,
+            &ack["canonicalReceipt"],
+        )?;
+    } else {
+        ensure!(
+            ack.get("canonicalReceipt").is_none(),
+            "MANAGED_WORK_RECEIPT_MISMATCH"
+        );
+    }
+    Ok(true)
+}
+fn persist_native_patch_acknowledgement(
+    path: &Path,
+    org: &str,
+    account: &str,
+    installation: &str,
+    request: &Value,
+    response: &Value,
+    canonical: Option<&Value>,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .and_then(Path::parent)
+        .context("UNSAFE_STATE")?;
+    let relative = format!(
+        "workflow-patches/{}.json",
+        operation_cache_scoped_key(
+            Some(org),
+            Some(account),
+            required(request, "idempotencyKey")?
+        )
+    );
+    ensure!(path == parent.join(&relative), "MANAGED_WORK_CHANGED");
+    let original = maintenance_cache_bytes(parent, &relative)?;
+    let record: Value = serde_json::from_slice(&original)?;
+    if native_patch_acknowledged(&record)? {
+        let ack = &record["nativeAcknowledgement"];
+        ensure!(
+            ack["organizationId"] == org
+                && ack["accountSubject"] == account
+                && ack["installationId"] == installation
+                && ack["originalRequest"] == *request
+                && ack["response"] == *response,
+            "MANAGED_WORK_CHANGED"
+        );
+        return Ok(());
+    }
+    if record.get("maintenanceResolution").is_some() {
+        ensure!(
+            crate::presentation::maintenance_native_patch_resolved(&record)?,
+            "MANAGED_WORK_CHANGED"
+        );
+        return Ok(());
+    }
+    let acknowledged = native_patch_acknowledgement(
+        &original,
+        org,
+        account,
+        installation,
+        request,
+        response,
+        canonical,
+    )?;
+    persist_native_patch_acknowledgement_bytes(path, &original, &acknowledged, |path, value| {
+        state::write_json(path, value)
+    })
+}
+fn persist_native_patch_acknowledgement_bytes<F>(
+    path: &Path,
+    original: &[u8],
+    acknowledged: &Value,
+    write: F,
+) -> Result<()>
+where
+    F: FnOnce(&Path, &Value) -> Result<()>,
+{
+    let parent = path
+        .parent()
+        .and_then(Path::parent)
+        .context("UNSAFE_STATE")?;
+    let relative = path
+        .strip_prefix(parent)?
+        .to_str()
+        .context("UNSAFE_STATE")?;
+    ensure!(
+        maintenance_cache_bytes(parent, relative)? == original,
+        "MANAGED_WORK_CHANGED"
+    );
+    write(path, acknowledged)
+}
+
+/// Owner-only exact cache reconciliation. These helpers never dispatch a method,
+/// mint a continuation, or recover a key from a hashed filename.
+pub(crate) fn maintenance_cache_identity(candidate: &Value) -> Result<(String, String)> {
+    let method = required(candidate, "method")?;
+    let params = candidate
+        .get("params")
+        .filter(|v| v.is_object())
+        .context("MANAGED_WORK_CHANGED")?;
+    let org = required(candidate, "organizationId")?;
+    let account = required(candidate, "accountSubject")?;
+    let key = required(candidate, "operationKey")?;
+    Uuid::parse_str(key).map_err(|_| anyhow::anyhow!("MANAGED_WORK_CHANGED"))?;
+    ensure!(params["idempotencyKey"] == key, "MANAGED_WORK_CHANGED");
+    let scoped_account = account_scoped_method(method).then_some(account);
+    let identity = operation_cache_identity(method, params, Some(org), scoped_account);
+    let journal_key = if account_scoped_method(method) {
+        operation_cache_scoped_key(Some(org), scoped_account, key)
+    } else {
+        key.to_owned()
+    };
+    Ok((format!("operations/{journal_key}.json"), identity))
+}
+fn maintenance_cache_bytes(dir: &Path, relative: &str) -> Result<Vec<u8>> {
+    let relative_path = Path::new(relative);
+    ensure!(
+        relative_path.components().count() == 2
+            && relative_path
+                .file_name()
+                .is_some_and(|name| name.to_str().is_some_and(|name| name.ends_with(".json")))
+            && matches!(
+                relative_path.parent().and_then(Path::to_str),
+                Some("operations" | "workflow-patches")
+            ),
+        "UNSAFE_STATE"
+    );
+    let parent = dir.join(relative_path.parent().context("UNSAFE_STATE")?);
+    let meta = std::fs::symlink_metadata(&parent)?;
+    ensure!(
+        meta.is_dir() && !meta.file_type().is_symlink() && meta.uid() == unsafe { libc::geteuid() },
+        "UNSAFE_STATE"
+    );
+    let path = dir.join(relative);
+    let meta = std::fs::symlink_metadata(&path)?;
+    ensure!(
+        meta.is_file()
+            && !meta.file_type().is_symlink()
+            && meta.uid() == unsafe { libc::geteuid() }
+            && meta.nlink() == 1
+            && meta.len() <= 16 * 1024 * 1024
+            && meta.mode() & 0o077 == 0,
+        "UNSAFE_STATE"
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)?;
+    let actual = file.metadata()?;
+    ensure!(
+        actual.dev() == meta.dev() && actual.ino() == meta.ino(),
+        "MANAGED_WORK_CHANGED"
+    );
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes)?;
+    let after = std::fs::symlink_metadata(&path)?;
+    ensure!(
+        after.dev() == actual.dev()
+            && after.ino() == actual.ino()
+            && after.len() == bytes.len() as u64
+            && after.mtime() == actual.mtime()
+            && after.mtime_nsec() == actual.mtime_nsec(),
+        "MANAGED_WORK_CHANGED"
+    );
+    Ok(bytes)
+}
+/// Prepare immutable private pre/post images before any cache write. Only an
+/// exact retained pending record may transition; completed cache data is kept.
+pub(crate) fn maintenance_cache_prepare(
+    dir: &Path,
+    candidate: &Value,
+    receipt: &Value,
+) -> Result<Option<Value>> {
+    crate::presentation::verify_maintenance_operation_receipt(candidate, receipt)?;
+    let (relative, identity) = maintenance_cache_identity(candidate)?;
+    if !dir.join(&relative).try_exists()? {
+        return Ok(None);
+    }
+    let before = maintenance_cache_bytes(dir, &relative)?;
+    let record: Value = serde_json::from_slice(&before)?;
+    ensure!(
+        record["digest"] == identity
+            && record["method"] == candidate["method"]
+            && record["expired"] != true,
+        "MANAGED_WORK_CHANGED"
+    );
+    if record.get("result").is_some() {
+        ensure!(
+            record.get("status").is_none_or(|v| v == "completed"),
+            "MANAGED_WORK_CHANGED"
+        );
+        return Ok(None);
+    }
+    ensure!(
+        record["status"] == "pending" && record.as_object().is_some_and(|object| object.len() == 3),
+        "MANAGED_WORK_CHANGED"
+    );
+    let result = &receipt["response"];
+    let execution = candidate["params"]
+        .get("runId")
+        .or_else(|| result.get("executionId"))
+        .or_else(|| result.get("execution").and_then(|v| v.get("id")))
+        .cloned();
+    let after = serde_json::to_string(
+        &json!({"digest":identity,"method":candidate["method"],"cachedAt":state::now(),"executionId":execution,"result":result}),
+    )?;
+    Ok(Some(
+        json!({"schema":"app.loomex.runner.uninstall-work-cache/v1","path":relative,"method":candidate["method"],"requestDigest":identity,"beforeSha256":state::digest(&before),"afterSha256":state::digest(after.as_bytes()),"before":String::from_utf8(before)?,"after":after,"responseDigest":state::json_digest(result),"keyReference":state::json_digest(&candidate["operationKey"]),"canonicalReceipt":receipt}),
+    ))
+}
+/// Resolve only an original retained native patch journal. Its submitted
+/// history stays intact; the additive receipt establishes mutation acceptance,
+/// without asserting workflow execution or host delivery completion.
+pub(crate) fn maintenance_patch_prepare(
+    dir: &Path,
+    candidate: &Value,
+    receipt: &Value,
+) -> Result<Option<Value>> {
+    if candidate["method"] != "workflows.patch" {
+        return Ok(None);
+    }
+    crate::presentation::verify_maintenance_operation_receipt(candidate, receipt)?;
+    let reference = operation_cache_scoped_key(
+        candidate["organizationId"].as_str(),
+        candidate["accountSubject"].as_str(),
+        required(candidate, "operationKey")?,
+    );
+    let relative = format!("workflow-patches/{reference}.json");
+    let before = maintenance_cache_bytes(dir, &relative)?;
+    let record: Value = serde_json::from_slice(&before)?;
+    ensure!(
+        record == candidate["nativePatchJournal"],
+        "MANAGED_WORK_CHANGED"
+    );
+    if native_patch_acknowledged(&record)?
+        || crate::presentation::maintenance_native_patch_resolved(&record)?
+    {
+        return Ok(None);
+    }
+    ensure!(
+        record == candidate["nativePatchJournal"] && record.get("maintenanceResolution").is_none(),
+        "MANAGED_WORK_CHANGED"
+    );
+    let mut completed = record.clone();
+    completed["maintenanceResolution"] = json!({"schema":"loomex.native-patch-reconciliation/v1","originalJournalDigest":state::json_digest(&record),"candidate":candidate,"canonicalReceipt":receipt,"receiptDigest":state::json_digest(receipt)});
+    ensure!(
+        crate::presentation::maintenance_native_patch_resolved(&completed)?,
+        "MANAGED_WORK_CHANGED"
+    );
+    let after = serde_json::to_string(&completed)?;
+    let (_, identity) = maintenance_cache_identity(candidate)?;
+    Ok(Some(
+        json!({"schema":"app.loomex.runner.uninstall-work-cache/v1","kind":"native_patch","path":relative,"method":candidate["method"],"requestDigest":identity,"beforeSha256":state::digest(&before),"afterSha256":state::digest(after.as_bytes()),"before":String::from_utf8(before)?,"after":after,"responseDigest":state::json_digest(&receipt["response"]),"keyReference":state::json_digest(&candidate["operationKey"]),"canonicalReceipt":receipt}),
+    ))
+}
+/// Verify the frozen images against the original journal. This is also used to
+/// recognize only this attempt's exact pre/post dependency transition on resume.
+fn maintenance_cache_validate_target(candidate: &Value, transition: &Value) -> Result<()> {
+    let (mut relative, identity) = maintenance_cache_identity(candidate)?;
+    if transition["kind"] == "native_patch" {
+        ensure!(
+            candidate["method"] == "workflows.patch",
+            "MANAGED_WORK_CHANGED"
+        );
+        relative = format!(
+            "workflow-patches/{}.json",
+            operation_cache_scoped_key(
+                candidate["organizationId"].as_str(),
+                candidate["accountSubject"].as_str(),
+                required(candidate, "operationKey")?
+            )
+        );
+    }
+    let before = transition["before"]
+        .as_str()
+        .context("MANAGED_WORK_CHANGED")?;
+    let after = transition["after"]
+        .as_str()
+        .context("MANAGED_WORK_CHANGED")?;
+    ensure!(
+        transition["schema"] == "app.loomex.runner.uninstall-work-cache/v1"
+            && transition["path"] == relative
+            && transition["method"] == candidate["method"]
+            && transition["requestDigest"] == identity
+            && transition["keyReference"] == state::json_digest(&candidate["operationKey"])
+            && transition["beforeSha256"] == state::digest(before.as_bytes())
+            && transition["afterSha256"] == state::digest(after.as_bytes()),
+        "MANAGED_WORK_CHANGED"
+    );
+    let old: Value = serde_json::from_str(before)?;
+    let new: Value = serde_json::from_str(after)?;
+    if transition["kind"] == "native_patch" {
+        ensure!(
+            old == candidate["nativePatchJournal"] && old.get("maintenanceResolution").is_none(),
+            "MANAGED_WORK_CHANGED"
+        );
+        let receipt = transition
+            .get("canonicalReceipt")
+            .context("MANAGED_WORK_CHANGED")?;
+        let mut expected = old.clone();
+        expected["maintenanceResolution"] = json!({"schema":"loomex.native-patch-reconciliation/v1","originalJournalDigest":state::json_digest(&old),"candidate":candidate,"canonicalReceipt":receipt,"receiptDigest":state::json_digest(receipt)});
+        ensure!(
+            new == expected
+                && transition["responseDigest"] == state::json_digest(&receipt["response"]),
+            "MANAGED_WORK_CHANGED"
+        );
+        crate::presentation::verify_maintenance_operation_receipt(candidate, receipt)?;
+        ensure!(
+            crate::presentation::maintenance_native_patch_resolved(&new)?,
+            "MANAGED_WORK_CHANGED"
+        );
+        return Ok(());
+    }
+    ensure!(
+        old == json!({"digest":identity,"method":candidate["method"],"status":"pending"})
+            && new["digest"] == identity
+            && new["method"] == candidate["method"]
+            && new["cachedAt"].is_u64()
+            && new.get("status").is_none()
+            && new["result"].is_object()
+            && transition["responseDigest"] == state::json_digest(&new["result"]),
+        "MANAGED_WORK_CHANGED"
+    );
+    let result = &new["result"];
+    let execution = candidate["params"]
+        .get("runId")
+        .or_else(|| result.get("executionId"))
+        .or_else(|| result.get("execution").and_then(|v| v.get("id")))
+        .cloned();
+    ensure!(
+        new == json!({"digest":identity,"method":candidate["method"],"cachedAt":new["cachedAt"],"executionId":execution,"result":result}),
+        "MANAGED_WORK_CHANGED"
+    );
+    let receipt = transition
+        .get("canonicalReceipt")
+        .context("MANAGED_WORK_CHANGED")?;
+    ensure!(receipt["response"] == *result, "MANAGED_WORK_CHANGED");
+    crate::presentation::verify_maintenance_operation_receipt(candidate, receipt)?;
+    Ok(())
+}
+pub(crate) fn maintenance_cache_validate(candidate: &Value, transition: &Value) -> Result<()> {
+    maintenance_cache_validate_target(candidate, transition)?;
+    if let Some(targets) = transition.get("relatedTargets") {
+        let targets = targets.as_array().context("MANAGED_WORK_CHANGED")?;
+        ensure!(targets.len() <= 1, "MANAGED_WORK_CHANGED");
+        for target in targets {
+            ensure!(
+                target["kind"] == "native_patch"
+                    && transition["kind"] != "native_patch"
+                    && target.get("relatedTargets").is_none()
+                    && target["path"] != transition["path"]
+                    && target["canonicalReceipt"] == transition["canonicalReceipt"],
+                "MANAGED_WORK_CHANGED"
+            );
+            maintenance_cache_validate_target(candidate, target)?;
+        }
+    }
+    Ok(())
+}
+fn maintenance_cache_apply_target(dir: &Path, transition: &Value) -> Result<()> {
+    let relative = transition["path"]
+        .as_str()
+        .context("MANAGED_WORK_CHANGED")?;
+    let bytes = maintenance_cache_bytes(dir, relative)?;
+    let digest = state::digest(&bytes);
+    ensure!(
+        transition["beforeSha256"] == digest || transition["afterSha256"] == digest,
+        "MANAGED_WORK_CHANGED"
+    );
+    if transition["beforeSha256"] == digest {
+        state::atomic_write(
+            &dir.join(relative),
+            transition["after"]
+                .as_str()
+                .context("MANAGED_WORK_CHANGED")?
+                .as_bytes(),
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn maintenance_cache_apply(
+    dir: &Path,
+    candidate: &Value,
+    transition: &Value,
+) -> Result<()> {
+    maintenance_cache_validate(candidate, transition)?;
+    maintenance_cache_apply_target(dir, transition)?;
+    if let Some(targets) = transition["relatedTargets"].as_array() {
+        for target in targets {
+            maintenance_cache_apply_target(dir, target)?;
+        }
+    }
+    Ok(())
+}
+
 fn account_scoped_method(method: &str) -> bool {
     method.starts_with("personas.")
         || method.starts_with("persona.roles.")
@@ -3820,7 +4418,7 @@ fn persona_mutation_operation(method: &str) -> Option<&'static str> {
         _ => None,
     }
 }
-fn verify_persona_receipt(params: &Value, receipt: &Value) -> Result<()> {
+pub(crate) fn verify_persona_receipt(params: &Value, receipt: &Value) -> Result<()> {
     ensure!(
         receipt["operation"] == params["operation"] && receipt["key"] == params["idempotencyKey"],
         "BACKEND_PROTOCOL_ERROR"
@@ -3849,7 +4447,7 @@ fn verify_persona_receipt(params: &Value, receipt: &Value) -> Result<()> {
     }
     Ok(())
 }
-fn verify_persona_creation(method: &str, params: &Value, result: &Value) -> Result<()> {
+pub(crate) fn verify_persona_creation(method: &str, params: &Value, result: &Value) -> Result<()> {
     let (entity, default_status) = match method {
         "persona.roles.create" => ("role", "active"),
         "personas.create" => ("person", "draft"),
@@ -4645,6 +5243,7 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
     let mut validation_errors_negotiated = false;
     let mut recovery_errors_negotiated = false;
     let mut queue_observation_negotiated = false;
+    let mut continuation_resolution_negotiated = false;
     loop {
         let frame = match read_frame(&mut reader).await {
             Ok(Some(frame)) => frame,
@@ -4683,6 +5282,7 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
                         validation_errors_negotiated = false;
                         recovery_errors_negotiated = false;
                         queue_observation_negotiated = false;
+                        continuation_resolution_negotiated = false;
                     }
                     // Disconnect cancels only fingerprint waiters. Dispatch and its
                     // durable mutation receipt continue to completion/reconciliation.
@@ -4693,9 +5293,12 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
                             cancellation.clone(),
                             QUEUE_OBSERVATION_CLIENT.scope(
                                 queue_observation_negotiated,
-                                daemon.dispatch(
-                                    request["method"].as_str().unwrap_or(""),
-                                    request["params"].clone(),
+                                CONTINUATION_RESOLUTION_CLIENT.scope(
+                                    continuation_resolution_negotiated,
+                                    daemon.dispatch(
+                                        request["method"].as_str().unwrap_or(""),
+                                        request["params"].clone(),
+                                    ),
                                 ),
                             ),
                         ),
@@ -4714,6 +5317,14 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
                                         .as_array()
                                         .is_some_and(|caps| {
                                             caps.contains(&json!("workflow.queue-observation/v1"))
+                                        });
+                                continuation_resolution_negotiated =
+                                    request["params"]["requiredCapabilities"]
+                                        .as_array()
+                                        .is_some_and(|caps| {
+                                            caps.contains(&json!(
+                                                "presentation.continuation-resolution/v1"
+                                            ))
                                         });
                                 recovery_errors_negotiated =
                                     request["params"]["requiredCapabilities"]
@@ -6053,6 +6664,18 @@ mod conformance {
         );
         let reconciled = daemon.dispatch("workflows.patch", input).await.unwrap();
         assert_eq!(reconciled, result);
+        let native = std::fs::read_dir(temp.path().join("workflow-patches"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let acknowledged: Value = state::read_json(&native).unwrap();
+        assert!(native_patch_acknowledged(&acknowledged).unwrap());
+        assert_eq!(
+            acknowledged["nativeAcknowledgement"]["provenance"],
+            "canonical_operation_receipt"
+        );
         backend.await.unwrap();
     }
 
@@ -6251,6 +6874,177 @@ mod conformance {
         backend.await.unwrap();
     }
 
+    #[test]
+    fn native_patch_acknowledgement_write_failure_tamper_and_duplicate_keep_first_proof() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = fixture(
+            temp.path(),
+            Api::for_test_origin("http://127.0.0.1:9").unwrap(),
+        );
+        let workflow = Uuid::new_v4().to_string();
+        let key = Uuid::new_v4().to_string();
+        let checksum = "a".repeat(64);
+        let definition = json!({"nodes":[{"key":"n","config":{"prompt":"new"}}],"transitions":[]});
+        let request = write_legacy_patch_journal(&daemon, &workflow, &checksum, &key, &definition);
+        let org = "11111111-1111-4111-8111-111111111111";
+        let account = "22222222-2222-4222-8222-222222222222";
+        let installation = "fixture-install";
+        let native = std::fs::read_dir(temp.path().join("workflow-patches"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let original = std::fs::read(&native).unwrap();
+        let response = json!({"workflow":{"id":workflow},"draft":{"definition":definition,"notes":"retained"}});
+        let acknowledged = native_patch_acknowledgement(
+            &original,
+            org,
+            account,
+            installation,
+            &request,
+            &response,
+            None,
+        )
+        .unwrap();
+        assert!(
+            persist_native_patch_acknowledgement_bytes(
+                &native,
+                &original,
+                &acknowledged,
+                |_, _| Err(anyhow::anyhow!("FIXTURE_WRITE_FAILURE"))
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&native).unwrap(), original);
+        assert!(!native_patch_acknowledged(&state::read_json::<Value>(&native).unwrap()).unwrap());
+        persist_native_patch_acknowledgement(
+            &native,
+            org,
+            account,
+            installation,
+            &request,
+            &response,
+            None,
+        )
+        .unwrap();
+        let first = std::fs::read(&native).unwrap();
+        let canonical = json!({"operation":"workflows.update","idempotencyKey":key,"status":"completed","response":response});
+        persist_native_patch_acknowledgement(
+            &native,
+            org,
+            account,
+            installation,
+            &request,
+            &response,
+            Some(&canonical),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&native).unwrap(), first);
+        for field in [
+            "originalJournalSha256",
+            "submissionIdentity",
+            "payloadDigest",
+            "workflowId",
+            "organizationId",
+            "accountSubject",
+            "operationKey",
+            "responseDigest",
+        ] {
+            let mut wrong = acknowledged.clone();
+            wrong["nativeAcknowledgement"][field] = json!("changed");
+            assert!(native_patch_acknowledged(&wrong).is_err(), "{field}");
+        }
+        assert!(
+            persist_native_patch_acknowledgement(
+                &native,
+                org,
+                account,
+                "replacement-installation",
+                &request,
+                &response,
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&native).unwrap(), first);
+    }
+
+    #[tokio::test]
+    async fn native_patch_acknowledgement_refuses_scope_drift_after_authenticated_response() {
+        for canonical in [false, true] {
+            for installation in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let api =
+                    Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                        .unwrap();
+                let daemon = fixture(temp.path(), api);
+                let workflow = Uuid::new_v4().to_string();
+                let key = Uuid::new_v4().to_string();
+                let checksum = "a".repeat(64);
+                let definition =
+                    json!({"nodes":[{"key":"n","config":{"prompt":"new"}}],"transitions":[]});
+                let input =
+                    write_legacy_patch_journal(&daemon, &workflow, &checksum, &key, &definition);
+                let org = "11111111-1111-4111-8111-111111111111";
+                let native = std::fs::read_dir(temp.path().join("workflow-patches"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path();
+                let original = std::fs::read(&native).unwrap();
+                let record: Value = serde_json::from_slice(&original).unwrap();
+                let owner = daemon.auth.current_child_identity(org).await.unwrap();
+                let response = json!({"workflow":{"id":workflow},"draft":{"definition":definition,"notes":"retained"}});
+                let auth = daemon.auth.clone();
+                let server_key = key.clone();
+                let backend = tokio::spawn(async move {
+                    let (stream, head) = receive_http(&listener).await;
+                    assert!(head.contains(if canonical {
+                        "/v2/workflow-operations/get/"
+                    } else {
+                        "/draft/"
+                    }));
+                    auth.test_fingerprint_identity_drift(
+                        org,
+                        installation.then_some("replacement-install"),
+                        (!installation).then_some("replacement-account"),
+                    )
+                    .await
+                    .unwrap();
+                    let response = if canonical {
+                        json!({"operation":"workflows.update","idempotencyKey":server_key,"status":"completed","response":response})
+                    } else {
+                        response
+                    };
+                    reply_http(stream, 200, response).await;
+                });
+                let result = if canonical {
+                    daemon.patch_workflow_draft(org, &input).await
+                } else {
+                    daemon
+                        .submit_workflow_patch_exact(PatchSubmission {
+                            org,
+                            owner: (&owner.0, &owner.1),
+                            params: &input,
+                            workflow_id: &workflow,
+                            key: &key,
+                            identity: record["identity"].as_str().unwrap(),
+                            path: &native,
+                            body: record["updateBody"].clone(),
+                            expected_notes: None,
+                        })
+                        .await
+                };
+                assert_eq!(result.unwrap_err().to_string(), "AUTH_IDENTITY_CHANGED");
+                assert_eq!(std::fs::read(&native).unwrap(), original);
+                backend.await.unwrap();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn concurrent_duplicate_workflow_patches_send_one_backend_update() {
         let temp = tempfile::tempdir().unwrap();
@@ -6297,6 +7091,42 @@ mod conformance {
         );
         assert_eq!(first.unwrap(), result);
         assert_eq!(second.unwrap(), result);
+        assert!(
+            daemon
+                .presentation
+                .maintenance_operation_candidates()
+                .unwrap()
+                .is_empty(),
+            "ordinary headless patch has no UI operation journal"
+        );
+        let native = std::fs::read_dir(temp.path().join("workflow-patches"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let acknowledged: Value = state::read_json(&native).unwrap();
+        assert!(native_patch_acknowledged(&acknowledged).unwrap());
+        assert_eq!(acknowledged["status"], "submitted");
+        assert_eq!(
+            acknowledged["nativeAcknowledgement"]["provenance"],
+            "authenticated_mutation_response"
+        );
+        assert!(
+            acknowledged["nativeAcknowledgement"]
+                .get("canonicalReceipt")
+                .is_none()
+        );
+        assert!(
+            crate::uninstall_state::assess_state(temp.path())
+                .unwrap()
+                .resolved
+        );
+        assert!(
+            crate::uninstall_state::inventory_resolved_state(temp.path())
+                .unwrap()
+                .contains(&native)
+        );
         backend.await.unwrap();
     }
 
@@ -8741,6 +9571,303 @@ mod conformance {
         assert!(!serialized.contains("secret-node-name"));
         assert!(!serialized.contains("exfiltrate_credentials"));
         backend.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn continuation_resolution_extension_is_negotiated_before_delivery_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(fixture(
+            temp.path(),
+            Api::for_test_origin("http://127.0.0.1:1").unwrap(),
+        ));
+        let org = "11111111-1111-4111-8111-111111111111";
+        let account = "22222222-2222-4222-8222-222222222222";
+        daemon.public.lock().await.active_organization = Some(org.into());
+        let run = Uuid::new_v4().to_string();
+        let identity = format!("follow:{run}:run_started");
+        daemon
+            .presentation
+            .register_delivery(
+                org,
+                account,
+                &identity,
+                &json!({
+                    "kind":"follow", "schemaVersion":"loomex.follow-session.continuation/v1",
+                    "runId":run, "receipt":"abcdefghijklmnop", "trigger":"run_started",
+                    "requestId":null, "requestStatus":null
+                }),
+            )
+            .unwrap();
+        let old = local_call_with_capabilities(
+            daemon.clone(),
+            vec!["method:presentation.delivery.get"],
+            "presentation.delivery.get",
+            json!({"identity":identity}),
+        )
+        .await;
+        assert!(old.get("error").is_none(), "{old}");
+        let mut keys = old["result"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "attemptId",
+                "continuation",
+                "identity",
+                "revision",
+                "schemaVersion",
+                "status"
+            ]
+        );
+        let new = local_call_with_capabilities(
+            daemon.clone(),
+            vec![
+                "method:presentation.delivery.get",
+                "presentation.continuation-resolution/v1",
+            ],
+            "presentation.delivery.get",
+            json!({"identity":identity}),
+        )
+        .await;
+        assert_eq!(new["result"]["continuationEligible"], true, "{new}");
+        assert_eq!(new["result"]["resolution"], json!({"state":"unresolved"}));
+        let mut request = daemon
+            .presentation
+            .maintenance_candidates()
+            .unwrap()
+            .remove(0);
+        request["idempotencyKey"] = json!(Uuid::new_v4());
+        daemon
+            .presentation
+            .maintenance_reconcile(
+                &request,
+                &json!({"snapshot":{
+                    "execution":{"id":run,"status":"running"}, "hasMoreEvents":false
+                }}),
+            )
+            .unwrap();
+        daemon.presentation.maintenance_retire(&request).unwrap();
+        let old = local_call_with_capabilities(
+            daemon.clone(),
+            vec!["method:presentation.delivery.get"],
+            "presentation.delivery.get",
+            json!({"identity":identity}),
+        )
+        .await;
+        assert_eq!(old["error"]["code"], "COMPATIBILITY_ERROR", "{old}");
+        assert!(old.get("result").is_none());
+        let new = local_call_with_capabilities(
+            daemon,
+            vec![
+                "method:presentation.delivery.get",
+                "presentation.continuation-resolution/v1",
+            ],
+            "presentation.delivery.get",
+            json!({"identity":identity}),
+        )
+        .await;
+        assert_eq!(new["result"]["status"], "ready", "{new}");
+        assert_eq!(new["result"]["continuationEligible"], false);
+        assert_eq!(new["result"]["resolution"]["state"], "retired_by_owner");
+    }
+
+    #[tokio::test]
+    async fn continuation_resolution_ignores_stale_generic_delivery_receipts_after_retirement() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(fixture(
+            temp.path(),
+            Api::for_test_origin("http://127.0.0.1:1").unwrap(),
+        ));
+        let org = "11111111-1111-4111-8111-111111111111";
+        let account = "22222222-2222-4222-8222-222222222222";
+        daemon.public.lock().await.active_organization = Some(org.into());
+        let run = Uuid::new_v4().to_string();
+        let identity = format!("follow:{run}:run_started");
+        daemon
+            .presentation
+            .register_delivery(
+                org,
+                account,
+                &identity,
+                &json!({
+                    "kind":"follow", "schemaVersion":"loomex.follow-session.continuation/v1",
+                    "runId":run, "receipt":"abcdefghijklmnop", "trigger":"run_started",
+                    "requestId":null, "requestStatus":null
+                }),
+            )
+            .unwrap();
+        let attempt = Uuid::new_v4();
+        let begin = json!({"identity":identity,"expectedRevision":0,"attemptId":attempt,"idempotencyKey":Uuid::new_v4()});
+        let settle = json!({"identity":identity,"expectedRevision":1,"attemptId":attempt,"status":"unknown","idempotencyKey":Uuid::new_v4()});
+        let mut old_files = Vec::new();
+        for (method, input) in [
+            ("presentation.delivery.begin", &begin),
+            ("presentation.delivery.settle", &settle),
+        ] {
+            let result = daemon.dispatch(method, input.clone()).await.unwrap();
+            // Seed the generic receipt written by a pre-fix daemon. New calls
+            // must neither trust it nor rewrite/delete this historical record.
+            let key = operation_cache_scoped_key(
+                Some(org),
+                Some(account),
+                input["idempotencyKey"].as_str().unwrap(),
+            );
+            let path = temp.path().join("operations").join(format!("{key}.json"));
+            assert!(!path.exists());
+            state::write_json(&path, &json!({"digest":operation_cache_identity(method,input,Some(org),Some(account)),"method":method,"result":result})).unwrap();
+            old_files.push((path.clone(), std::fs::read(path).unwrap()));
+        }
+        // A pre-extension PresentationStore persisted only the six business
+        // fields. Downgrade both exact store receipts while preserving the live
+        // row, then exercise old/new socket consumers before retirement.
+        let sqlite = rusqlite::Connection::open(temp.path().join("presentation.sqlite3")).unwrap();
+        let mut historical_receipts = Vec::new();
+        for (method, input) in [
+            ("presentation.delivery.begin", &begin),
+            ("presentation.delivery.settle", &settle),
+        ] {
+            let key = input["idempotencyKey"].as_str().unwrap();
+            let bytes: Vec<u8> = sqlite.query_row("SELECT result_json FROM presentation_receipts WHERE organization_id=?1 AND account_subject=?2 AND method=?3 AND idempotency_key=?4", rusqlite::params![org,account,method,key], |row| row.get(0)).unwrap();
+            let mut historical: Value = serde_json::from_slice(&bytes).unwrap();
+            historical.as_object_mut().unwrap().remove("resolution");
+            historical
+                .as_object_mut()
+                .unwrap()
+                .remove("continuationEligible");
+            let bytes = serde_json::to_vec(&historical).unwrap();
+            sqlite.execute("UPDATE presentation_receipts SET result_json=?1 WHERE organization_id=?2 AND account_subject=?3 AND method=?4 AND idempotency_key=?5", rusqlite::params![bytes,org,account,method,key]).unwrap();
+            historical_receipts.push((method, key.to_owned(), bytes.clone()));
+            for enabled in [false, true] {
+                let mut caps = vec!["presentation.delivery/v2"];
+                if enabled {
+                    caps.push("presentation.continuation-resolution/v1");
+                }
+                let reply =
+                    local_call_with_capabilities(daemon.clone(), caps, method, input.clone()).await;
+                assert!(reply.get("error").is_none(), "{reply}");
+                let mut replay = reply["result"].clone();
+                if enabled {
+                    assert_eq!(replay["resolution"], json!({"state":"unresolved"}));
+                    assert_eq!(replay["continuationEligible"], true);
+                    replay.as_object_mut().unwrap().remove("resolution");
+                    replay
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("continuationEligible");
+                }
+                assert_eq!(replay, historical); // begin keeps its original sending/revision 1
+            }
+        }
+        let mut request = daemon
+            .presentation
+            .maintenance_candidates()
+            .unwrap()
+            .remove(0);
+        request["idempotencyKey"] = json!(Uuid::new_v4());
+        daemon
+            .presentation
+            .maintenance_reconcile(
+                &request,
+                &json!({"snapshot":{
+                    "execution":{"id":run,"status":"running"},"hasMoreEvents":false
+                }}),
+            )
+            .unwrap();
+        daemon.presentation.maintenance_retire(&request).unwrap();
+        for enabled in [false, true] {
+            for (method, input) in [
+                ("presentation.delivery.begin", &begin),
+                ("presentation.delivery.settle", &settle),
+            ] {
+                let direct = daemon.dispatch(method, input.clone()).await.unwrap_err();
+                assert_eq!(direct.to_string(), "CONTINUATION_RESOLVED");
+                let mut caps = vec!["presentation.delivery/v2"];
+                if enabled {
+                    caps.push("presentation.continuation-resolution/v1");
+                }
+                let reply =
+                    local_call_with_capabilities(daemon.clone(), caps, method, input.clone()).await;
+                assert!(reply.get("error").is_some(), "{reply}");
+                assert!(reply.get("result").is_none(), "{reply}");
+            }
+        }
+        for (path, bytes) in old_files {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+        for (method, key, bytes) in historical_receipts {
+            let unchanged: Vec<u8> = sqlite.query_row("SELECT result_json FROM presentation_receipts WHERE organization_id=?1 AND account_subject=?2 AND method=?3 AND idempotency_key=?4", rusqlite::params![org,account,method,key], |row| row.get(0)).unwrap();
+            assert_eq!(unchanged, bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn continuation_resolution_projection_precedes_spool_checksum() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = fixture(
+            temp.path(),
+            Api::for_test_origin("http://127.0.0.1:1").unwrap(),
+        );
+        // Stress the serializer boundary directly: real bounded delivery records
+        // are below a frame, but future payload growth must not bypass projection.
+        let projection = json!({"schemaVersion":2,"identity":"fixture","continuation":{"large":"x".repeat(MAX_FRAME)},
+            "revision":0,"status":"ready","attemptId":null,"resolution":{"state":"unresolved"},"continuationEligible":true});
+        for enabled in [false, true] {
+            let reference = CONTINUATION_RESOLUTION_CLIENT
+                .scope(enabled, async {
+                    daemon.spool_response_for_method(
+                        "presentation.delivery.get",
+                        &json!({}),
+                        projection.clone(),
+                        None,
+                        None,
+                    )
+                })
+                .await
+                .unwrap();
+            let bytes = std::fs::read(temp.path().join("responses").join(format!(
+                "{}.json",
+                reference["responseRef"].as_str().unwrap()
+            )))
+            .unwrap();
+            assert_eq!(state::digest(&bytes), reference["checksumSha256"]);
+            let hydrated: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(hydrated.get("resolution").is_some(), enabled);
+            assert_eq!(hydrated.get("continuationEligible").is_some(), enabled);
+            assert_eq!(
+                hydrated.as_object().unwrap().len(),
+                if enabled { 8 } else { 6 }
+            );
+        }
+        let mut closed = projection;
+        closed["continuationEligible"] = json!(false);
+        closed["resolution"] = json!({"state":"retired_by_owner"});
+        let before = std::fs::read_dir(temp.path().join("responses"))
+            .unwrap()
+            .count();
+        let error = CONTINUATION_RESOLUTION_CLIENT
+            .scope(false, async {
+                daemon.spool_response_for_method(
+                    "presentation.delivery.get",
+                    &json!({}),
+                    closed,
+                    None,
+                    None,
+                )
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "COMPATIBILITY_ERROR");
+        assert_eq!(
+            std::fs::read_dir(temp.path().join("responses"))
+                .unwrap()
+                .count(),
+            before
+        );
     }
 
     #[tokio::test]
