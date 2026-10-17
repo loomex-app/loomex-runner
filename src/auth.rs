@@ -39,6 +39,40 @@ pub(crate) struct CredentialIdentity {
     pub(crate) device_id: Option<String>,
 }
 
+/// Non-authorizing owner captured under the same gate as credential recovery.
+/// Access-token lifetime is deliberately absent from this identity fence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BoundCredentialOwner {
+    pub(crate) organization: String,
+    pub(crate) account: String,
+    pub(crate) identity: CredentialIdentity,
+}
+// Existing protected rotation target, distinct from the selected domain owner.
+// A foreign enrolled child's exact pending rotation may be reconciled, but its
+// original subject must be present before recovery and unchanged afterward.
+enum PendingRefreshOwner {
+    Device(String),
+    Child {
+        organization: String,
+        subject: String,
+    },
+}
+#[derive(Debug)]
+struct BoundCredentialUnavailable(BoundCredentialOwner);
+impl std::fmt::Display for BoundCredentialUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AUTH_EXPIRED")
+    }
+}
+impl std::error::Error for BoundCredentialUnavailable {}
+/// Only a completed, owner-preserving rotation with unusable access can be
+/// isolated in a legacy multi-organization lookup. Pending auth stays explicit.
+pub(crate) fn unavailable_bound_owner(error: &anyhow::Error) -> Option<&BoundCredentialOwner> {
+    error
+        .downcast_ref::<BoundCredentialUnavailable>()
+        .map(|failure| &failure.0)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct RevocationEvidence {
     identity: CredentialIdentity,
@@ -700,6 +734,40 @@ impl Auth {
             .save(&serde_json::to_vec(&state).expect("in-memory fixture encoding"))
             .expect("in-memory fixture write");
         auth
+    }
+    #[cfg(test)]
+    pub(crate) async fn test_bound_owner_device_change(&self) -> Result<()> {
+        ensure!(
+            self.store.synthetic_fixture(),
+            "SYNTHETIC_AUTH_FIXTURE_REQUIRED"
+        );
+        let _guard = self.auth_guard().await?;
+        let mut state = self.required().await?;
+        state
+            .device
+            .as_mut()
+            .ok_or_else(|| anyhow!("SYNTHETIC_AUTH_FIXTURE_REQUIRED"))?
+            .subject = "replacement-device".into();
+        self.save(&state).await
+    }
+    #[cfg(test)]
+    pub(crate) async fn test_add_enrolled_child(&self, org: &str, account: &str) -> Result<()> {
+        ensure!(
+            self.store.synthetic_fixture(),
+            "SYNTHETIC_AUTH_FIXTURE_REQUIRED"
+        );
+        let _guard = self.auth_guard().await?;
+        let mut state = self.required().await?;
+        let mut child = state
+            .children
+            .values()
+            .next()
+            .ok_or_else(|| anyhow!("SYNTHETIC_AUTH_FIXTURE_REQUIRED"))?
+            .clone();
+        child.subject = account.into();
+        child.expires_at = now() + 3600;
+        state.children.insert(org.into(), child);
+        self.save(&state).await
     }
     /// Synthetic MemoryStore only. No native credential store or serialized
     /// credential bytes escape this fixture; lifecycle tests receive identities
@@ -1663,6 +1731,161 @@ impl Auth {
             .await?;
         }
         bail!("AUTH_EXPIRED")
+    }
+    /// Acquire only an existing enrolled owner's credential. Validate its
+    /// original installation/device/account before any recovery or rotation;
+    /// never bootstrap, enroll, or replace authority for this caller.
+    pub(crate) async fn owner_bound_credential(
+        &self,
+        org: &str,
+        expected: Option<&CredentialIdentity>,
+        account: Option<&str>,
+    ) -> Result<(SignedCredential, BoundCredentialOwner)> {
+        let _guard = self.auth_guard().await?;
+        let mut state = self.required().await?;
+        let owner = Self::bound_owner(&state, org, expected, account, true)?;
+        if let Some(refresh_owner) = Self::pending_refresh_owner(&state)? {
+            self.recover(&mut state).await?;
+            Self::validate_bound_owner(&state, &owner, false)?;
+            Self::validate_pending_refresh_owner(&state, &refresh_owner)?;
+        }
+        for _ in 0..2 {
+            Self::validate_bound_owner(&state, &owner, false)?;
+            let child = state.children.get(org).unwrap();
+            if child.usable() {
+                return Ok((child.signed(&state), owner));
+            }
+            self.refresh_child(&mut state, org).await?;
+            Self::validate_bound_owner(&state, &owner, false)?;
+        }
+        Err(BoundCredentialUnavailable(owner).into())
+    }
+    /// Strict local admission for retirement: never recovers, refreshes,
+    /// initializes identity, or writes protected state.
+    pub(crate) async fn owner_bound_existing_credential(
+        &self,
+        org: &str,
+        expected: Option<&CredentialIdentity>,
+        account: Option<&str>,
+    ) -> Result<(SignedCredential, BoundCredentialOwner)> {
+        let _guard = self.auth_guard().await?;
+        let state = self.required().await?;
+        let owner = Self::bound_owner(&state, org, expected, account, false)?;
+        let child = state.children.get(org).unwrap();
+        ensure!(child.usable(), "AUTH_REQUIRED");
+        Ok((child.signed(&state), owner))
+    }
+    fn bound_owner(
+        state: &ProtectedState,
+        org: &str,
+        expected: Option<&CredentialIdentity>,
+        account: Option<&str>,
+        recover: bool,
+    ) -> Result<BoundCredentialOwner> {
+        Self::allowed(state)?;
+        let identity = credential_identity(state);
+        if let Some(expected) = expected {
+            ensure!(
+                identity.installation_id == expected.installation_id
+                    && (expected.device_id.is_none() || identity.device_id == expected.device_id),
+                "AUTH_IDENTITY_CHANGED"
+            );
+        }
+        let child = state
+            .children
+            .get(org)
+            .ok_or_else(|| anyhow!("ORGANIZATION_NOT_ENROLLED"))?;
+        ensure!(
+            account.is_none_or(|account| child.subject == account),
+            "AUTH_IDENTITY_CHANGED"
+        );
+        let owner = BoundCredentialOwner {
+            organization: org.into(),
+            account: child.subject.clone(),
+            identity,
+        };
+        Self::validate_bound_owner(state, &owner, recover)?;
+        Ok(owner)
+    }
+    fn validate_bound_owner(
+        state: &ProtectedState,
+        owner: &BoundCredentialOwner,
+        recover: bool,
+    ) -> Result<()> {
+        ensure!(
+            credential_identity(state) == owner.identity
+                && state
+                    .children
+                    .get(&owner.organization)
+                    .is_some_and(|child| child.subject == owner.account),
+            "AUTH_IDENTITY_CHANGED"
+        );
+        Self::allowed(state)?;
+        ensure!(state.login.is_none(), "AUTH_RECONCILIATION_REQUIRED");
+        ensure!(
+            state.pending.as_ref().is_none_or(|pending| recover
+                && match &pending.target {
+                    Target::DeviceRefresh => state.device.is_some(),
+                    Target::ChildRefresh(org) => state.children.contains_key(org),
+                    _ => false,
+                }
+                && pending.superseded.is_none()),
+            "AUTH_RECONCILIATION_REQUIRED"
+        );
+        Ok(())
+    }
+    fn pending_refresh_owner(state: &ProtectedState) -> Result<Option<PendingRefreshOwner>> {
+        let Some(pending) = &state.pending else {
+            return Ok(None);
+        };
+        let owner = match &pending.target {
+            Target::DeviceRefresh => PendingRefreshOwner::Device(
+                state
+                    .device
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("AUTH_RECONCILIATION_REQUIRED"))?
+                    .subject
+                    .clone(),
+            ),
+            Target::ChildRefresh(org) => PendingRefreshOwner::Child {
+                organization: org.clone(),
+                subject: state
+                    .children
+                    .get(org)
+                    .ok_or_else(|| anyhow!("AUTH_RECONCILIATION_REQUIRED"))?
+                    .subject
+                    .clone(),
+            },
+            _ => bail!("AUTH_RECONCILIATION_REQUIRED"),
+        };
+        Ok(Some(owner))
+    }
+    fn validate_pending_refresh_owner(
+        state: &ProtectedState,
+        owner: &PendingRefreshOwner,
+    ) -> Result<()> {
+        let unchanged = match owner {
+            PendingRefreshOwner::Device(subject) => state
+                .device
+                .as_ref()
+                .is_some_and(|device| device.subject == *subject),
+            PendingRefreshOwner::Child {
+                organization,
+                subject,
+            } => state
+                .children
+                .get(organization)
+                .is_some_and(|child| child.subject == *subject),
+        };
+        ensure!(unchanged, "AUTH_IDENTITY_CHANGED");
+        Ok(())
+    }
+    /// Local, serialized fence before dispatch and after response. Successful
+    /// authenticated transport remains usable when only token lifetime changes.
+    pub(crate) async fn verify_bound_owner(&self, owner: &BoundCredentialOwner) -> Result<()> {
+        let _guard = self.auth_guard().await?;
+        let state = self.required().await?;
+        Self::validate_bound_owner(&state, owner, false)
     }
     /// Returns the already-enrolled local child identity without refreshing,
     /// recovering, persisting, or contacting the backend.
@@ -2967,6 +3190,477 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+    #[tokio::test]
+    async fn owner_bound_credential_fences_original_identity_before_any_recovery() {
+        for mismatch in ["installation", "device", "account"] {
+            let (auth, store, listener) = test_auth().await;
+            let fixture = Auth::test_enrolled(auth.api.clone(), "org", "original-account");
+            let mut state = fixture.required().await.unwrap();
+            state.children.get_mut("org").unwrap().expires_at = 0;
+            state.pending = Some(Pending {
+                target: Target::ChildRefresh("org".into()),
+                route: "v1/delegations/refresh/".into(),
+                body: json!({"refreshToken":"original-refresh","proof":"original-proof"}),
+                started_at: now(),
+                recovery_used: false,
+                recovery_generation: Some("original-generation".into()),
+                superseded: None,
+            });
+            let mut expected = credential_identity(&state);
+            let mut account = "original-account";
+            match mismatch {
+                "installation" => expected.installation_id = "different-installation".into(),
+                "device" => expected.device_id = Some("different-device".into()),
+                _ => account = "different-account",
+            }
+            auth.save(&state).await.unwrap();
+            let original = store.load().unwrap();
+            assert_eq!(
+                auth.owner_bound_credential("org", Some(&expected), Some(account))
+                    .await
+                    .err()
+                    .unwrap()
+                    .to_string(),
+                "AUTH_IDENTITY_CHANGED"
+            );
+            assert_eq!(store.load().unwrap(), original);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn owner_bound_credential_never_initializes_or_recovers_replacement_authority() {
+        let (auth, store, listener) = test_auth().await;
+        assert_eq!(
+            auth.owner_bound_credential("org", None, None)
+                .await
+                .err()
+                .unwrap()
+                .to_string(),
+            "AUTH_REQUIRED"
+        );
+        assert!(store.load().unwrap().is_none());
+        for phase in [
+            "bootstrap",
+            "enroll",
+            "exchange",
+            "cancel",
+            "login",
+            "logout",
+        ] {
+            let fixture = Auth::test_enrolled(auth.api.clone(), "org", "original-account");
+            let mut state = fixture.required().await.unwrap();
+            if phase == "login" {
+                state.login = Some(Login::default());
+            } else if phase == "logout" {
+                state.logout_pending = true;
+            } else {
+                let target = match phase {
+                    "bootstrap" => Target::Bootstrap,
+                    "enroll" => Target::Enroll("org".into()),
+                    "exchange" => Target::BrowserExchange,
+                    _ => Target::BrowserCancel,
+                };
+                state.pending = Some(Pending {
+                    target,
+                    route: "must-not-dispatch".into(),
+                    body: json!({"proof":"protected"}),
+                    started_at: now(),
+                    recovery_used: false,
+                    recovery_generation: Some("original-generation".into()),
+                    superseded: None,
+                });
+            }
+            auth.save(&state).await.unwrap();
+            let original = store.load().unwrap();
+            let error = auth
+                .owner_bound_credential("org", None, Some("original-account"))
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(
+                error.to_string(),
+                if phase == "logout" {
+                    "LOGOUT_PENDING"
+                } else {
+                    "AUTH_RECONCILIATION_REQUIRED"
+                }
+            );
+            assert!(unavailable_bound_owner(&error).is_none());
+            assert_eq!(store.load().unwrap(), original);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn owner_bound_credential_recovery_rejects_store_drift_and_keeps_replacement_untouched() {
+        for drift in ["installation", "device", "account"] {
+            let (auth, store, listener) = test_auth().await;
+            let fixture = Auth::test_enrolled(auth.api.clone(), "org", "original-account");
+            let mut state = fixture.required().await.unwrap();
+            state.children.get_mut("org").unwrap().expires_at = 0;
+            auth.save(&state).await.unwrap();
+            let expected = credential_identity(&state);
+            let server_store = store.clone();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let body = read_request(&mut socket).await;
+                assert!(body.get("recovery").is_none());
+                let mut replacement: ProtectedState =
+                    serde_json::from_slice(&server_store.load().unwrap().unwrap()).unwrap();
+                match drift {
+                    "installation" => {
+                        replacement.installation_id = "replacement-installation".into()
+                    }
+                    "device" => {
+                        replacement.device.as_mut().unwrap().subject = "replacement-device".into()
+                    }
+                    _ => {
+                        replacement.children.get_mut("org").unwrap().subject =
+                            "replacement-account".into()
+                    }
+                }
+                let bytes = serde_json::to_vec(&replacement).unwrap();
+                server_store.save(&bytes).unwrap();
+                respond(&mut socket, 200, json!({"data":{"accessToken":"lmxr_fresh_secret","refreshToken":"fresh-refresh","expiresInSeconds":3600}})).await;
+                bytes
+            });
+            assert_eq!(
+                auth.owner_bound_credential("org", Some(&expected), Some("original-account"))
+                    .await
+                    .err()
+                    .unwrap()
+                    .to_string(),
+                "AUTH_IDENTITY_CHANGED"
+            );
+            let replacement = server.await.unwrap();
+            assert_eq!(store.load().unwrap().unwrap(), replacement);
+        }
+    }
+    async fn assert_owner_bound_orphan_refresh_refused(target: Target, missing_device: bool) {
+        let (auth, store, listener) = test_auth().await;
+        let fixture = Auth::test_enrolled(auth.api.clone(), "selected-org", "selected-account");
+        let mut state = fixture.required().await.unwrap();
+        if missing_device {
+            state.device = None;
+        }
+        state.pending = Some(Pending {
+            target,
+            route: "v1/delegations/refresh/".into(),
+            body: json!({"refreshToken":"original-refresh","proof":"original-proof"}),
+            started_at: now(),
+            recovery_used: false,
+            recovery_generation: Some("original-generation".into()),
+            superseded: None,
+        });
+        let expected = credential_identity(&state);
+        auth.save(&state).await.unwrap();
+        let original = store.load().unwrap();
+        let reference = auth.status().await.unwrap()["recoveryRef"].clone();
+        let server = tokio::spawn(async move {
+            let Ok(Ok((mut socket, _))) =
+                tokio::time::timeout(Duration::from_millis(80), listener.accept()).await
+            else {
+                return false;
+            };
+            read_request(&mut socket).await;
+            respond(&mut socket, 200, json!({"data":{"accessToken":"lmxr_fresh_secret","refreshToken":"fresh-refresh","expiresInSeconds":3600}})).await;
+            true
+        });
+        let error = auth
+            .owner_bound_credential("selected-org", Some(&expected), Some("selected-account"))
+            .await
+            .err()
+            .unwrap();
+        let dispatched = server.await.unwrap();
+        assert_eq!(error.to_string(), "AUTH_RECONCILIATION_REQUIRED");
+        assert!(
+            !dispatched,
+            "orphan refresh must be refused before transport"
+        );
+        assert_eq!(
+            store.load().unwrap(),
+            original,
+            "orphan refresh must retain the exact protected intent and recovery-used marker"
+        );
+        assert_eq!(auth.status().await.unwrap()["recoveryRef"], reference);
+    }
+    #[tokio::test]
+    async fn owner_bound_orphan_foreign_child_refresh_refuses_before_write_or_transport() {
+        assert_owner_bound_orphan_refresh_refused(
+            Target::ChildRefresh("missing-foreign-org".into()),
+            false,
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn owner_bound_orphan_device_refresh_refuses_before_write_or_transport() {
+        assert_owner_bound_orphan_refresh_refused(Target::DeviceRefresh, true).await;
+    }
+    #[tokio::test]
+    async fn owner_bound_existing_foreign_child_recovers_exact_intent_and_fences_all_owner_drift() {
+        for drift in [
+            "none",
+            "foreign-account",
+            "selected-account",
+            "device",
+            "installation",
+        ] {
+            let (auth, store, listener) = test_auth().await;
+            let fixture = Auth::test_enrolled(auth.api.clone(), "selected-org", "selected-account");
+            let mut state = fixture.required().await.unwrap();
+            let mut foreign = state.children["selected-org"].clone();
+            foreign.subject = "foreign-account".into();
+            foreign.expires_at = 0;
+            state.children.insert("foreign-org".into(), foreign);
+            state.pending = Some(Pending {
+                target: Target::ChildRefresh("foreign-org".into()),
+                route: "v1/delegations/refresh/".into(),
+                body: json!({"refreshToken":"original-foreign-refresh","proof":"original-foreign-proof"}),
+                started_at: now(),
+                recovery_used: false,
+                recovery_generation: Some("original-foreign-generation".into()),
+                superseded: None,
+            });
+            let expected = credential_identity(&state);
+            auth.save(&state).await.unwrap();
+            let server_store = store.clone();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                assert_eq!(
+                    read_request(&mut socket).await,
+                    json!({"refreshToken":"original-foreign-refresh","proof":"original-foreign-proof","recovery":true})
+                );
+                let replacement = if drift == "none" {
+                    None
+                } else {
+                    let mut replacement: ProtectedState =
+                        serde_json::from_slice(&server_store.load().unwrap().unwrap()).unwrap();
+                    match drift {
+                        "foreign-account" => {
+                            replacement.children.get_mut("foreign-org").unwrap().subject =
+                                "replacement-foreign-account".into()
+                        }
+                        "selected-account" => {
+                            replacement
+                                .children
+                                .get_mut("selected-org")
+                                .unwrap()
+                                .subject = "replacement-selected-account".into()
+                        }
+                        "device" => {
+                            replacement.device.as_mut().unwrap().subject =
+                                "replacement-device".into()
+                        }
+                        _ => replacement.installation_id = "replacement-installation".into(),
+                    }
+                    let bytes = serde_json::to_vec(&replacement).unwrap();
+                    server_store.save(&bytes).unwrap();
+                    Some(bytes)
+                };
+                respond(&mut socket, 200, json!({"data":{"accessToken":"lmxr_foreignfresh_secret","refreshToken":"fresh-foreign-refresh","expiresInSeconds":3600}})).await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                        .await
+                        .is_err()
+                );
+                replacement
+            });
+            let result = auth
+                .owner_bound_credential("selected-org", Some(&expected), Some("selected-account"))
+                .await;
+            let replacement = server.await.unwrap();
+            if let Some(replacement) = replacement {
+                assert_eq!(result.err().unwrap().to_string(), "AUTH_IDENTITY_CHANGED");
+                assert_eq!(store.load().unwrap().unwrap(), replacement);
+            } else {
+                let (credential, owner) = result.unwrap();
+                assert_eq!(credential.subject, "selected-account");
+                assert_eq!(owner.identity, expected);
+                auth.verify_bound_owner(&owner).await.unwrap();
+                let saved = auth.required().await.unwrap();
+                assert!(saved.pending.is_none());
+                assert_eq!(saved.children["foreign-org"].subject, "foreign-account");
+                assert_eq!(
+                    saved.children["foreign-org"].refresh,
+                    "fresh-foreign-refresh"
+                );
+                assert_eq!(
+                    saved.children["selected-org"].refresh,
+                    state.children["selected-org"].refresh
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn owner_bound_credential_pending_device_refresh_and_queued_owner_change_remain_fenced() {
+        let (auth, store, listener) = test_auth().await;
+        let fixture = Auth::test_enrolled(auth.api.clone(), "org", "original-account");
+        let mut state = fixture.required().await.unwrap();
+        state.pending = Some(Pending {
+            target: Target::DeviceRefresh,
+            route: "v2/device-authorities/refresh/".into(),
+            body: json!({"refreshToken":"original-device-refresh","proof":"original-device-proof"}),
+            started_at: now(),
+            recovery_used: false,
+            recovery_generation: Some("original-generation".into()),
+            superseded: None,
+        });
+        let expected = credential_identity(&state);
+        auth.save(&state).await.unwrap();
+        let server_auth = auth.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            assert_eq!(
+                read_request(&mut socket).await,
+                json!({"refreshToken":"original-device-refresh","proof":"original-device-proof","recovery":true})
+            );
+            let change = tokio::spawn(async move {
+                server_auth
+                    .test_fingerprint_identity_drift("org", None, Some("replacement-account"))
+                    .await
+                    .unwrap();
+            });
+            // The admitted owner holds its gate across exact recovery. A queued
+            // identity mutation runs before the subsequent verifier acquires it.
+            tokio::task::yield_now().await;
+            respond(&mut socket, 200, json!({"data":{"accessToken":"lmxda_new_secret","refreshToken":"new-refresh","expiresInSeconds":3600}})).await;
+            change.await.unwrap();
+        });
+        let (credential, owner) = auth
+            .owner_bound_credential("org", Some(&expected), Some("original-account"))
+            .await
+            .unwrap();
+        assert_eq!(credential.subject, "original-account");
+        server.await.unwrap();
+        assert_eq!(
+            auth.verify_bound_owner(&owner)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "AUTH_IDENTITY_CHANGED"
+        );
+        let saved: ProtectedState =
+            serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+        assert!(saved.pending.is_none());
+        assert_eq!(saved.device.unwrap().refresh, "new-refresh");
+    }
+    #[tokio::test]
+    async fn owner_bound_rejected_or_exhausted_recovery_retains_exact_original_pending_intent() {
+        for (status, code) in [(403, "REFRESH_REJECTED"), (409, "RECOVERY_EXHAUSTED")] {
+            let (auth, store, listener) = test_auth().await;
+            let fixture = Auth::test_enrolled(auth.api.clone(), "org", "original-account");
+            let mut state = fixture.required().await.unwrap();
+            state.pending = Some(Pending {
+                target: Target::ChildRefresh("org".into()),
+                route: "v1/delegations/refresh/".into(),
+                body: json!({"refreshToken":"original-refresh","proof":"original-proof"}),
+                started_at: now(),
+                recovery_used: false,
+                recovery_generation: Some("original-generation".into()),
+                superseded: None,
+            });
+            let expected = credential_identity(&state);
+            auth.save(&state).await.unwrap();
+            let original_reference = auth.status().await.unwrap()["recoveryRef"].clone();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                assert_eq!(
+                    read_request(&mut socket).await,
+                    json!({"refreshToken":"original-refresh","proof":"original-proof","recovery":true})
+                );
+                respond(&mut socket, status, json!({"error":{"code":code}})).await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            let error = auth
+                .owner_bound_credential("org", Some(&expected), Some("original-account"))
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.to_string(), code);
+            assert!(unavailable_bound_owner(&error).is_none());
+            server.await.unwrap();
+            let saved: ProtectedState =
+                serde_json::from_slice(&store.load().unwrap().unwrap()).unwrap();
+            assert_eq!(credential_identity(&saved), expected);
+            assert_eq!(saved.children["org"].subject, "original-account");
+            let retained = saved.pending.unwrap();
+            assert_eq!(retained.body, state.pending.as_ref().unwrap().body);
+            assert_eq!(
+                retained.started_at,
+                state.pending.as_ref().unwrap().started_at
+            );
+            assert_eq!(
+                retained.recovery_generation,
+                state.pending.as_ref().unwrap().recovery_generation
+            );
+            assert_eq!(
+                auth.status().await.unwrap()["recoveryRef"],
+                original_reference
+            );
+        }
+    }
+    #[tokio::test]
+    async fn owner_bound_verify_separates_access_lifetime_from_pending_logout_and_owner() {
+        for transition in [
+            "lifetime",
+            "pending",
+            "logout",
+            "login",
+            "device",
+            "installation",
+            "account",
+        ] {
+            let (auth, store, listener) = test_auth().await;
+            let fixture = Auth::test_enrolled(auth.api.clone(), "org", "original-account");
+            auth.save(&fixture.required().await.unwrap()).await.unwrap();
+            let (_, owner) = auth
+                .owner_bound_credential("org", None, Some("original-account"))
+                .await
+                .unwrap();
+            let mut state = auth.required().await.unwrap();
+            match transition {
+                "lifetime" => state.children.get_mut("org").unwrap().expires_at = 0,
+                "pending" => state.pending = bound_recovery_fixture().pending,
+                "logout" => state.logout_pending = true,
+                "login" => state.login = Some(Login::default()),
+                "device" => state.device.as_mut().unwrap().subject = "replacement-device".into(),
+                "installation" => state.installation_id = "replacement-installation".into(),
+                _ => state.children.get_mut("org").unwrap().subject = "replacement-account".into(),
+            }
+            auth.save(&state).await.unwrap();
+            let bytes = store.load().unwrap();
+            let result = auth.verify_bound_owner(&owner).await;
+            if transition == "lifetime" {
+                result.unwrap();
+                assert_eq!(
+                    auth.current_child_identity("org")
+                        .await
+                        .unwrap_err()
+                        .to_string(),
+                    "AUTH_REQUIRED"
+                );
+            } else {
+                assert!(result.is_err(), "{transition}");
+            }
+            assert_eq!(store.load().unwrap(), bytes);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                    .await
+                    .is_err()
+            );
+        }
     }
     #[tokio::test]
     async fn current_child_identity_never_refreshes_or_writes_expired_auth() {

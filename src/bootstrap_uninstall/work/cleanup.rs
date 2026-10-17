@@ -28,6 +28,29 @@ fn resource_names(work: &Value) -> Result<(std::collections::BTreeSet<String>, V
     }
     Ok((names, generations))
 }
+/// Exact private attempt files; a missing file is part of the proof as well.
+pub(super) fn attempt_resources(paths: &lifecycle::Paths, attempt: &str) -> Result<Vec<Value>> {
+    Uuid::parse_str(attempt)?;
+    let mut names = vec![];
+    for kind in ["context", "requests", "result", "authorization"] {
+        names.push(format!("uninstall-work-{kind}-{attempt}.json"));
+    }
+    for index in 0..256 {
+        for kind in ["checkpoint", "cache"] {
+            names.push(format!("uninstall-work-{kind}-{attempt}-{index}.json"));
+        }
+    }
+    let mut files = vec![];
+    for name in names {
+        let path = paths.state_dir.join(&name);
+        if present(&path)? {
+            files.push(json!({"name":name,"sha256":digest_file(&path)?}));
+        }
+    }
+    files.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    Ok(files)
+}
+
 fn resource_entries(
     paths: &lifecycle::Paths,
     allowed: &std::collections::BTreeSet<String>,
@@ -80,7 +103,7 @@ pub(super) fn cleanup(paths: &lifecycle::Paths, work: &Value, journal: &Value) -
             evidence.push(json!({"name":name,"sha256":digest_file(&entry.path())?}));
         }
         evidence.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-        let plan = json!({"schema":"app.loomex.runner.uninstall-work-cleanup/v1","operationId":id,"ownerSha256":owner_sha,"ownerPhase":work["phase"],"journalSha256":work["journalSha256"],"generations":generations,"attemptIds":work["attemptIds"],"resourceFiles":files,"evidenceFiles":evidence});
+        let plan = json!({"schema":"app.loomex.runner.uninstall-work-cleanup/v1","operationId":id,"ownerSha256":owner_sha,"ownerPhase":work["phase"],"journalSha256":work["journalSha256"],"generations":generations,"attemptIds":work["attemptIds"],"failedReconcileProofs":work["failedReconcileProofs"],"resourceFiles":files,"evidenceFiles":evidence});
         immutable_copy(&plan_path, &serde_json::to_vec(&plan)?)?;
     }
     let plan: Value = work_json(&plan_path)?;
@@ -92,7 +115,8 @@ pub(super) fn cleanup(paths: &lifecycle::Paths, work: &Value, journal: &Value) -
             && plan["journalSha256"] == work["journalSha256"]
             && plan["journalSha256"] == journal["recovery"]["oldJournalSha256"]
             && plan["generations"] == json!(generations)
-            && plan["attemptIds"] == work["attemptIds"],
+            && plan["attemptIds"] == work["attemptIds"]
+            && plan["failedReconcileProofs"] == work["failedReconcileProofs"],
         "UNINSTALL_WORK_BINDING_CHANGED",
     )?;
     generations::verify_archives(paths, work)?;
@@ -214,7 +238,7 @@ pub(super) fn require_completed(paths: &lifecycle::Paths, journal: &Value) -> Re
         .as_array()
         .context("invalid work cleanup generations")?;
     let current = records.last().context("invalid work cleanup generations")?;
-    let work = json!({"schema":generations::OWNER_V2,"phase":plan["ownerPhase"],"operationId":id,"journalSha256":plan["journalSha256"],"releasePath":current["releasePath"],"releaseManifestSha256":current["releaseManifestSha256"],"currentGeneration":records.len()-1,"generations":records,"attemptIds":plan["attemptIds"]});
+    let work = json!({"schema":generations::OWNER_V2,"phase":plan["ownerPhase"],"operationId":id,"journalSha256":plan["journalSha256"],"releasePath":current["releasePath"],"releaseManifestSha256":current["releaseManifestSha256"],"currentGeneration":records.len()-1,"generations":records,"attemptIds":plan["attemptIds"],"failedReconcileProofs":plan["failedReconcileProofs"]});
     generations::verify_archives(paths, &work)?;
     let (allowed, _) = resource_names(&work)?;
     require(

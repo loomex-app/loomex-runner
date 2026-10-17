@@ -92,47 +92,23 @@ pub(super) async fn read(
     let account = candidate["accountSubject"]
         .as_str()
         .context("INVALID_REQUEST")?;
-    ensure!(
-        auth.enrolled_organizations()
-            .await?
-            .iter()
-            .any(|id| id == org),
-        "ORGANIZATION_NOT_ENROLLED"
-    );
-    let credential = auth.credential(org).await?;
-    let before = auth.current_child_identity(org).await?;
-    ensure!(
-        before.0 == account
-            && credential.subject == account
-            && before.1 == expected.installation_id,
-        "AUTH_IDENTITY_CHANGED"
-    );
+    let (credential, owner_snapshot) = auth
+        .owner_bound_credential(org, Some(expected), Some(account))
+        .await?;
     let owner = Owner {
         organization: org,
         account,
-        installation: &before.1,
+        installation: &owner_snapshot.identity.installation_id,
     };
+    auth.verify_bound_owner(&owner_snapshot).await?;
     let receipt = read_with(candidate, &owner, |verb, route, body| async move {
         Ok(api
             .request(&verb, &route, body, Some(&credential), None)
             .await?)
     })
-    .await?;
-    ensure!(
-        auth.current_child_identity(org).await? == before,
-        "AUTH_IDENTITY_CHANGED"
-    );
-    ensure!(
-        auth.maintenance_identity()
-            .await?
-            .as_ref()
-            .is_some_and(
-                |identity| identity.installation_id == expected.installation_id
-                    && (expected.device_id.is_none() || identity.device_id == expected.device_id)
-            ),
-        "AUTH_IDENTITY_CHANGED"
-    );
-    Ok(receipt)
+    .await;
+    auth.verify_bound_owner(&owner_snapshot).await?;
+    receipt
 }
 
 /// A legacy observation with no original request identity cannot be correlated
@@ -142,6 +118,7 @@ pub(super) async fn read_operation(
     auth: &Auth,
     candidate: &Value,
     expected: &CredentialIdentity,
+    recover_auth: bool,
 ) -> Result<Value> {
     let binding = &candidate["binding"];
     let method = candidate["method"]
@@ -167,25 +144,49 @@ pub(super) async fn read_operation(
     ensure!(organizations.len() <= 64, "MANAGED_WORK_PREVIEW_LIMIT");
     let mut matches = Vec::new();
     let mut lookup_state = "missing_binding";
+    let mut unavailable = false;
     for org in organizations {
-        let before = auth.current_child_identity(&org).await?;
-        ensure!(
-            before.1 == expected.installation_id,
-            "AUTH_IDENTITY_CHANGED"
-        );
-        if !binding.is_null() {
+        let account = if binding.is_null() {
+            None
+        } else {
             ensure!(
-                binding["installationId"] == expected.installation_id
-                    && binding["accountSubject"] == before.0,
+                binding["installationId"] == expected.installation_id,
                 "AUTH_IDENTITY_CHANGED"
             );
-        }
-        let credential = auth.credential(&org).await?;
-        ensure!(credential.subject == before.0, "AUTH_IDENTITY_CHANGED");
+            Some(
+                binding["accountSubject"]
+                    .as_str()
+                    .context("AUTH_IDENTITY_CHANGED")?,
+            )
+        };
+        let admission = if recover_auth {
+            auth.owner_bound_credential(&org, Some(expected), account)
+                .await
+        } else {
+            auth.owner_bound_existing_credential(&org, Some(expected), account)
+                .await
+        };
+        let (credential, before) = match admission {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                // An unknown or pending protected auth operation is never
+                // skipped. Only a completed rotation with the original owner
+                // still present may be isolated for an unbound legacy lookup.
+                if binding.is_null() {
+                    if let Some(owner) = crate::auth::unavailable_bound_owner(&error) {
+                        auth.verify_bound_owner(owner).await?;
+                        unavailable = true;
+                        continue;
+                    }
+                }
+                return Err(error);
+            }
+        };
+        auth.verify_bound_owner(&before).await?;
         let (route, body) = if native {
             (
                 "v2/native-authoring-receipts/get/",
-                serde_json::json!({"operation":method,"executionId":candidate["runId"],"cacheReference":candidate["legacySlot"],"accountSubject":before.0,"cacheRequestDigest":candidate["record"]["digest"]}),
+                serde_json::json!({"operation":method,"executionId":candidate["runId"],"cacheReference":candidate["legacySlot"],"accountSubject":before.account,"cacheRequestDigest":candidate["record"]["digest"]}),
             )
         } else if interaction {
             if binding["receipt"]["method"] == "interactions.operations.get" {
@@ -196,7 +197,7 @@ pub(super) async fn read_operation(
             } else {
                 (
                     "v2/interaction-operations/get/",
-                    serde_json::json!({"operation":if method=="interactions.respond"||method=="interactions.decide" {"interaction.resolve"}else{method},"cacheReference":candidate["legacySlot"],"accountSubject":before.0}),
+                    serde_json::json!({"operation":if method=="interactions.respond"||method=="interactions.decide" {"interaction.resolve"}else{method},"cacheReference":candidate["legacySlot"],"accountSubject":before.account}),
                 )
             }
         } else {
@@ -210,10 +211,8 @@ pub(super) async fn read_operation(
         {
             Ok(receipt) => receipt,
             Err(_) => {
-                ensure!(
-                    auth.current_child_identity(&org).await? == before,
-                    "AUTH_IDENTITY_CHANGED"
-                );
+                auth.verify_bound_owner(&before).await?;
+                unavailable = true;
                 lookup_state = "unavailable";
                 continue;
             }
@@ -225,10 +224,8 @@ pub(super) async fn read_operation(
             Some("completed") => "same_key_only",
             _ => "unavailable",
         };
-        ensure!(
-            auth.current_child_identity(&org).await? == before,
-            "AUTH_IDENTITY_CHANGED"
-        );
+        unavailable |= lookup_state == "unavailable";
+        auth.verify_bound_owner(&before).await?;
         ensure!(
             receipt["operation"]
                 == (if method == "interactions.respond" || method == "interactions.decide" {
@@ -252,7 +249,7 @@ pub(super) async fn read_operation(
                 receipt["result"]["executionId"] == candidate["runId"],
                 "MANAGED_WORK_RECEIPT_MISMATCH"
             );
-            matches.push((org, before.0, receipt));
+            matches.push((before, receipt));
         } else {
             ensure!(
                 receipt["submissionFingerprintVersion"] == "loomex.operation-submission/v1"
@@ -264,14 +261,15 @@ pub(super) async fn read_operation(
                 receipt["requestId"] == binding["references"]["requestId"],
                 "MANAGED_WORK_RECEIPT_MISMATCH"
             );
-            matches.push((org, before.0, receipt));
+            matches.push((before, receipt));
         }
     }
     ensure!(matches.len() <= 1, "MANAGED_WORK_RECEIPT_MISMATCH");
-    if let Some((org, account, receipt)) = matches.pop() {
+    if let Some((matched_owner, receipt)) = matches.pop() {
+        auth.verify_bound_owner(&matched_owner).await?;
         let mut owner = candidate.clone();
-        owner["organizationId"] = serde_json::json!(org);
-        owner["accountSubject"] = serde_json::json!(account);
+        owner["organizationId"] = serde_json::json!(matched_owner.organization);
+        owner["accountSubject"] = serde_json::json!(matched_owner.account);
         let run = if native {
             Some(candidate["runId"].clone())
         } else {
@@ -281,7 +279,8 @@ pub(super) async fn read_operation(
         };
         if let Some(run) = run {
             owner["runId"] = run;
-            let observation = super::read_run(api, auth, &owner, expected).await?;
+            let observation =
+                super::read_run(api, auth, &owner, &matched_owner.identity, recover_auth).await?;
             if !observation["terminalResult"].is_null() {
                 return Ok(
                     serde_json::json!({"remoteOutcome":"terminal","organizationId":owner["organizationId"],"accountSubject":owner["accountSubject"],"installationId":expected.installation_id,"canonicalReceipt":receipt,"observation":observation}),
@@ -294,6 +293,9 @@ pub(super) async fn read_operation(
             );
         }
         return Ok(serde_json::json!({"remoteOutcome":"unknown","safeReason":"terminal_missing"}));
+    }
+    if unavailable {
+        lookup_state = "unavailable";
     }
     Ok(
         serde_json::json!({"remoteOutcome":"unknown","safeReason":if lookup_state=="missing_binding" && binding.is_null(){"missing_binding"}else{"canonical_pending"},"lookupState":lookup_state}),

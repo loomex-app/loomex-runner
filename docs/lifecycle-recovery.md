@@ -183,6 +183,42 @@ This mode can inspect eligible retained work even when deletion is blocked.
 Remote observations and explicit delivery evidence determine resolution. Unavailable or ambiguous observations stay
 protected; clean-reinstall approval supplies no missing acknowledgement.
 
+A written failed Reconcile result can become eligible for a successor only after
+the owner verifies the exact result, context and release, observes the original
+process has exited, and reacquires native singleton ownership. The owner retains
+the original operation UUID and immutable failure evidence; the successor gets
+its own attempt and reconciles existing domain/auth intents. This disposition
+proves inactivity, not completion or absence of earlier effects. Active or
+uncertain attempts, missing or contradictory evidence, and failed `retire-local`
+attempts remain pinned. A successor cannot retire records until its own Reconcile
+succeeds and a fresh Inspect assessment is explicitly approved.
+
+The selected candidate must declare the capabilities needed to read retained
+maintenance generations, inactive failed-Reconcile evidence, and any protected
+retirement evidence before changing that state. A missing capability is reported
+as `UNINSTALL_WORK_GENERATION_CAPABILITY_REQUIRED` or
+`OPERATION_RETIREMENT_CAPABILITY_REQUIRED`, with `select_compatible_release`.
+Select a verified compatible release, then use the existing Inspect/Reconcile
+flow with the original journal binding. Retrying the same incompatible artifact
+does not add a capability; the refusal grants no mutation or retirement authority.
+
+Authentication diagnostics retain the bounded native code, stage/category, OS
+status, outcome/recovery, HTTP status, correlation UUID, remote code, revocation
+state and credential-removal fact when supplied. Arbitrary error text, response
+bodies and private fields are omitted. `AUTH_REQUIRED` and `AUTH_EXPIRED` retain
+the conservative `unknown` outcome; a stage-local `not_dispatched` observation
+never establishes the outcome of a historical domain mutation. Missing or revoked
+original credentials remain protected blockers. Sign-in through the stopped
+service is unavailable; Inspect and supported owner-bound Reconcile are the
+existing recovery flow. Do not start a competing daemon or replace native
+credential material to bypass ownership.
+
+Preview `retirementEligible` describes record eligibility. `availableActions`
+is constrained by the current maintenance attempt and generation: a pinned
+Reconcile attempt does not advertise retirement, and any resumed retirement still
+requires its exact saved scope and assessment. These fields do not grant action
+authority or waive a fresh assessment approval.
+
 When supported reconciliation cannot resolve retained local continuation records,
 review the inspect assessment and its scope before explicitly authorizing local
 retirement. Preview and retain the current assessment using `inspect`; only after

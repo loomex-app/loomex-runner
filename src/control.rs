@@ -86,6 +86,11 @@ struct PatchSubmission<'a> {
     expected_notes: Option<&'a str>,
 }
 type ProviderPaths = Vec<(&'static str, &'static str, Option<PathBuf>)>;
+struct AuthoringRequestOwner<'a> {
+    account: &'a str,
+    expected: Option<&'a crate::auth::BoundCredentialOwner>,
+}
+
 pub struct Daemon {
     pub dir: PathBuf,
     pub api: Api,
@@ -255,21 +260,26 @@ impl Daemon {
         path: &str,
         body: Option<Value>,
         key: Option<&str>,
-        account: &str,
+        request_owner: AuthoringRequestOwner<'_>,
     ) -> Result<Value> {
-        let identity = self.auth.current_child_identity(org).await?;
-        ensure!(identity.0 == account, "AUTH_IDENTITY_CHANGED");
-        let credential = self.auth.credential(org).await?;
-        ensure!(credential.subject == account, "AUTH_IDENTITY_CHANGED");
+        let AuthoringRequestOwner { account, expected } = request_owner;
+        if let Some(expected) = expected {
+            ensure!(
+                expected.organization == org && expected.account == account,
+                "AUTH_IDENTITY_CHANGED"
+            );
+        }
+        let (credential, owner) = self
+            .auth
+            .owner_bound_credential(org, expected.map(|owner| &owner.identity), Some(account))
+            .await?;
+        self.auth.verify_bound_owner(&owner).await?;
         let result = self
             .api
             .request(method, path, body, Some(&credential), key)
-            .await?;
-        ensure!(
-            self.auth.current_child_identity(org).await? == identity,
-            "AUTH_IDENTITY_CHANGED"
-        );
-        Ok(result)
+            .await;
+        self.auth.verify_bound_owner(&owner).await?;
+        Ok(result?)
     }
     pub async fn granted(&self, path: &Path, org: &str) -> Result<PathBuf> {
         let install = self.auth.installation_id().await?;
@@ -425,7 +435,26 @@ impl Daemon {
                 .active_organization
                 .clone())
         };
-        let scoped_account = if account_scoped_method(method) {
+        // Native authoring keeps one existing owner across credential rotation,
+        // backend transport and final cache/spool publication. Other authority
+        // fences retain their stricter lifetime policy.
+        let native_owner = if native_authoring_owner_method(method, &params) {
+            Some(
+                self.auth
+                    .owner_bound_credential(
+                        scope.as_deref().context("ORGANIZATION_REQUIRED")?,
+                        None,
+                        None,
+                    )
+                    .await?
+                    .1,
+            )
+        } else {
+            None
+        };
+        let scoped_account = if let Some(owner) = &native_owner {
+            Some(owner.account.clone())
+        } else if account_scoped_method(method) {
             Some(
                 self.auth
                     .credential(scope.as_deref().context("ORGANIZATION_REQUIRED")?)
@@ -680,7 +709,12 @@ impl Daemon {
                                 &route,
                                 body,
                                 None,
-                                scoped_account.as_deref().context("ORGANIZATION_REQUIRED")?,
+                                AuthoringRequestOwner {
+                                    account: scoped_account
+                                        .as_deref()
+                                        .context("ORGANIZATION_REQUIRED")?,
+                                    expected: native_owner.as_ref(),
+                                },
                             )
                             .await?;
                         ensure!(
@@ -710,7 +744,12 @@ impl Daemon {
                             &route,
                             body,
                             None,
-                            scoped_account.as_deref().context("ORGANIZATION_REQUIRED")?,
+                            AuthoringRequestOwner {
+                                account: scoped_account
+                                    .as_deref()
+                                    .context("ORGANIZATION_REQUIRED")?,
+                                expected: None,
+                            },
                         )
                         .await?;
                     verify_persona_receipt(&query, &receipt)?;
@@ -871,7 +910,9 @@ impl Daemon {
             let result = self
                 .restore_cached_follow_continuation(scope.as_deref(), method, &params, cached)
                 .await?;
-            if fenced_authoring_method(method) {
+            if let Some(owner) = &native_owner {
+                self.auth.verify_bound_owner(owner).await?;
+            } else if fenced_authoring_method(method) {
                 ensure!(
                     self.auth
                         .current_child_identity(scope.as_deref().context("ORGANIZATION_REQUIRED")?)
@@ -920,7 +961,13 @@ impl Daemon {
                 .measure(
                     method,
                     "total",
-                    self.handle(method, &params, scope.as_deref(), scoped_account.as_deref()),
+                    self.handle(
+                        method,
+                        &params,
+                        scope.as_deref(),
+                        scoped_account.as_deref(),
+                        native_owner.as_ref(),
+                    ),
                 )
                 .await;
             if let Err(error) = &attempt {
@@ -953,7 +1000,9 @@ impl Daemon {
                     state::write_json(operation.as_ref().context("INTERNAL")?, &record)?;
                 }
             }
-            if fenced_authoring_method(method) {
+            if let Some(owner) = &native_owner {
+                self.auth.verify_bound_owner(owner).await?;
+            } else if fenced_authoring_method(method) {
                 ensure!(
                     self.auth
                         .current_child_identity(scope.as_deref().context("ORGANIZATION_REQUIRED")?)
@@ -1249,6 +1298,7 @@ impl Daemon {
         p: &Value,
         scope: Option<&str>,
         account: Option<&str>,
+        native_owner: Option<&crate::auth::BoundCredentialOwner>,
     ) -> Result<Value> {
         let key = p.get("idempotencyKey").and_then(Value::as_str);
         match method {
@@ -1460,7 +1510,10 @@ impl Daemon {
                         &route,
                         body,
                         key,
-                        account.context("ORGANIZATION_REQUIRED")?,
+                        AuthoringRequestOwner {
+                            account: account.context("ORGANIZATION_REQUIRED")?,
+                            expected: native_owner,
+                        },
                     )
                     .await
                     .map_err(|error| {
@@ -1581,8 +1634,13 @@ impl Daemon {
             // not a reason to wake the chat model. Coalesce it locally until
             // a user-visible state change, an event page that must be read,
             // or the caller's bounded wait deadline.
-            self.wait_for_meaningful_run_update(&org, p, account.context("ORGANIZATION_REQUIRED")?)
-                .await?
+            self.wait_for_meaningful_run_update(
+                &org,
+                p,
+                account.context("ORGANIZATION_REQUIRED")?,
+                native_owner,
+            )
+            .await?
         } else {
             let (verb, route, body) = backend_route(method, p)?;
             let response = if fenced_authoring_method(method) {
@@ -1592,7 +1650,10 @@ impl Daemon {
                     &route,
                     body,
                     key,
-                    account.context("ORGANIZATION_REQUIRED")?,
+                    AuthoringRequestOwner {
+                        account: account.context("ORGANIZATION_REQUIRED")?,
+                        expected: native_owner,
+                    },
                 )
                 .await
             } else {
@@ -1644,8 +1705,13 @@ impl Daemon {
             method,
             "runs.get" | "runs.wait" | "runs.events" | "runs.result"
         ) {
-            self.attach_monitoring_observation(&org, required(p, "runId")?, &mut result)
-                .await?;
+            self.attach_monitoring_observation(
+                &org,
+                required(p, "runId")?,
+                &mut result,
+                native_owner.context("INTERNAL")?,
+            )
+            .await?;
         }
         if method == "runs.delete" {
             let run = required(p, "runId")?;
@@ -1769,15 +1835,18 @@ impl Daemon {
         org: &str,
         run: &str,
         result: &mut Value,
+        owner: &crate::auth::BoundCredentialOwner,
     ) -> Result<()> {
-        let account = self.auth.credential(org).await?.subject;
-        let installation = self.auth.installation_id().await?;
+        ensure!(owner.organization == org, "AUTH_IDENTITY_CHANGED");
+        self.auth.verify_bound_owner(owner).await?;
+        let account = &owner.account;
+        let installation = &owner.identity.installation_id;
         let follow = self
             .follow
-            .monitoring_observation(org, &account, &installation, run)?;
+            .monitoring_observation(org, account, installation, run)?;
         let recovery = self
             .recovery
-            .monitoring_observation(org, &account, &installation, run)?;
+            .monitoring_observation(org, account, installation, run)?;
         let details = result
             .as_object_mut()
             .context("BACKEND_PROTOCOL_ERROR")?
@@ -1818,6 +1887,7 @@ impl Daemon {
         org: &str,
         params: &Value,
         account: &str,
+        native_owner: Option<&crate::auth::BoundCredentialOwner>,
     ) -> Result<Value> {
         let requested = params
             .get("timeoutSeconds")
@@ -1835,7 +1905,17 @@ impl Daemon {
             request["timeoutSeconds"] = json!(timeout);
             let (verb, route, body) = backend_route("runs.wait", &request)?;
             let result = self
-                .native_authoring_backend(org, &verb, &route, body, None, account)
+                .native_authoring_backend(
+                    org,
+                    &verb,
+                    &route,
+                    body,
+                    None,
+                    AuthoringRequestOwner {
+                        account,
+                        expected: native_owner,
+                    },
+                )
                 .await?;
             if !automated_progress_only(&result) || Instant::now() >= deadline {
                 return Ok(result);
@@ -4776,6 +4856,23 @@ fn account_scoped_method(method: &str) -> bool {
                 | "interactions.decide"
                 | "workflow.operations.get"
         )
+}
+fn native_authoring_owner_method(method: &str, params: &Value) -> bool {
+    matches!(
+        method,
+        "builder.start"
+            | "editor.start"
+            | "builder.get"
+            | "interactions.get"
+            | "runs.get"
+            | "runs.wait"
+            | "runs.events"
+            | "runs.result"
+    ) || (method == "workflow.operations.get"
+        && matches!(
+            params["operation"].as_str(),
+            Some("builder.start" | "editor.start")
+        ))
 }
 fn fenced_authoring_method(method: &str) -> bool {
     matches!(
@@ -11533,6 +11630,318 @@ mod persona_contract_tests {
     async fn response(mut stream: tokio::net::TcpStream, body: Value) {
         let bytes = body.to_string();
         stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",bytes.len(),bytes).as_bytes()).await.unwrap();
+    }
+    #[tokio::test]
+    async fn native_authoring_backend_accepts_response_across_access_lifetime_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let auth = Auth::test_enrolled(api.clone(), "org", "original-account");
+        let daemon = Daemon::new(tmp.path().into(), api, auth.clone()).unwrap();
+        // Dispatch ordinarily pre-authenticates; emulate crossing the threshold
+        // only once the authenticated backend request has already arrived.
+        auth.credential("org").await.unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, header, body) = request(&listener).await;
+            assert!(header.contains("/v2/native-authoring-receipts/get/"));
+            assert_eq!(body, json!({"operation":"builder.start"}));
+            auth.test_fingerprint_access_near_expiry("org")
+                .await
+                .unwrap();
+            response(socket, json!({"data":{"accepted":true}})).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let result = daemon
+            .native_authoring_backend(
+                "org",
+                "POST",
+                "v2/native-authoring-receipts/get/",
+                Some(json!({"operation":"builder.start"})),
+                None,
+                AuthoringRequestOwner {
+                    account: "original-account",
+                    expected: None,
+                },
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(result, json!({"accepted":true}));
+    }
+    #[tokio::test]
+    async fn native_dispatch_access_boundary_preserves_fresh_cached_and_lost_start_receipts() {
+        for (method, lost_response) in [
+            ("builder.start", false),
+            ("builder.start", true),
+            ("editor.start", false),
+            ("editor.start", true),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api = Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+            let auth = Auth::test_enrolled(api.clone(), "org", "original-account");
+            let daemon = Daemon::new(tmp.path().into(), api, auth.clone()).unwrap();
+            *daemon.test_provider_paths.lock().unwrap() = Some(Vec::new());
+            daemon.public.lock().await.active_organization = Some("org".into());
+            let mut input = json!({"prompt":"Original reviewed authoring intent","idempotencyKey":Uuid::new_v4()});
+            if method == "editor.start" {
+                input["workflowId"] = json!(Uuid::new_v4());
+                input["expectedVersion"] = json!(0);
+                input["expectedDefinitionChecksum"] = json!("b".repeat(64));
+            }
+            let session = Uuid::new_v4();
+            let expected = json!({"schemaVersion":"loomex.native-authoring-session/v1","sessionId":session,"builderSessionId":session,"executionId":Uuid::new_v4(),"status":"queued","systemWorkflowKey":if method == "builder.start" { "workflow_builder" } else { "workflow_editor" },"systemWorkflowVersionId":Uuid::new_v4(),"systemWorkflowDefinitionChecksum":"a".repeat(64),"nextAction":"run_get"});
+            let server_expected = expected.clone();
+            let server_input = input.clone();
+            let server = tokio::spawn(async move {
+                let (socket, header, body) = request(&listener).await;
+                assert!(header.contains(if method == "builder.start" {
+                    "/v2/workflow-builder/start/"
+                } else {
+                    "/v2/workflow-edit/start/"
+                }));
+                assert_eq!(body, server_input);
+                auth.test_fingerprint_access_near_expiry("org")
+                    .await
+                    .unwrap();
+                if lost_response {
+                    drop(socket);
+                } else {
+                    response(socket, json!({"data":server_expected})).await;
+                }
+                // The next same-key dispatch refreshes existing auth, then
+                // reconciles the accepted mutation through its original key.
+                let (socket, header, body) = request(&listener).await;
+                assert!(header.contains("/v1/delegations/refresh/"));
+                assert!(body.get("recovery").is_none());
+                response(socket, json!({"data":{"accessToken":"lmxr_fresh_secret","refreshToken":"fresh-refresh","expiresInSeconds":3600}})).await;
+                let (socket, header, body) = request(&listener).await;
+                assert!(header.contains("/v2/workflow-operations/get/"));
+                assert_eq!(
+                    body,
+                    json!({"operation":method,"idempotencyKey":server_input["idempotencyKey"]})
+                );
+                auth.test_fingerprint_access_near_expiry("org")
+                    .await
+                    .unwrap();
+                response(socket, json!({"data":{"operation":method,"idempotencyKey":server_input["idempotencyKey"],"status":"completed","response":server_expected}})).await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(40), listener.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            let first = daemon.dispatch(method, input.clone()).await;
+            if lost_response {
+                assert_eq!(first.unwrap_err().to_string(), "NETWORK_AMBIGUOUS");
+            } else {
+                assert_eq!(first.unwrap(), expected);
+            }
+            let pending = crate::operation_cache::inspect(tmp.path()).unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(
+                pending[0]["binding"]["operationKey"],
+                input["idempotencyKey"]
+            );
+            assert_eq!(pending[0]["binding"]["accountSubject"], "original-account");
+            assert_eq!(daemon.dispatch(method, input).await.unwrap(), expected);
+            server.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn native_dispatch_preserves_pending_mutation_on_owner_drift_pending_auth_or_logout() {
+        for drift in ["account", "installation", "device", "pending", "logout"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api = Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+            let auth = Auth::test_enrolled(api.clone(), "org", "original-account");
+            let daemon = Daemon::new(tmp.path().into(), api, auth.clone()).unwrap();
+            *daemon.test_provider_paths.lock().unwrap() = Some(Vec::new());
+            daemon.public.lock().await.active_organization = Some("org".into());
+            let input = json!({"prompt":"Original reviewed authoring intent","idempotencyKey":Uuid::new_v4()});
+            let server = tokio::spawn(async move {
+                let (socket, header, _) = request(&listener).await;
+                assert!(header.contains("/v2/workflow-builder/start/"));
+                match drift {
+                    "device" => auth.test_bound_owner_device_change().await.unwrap(),
+                    "pending" => {
+                        auth.test_fingerprint_access_near_expiry("org")
+                            .await
+                            .unwrap();
+                        let refresh =
+                            tokio::spawn(
+                                async move { auth.credential("org").await.err().unwrap() },
+                            );
+                        let (mut refresh_socket, header, _) = request(&listener).await;
+                        assert!(header.contains("/v1/delegations/refresh/"));
+                        let body = json!({"error":{"code":"REFRESH_REJECTED"}}).to_string();
+                        refresh_socket.write_all(format!("HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+                        assert_eq!(refresh.await.unwrap().to_string(), "REFRESH_REJECTED");
+                    }
+                    "logout" => {
+                        let logout = tokio::spawn(async move { auth.logout().await.unwrap() });
+                        let (logout_socket, header, _) = request(&listener).await;
+                        assert!(header.contains("/v2/device-authorities/logout/"));
+                        response(logout_socket, json!({"data":{"revoked":true}})).await;
+                        assert_eq!(logout.await.unwrap()["revoked"], true);
+                    }
+                    _ => auth
+                        .test_fingerprint_identity_drift(
+                            "org",
+                            (drift == "installation").then_some("replacement-installation"),
+                            (drift == "account").then_some("replacement-account"),
+                        )
+                        .await
+                        .unwrap(),
+                }
+                let session = Uuid::new_v4();
+                response(socket, json!({"data":{"schemaVersion":"loomex.native-authoring-session/v1","sessionId":session,"builderSessionId":session,"executionId":Uuid::new_v4(),"status":"queued","systemWorkflowKey":"workflow_builder","systemWorkflowVersionId":Uuid::new_v4(),"systemWorkflowDefinitionChecksum":"a".repeat(64),"nextAction":"run_get"}})).await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(40), listener.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            let error = daemon
+                .dispatch("builder.start", input.clone())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error.to_string().as_str(),
+                    "AUTH_IDENTITY_CHANGED" | "AUTH_RECONCILIATION_REQUIRED"
+                ),
+                "{drift}: {error}"
+            );
+            server.await.unwrap();
+            let retained = crate::operation_cache::inspect(tmp.path()).unwrap();
+            assert_eq!(retained.len(), 1);
+            assert_eq!(retained[0]["record"]["status"], "pending");
+            assert_eq!(retained[0]["record"]["stage"], "dispatch_uncertain");
+            assert_eq!(
+                retained[0]["binding"]["operationKey"],
+                input["idempotencyKey"]
+            );
+            assert!(retained[0]["record"].get("result").is_none());
+            assert!(!tmp.path().join("responses").exists());
+        }
+    }
+    #[tokio::test]
+    async fn native_canonical_read_dispatch_accepts_only_lifetime_change_at_final_fence() {
+        for method in [
+            "builder.get",
+            "interactions.get",
+            "workflow.operations.get",
+            "runs.get",
+            "runs.wait",
+            "runs.events",
+            "runs.result",
+            "ordinary_receipt",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api = Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+            let auth = Auth::test_enrolled(api.clone(), "org", "original-account");
+            let daemon = Daemon::new(tmp.path().into(), api, auth.clone()).unwrap();
+            daemon.public.lock().await.active_organization = Some("org".into());
+            let reference = Uuid::new_v4();
+            let input = match method {
+                "builder.get" => json!({"sessionId":reference}),
+                "interactions.get" => json!({"requestId":reference}),
+                "workflow.operations.get" | "ordinary_receipt" => {
+                    json!({"operation":if method == "ordinary_receipt" { "workflows.create" } else { "builder.start" },"idempotencyKey":reference})
+                }
+                _ => json!({"runId":reference,"timeoutSeconds":1}),
+            };
+            let data = match method {
+                "builder.get" => {
+                    json!({"builderSession":{"id":reference},"events":[],"latestSequence":0,"hasMoreEvents":false,"timedOut":false})
+                }
+                "interactions.get" => json!({"humanRequest":{"id":reference}}),
+                "workflow.operations.get" | "ordinary_receipt" => {
+                    json!({"operation":input["operation"],"idempotencyKey":reference,"status":"pending"})
+                }
+                _ => {
+                    json!({"execution":{"id":reference,"status":"completed"},"events":[],"latestSequence":0,"hasMoreEvents":false,"timedOut":false})
+                }
+            };
+            let server = tokio::spawn(async move {
+                let (socket, header, _) = request(&listener).await;
+                assert!(!header.contains("/refresh/"));
+                auth.test_fingerprint_access_near_expiry("org")
+                    .await
+                    .unwrap();
+                response(socket, json!({"data":data})).await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                        .await
+                        .is_err(),
+                    "{method}"
+                );
+            });
+            let result = daemon
+                .dispatch(
+                    if method == "ordinary_receipt" {
+                        "workflow.operations.get"
+                    } else {
+                        method
+                    },
+                    input,
+                )
+                .await;
+            server.await.unwrap();
+            if method == "ordinary_receipt" {
+                assert_eq!(result.unwrap_err().to_string(), "AUTH_REQUIRED");
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+    #[tokio::test]
+    async fn native_semantic_wait_retains_original_owner_when_refreshing_between_iterations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let auth = Auth::test_enrolled(api.clone(), "org", "original-account");
+        let daemon = Daemon::new(tmp.path().into(), api, auth.clone()).unwrap();
+        daemon.public.lock().await.active_organization = Some("org".into());
+        let run = Uuid::new_v4();
+        let server = tokio::spawn(async move {
+            let (socket, header, _) = request(&listener).await;
+            assert!(header.starts_with("GET "));
+            auth.test_fingerprint_access_near_expiry("org")
+                .await
+                .unwrap();
+            response(socket, json!({"data":{"execution":{"id":run,"status":"running"},"events":[{"type":"ai.progress.v1","sequence":1}],"waitState":"automated_progress","humanRequest":null,"latestSequence":1,"hasMoreEvents":false,"timedOut":false}})).await;
+            let (socket, header, body) = request(&listener).await;
+            assert!(header.contains("/v1/delegations/refresh/"));
+            assert!(body.get("recovery").is_none());
+            response(socket, json!({"data":{"accessToken":"lmxr_fresh_secret","refreshToken":"fresh-refresh","expiresInSeconds":3600}})).await;
+            let (socket, header, _) = request(&listener).await;
+            assert!(header.starts_with("GET "));
+            assert!(header.contains("afterSequence=1"));
+            response(socket, json!({"data":{"execution":{"id":run,"status":"completed"},"events":[],"latestSequence":2,"hasMoreEvents":false,"timedOut":false}})).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let result = daemon
+            .dispatch("runs.wait", json!({"runId":run,"timeoutSeconds":10}))
+            .await
+            .unwrap();
+        assert_eq!(result["execution"]["status"], "completed");
+        server.await.unwrap();
     }
     #[tokio::test]
     async fn persona_creation_lost_response_reconciles_both_owner_checked_operations() {

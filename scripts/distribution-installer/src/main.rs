@@ -733,6 +733,8 @@ fn bounded_native_diagnostic(value: &Value) -> Option<Value> {
                 | "STORE_INVALID"
                 | "STORE_OWNER_BUSY"
                 | "STORE_UNAVAILABLE"
+                | "AUTH_REQUIRED"
+                | "AUTH_EXPIRED"
                 | "AUTH_IDENTITY_CHANGED"
                 | "AUTH_RECONCILIATION_REQUIRED"
                 | "AUTH_RECOVERY_PENDING"
@@ -778,9 +780,62 @@ fn bounded_native_diagnostic(value: &Value) -> Option<Value> {
                 | "unavailable"
         )
     });
-    Some(
-        serde_json::json!({"code":code,"failureStage":stage,"failureCategory":category,"nativeOsStatus":value["nativeOsStatus"].as_i64().and_then(|n|i32::try_from(n).ok())}),
-    )
+    let mut projected = serde_json::json!({"code":code,"failureStage":stage,"failureCategory":category,"nativeOsStatus":value["nativeOsStatus"].as_i64().and_then(|n|i32::try_from(n).ok())});
+    // Native output is still untrusted at this boundary. Preserve only the same
+    // typed evidence as the native formatter, never arbitrary error/response data.
+    if let Some(status) = value["httpStatus"]
+        .as_u64()
+        .filter(|status| (100..=599).contains(status))
+    {
+        projected["httpStatus"] = serde_json::json!(status);
+    }
+    if let Ok(Some(correlation)) = work_operation_id(&value["correlationId"]) {
+        projected["correlationId"] = serde_json::json!(correlation);
+    }
+    if let Some(remote) = value["remoteCode"].as_str().filter(|code| {
+        !code.is_empty()
+            && code.len() <= 120
+            && code
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    }) {
+        projected["remoteCode"] = serde_json::json!(remote);
+    }
+    if let Some(outcome) = value["outcome"]
+        .as_str()
+        .filter(|outcome| matches!(*outcome, "not_dispatched" | "rejected" | "unknown"))
+    {
+        projected["outcome"] = serde_json::json!(outcome);
+    }
+    if let Some(recovery) = value["recovery"].as_str().filter(|recovery| {
+        matches!(
+            *recovery,
+            "correct_input"
+                | "explicit_scope_upgrade"
+                | "prepare_again"
+                | "read_run_status"
+                | "reconcile_outcome"
+                | "refresh_authority"
+                | "refresh_context"
+                | "retry_exact_operation"
+                | "select_supported_provider"
+                | "unavailable"
+        )
+    }) {
+        projected["recovery"] = serde_json::json!(recovery);
+    }
+    if let Some(remote) = value["remoteRevocation"].as_str().filter(|remote| {
+        matches!(
+            *remote,
+            "not_dispatched" | "pending" | "confirmed" | "not_required" | "unverified"
+        )
+    }) {
+        projected["remoteRevocation"] = serde_json::json!(remote);
+    }
+    if let Some(removed) = value["protectedStoreRemoved"].as_bool() {
+        projected["protectedStoreRemoved"] = serde_json::json!(removed);
+    }
+    Some(projected)
 }
 fn require_maintenance_continuity(
     before: Option<&Value>,
@@ -811,7 +866,10 @@ fn require_maintenance_continuity(
     let settled_successor =
         before["transition"] == "eligible_successor" && before["attemptId"].is_null();
     let original_result_successor = successor_after_original_result
-        && before["transition"] == "resume_original_attempt"
+        && matches!(
+            before["transition"].as_str(),
+            Some("resume_original_attempt" | "eligible_successor")
+        )
         && before["attemptId"].is_string()
         && before["attemptId"] != after["attemptId"];
     let successor = (settled_successor || original_result_successor)
@@ -848,7 +906,10 @@ fn require_maintenance_continuity(
                 );
             }
         }
-        if before["transition"] == "resume_original_attempt" {
+        // A transition describes candidate eligibility, not permission to replace
+        // an existing attempt. Only the explicit generation handover above may
+        // bind a different non-null attempt identity.
+        if before["attemptId"].is_string() {
             ensure!(
                 before["attemptId"] == after["attemptId"]
                     || (after["attemptId"].is_null()
@@ -921,6 +982,24 @@ fn bounded_assessment(v: &Value) -> Result<Option<Value>> {
         serde_json::json!({"schema":"app.loomex.runner.managed-state-assessment/v1","assessmentDigest":digest,"resolved":resolved,"blockers":bounded}),
     ))
 }
+const WORK_PREVIEW_METHODS: &[&str] = &[
+    "interactions.respond",
+    "interactions.decide",
+    "interactions.draft.delete",
+    "interactions.draft.update",
+    "auth.recover",
+    "builder.start",
+    "editor.start",
+    "workflows.create",
+    "workflows.update",
+    "workflows.patch",
+    "workflows.publish",
+    "personas.memory.write",
+    "personas.memory.update",
+    "personas.create",
+    "personas.chat_context.create",
+    "persona.roles.create",
+];
 fn bounded_work_preview(value: &Value) -> Result<Option<Value>> {
     if value.is_null() {
         return Ok(None);
@@ -956,26 +1035,10 @@ fn bounded_work_preview(value: &Value) -> Result<Option<Value>> {
                 safe[key] = serde_json::json!(text);
             }
         }
-        if let Some(method) = record["method"].as_str().filter(|method| {
-            matches!(
-                *method,
-                "interactions.respond"
-                    | "interactions.draft.delete"
-                    | "interactions.draft.update"
-                    | "auth.recover"
-                    | "builder.start"
-                    | "editor.start"
-                    | "workflows.create"
-                    | "workflows.update"
-                    | "workflows.patch"
-                    | "workflows.publish"
-                    | "personas.memory.write"
-                    | "personas.memory.update"
-                    | "personas.create"
-                    | "personas.chat_context.create"
-                    | "personas.roles.create"
-            )
-        }) {
+        if let Some(method) = record["method"]
+            .as_str()
+            .filter(|method| WORK_PREVIEW_METHODS.contains(method))
+        {
             safe["method"] = serde_json::json!(method);
         }
         if let Some(reason) = record["safeReason"].as_str().filter(|reason| {
@@ -1081,6 +1144,8 @@ fn known_reason(reason: &str) -> bool {
             | "UNINSTALL_WORK_DOMAIN_OUTCOME_PENDING"
             | "UNINSTALL_WORK_RECEIPT_MISMATCH"
             | "UNINSTALL_WORK_RECONCILIATION_UNSUPPORTED"
+            | "UNINSTALL_WORK_GENERATION_CAPABILITY_REQUIRED"
+            | "OPERATION_RETIREMENT_CAPABILITY_REQUIRED"
             | "ASSESSMENT_STALE"
     )
 }
@@ -1099,6 +1164,7 @@ fn known_next(next: &str) -> bool {
             | "resume_plugin_operation"
             | "inspect_uninstall_work"
             | "resume_uninstall_work"
+            | "select_compatible_release"
     )
 }
 fn retain_diagnostics(value: &Value, completion: &mut Completion) -> Result<()> {
@@ -1268,7 +1334,34 @@ impl Default for Completion {
     }
 }
 fn failure_report(c: &Completion) -> Value {
+    let auth_blocked = c.native_diagnostic.as_ref().is_some_and(|diagnostic| {
+        matches!(
+            diagnostic["code"].as_str(),
+            Some(
+                "AUTH_REQUIRED"
+                    | "AUTH_EXPIRED"
+                    | "AUTH_RECONCILIATION_REQUIRED"
+                    | "AUTH_RECOVERY_PENDING"
+                    | "AUTH_IDENTITY_CHANGED"
+            )
+        )
+    });
     let message = match c.phase {
+        "runner-preflight" | "runner-uninstall-work"
+            if matches!(
+                c.reason_code.as_str(),
+                "UNINSTALL_WORK_GENERATION_CAPABILITY_REQUIRED"
+                    | "OPERATION_RETIREMENT_CAPABILITY_REQUIRED"
+            ) =>
+        {
+            "The selected release lacks a required maintenance or retirement capability. Select a verified compatible release before Inspect or Reconcile. Preserved ownership and failure evidence remain required; this refusal does not authorize a mutation or retirement."
+        }
+        "runner-preflight" | "runner-uninstall-work"
+            if auth_blocked
+                && (c.phase == "runner-uninstall-work" || c.maintenance_reference.is_some()) =>
+        {
+            "Authentication requires the original installation authority. Inspect retained uninstall work and use supported Reconcile with the reviewed eligible release after the original attempt is proven inactive. Missing or revoked credentials remain protected blockers; sign-in through the stopped daemon is unavailable. Review a fresh successful reconciliation and assessment before authorizing retirement."
+        }
         "runner-preflight" => {
             "Runner eligibility requires the indicated native owner action. Inspect retained uninstall work, reconcile with the reviewed release when eligible, then review a fresh assessment before retirement."
         }
@@ -2661,6 +2754,175 @@ mod tests {
         }
     }
     #[test]
+    fn same_generation_preserves_every_existing_attempt_without_handover() {
+        for transition in [
+            "eligible_successor",
+            "resume_original_attempt",
+            "current_release",
+            "review_required",
+        ] {
+            let before = serde_json::json!({"operationId":"11111111-1111-4111-8111-111111111111","journalSha256":"a".repeat(64),"candidateManifestSha256":"b".repeat(64),"candidateReleasePathSha256":"c".repeat(64),"releaseManifestSha256":"d".repeat(64),"releasePathSha256":"e".repeat(64),"generation":1,"attemptId":"22222222-2222-4222-8222-222222222222","phase":"qualified","ownerSha256":"f".repeat(64),"transition":transition});
+            let operation = before["operationId"].as_str();
+            for proof in [false, true] {
+                assert!(
+                    require_maintenance_continuity(
+                        Some(&before),
+                        Some(&before),
+                        operation,
+                        "reconcile",
+                        proof
+                    )
+                    .is_ok()
+                );
+                let mut changed = before.clone();
+                changed["attemptId"] = serde_json::json!("33333333-3333-4333-8333-333333333333");
+                assert!(
+                    require_maintenance_continuity(
+                        Some(&before),
+                        Some(&changed),
+                        operation,
+                        "reconcile",
+                        proof
+                    )
+                    .is_err(),
+                    "same-generation {transition} attempt changed with proof {proof}"
+                );
+                changed["attemptId"] = Value::Null;
+                assert!(
+                    require_maintenance_continuity(
+                        Some(&before),
+                        Some(&changed),
+                        operation,
+                        "reconcile",
+                        proof
+                    )
+                    .is_err(),
+                    "qualified phase cannot clear attempt"
+                );
+                for phase in ["settled", "review_required"] {
+                    changed["phase"] = serde_json::json!(phase);
+                    assert!(
+                        require_maintenance_continuity(
+                            Some(&before),
+                            Some(&changed),
+                            operation,
+                            "reconcile",
+                            proof
+                        )
+                        .is_ok()
+                    );
+                    assert!(
+                        require_maintenance_continuity(
+                            Some(&before),
+                            Some(&changed),
+                            operation,
+                            "inspect",
+                            proof
+                        )
+                        .is_err(),
+                        "inspection cannot clear attempt"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn verified_inactive_failed_reconcile_continuity_requires_exact_successor_proof() {
+        let before = serde_json::json!({"operationId":"11111111-1111-4111-8111-111111111111","journalSha256":"a".repeat(64),"candidateManifestSha256":"b".repeat(64),"candidateReleasePathSha256":"c".repeat(64),"releaseManifestSha256":"d".repeat(64),"releasePathSha256":"e".repeat(64),"generation":1,"attemptId":"22222222-2222-4222-8222-222222222222","transition":"eligible_successor"});
+        let mut after = before.clone();
+        after["generation"] = serde_json::json!(2);
+        after["attemptId"] = Value::Null;
+        after["releaseManifestSha256"] = before["candidateManifestSha256"].clone();
+        after["releasePathSha256"] = before["candidateReleasePathSha256"].clone();
+        after["transition"] = serde_json::json!("current_release");
+        let operation = before["operationId"].as_str();
+        assert!(
+            require_maintenance_continuity(
+                Some(&before),
+                Some(&after),
+                operation,
+                "reconcile",
+                true
+            )
+            .is_ok()
+        );
+        assert!(
+            require_maintenance_continuity(
+                Some(&before),
+                Some(&after),
+                operation,
+                "reconcile",
+                false
+            )
+            .is_err()
+        );
+        for action in ["inspect", "retire-local"] {
+            assert!(
+                require_maintenance_continuity(
+                    Some(&before),
+                    Some(&after),
+                    operation,
+                    action,
+                    true
+                )
+                .is_err()
+            );
+        }
+        for field in [
+            "operationId",
+            "journalSha256",
+            "candidateManifestSha256",
+            "candidateReleasePathSha256",
+            "releaseManifestSha256",
+            "releasePathSha256",
+            "generation",
+        ] {
+            let mut changed = after.clone();
+            changed[field] = if field == "generation" {
+                serde_json::json!(3)
+            } else {
+                serde_json::json!("f".repeat(64))
+            };
+            assert!(
+                require_maintenance_continuity(
+                    Some(&before),
+                    Some(&changed),
+                    operation,
+                    "reconcile",
+                    true
+                )
+                .is_err(),
+                "{field}"
+            );
+        }
+    }
+    #[test]
+    fn capability_refusals_preserve_fixed_safe_code_and_compatible_release_action() {
+        for code in [
+            "UNINSTALL_WORK_GENERATION_CAPABILITY_REQUIRED",
+            "OPERATION_RETIREMENT_CAPABILITY_REQUIRED",
+        ] {
+            assert!(known_reason(code));
+            assert!(known_next("select_compatible_release"));
+            let value = serde_json::json!({"reasonCode":code,"nextAction":"select_compatible_release","private":"PRIVATE","error":{"response":"PRIVATE"}});
+            let mut completion = Completion {
+                phase: "runner-preflight",
+                ..Completion::default()
+            };
+            retain_diagnostics(&value, &mut completion).unwrap();
+            let report = failure_report(&completion);
+            assert_eq!(report["reasonCode"], code);
+            assert_eq!(report["nextAction"], "select_compatible_release");
+            assert!(
+                report["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("compatible release")
+            );
+            assert!(!report.to_string().contains("PRIVATE"));
+        }
+    }
+    #[test]
     fn maintenance_diagnostics_and_inspection_operation_are_bounded() {
         let reference = serde_json::json!({"schema":"app.loomex.runner.uninstall-work-reference/v1","operationId":"11111111-1111-4111-8111-111111111111","attemptId":null,"generation":0,"ownerSha256":"a".repeat(64),"journalSha256":"b".repeat(64),"releaseManifestSha256":"c".repeat(64),"candidateManifestSha256":"c".repeat(64),"releasePathSha256":"d".repeat(64),"candidateReleasePathSha256":"d".repeat(64),"phase":"settled","transition":"current_release","private":"SECRET"});
         let safe = bounded_maintenance_reference(&reference).unwrap().unwrap();
@@ -2683,6 +2945,85 @@ mod tests {
         assert_eq!(diagnostic["code"], "STORE_ACCESS_DENIED");
         assert!(diagnostic["failureStage"].is_null() && diagnostic["failureCategory"].is_null());
         assert!(!diagnostic.to_string().contains("SECRET"));
+    }
+    #[test]
+    fn auth_and_store_diagnostics_retain_bounded_evidence_without_outcome_inference() {
+        for code in ["AUTH_REQUIRED", "AUTH_EXPIRED", "STORE_UNAVAILABLE"] {
+            let diagnostic = serde_json::json!({"code":code,"failureStage":"identity_probe","failureCategory":"native_io_timeout","nativeOsStatus":-36,"outcome":"unknown","recovery":"reconcile_outcome","httpStatus":401,"correlationId":"950f1dd5-47f4-45f8-8128-432001564196","remoteCode":"DEVICE_AUTHORITY_INVALID_401","remoteRevocation":"not_dispatched","protectedStoreRemoved":false,"message":"PRIVATE","error":{"token":"PRIVATE"},"response":"PRIVATE"});
+            let bounded = bounded_native_diagnostic(&diagnostic).expect("auth diagnostic retained");
+            for key in [
+                "code",
+                "failureStage",
+                "failureCategory",
+                "nativeOsStatus",
+                "outcome",
+                "recovery",
+                "httpStatus",
+                "correlationId",
+                "remoteCode",
+                "remoteRevocation",
+                "protectedStoreRemoved",
+            ] {
+                assert_eq!(bounded[key], diagnostic[key], "{key}");
+            }
+            assert!(!bounded.to_string().contains("PRIVATE"));
+        }
+        let malformed = serde_json::json!({"code":"AUTH_REQUIRED","outcome":"PRIVATE","recovery":"PRIVATE","httpStatus":600,"correlationId":"https://PRIVATE","remoteCode":"PRIVATE text","remoteRevocation":"PRIVATE","protectedStoreRemoved":"false"});
+        let bounded = bounded_native_diagnostic(&malformed).unwrap();
+        for key in [
+            "outcome",
+            "recovery",
+            "httpStatus",
+            "correlationId",
+            "remoteCode",
+            "remoteRevocation",
+            "protectedStoreRemoved",
+        ] {
+            assert!(bounded.get(key).is_none(), "malformed {key} omitted");
+        }
+        assert!(!bounded.to_string().contains("PRIVATE"));
+        assert!(bounded_native_diagnostic(&serde_json::json!({"code":"PRIVATE"})).is_none());
+    }
+    #[test]
+    fn auth_refusal_guidance_preserves_stopped_daemon_recovery_boundary() {
+        let completion = Completion {
+            phase: "runner-uninstall-work",
+            native_diagnostic: Some(
+                serde_json::json!({"code":"AUTH_REQUIRED","outcome":"unknown"}),
+            ),
+            ..Completion::default()
+        };
+        let report = failure_report(&completion);
+        let message = report["message"].as_str().unwrap();
+        assert!(message.contains("original installation authority"));
+        assert!(message.contains("stopped daemon"));
+        assert!(!message.contains("retry this exact release set"));
+        assert_eq!(report["nativeDiagnostic"]["outcome"], "unknown");
+    }
+    #[test]
+    fn work_preview_supported_methods_match_canonical_catalog() {
+        let catalog: Value =
+            serde_json::from_str(include_str!("../../../contracts/method-catalog.json")).unwrap();
+        let methods = catalog["methods"].as_array().unwrap();
+        for method in WORK_PREVIEW_METHODS {
+            assert!(
+                methods.iter().any(|entry| entry["name"] == *method),
+                "preview method {method} must exist in the canonical RPC catalog"
+            );
+            let bounded = bounded_work_preview(
+                &serde_json::json!({"records":[{"kind":"operation_cache","method":method}]}),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(bounded["records"][0]["method"], *method);
+        }
+        assert!(WORK_PREVIEW_METHODS.contains(&"persona.roles.create"));
+        assert!(WORK_PREVIEW_METHODS.contains(&"interactions.decide"));
+        let alias = bounded_work_preview(&serde_json::json!({"records":[{"kind":"operation_cache","method":"personas.roles.create"}]})).unwrap().unwrap();
+        assert!(
+            alias["records"][0].get("method").is_none(),
+            "noncanonical plural alias must be omitted"
+        );
     }
     #[test]
     fn bounded_diagnostics_preserve_historical_reference_without_fabricating_operation() {

@@ -129,6 +129,7 @@ const OPERATION_OBSERVATION_WORK_SCHEMA: &str = "app.loomex.runner.lifecycle-ope
 // a single release-bound maintenance attempt. The v12 retirement envelope stays
 // unchanged when retained denial evidence is present.
 pub const GENERATION_UNINSTALL_WORK_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v13";
+pub const FAILED_RECONCILE_WORK_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v14";
 const LOCK_NAME: &str = "lifecycle.lock";
 const OPERATION_NAME: &str = "lifecycle-operation.json";
 const NATIVE_EXECUTABLES: &[&str] = &["/bin/launchctl"];
@@ -485,6 +486,7 @@ impl Operation {
                 | UNINSTALL_WORK_SCHEMA
                 | OPERATION_OBSERVATION_WORK_SCHEMA
                 | GENERATION_UNINSTALL_WORK_SCHEMA
+                | FAILED_RECONCILE_WORK_SCHEMA
         ) {
             let fence = self
                 .uninstall_fence
@@ -498,6 +500,7 @@ impl Operation {
                             UNINSTALL_WORK_SCHEMA
                                 | OPERATION_OBSERVATION_WORK_SCHEMA
                                 | GENERATION_UNINSTALL_WORK_SCHEMA
+                                | FAILED_RECONCILE_WORK_SCHEMA
                         ) && self.phase == "work_maintenance"))
                     && self.package.is_none()
                     && self.previous_target.is_none()
@@ -2610,7 +2613,9 @@ pub fn begin_uninstall_work_locked(paths: &Paths, id: Uuid, digest: &str) -> Res
     let mut operation: Operation = state::read_json(&paths.operation())?;
     if !matches!(
         operation.schema.as_str(),
-        OPERATION_OBSERVATION_WORK_SCHEMA | GENERATION_UNINSTALL_WORK_SCHEMA
+        OPERATION_OBSERVATION_WORK_SCHEMA
+            | GENERATION_UNINSTALL_WORK_SCHEMA
+            | FAILED_RECONCILE_WORK_SCHEMA
     ) {
         operation.schema = UNINSTALL_WORK_SCHEMA.into();
     }
@@ -2627,7 +2632,10 @@ pub fn fence_operation_observation_work_locked(paths: &Paths, id: Uuid) -> Resul
         operation.id == id && operation.phase == "work_maintenance",
         "LIFECYCLE_OPERATION_PENDING"
     );
-    if operation.schema != GENERATION_UNINSTALL_WORK_SCHEMA {
+    if !matches!(
+        operation.schema.as_str(),
+        GENERATION_UNINSTALL_WORK_SCHEMA | FAILED_RECONCILE_WORK_SCHEMA
+    ) {
         operation.schema = OPERATION_OBSERVATION_WORK_SCHEMA.into();
     }
     save_operation(paths, &operation)
@@ -2642,7 +2650,17 @@ pub fn adopt_uninstall_work_generation_locked(
 ) -> Result<()> {
     begin_uninstall_work_locked(paths, id, journal_sha256)?;
     let mut operation: Operation = state::read_json(&paths.operation())?;
-    operation.schema = GENERATION_UNINSTALL_WORK_SCHEMA.into();
+    if operation.schema != FAILED_RECONCILE_WORK_SCHEMA {
+        operation.schema = GENERATION_UNINSTALL_WORK_SCHEMA.into();
+    }
+    save_operation(paths, &operation)
+}
+
+/// Fence older generation controllers before publishing failed-attempt proof.
+pub fn fence_inactive_failed_reconcile_locked(paths: &Paths, id: Uuid, digest: &str) -> Result<()> {
+    adopt_uninstall_work_generation_locked(paths, id, digest)?;
+    let mut operation: Operation = state::read_json(&paths.operation())?;
+    operation.schema = FAILED_RECONCILE_WORK_SCHEMA.into();
     save_operation(paths, &operation)
 }
 
@@ -2655,12 +2673,31 @@ pub fn require_operation_observation_capability(paths: &Paths, target: &Path) ->
         evidence || !previous.as_ref().is_some_and(|old| old.minimum_reader),
         "OPERATION_RETIREMENT_EVIDENCE_REQUIRED"
     );
-    let generation_owner = read_optional::<Value>(&paths.state_dir.join("uninstall-work.json"))?
+    let work_owner = read_optional::<Value>(&paths.state_dir.join("uninstall-work.json"))?;
+    let generation_owner = work_owner
+        .as_ref()
         .is_some_and(|owner| owner["schema"] == "app.loomex.runner.uninstall-work/v2");
-    if !evidence && !generation_owner {
+    let failed_owner = previous
+        .as_ref()
+        .is_some_and(|operation| operation.schema == FAILED_RECONCILE_WORK_SCHEMA)
+        || work_owner.as_ref().is_some_and(|owner| {
+            owner["failedReconcileProofs"]
+                .as_object()
+                .is_some_and(|proofs| !proofs.is_empty())
+        });
+    if !evidence && !generation_owner && !failed_owner {
         return Ok(());
     }
     let manifest: Value = state::read_json(&target.join("metadata/compatibility-manifest.json"))?;
+    ensure!(
+        !failed_owner
+            || manifest["capabilities"]
+                .as_array()
+                .is_some_and(|values| values
+                    .iter()
+                    .any(|value| value == "uninstall-work.inactive-failed-reconcile/v1")),
+        "UNINSTALL_WORK_GENERATION_CAPABILITY_REQUIRED"
+    );
     ensure!(
         !generation_owner
             || manifest["capabilities"]
@@ -7406,6 +7443,30 @@ mod tests {
             let operation: Operation = serde_json::from_value(raw).unwrap();
             operation.validate().unwrap();
         }
+        for _ in 0..3 {
+            fence_inactive_failed_reconcile_locked(&paths, id, &digest).unwrap();
+            begin_uninstall_work_locked(&paths, id, &digest).unwrap();
+            fence_operation_observation_work_locked(&paths, id).unwrap();
+            adopt_uninstall_work_generation_locked(&paths, id, &digest).unwrap();
+            let raw: Value = state::read_json(&paths.operation()).unwrap();
+            assert_eq!(raw["schema"], OPERATION_RETIREMENT_READER_SCHEMA);
+            assert_eq!(raw["logicalSchema"], FAILED_RECONCILE_WORK_SCHEMA);
+            assert_eq!(
+                raw["minimumReaderCapability"],
+                "operation-cache.retirement-fence/v1"
+            );
+            let operation: Operation = serde_json::from_value(raw).unwrap();
+            operation.validate().unwrap();
+            assert!(
+                ![
+                    UNINSTALL_WORK_SCHEMA,
+                    OPERATION_OBSERVATION_WORK_SCHEMA,
+                    GENERATION_UNINSTALL_WORK_SCHEMA
+                ]
+                .contains(&operation.schema.as_str()),
+                "frozen v13 reader rejects inactive-failure authority"
+            );
+        }
         fs::remove_file(evidence_path).unwrap();
         assert_eq!(
             adopt_uninstall_work_generation_locked(&paths, id, &digest)
@@ -7443,6 +7504,15 @@ mod tests {
             &json!({"capabilities":["uninstall-work.generations/v1"]}),
         )
         .unwrap();
+        require_operation_observation_capability(&paths, &target).unwrap();
+        state::write_json(&paths.state_dir.join("uninstall-work.json"),&json!({"schema":"app.loomex.runner.uninstall-work/v2","failedReconcileProofs":{"fixture":"a".repeat(64)}})).unwrap();
+        assert_eq!(
+            require_operation_observation_capability(&paths, &target)
+                .unwrap_err()
+                .to_string(),
+            "UNINSTALL_WORK_GENERATION_CAPABILITY_REQUIRED"
+        );
+        state::write_json(&target.join("metadata/compatibility-manifest.json"),&json!({"capabilities":["uninstall-work.generations/v1","uninstall-work.inactive-failed-reconcile/v1"]})).unwrap();
         require_operation_observation_capability(&paths, &target).unwrap();
     }
 

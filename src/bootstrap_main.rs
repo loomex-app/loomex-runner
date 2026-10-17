@@ -1607,7 +1607,22 @@ fn preflight_failure(error: &anyhow::Error) -> Value {
         return json!({"category":"owner_validation","reasonCode":reason,"nextAction":"inspect_lifecycle_status","message":"The exact lifecycle owner could not authorize this recovery."});
     }
     if let Some(error) = error.downcast_ref::<bootstrap_uninstall::WorkRefusal>() {
-        return json!({"category":"uninstall_work","reasonCode":error.0,"nextAction":if error.0=="UNINSTALL_WORK_MAINTENANCE_PENDING" {"resume_uninstall_work"} else {"inspect_uninstall_work"},"message":"Inspect retained work and reconcile an eligible successor. Resume an active attempt with its original release; review a fresh assessment before retirement."});
+        let (next, message) = match error.0 {
+            "UNINSTALL_WORK_GENERATION_CAPABILITY_REQUIRED"
+            | "OPERATION_RETIREMENT_CAPABILITY_REQUIRED" => (
+                "select_compatible_release",
+                "The selected release lacks a required maintenance or retirement capability. Select a verified compatible release before Inspect or Reconcile; retained ownership remains protected.",
+            ),
+            _ => (
+                if error.0 == "UNINSTALL_WORK_MAINTENANCE_PENDING" {
+                    "resume_uninstall_work"
+                } else {
+                    "inspect_uninstall_work"
+                },
+                "Inspect retained work and reconcile an eligible successor. Resume an active attempt with its original release; review a fresh assessment before retirement.",
+            ),
+        };
+        return json!({"category":"uninstall_work","reasonCode":error.0,"nextAction":next,"message":message});
     }
     if let Some(error) = error.downcast_ref::<uninstall_state::ManagedStateError>() {
         use uninstall_state::BlockerCategory::*;
@@ -1776,6 +1791,26 @@ async fn run() -> Result<()> {
 #[cfg(test)]
 mod pending_stop_tests {
     use super::*;
+    #[test]
+    fn work_capability_preflight_refusals_preserve_fixed_code_and_selection_action() {
+        for code in [
+            "UNINSTALL_WORK_GENERATION_CAPABILITY_REQUIRED",
+            "OPERATION_RETIREMENT_CAPABILITY_REQUIRED",
+        ] {
+            let error = anyhow::Error::new(bootstrap_uninstall::WorkRefusal(code))
+                .context("PRIVATE filesystem and payload details");
+            let projected = preflight_failure(&error);
+            assert_eq!(projected["reasonCode"], code);
+            assert_eq!(projected["nextAction"], "select_compatible_release");
+            assert!(
+                projected["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("compatible release")
+            );
+            assert!(!projected.to_string().contains("PRIVATE"));
+        }
+    }
     #[test]
     fn operation_retirement_scope_is_explicit_bounded_and_defaults_to_continuations() {
         let mut args = Arguments {

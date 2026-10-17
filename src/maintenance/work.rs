@@ -225,6 +225,7 @@ async fn read_run(
     auth: &Auth,
     candidate: &Value,
     identity: &crate::auth::CredentialIdentity,
+    recover_auth: bool,
 ) -> Result<Value> {
     let org = candidate["organizationId"]
         .as_str()
@@ -238,38 +239,23 @@ async fn read_run(
     let mut previous = None;
     let mut terminal_status: Option<String> = None;
     loop {
-        ensure!(
-            auth.maintenance_identity()
+        let account = candidate["accountSubject"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("INVALID_REQUEST"))?;
+        let (credential, owner) = if recover_auth {
+            auth.owner_bound_credential(org, Some(identity), Some(account))
                 .await?
-                .as_ref()
-                .is_some_and(|actual| actual.installation_id == identity.installation_id
-                    && (identity.device_id.is_none() || actual.device_id == identity.device_id)),
-            "AUTH_IDENTITY_CHANGED"
-        );
-        ensure!(
-            auth.enrolled_organizations()
+        } else {
+            auth.owner_bound_existing_credential(org, Some(identity), Some(account))
                 .await?
-                .iter()
-                .any(|id| id == org),
-            "ORGANIZATION_NOT_ENROLLED"
-        );
-        let credential = auth.credential(org).await?;
-        ensure!(
-            auth.maintenance_identity()
-                .await?
-                .as_ref()
-                .is_some_and(|actual| actual.installation_id == identity.installation_id
-                    && (identity.device_id.is_none() || actual.device_id == identity.device_id)),
-            "AUTH_IDENTITY_CHANGED"
-        );
-        ensure!(
-            credential.subject == candidate["accountSubject"].as_str().unwrap_or(""),
-            "AUTH_IDENTITY_CHANGED"
-        );
+        };
+        auth.verify_bound_owner(&owner).await?;
         let (verb, route, body) = control::backend_route(method, &params)?;
         let value = api
             .request(&verb, &route, body, Some(&credential), None)
-            .await?;
+            .await;
+        auth.verify_bound_owner(&owner).await?;
+        let value = value?;
         ensure!(
             value.pointer("/execution/id").and_then(Value::as_str) == Some(run),
             "MANAGED_WORK_OBSERVATION_INCOMPLETE"
@@ -1232,26 +1218,13 @@ async fn execute_with_services(
                 "AUTH_IDENTITY_CHANGED"
             );
         } else {
-            ensure!(
-                auth.enrolled_organizations()
-                    .await?
-                    .iter()
-                    .any(|id| id == org),
-                "ORGANIZATION_NOT_ENROLLED"
-            );
-            let credential = auth.credential(org).await?;
-            ensure!(
-                Some(credential.subject.as_str()) == candidate["accountSubject"].as_str(),
-                "AUTH_IDENTITY_CHANGED"
-            );
-            ensure!(
-                auth.maintenance_identity()
-                    .await?
-                    .as_ref()
-                    .is_some_and(|identity| identity.installation_id
-                        == context.expected_identity.installation_id),
-                "AUTH_IDENTITY_CHANGED"
-            );
+            let account = candidate["accountSubject"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("INVALID_REQUEST"))?;
+            let (_, owner) = auth
+                .owner_bound_credential(org, Some(&context.expected_identity), Some(account))
+                .await?;
+            auth.verify_bound_owner(&owner).await?;
         }
     }
     let schema_before = crate::uninstall_state::maintenance_schema_digest(&context.state_dir)?;
@@ -1296,6 +1269,7 @@ async fn execute_with_services(
                 auth,
                 request,
                 &context.expected_identity,
+                context.action == "reconcile",
             )
             .await?;
             if matches!(
@@ -1342,7 +1316,8 @@ async fn execute_with_services(
                 // owner revalidates again in its short settlement transaction.
                 settle_domain_locally(context, index, &presentation, request, &observation)?
             } else {
-                let observation = read_run(api, auth, request, &context.expected_identity).await?;
+                let observation =
+                    read_run(api, auth, request, &context.expected_identity, true).await?;
                 if generation_context(context) {
                     current_context_owner(context)?;
                 }
@@ -1422,7 +1397,8 @@ pub async fn run(path: &Path) -> Result<Value> {
     ensure!(
         operation.id == context.operation_id
             && (!generation_context(&context)
-                || operation.schema == crate::lifecycle::GENERATION_UNINSTALL_WORK_SCHEMA)
+                || operation.schema == crate::lifecycle::GENERATION_UNINSTALL_WORK_SCHEMA
+                || operation.schema == crate::lifecycle::FAILED_RECONCILE_WORK_SCHEMA)
             && operation.phase == "work_maintenance"
             && operation
                 .uninstall_fence
@@ -2303,10 +2279,509 @@ mod tests {
         }
     }
 
+    async fn auth_receipt_request(
+        listener: &tokio::net::TcpListener,
+    ) -> (tokio::net::TcpStream, String, Value) {
+        use tokio::io::AsyncReadExt;
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        loop {
+            let mut buffer = [0; 4096];
+            let size = socket.read(&mut buffer).await.unwrap();
+            assert!(size > 0);
+            bytes.extend_from_slice(&buffer[..size]);
+            if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                let header = String::from_utf8_lossy(&bytes[..end]).into_owned();
+                let length = header
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                if bytes.len() >= end + 4 + length {
+                    let body = if length == 0 {
+                        json!({})
+                    } else {
+                        serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap()
+                    };
+                    return (socket, header, body);
+                }
+            }
+        }
+    }
+    async fn auth_receipt_response(mut socket: tokio::net::TcpStream, value: Value) {
+        use tokio::io::AsyncWriteExt;
+        let body = json!({"data":value}).to_string();
+        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+    }
+    fn legacy_auth_cache(root: &Path) -> (PathBuf, Vec<u8>) {
+        state::private_dir(&root.join("operations")).unwrap();
+        let run = Uuid::new_v4();
+        let session = Uuid::new_v4();
+        let path = root.join(format!("operations/{}.json", "a".repeat(64)));
+        let queued = json!({"schemaVersion":"loomex.native-authoring-session/v1","sessionId":session,"builderSessionId":session,"executionId":run,"status":"queued","systemWorkflowKey":"workflow_builder","systemWorkflowVersionId":Uuid::new_v4(),"systemWorkflowDefinitionChecksum":"d".repeat(64),"nextAction":"run_get"});
+        let original = serde_json::to_vec_pretty(&json!({"method":"builder.start","digest":"b".repeat(64),"result":queued,"executionId":run,"cachedAt":1})).unwrap();
+        state::atomic_write(&path, &original).unwrap();
+        (path, original)
+    }
+    #[tokio::test]
+    async fn actual_execute_legacy_auth_recovers_before_exact_receipt_without_mutation_replay() {
+        for (pending, bound) in [(false, false), (true, false), (false, true), (true, true)] {
+            let root = tempfile::tempdir().unwrap();
+            state::private_dir(root.path()).unwrap();
+            let org = Uuid::new_v4().to_string();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api = Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+            let auth = Auth::test_enrolled(api.clone(), &org, "original-account");
+            let mut ctx = context(root.path(), "reconcile");
+            ctx.expected_identity = auth.maintenance_identity().await.unwrap().unwrap();
+            let (path, mut original) = legacy_auth_cache(root.path());
+            if bound {
+                let mut record: Value = serde_json::from_slice(&original).unwrap();
+                record["binding"] = crate::operation_cache::binding(
+                    "builder.start",
+                    &Uuid::new_v4().to_string(),
+                    record["digest"].as_str().unwrap(),
+                    &json!({}),
+                    &json!({}),
+                    crate::operation_cache::BindingOrigin {
+                        organization: Some(&org),
+                        account: Some("original-account"),
+                        installation: &ctx.expected_identity.installation_id,
+                        control_reference: None,
+                    },
+                );
+                record["status"] = json!("completed");
+                record["stage"] = json!("accepted");
+                original = serde_json::to_vec_pretty(&record).unwrap();
+                state::atomic_write(&path, &original).unwrap();
+            }
+            auth.test_fingerprint_access_near_expiry(&org)
+                .await
+                .unwrap();
+            let listener = Arc::new(listener);
+            let mut original_refresh = None;
+            if pending {
+                let server = tokio::spawn({
+                    let listener = listener.clone();
+                    async move {
+                        let mut first: Option<Value> = None;
+                        for recovery in [false, true] {
+                            let (socket, header, body) = auth_receipt_request(&listener).await;
+                            assert!(header.contains("/v1/delegations/refresh/"));
+                            if recovery {
+                                let mut expected = first.clone().unwrap();
+                                expected["recovery"] = json!(true);
+                                assert_eq!(body, expected);
+                            } else {
+                                first = Some(body);
+                            }
+                            drop(socket);
+                        }
+                        first.unwrap()
+                    }
+                });
+                assert!(auth.credential(&org).await.is_err());
+                original_refresh = Some(server.await.unwrap());
+            }
+            let server_org = org.clone();
+            let server = tokio::spawn({
+                let listener = listener.clone();
+                async move {
+                    let (socket, header, body) = auth_receipt_request(&listener).await;
+                    assert!(header.contains("/v1/delegations/refresh/"));
+                    if let Some(mut expected) = original_refresh {
+                        expected["recovery"] = json!(true);
+                        assert_eq!(body, expected);
+                    } else {
+                        assert!(body.get("recovery").is_none());
+                    }
+                    auth_receipt_response(socket, json!({"accessToken":"lmxr_fresh_secret","refreshToken":"fresh-refresh","expiresInSeconds":3600})).await;
+                    let (socket, header, body) = auth_receipt_request(&listener).await;
+                    assert!(header.contains("/v2/native-authoring-receipts/get/"));
+                    assert_eq!(body["accountSubject"], "original-account");
+                    assert_eq!(body["operation"], "builder.start");
+                    assert!(body.get("prompt").is_none());
+                    assert!(header.contains("lmxr_fresh_secret"));
+                    auth_receipt_response(socket, json!({"operation":"builder.start","status":"pending","organizationId":server_org})).await;
+                    assert!(
+                        tokio::time::timeout(
+                            std::time::Duration::from_millis(50),
+                            listener.accept()
+                        )
+                        .await
+                        .is_err()
+                    );
+                }
+            });
+            let lock = Arc::new(acquire_singleton(root.path()).unwrap());
+            let result = execute_with_services(&ctx, &lock, &api, &auth)
+                .await
+                .unwrap();
+            server.await.unwrap();
+            assert_eq!(result["receipts"][0]["remoteOutcome"], "unknown");
+            assert_eq!(result["receipts"][0]["lookupState"], "pending");
+            assert_eq!(std::fs::read(path).unwrap(), original);
+            assert_eq!(
+                auth.maintenance_identity().await.unwrap(),
+                Some(ctx.expected_identity)
+            );
+        }
+    }
+    #[tokio::test]
+    async fn actual_execute_legacy_auth_isolates_only_completed_unavailable_owner() {
+        use tokio::io::AsyncWriteExt;
+        for outcome in ["later_exact", "later_not_found", "refresh_rejected"] {
+            let root = tempfile::tempdir().unwrap();
+            state::private_dir(root.path()).unwrap();
+            let first_org = "11111111-1111-4111-8111-111111111111";
+            let later_org = "22222222-2222-4222-8222-222222222222";
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api = Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+            let auth = Auth::test_enrolled(api.clone(), first_org, "first-account");
+            auth.test_add_enrolled_child(later_org, "rightful-account")
+                .await
+                .unwrap();
+            auth.test_fingerprint_access_near_expiry(first_org)
+                .await
+                .unwrap();
+            let mut ctx = context(root.path(), "reconcile");
+            ctx.expected_identity = auth.maintenance_identity().await.unwrap().unwrap();
+            let (path, original) = legacy_auth_cache(root.path());
+            let historical: Value = serde_json::from_slice(&original).unwrap();
+            let server = tokio::spawn(async move {
+                for attempt in 0..2 {
+                    let (mut socket, header, body) = auth_receipt_request(&listener).await;
+                    assert!(header.contains("/v1/delegations/refresh/"));
+                    assert!(body.get("recovery").is_none());
+                    if outcome == "refresh_rejected" {
+                        let value = json!({"error":{"code":"REFRESH_REJECTED"}}).to_string();
+                        socket.write_all(format!("HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}", value.len(), value).as_bytes()).await.unwrap();
+                        assert!(
+                            tokio::time::timeout(
+                                std::time::Duration::from_millis(30),
+                                listener.accept()
+                            )
+                            .await
+                            .is_err()
+                        );
+                        return;
+                    }
+                    auth_receipt_response(socket, json!({"accessToken":"lmxr_unusable_secret","refreshToken":format!("next-refresh-{attempt}"),"expiresInSeconds":1})).await;
+                }
+                let (socket, header, body) = auth_receipt_request(&listener).await;
+                assert!(header.contains("/v2/native-authoring-receipts/get/"));
+                assert_eq!(body["accountSubject"], "rightful-account");
+                if outcome == "later_not_found" {
+                    auth_receipt_response(
+                        socket,
+                        json!({"operation":"builder.start","status":"not_found"}),
+                    )
+                    .await;
+                } else {
+                    let run = historical["executionId"].as_str().unwrap();
+                    let receipt = json!({"operation":"builder.start","status":"completed","match":"exact_request_match","cacheRequestDigest":historical["digest"],"provenance":"native_authoring_queued_receipt","result":historical["result"]});
+                    auth_receipt_response(socket, receipt).await;
+                    for _ in 0..2 {
+                        let (socket, header, body) = auth_receipt_request(&listener).await;
+                        assert!(header.starts_with("GET "));
+                        assert!(header.contains(&format!("/v1/executions/{run}/")));
+                        assert_eq!(body, json!({}));
+                        auth_receipt_response(socket, json!({"execution":{"id":run,"status":"completed"},"events":[],"hasMoreEvents":false,"latestSequence":12,"result":{"accepted":true}})).await;
+                    }
+                }
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(30), listener.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            let lock = Arc::new(acquire_singleton(root.path()).unwrap());
+            let result = execute_with_services(&ctx, &lock, &api, &auth).await;
+            server.await.unwrap();
+            if outcome == "refresh_rejected" {
+                assert_eq!(result.unwrap_err().to_string(), "REFRESH_REJECTED");
+                assert_eq!(
+                    auth.status().await.unwrap()["code"],
+                    "AUTH_RECOVERY_PENDING"
+                );
+            } else {
+                let result = result.unwrap();
+                assert_eq!(result["actionCompleted"], true);
+                if outcome == "later_exact" {
+                    assert_eq!(result["receipts"][0]["state"], "completed");
+                    assert!(
+                        crate::uninstall_state::assess_state(root.path())
+                            .unwrap()
+                            .resolved
+                    );
+                } else {
+                    assert_eq!(result["receipts"][0]["remoteOutcome"], "unknown");
+                    assert_eq!(result["receipts"][0]["lookupState"], "unavailable");
+                    assert!(
+                        !crate::uninstall_state::assess_state(root.path())
+                            .unwrap()
+                            .resolved
+                    );
+                }
+            }
+            assert_eq!(std::fs::read(path).unwrap(), original);
+            assert_eq!(
+                auth.maintenance_identity().await.unwrap(),
+                Some(ctx.expected_identity)
+            );
+        }
+    }
+    #[tokio::test]
+    async fn actual_execute_legacy_auth_fences_changed_owner_and_concurrent_logout() {
+        for drift in ["account", "installation", "device", "logout"] {
+            let root = tempfile::tempdir().unwrap();
+            state::private_dir(root.path()).unwrap();
+            let org = Uuid::new_v4().to_string();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api = Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+            let auth = Auth::test_enrolled(api.clone(), &org, "original-account");
+            let mut ctx = context(root.path(), "reconcile");
+            ctx.expected_identity = auth.maintenance_identity().await.unwrap().unwrap();
+            let (path, original) = legacy_auth_cache(root.path());
+            let server_auth = auth.clone();
+            let server = tokio::spawn(async move {
+                let (socket, header, _) = auth_receipt_request(&listener).await;
+                assert!(header.contains("/v2/native-authoring-receipts/get/"));
+                if drift == "device" {
+                    server_auth.test_bound_owner_device_change().await.unwrap();
+                } else if drift == "logout" {
+                    let logout = tokio::spawn(async move { server_auth.logout().await.unwrap() });
+                    let (logout_socket, header, _) = auth_receipt_request(&listener).await;
+                    assert!(header.contains("/v2/device-authorities/logout/"));
+                    auth_receipt_response(logout_socket, json!({"revoked":true})).await;
+                    assert_eq!(logout.await.unwrap()["revoked"], true);
+                } else {
+                    server_auth
+                        .test_fingerprint_identity_drift(
+                            &org,
+                            (drift == "installation").then_some("replacement-installation"),
+                            (drift == "account").then_some("replacement-account"),
+                        )
+                        .await
+                        .unwrap();
+                }
+                auth_receipt_response(
+                    socket,
+                    json!({"operation":"builder.start","status":"pending"}),
+                )
+                .await;
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(30), listener.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            let lock = Arc::new(acquire_singleton(root.path()).unwrap());
+            let error = execute_with_services(&ctx, &lock, &api, &auth)
+                .await
+                .unwrap_err();
+            server.await.unwrap();
+            assert!(
+                matches!(
+                    error.to_string().as_str(),
+                    "AUTH_IDENTITY_CHANGED" | "AUTH_REQUIRED"
+                ),
+                "{drift}: {error}"
+            );
+            assert_eq!(std::fs::read(path).unwrap(), original);
+            assert!(
+                !root
+                    .path()
+                    .join(format!("uninstall-work-receipt-{}-0.json", ctx.attempt_id))
+                    .exists()
+            );
+        }
+    }
+    #[tokio::test]
+    async fn actual_execute_interaction_auth_refresh_and_response_ttl_preserve_exact_binding() {
+        for bound in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            state::private_dir(root.path()).unwrap();
+            state::private_dir(&root.path().join("operations")).unwrap();
+            let org = Uuid::new_v4().to_string();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api = Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+            let auth = Auth::test_enrolled(api.clone(), &org, "original-account");
+            let mut ctx = context(root.path(), "reconcile");
+            ctx.expected_identity = auth.maintenance_identity().await.unwrap().unwrap();
+            let digest = "c".repeat(64);
+            let slot = "d".repeat(64);
+            let request_id = Uuid::new_v4();
+            let operation_key = Uuid::new_v4();
+            let path = root.path().join(format!("operations/{slot}.json"));
+            let mut record =
+                json!({"method":"interactions.draft.delete","digest":digest,"status":"pending"});
+            let receipt_query = json!({"operation":"interactions.draft.delete","requestId":request_id,"idempotencyKey":operation_key,"submissionFingerprint":"e".repeat(64)});
+            if bound {
+                let mut binding = crate::operation_cache::binding(
+                    "interactions.draft.delete",
+                    &operation_key.to_string(),
+                    &digest,
+                    &json!({}),
+                    &json!({"requestId":request_id}),
+                    crate::operation_cache::BindingOrigin {
+                        organization: Some(&org),
+                        account: Some("original-account"),
+                        installation: &ctx.expected_identity.installation_id,
+                        control_reference: None,
+                    },
+                );
+                binding["backendSubmissionDigest"] = json!("e".repeat(64));
+                binding["receipt"] =
+                    json!({"method":"interactions.operations.get","params":receipt_query});
+                record =
+                    crate::operation_cache::pending(&digest, "interactions.draft.delete", binding);
+                record["stage"] = json!("dispatch_uncertain");
+            }
+            let original = serde_json::to_vec_pretty(&record).unwrap();
+            state::atomic_write(&path, &original).unwrap();
+            auth.test_fingerprint_access_near_expiry(&org)
+                .await
+                .unwrap();
+            let server_auth = auth.clone();
+            let server_org = org.clone();
+            let server = tokio::spawn(async move {
+                let (socket, header, _) = auth_receipt_request(&listener).await;
+                assert!(header.contains("/v1/delegations/refresh/"));
+                auth_receipt_response(socket, json!({"accessToken":"lmxr_fresh_secret","refreshToken":"fresh-refresh","expiresInSeconds":3600})).await;
+                let (socket, header, body) = auth_receipt_request(&listener).await;
+                assert!(header.contains("/v2/interaction-operations/get/"));
+                if bound {
+                    assert_eq!(body, receipt_query);
+                } else {
+                    assert_eq!(
+                        body,
+                        json!({"operation":"interactions.draft.delete","cacheReference":slot,"accountSubject":"original-account"})
+                    );
+                }
+                server_auth
+                    .test_fingerprint_access_near_expiry(&server_org)
+                    .await
+                    .unwrap();
+                let receipt = if bound {
+                    json!({"operation":"interactions.draft.delete","requestId":request_id,"status":"completed","match":"exact_request_match","submissionFingerprintVersion":"loomex.operation-submission/v1","submissionFingerprint":"e".repeat(64),"result":{"deleted":true}})
+                } else {
+                    json!({"operation":"interactions.draft.delete","status":"pending"})
+                };
+                auth_receipt_response(socket, receipt).await;
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(30), listener.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            let lock = Arc::new(acquire_singleton(root.path()).unwrap());
+            let result = execute_with_services(&ctx, &lock, &api, &auth)
+                .await
+                .unwrap();
+            server.await.unwrap();
+            if bound {
+                assert_eq!(result["receipts"][0]["state"], "completed");
+            } else {
+                assert_eq!(result["receipts"][0]["remoteOutcome"], "unknown");
+            }
+            assert_eq!(std::fs::read(path).unwrap(), original);
+        }
+    }
+    #[tokio::test]
+    async fn actual_execute_without_existing_credentials_never_initializes_or_dispatches() {
+        let root = tempfile::tempdir().unwrap();
+        state::private_dir(root.path()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let auth = Auth::test_unauthed(api.clone());
+        let ctx = context(root.path(), "reconcile");
+        let (path, original) = legacy_auth_cache(root.path());
+        let lock = Arc::new(acquire_singleton(root.path()).unwrap());
+        assert_eq!(
+            execute_with_services(&ctx, &lock, &api, &auth)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "AUTH_REQUIRED"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+        assert!(auth.maintenance_identity().await.unwrap().is_none());
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+    #[tokio::test]
+    async fn actual_retire_legacy_expired_or_pending_auth_never_refreshes_or_rewrites_protected_owner()
+     {
+        for pending in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            state::private_dir(root.path()).unwrap();
+            let org = Uuid::new_v4().to_string();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api = Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+            let auth = Auth::test_persona_lifecycle_fixture(
+                api.clone(),
+                &org,
+                "original-account",
+                pending,
+            );
+            let (path, original) = legacy_auth_cache(root.path());
+            if !pending {
+                auth.test_fingerprint_access_near_expiry(&org)
+                    .await
+                    .unwrap();
+            }
+            let protected = auth.test_persona_lifecycle_fingerprint(&org);
+            let mut ctx = context(root.path(), "retire-local");
+            ctx.expected_identity = auth.maintenance_identity().await.unwrap().unwrap();
+            ctx.retirement_scope = "operation-observations".into();
+            ctx.expected_assessment_sha256 = Some(
+                crate::uninstall_state::assess_state(root.path())
+                    .unwrap()
+                    .assessment_digest,
+            );
+            let lock = Arc::new(acquire_singleton(root.path()).unwrap());
+            let error = execute_with_services(&ctx, &lock, &api, &auth)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                if pending {
+                    "AUTH_RECONCILIATION_REQUIRED"
+                } else {
+                    "AUTH_REQUIRED"
+                }
+            );
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(40), listener.accept())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(auth.test_persona_lifecycle_fingerprint(&org), protected);
+            assert_eq!(std::fs::read(path).unwrap(), original);
+            assert!(
+                !crate::uninstall_state::assess_state(root.path())
+                    .unwrap()
+                    .resolved
+            );
+        }
+    }
     #[tokio::test]
     async fn actual_execute_joins_legacy_owner_and_preserves_versioned_pending_on_read_and_retry() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        for versioned in [false, true] {
+        for (versioned, refresh) in [(false, false), (true, false), (false, true), (true, true)] {
             let root = tempfile::tempdir().unwrap();
             state::private_dir(root.path()).unwrap();
             let org = Uuid::new_v4().to_string();
@@ -2342,7 +2817,17 @@ mod tests {
             let original = std::fs::read(root.path().join(&relative)).unwrap();
             let response = domain_receipt(&candidate);
             let response_copy = response.clone();
+            if refresh {
+                auth.test_fingerprint_access_near_expiry(&org)
+                    .await
+                    .unwrap();
+            }
             let read = tokio::spawn(async move {
+                if refresh {
+                    let (socket, header, _) = auth_receipt_request(&server).await;
+                    assert!(header.contains("/v1/delegations/refresh/"));
+                    auth_receipt_response(socket, json!({"accessToken":"lmxr_fresh_secret","refreshToken":"fresh-refresh","expiresInSeconds":3600})).await;
+                }
                 let (mut socket, _) = server.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 loop {

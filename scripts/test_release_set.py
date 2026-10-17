@@ -220,7 +220,7 @@ class SchemaTests(unittest.TestCase):
             self.assertIn('/releases/download/runner-v1.2.7-plugin-v1.2.3/install.sh',notes)
             self.assertNotIn('/releases/latest/',notes)
             self.assertNotIn('cross-release recovery',historical)
-            for text in ['existing Inspect and Reconcile actions','settled maintenance generation','pinned to their original release','approve a fresh assessment','no takeover command','Native recovery acceptance remains a separate validation step']:
+            for text in ['existing Inspect and Reconcile actions','settled maintenance generation','verified inactive failed Reconcile attempt','preserving its original evidence','Active, uncertain and failed retirement attempts remain pinned to their original authority','missing or revoked credentials remain explicit blockers','Successful reconciliation and a fresh approved assessment are required before local retirement','no takeover command','Native recovery acceptance remains a separate validation step']:
                 self.assertIn(text,notes)
             self.assertEqual(notes,pack.release_notes(manifest,digest))
 
@@ -751,6 +751,54 @@ esac
             result=self.invoke(flags);self.assertEqual(result.returncode,0 if verified else 1,result.stderr)
         self.assert_no_owner()
 
+    def test_verified_inactive_failed_reconcile_successor_preserves_paired_continuity(self):
+        flags=self.maintenance_fixture()
+        before=json.loads(self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']);before['maintenanceReference'].update(transition='eligible_successor',phase='qualified',attemptId='33333333-3333-4333-8333-333333333333',releaseManifestSha256='e'*64)
+        after=json.loads(self.env['FIXTURE_WORK_RESULT']);after['maintenanceReference'].update(generation=1,ownerSha256='f'*64)
+        self.env['FIXTURE_WORK_RESULT']=json.dumps(after)
+        for proven in [None,False,'true',True]:
+            if proven is None:before['uninstallWorkEligibility'].pop('successorAfterOriginalResult',None)
+            else:before['uninstallWorkEligibility']['successorAfterOriginalResult']=proven
+            self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']=json.dumps(before)
+            result=self.invoke(flags);self.assertEqual(result.returncode,0 if proven is True else 1,result.stderr)
+            if proven is True:
+                report=json.loads(result.stdout);self.assertEqual(report['operationId'],before['maintenanceReference']['operationId']);self.assertEqual(report['maintenanceReference']['generation'],1);self.assertFalse(report['cleanupEligible'])
+        self.assert_no_owner()
+
+    def test_eligible_failed_attempt_cannot_change_in_same_generation_with_any_proof(self):
+        flags=self.maintenance_fixture()
+        before=json.loads(self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']);before['maintenanceReference'].update(transition='eligible_successor',phase='qualified',attemptId='33333333-3333-4333-8333-333333333333',releaseManifestSha256='e'*64)
+        after=json.loads(self.env['FIXTURE_WORK_RESULT']);after['maintenanceReference'].update(releaseManifestSha256='e'*64,attemptId='44444444-4444-4444-8444-444444444444')
+        self.env['FIXTURE_WORK_RESULT']=json.dumps(after)
+        for proof in [None,False,True]:
+            if proof is None:before['uninstallWorkEligibility'].pop('successorAfterOriginalResult',None)
+            else:before['uninstallWorkEligibility']['successorAfterOriginalResult']=proof
+            self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']=json.dumps(before)
+            result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout)
+            report=json.loads(result.stderr);self.assertEqual(report['outcome'],'unconfirmed');self.assertNotEqual(report['actionCompleted'],True);self.assertEqual(report['maintenanceReference']['attemptId'],before['maintenanceReference']['attemptId']);self.assert_no_owner()
+
+    def test_maintenance_capability_preflight_refusal_selects_compatible_release_without_writes(self):
+        flags=self.maintenance_fixture('inspect','inspected')
+        before=json.loads(self.env['FIXTURE_RUNNER_PREFLIGHT_JSON'])
+        for code in ['UNINSTALL_WORK_GENERATION_CAPABILITY_REQUIRED','OPERATION_RETIREMENT_CAPABILITY_REQUIRED']:
+            value=copy.deepcopy(before);value.update(reasonCode=code,nextAction='select_compatible_release',error={'private':'PRIVATE DETAILS'},nativeDiagnostic={'private':'PRIVATE DETAILS'})
+            value['uninstallWorkEligibility']['eligible']=False
+            self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']=json.dumps(value);self.env['FIXTURE_RUNNER_PREFLIGHT_EXIT']='1'
+            result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout)
+            report=json.loads(result.stderr);self.assertEqual(report['reasonCode'],code);self.assertEqual(report['nextAction'],'select_compatible_release');self.assertIn('compatible release',report['message']);self.assertNotIn('PRIVATE DETAILS',result.stderr)
+            self.assertEqual(report['maintenanceReference'],before['maintenanceReference']);self.assertNotEqual(report['actionCompleted'],True);self.assertFalse(report['cleanupEligible'])
+            self.assertFalse((self.root/'cache').exists());self.assertFalse((self.state/'work.log').exists());self.assert_no_owner()
+
+    def test_maintenance_capability_work_refusal_preserves_safe_action_and_private_filtering(self):
+        flags=self.maintenance_fixture('reconcile','blocked')
+        before=json.loads(self.env['FIXTURE_WORK_RESULT'])
+        for code in ['UNINSTALL_WORK_GENERATION_CAPABILITY_REQUIRED','OPERATION_RETIREMENT_CAPABILITY_REQUIRED']:
+            value=copy.deepcopy(before);value.update(reasonCode=code,nextAction='select_compatible_release',private='PRIVATE DETAILS',error={'body':'PRIVATE DETAILS'},nativeDiagnostic={'private':'PRIVATE DETAILS'})
+            self.env['FIXTURE_WORK_RESULT']=json.dumps(value);self.env['FIXTURE_WORK_EXIT']='1'
+            result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout)
+            report=json.loads(result.stderr);self.assertEqual(report['reasonCode'],code);self.assertEqual(report['nextAction'],'select_compatible_release');self.assertIn('compatible release',report['message']);self.assertNotIn('PRIVATE DETAILS',result.stderr)
+            self.assertFalse(report['actionCompleted']);self.assertFalse(report['cleanupEligible']);self.assertEqual(report['operationId'],before['operationId']);self.assert_no_owner()
+
     def test_same_manifest_successor_requires_distinct_verified_locator(self):
         flags=self.maintenance_fixture()
         before=json.loads(self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']);before['maintenanceReference'].update(transition='eligible_successor',releasePathSha256='2'*64)
@@ -809,6 +857,36 @@ esac
         preflight=json.loads(self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']);preflight.update(reasonCode='OWNER_AUTHORIZATION_REQUIRED',nextAction='inspect_uninstall_work',nativeDiagnostic=value['nativeDiagnostic']);preflight['maintenanceReference']['private']='SECRET'
         self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']=json.dumps(preflight);self.env['FIXTURE_RUNNER_PREFLIGHT_EXIT']='1'
         result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout);report=json.loads(result.stderr);self.assertEqual(report['maintenanceReference']['generation'],0);self.assertNotIn('SECRET',result.stderr)
+
+    def test_auth_and_store_diagnostics_survive_both_paired_boundaries(self):
+        flags=self.maintenance_fixture('reconcile','blocked')
+        diagnostic={'code':'AUTH_REQUIRED','outcome':'unknown','recovery':'reconcile_outcome','correlationId':'950f1dd5-47f4-45f8-8128-432001564196','failureStage':'identity_probe','failureCategory':'native_io_timeout','nativeOsStatus':-36,'httpStatus':401,'remoteCode':'DEVICE_AUTHORITY_INVALID_401','remoteRevocation':'not_dispatched','protectedStoreRemoved':False}
+        for code in ['AUTH_REQUIRED','AUTH_EXPIRED','STORE_UNAVAILABLE']:
+            diagnostic['code']=code;diagnostic['outcome']='not_dispatched' if code=='STORE_UNAVAILABLE' else 'unknown'
+            value=json.loads(self.env['FIXTURE_WORK_RESULT']);value.update(outcome='blocked',reasonCode='OWNER_AUTHORIZATION_REQUIRED',nextAction='inspect_uninstall_work',nativeDiagnostic=dict(diagnostic,private='PRIVATE TEXT',response={'token':'PRIVATE TEXT'},error='PRIVATE TEXT'))
+            self.env['FIXTURE_WORK_RESULT']=json.dumps(value);self.env['FIXTURE_WORK_EXIT']='1'
+            result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout)
+            report=json.loads(result.stderr);self.assertEqual(report['nativeDiagnostic'],diagnostic);self.assertNotIn('PRIVATE TEXT',result.stderr)
+            self.assertFalse(report['actionCompleted']);self.assertFalse(report['cleanupEligible'])
+            self.assertEqual(report['operationId'],value['operationId']);self.assertEqual(report['maintenanceReference']['attemptId'],value['maintenanceReference']['attemptId'])
+        preflight=json.loads(self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']);preflight.update(nativeDiagnostic=dict(diagnostic,error='PRIVATE TEXT'),reasonCode='OWNER_AUTHORIZATION_REQUIRED',nextAction='inspect_uninstall_work')
+        self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']=json.dumps(preflight);self.env['FIXTURE_RUNNER_PREFLIGHT_EXIT']='1'
+        result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout)
+        self.assertEqual(json.loads(result.stderr)['nativeDiagnostic'],diagnostic);self.assertNotIn('PRIVATE TEXT',result.stderr)
+
+    def test_supported_preview_methods_and_pinned_actions_survive_paired_projection(self):
+        flags=self.scoped_work_fixture()
+        catalog=json.loads((ROOT/'contracts/method-catalog.json').read_text())
+        canonical={method['name'] for method in catalog['methods']}
+        expected=['persona.roles.create','interactions.decide']
+        self.assertTrue(set(expected)<=canonical);self.assertNotIn('personas.roles.create',canonical)
+        value=json.loads(self.env['FIXTURE_WORK_RESULT'])
+        value['preview']={'records':[{'kind':'operation_cache','method':method,'retirementEligible':True,'availableActions':['reconcile']} for method in expected]}
+        self.env['FIXTURE_WORK_RESULT']=json.dumps(value)
+        result=self.invoke(flags);self.assertEqual(result.returncode,0,result.stderr)
+        records=json.loads(result.stdout)['preview']['records']
+        self.assertEqual([record['method'] for record in records],expected)
+        self.assertTrue(all(record['availableActions']==['reconcile'] for record in records))
 
     def test_uninstall_work_inspection_preserves_historical_null_operation_and_13_14_chain(self):
         result=self.invoke(self.work_fixture())

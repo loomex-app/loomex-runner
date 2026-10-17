@@ -66,6 +66,8 @@ fn require_result(result: &Value) -> Result<()> {
                 | "STORE_INVALID"
                 | "STORE_OWNER_BUSY"
                 | "STORE_UNAVAILABLE"
+                | "AUTH_REQUIRED"
+                | "AUTH_EXPIRED"
                 | "AUTH_IDENTITY_CHANGED"
                 | "AUTH_RECONCILIATION_REQUIRED"
                 | "AUTH_RECOVERY_PENDING"
@@ -183,12 +185,14 @@ pub(crate) async fn work_preflight(
         bytes.len() <= 16 * 1024 * 1024,
         "UNINSTALL_WORK_AUDIT_LIMIT",
     )?;
-    let transition = qualify_work_candidate(args, &old, manifest, payload).await?;
+    let transition = qualify_work_candidate(paths, args, &old, release, manifest, payload).await?;
     work_state_preflight(paths, args, release, transition, &bytes)
 }
 async fn qualify_work_candidate(
+    paths: &lifecycle::Paths,
     args: &Arguments,
     old: &Value,
+    release: &Path,
     manifest: &Value,
     payload: &Path,
 ) -> Result<SigningTransition> {
@@ -196,7 +200,56 @@ async fn qualify_work_candidate(
         digest_file(&std::env::current_exe()?)? == manifest["bootstrap"]["sha256"],
         "UNINSTALL_WORK_BINDING_CHANGED",
     )?;
-    validate_recovery_candidate(args, old, manifest, payload).await
+    let transition = validate_recovery_candidate(args, old, manifest, payload).await?;
+    require_work_candidate_capabilities(paths, args, release, payload)?;
+    Ok(transition)
+}
+
+/// Existing and prospective persisted meanings must be understood by this exact
+/// verified payload, before publishing any proof or changing the lifecycle fence.
+fn require_work_candidate_capabilities(
+    paths: &lifecycle::Paths,
+    args: &Arguments,
+    release: &Path,
+    payload: &Path,
+) -> Result<()> {
+    lifecycle::require_operation_observation_capability(paths, payload).map_err(
+        |error| match error.to_string().as_str() {
+            "UNINSTALL_WORK_GENERATION_CAPABILITY_REQUIRED" => {
+                refusal("UNINSTALL_WORK_GENERATION_CAPABILITY_REQUIRED")
+            }
+            "OPERATION_RETIREMENT_CAPABILITY_REQUIRED" => {
+                refusal("OPERATION_RETIREMENT_CAPABILITY_REQUIRED")
+            }
+            _ => error,
+        },
+    )?;
+    let owner_path = paths.state_dir.join("uninstall-work.json");
+    if !present(&owner_path)? {
+        return Ok(());
+    }
+    let work: Value = work_json(&owner_path)?;
+    let expected_release = args.expected_release_path.as_deref().unwrap_or(release);
+    let different = work["releaseManifestSha256"] != digest_file(&release.join("manifest.json"))?
+        || work["releasePath"].as_str() != Some(expected_release.to_string_lossy().as_ref());
+    if different
+        && !work["attempt"].is_null()
+        && generations::failed_reconcile_candidate(paths, &work)?
+    {
+        let compatibility: Value =
+            work_json(&payload.join("metadata/compatibility-manifest.json"))?;
+        require(
+            compatibility["capabilities"]
+                .as_array()
+                .is_some_and(|values| {
+                    values
+                        .iter()
+                        .any(|value| value == "uninstall-work.inactive-failed-reconcile/v1")
+                }),
+            "UNINSTALL_WORK_GENERATION_CAPABILITY_REQUIRED",
+        )?;
+    }
+    Ok(())
 }
 fn work_state_preflight(
     paths: &lifecycle::Paths,
@@ -228,7 +281,10 @@ fn work_state_preflight(
         if args.work_action.as_deref() == Some("retire-local")
             && work["attempt"].is_null()
             && work["schema"] == generations::OWNER_V2
-            && work["currentGeneration"].as_u64().unwrap_or(0) > 0
+            && (work["currentGeneration"].as_u64().unwrap_or(0) > 0
+                || work["failedReconcileProofs"]
+                    .as_object()
+                    .is_some_and(|proofs| !proofs.is_empty()))
         {
             require(
                 generations::reconciled_current(paths, &work)?,
@@ -239,13 +295,21 @@ fn work_state_preflight(
             != digest_file(&release.join("manifest.json"))?
             || work["releasePath"].as_str() != Some(expected_release.to_string_lossy().as_ref()))
             && !work["attempt"].is_null()
-            && generations::known_result(paths, &work)?;
+            && (generations::known_result(paths, &work)?
+                || (transition == "eligible_successor"
+                    && generations::failed_reconcile_candidate(paths, &work)?));
         successor_after_original_result = consuming_successor_result;
         if consuming_successor_result {
             require(
                 args.work_action.as_deref() != Some("retire-local"),
                 "UNINSTALL_WORK_RECONCILIATION_REQUIRED",
             )?;
+            if args.work_action.as_deref() == Some("reconcile") {
+                require(
+                    args.expected_assessment_sha256.is_none(),
+                    "UNINSTALL_WORK_ASSESSMENT_CHANGED",
+                )?;
+            }
         }
         if !consuming_successor_result {
             require_attempt_arguments(&work, args)?;
@@ -367,6 +431,7 @@ fn save_work(paths: &lifecycle::Paths, value: &Value) -> Result<()> {
             )?;
         }
     }
+    fault("AFTER_WORK_GENERATION_ARCHIVES")?;
     state::write_json(&paths.state_dir.join("uninstall-work.json"), value)
 }
 async fn stop_service(paths: &lifecycle::Paths, old: &Value, work: &mut Value) -> Result<()> {
@@ -819,6 +884,65 @@ fn public_report(
             .as_deref(),
         candidate_release.as_deref(),
     );
+    if let Some(records) = preview["records"].as_array_mut() {
+        let owner_path = paths.state_dir.join("uninstall-work.json");
+        let work: Option<Value> = work_json(&owner_path).ok();
+        let blocked = matches!(
+            reason,
+            "UNINSTALL_WORK_GENERATION_CAPABILITY_REQUIRED"
+                | "OPERATION_RETIREMENT_CAPABILITY_REQUIRED"
+        ) || present(&owner_path).unwrap_or(true)
+            && (work
+                .as_ref()
+                .is_none_or(|work| !generations::supported(work))
+                || !matches!(
+                    maintenance_reference["transition"].as_str(),
+                    Some(
+                        "current_release"
+                            | "review_required"
+                            | "eligible_successor"
+                            | "resume_original_attempt"
+                    )
+                ));
+        let retirement_ready = work.as_ref().is_some_and(|work| {
+            work["attempt"].is_null()
+                && matches!(
+                    maintenance_reference["transition"].as_str(),
+                    Some("current_release" | "review_required")
+                )
+                && (work["schema"] != generations::OWNER_V2
+                    || (work["currentGeneration"].as_u64().unwrap_or(0) == 0
+                        && work["failedReconcileProofs"]
+                            .as_object()
+                            .is_none_or(|proofs| proofs.is_empty()))
+                    || generations::reconciled_current(paths, work).unwrap_or(false))
+        });
+        for record in records {
+            if let Some(actions) = record["availableActions"].as_array_mut() {
+                if blocked {
+                    actions.clear();
+                    continue;
+                }
+                if let Some(work) = &work {
+                    actions.retain(|action| match work["attempt"]["action"].as_str() {
+                        Some("reconcile") => {
+                            action == "reconcile"
+                                && (maintenance_reference["transition"] == "eligible_successor"
+                                    || saved_scope(&work["attempt"]) == retirement_scope(args))
+                                && args.expected_assessment_sha256.is_none()
+                        }
+                        Some("retire-local") => {
+                            action == "retire-local"
+                                && saved_scope(&work["attempt"]) == retirement_scope(args)
+                                && work["attempt"]["expectedAssessmentSha256"].as_str()
+                                    == args.expected_assessment_sha256.as_deref()
+                        }
+                        _ => action != "retire-local" || retirement_ready,
+                    });
+                }
+            }
+        }
+    }
     let operation = operation.or_else(|| {
         maintenance_reference["operationId"]
             .as_str()
@@ -866,7 +990,7 @@ fn review_state(paths: &lifecycle::Paths) -> Result<(Value, Value)> {
         let operation = value["kind"] == "operation_cache";
         let eligible = if operation { value["retirementEligible"] == true } else { value["kind"] != "presentation_operation" && (value["kind"] == "follow_session" || value["retirementEligible"] == true) && backend["recordDigest"] == value["recordDigest"] };
         let reason = value["safeReason"].as_str().filter(|reason| matches!(*reason, "missing_binding" | "canonical_pending" | "terminal_missing" | "unsupported_family" | "response_dependency_missing"));
-        let method = value["method"].as_str().filter(|method| matches!(*method, "interactions.respond" | "interactions.draft.delete" | "interactions.draft.update" | "auth.recover" | "builder.start" | "editor.start" | "workflows.create" | "workflows.update" | "workflows.patch" | "workflows.publish" | "personas.memory.write" | "personas.memory.update" | "personas.create" | "personas.chat_context.create" | "persona.roles.create"));
+        let method = value["method"].as_str().filter(|method| matches!(*method, "interactions.respond" | "interactions.decide" | "interactions.draft.delete" | "interactions.draft.update" | "auth.recover" | "builder.start" | "editor.start" | "workflows.create" | "workflows.update" | "workflows.patch" | "workflows.publish" | "personas.memory.write" | "personas.memory.update" | "personas.create" | "personas.chat_context.create" | "persona.roles.create"));
         json!({"recordReference":state::json_digest(&json!([value["kind"],value["organizationId"],value["accountSubject"],value["installationId"],if operation {&value["legacySlot"]}else{&value["recordId"]}])),"scopeReference":state::json_digest(&json!([value["organizationId"],value["accountSubject"],value["installationId"]])),"kind":value["kind"],"method":if operation || value["reconciliationSupported"]==true {json!(method)} else {Value::Null},"reconciliationSupported":value["reconciliationSupported"]==true,"runId":run,"revision":value["revision"],"generation":value["generation"],"attemptReference":value["attemptId"].as_str().map(|id|state::digest(id.as_bytes())),"status":state,"recordDigest":value["recordDigest"],"resolution":value["resolution"]["state"],"canonicalObservation":if operation {Value::Null}else{backend.clone()},"safeReason":reason,"retirementEligible":eligible,"cleanupEligible":value["cleanupEligible"]==true,"availableActions":if operation {if eligible {json!(["reconcile","retire-local"])}else{json!(["reconcile"])}}else{json!([])},"dependencies":"exact_receipt_linked_acceptance_caches_and_response_spools"})
     }).collect::<Vec<_>>();
     require(
@@ -900,6 +1024,12 @@ pub(crate) async fn run_work(args: Arguments) -> Result<()> {
                 code,
                 if pending {
                     "resume_uninstall_work"
+                } else if matches!(
+                    code,
+                    "UNINSTALL_WORK_GENERATION_CAPABILITY_REQUIRED"
+                        | "OPERATION_RETIREMENT_CAPABILITY_REQUIRED"
+                ) {
+                    "select_compatible_release"
                 } else {
                     "inspect_uninstall_work"
                 },
@@ -1175,9 +1305,22 @@ async fn qualify_before_settlement(
         old_bytes.len() <= 16 * 1024 * 1024,
         "UNINSTALL_WORK_AUDIT_LIMIT",
     )?;
-    let transition = qualify_work_candidate(args, old, manifest, payload).await?;
+    let transition = qualify_work_candidate(paths, args, old, release, manifest, payload).await?;
+    if args.work_action.as_deref() == Some("reconcile") {
+        require(
+            args.expected_assessment_sha256.is_none(),
+            "UNINSTALL_WORK_ASSESSMENT_CHANGED",
+        )?;
+    }
     if args.work_action.as_deref() != Some("inspect") {
-        settle_known_successor_result(paths, old, old_bytes, release).await?;
+        settle_known_successor_result(
+            paths,
+            old,
+            old_bytes,
+            release,
+            args.work_action.as_deref() == Some("reconcile"),
+        )
+        .await?;
     }
     Ok(transition)
 }
@@ -1346,6 +1489,7 @@ async fn settle_known_successor_result(
     old: &Value,
     old_bytes: &[u8],
     release: &Path,
+    allow_failed_reconcile: bool,
 ) -> Result<()> {
     let owner_path = paths.state_dir.join("uninstall-work.json");
     if !owner_path.try_exists()? {
@@ -1379,7 +1523,11 @@ async fn settle_known_successor_result(
         result["operationId"] == work["operationId"] && result["attemptId"] == attempt,
         "UNINSTALL_WORK_BINDING_CHANGED",
     )?;
-    consume_cached_result(paths, &mut work, old_bytes, &result)?;
+    if allow_failed_reconcile && generations::failed_reconcile_candidate(paths, &work)? {
+        generations::settle_failed_reconcile(paths, &mut work, old_bytes)?;
+    } else {
+        consume_cached_result(paths, &mut work, old_bytes, &result)?;
+    }
     Ok(())
 }
 
@@ -1527,6 +1675,10 @@ fn validate_cleanup_approvals(paths: &lifecycle::Paths, work: &Value) -> Result<
         .context("invalid work attempts")?
     {
         let attempt = Uuid::parse_str(attempt.as_str().context("invalid work attempt")?)?;
+        if !work["failedReconcileProofs"][attempt.to_string()].is_null() {
+            generations::verify_failed_proof(paths, work, &attempt.to_string())?;
+            continue;
+        }
         let approval: Value = work_json(
             &paths
                 .state_dir
@@ -2237,6 +2389,837 @@ mod tests {
             "UNINSTALL_WORK_MAINTENANCE_PENDING"
         );
     }
+    async fn failed_owner_fixture(
+        early: bool,
+        partial: bool,
+    ) -> (super::super::tests::Fixture, Value, PathBuf, Value, Vec<u8>) {
+        failed_owner_fixture_with_install(early, partial, false).await
+    }
+    async fn failed_owner_fixture_with_install(
+        early: bool,
+        partial: bool,
+        signed_install: bool,
+    ) -> (super::super::tests::Fixture, Value, PathBuf, Value, Vec<u8>) {
+        let mut fixture = super::super::tests::historical_fixture();
+        if signed_install {
+            let runner = PathBuf::from(fixture.journal["receipt"]["versionPath"].as_str().unwrap())
+                .join("bin/loomex-runner");
+            fs::hard_link(std::env::current_exe().unwrap(), &runner).unwrap();
+            let metadata = fs::metadata(&runner).unwrap();
+            fixture.journal["inventories"][0]["files"].as_array_mut().unwrap().push(json!({"path":"bin/loomex-runner","sha256":digest_file(&runner).unwrap(),"size":metadata.len(),"mode":metadata.mode()&0o777}));
+            fixture.journal["receipt"]["developmentOnly"] = json!(true);
+            fixture.journal["receipt"]["developmentApiOrigin"] = json!("http://127.0.0.1:9/");
+            state::write_json(
+                &fixture.paths.state_dir.join("install-receipt.json"),
+                &fixture.journal["receipt"],
+            )
+            .unwrap();
+            state::write_json(
+                &fixture.paths.state_dir.join("owned-versions.json"),
+                &journal_owned(&fixture.journal),
+            )
+            .unwrap();
+            save(&fixture.paths, &fixture.journal).unwrap();
+        }
+        let paths = &fixture.paths;
+        let base = paths.state_dir.parent().unwrap();
+        let (prior, prior_manifest) = release_fixture(base, "1.2.9");
+        let (release, manifest) = release_fixture(base, "1.2.11");
+        let (candidate, candidate_manifest) = release_fixture(base, "1.2.12");
+        let old_bytes = regular_bytes(&paths.state_dir.join("bootstrap-uninstall.json")).unwrap();
+        let id = Uuid::new_v4();
+        let mut work = json!({"schema":generations::OWNER_V2,"operationId":id,"journalSha256":state::digest(&old_bytes),"releasePath":prior,"releaseManifestSha256":digest_file(&prior.join("manifest.json")).unwrap(),"phase":"qualified","attempt":null,"currentGeneration":0,"attemptIds":[],"generations":[{"generation":0,"releasePath":prior,"releaseManifestSha256":digest_file(&prior.join("manifest.json")).unwrap(),"files":prior_manifest["payload"]["files"],"stageName":format!("uninstall-work-stage-{id}-generation-0")}]});
+        save_work(paths, &work).unwrap();
+        publish_stage(
+            paths,
+            &prior,
+            &prior_manifest,
+            &generations::stage(paths, &work).unwrap(),
+        )
+        .await
+        .unwrap();
+        fixture_attempt(paths, &mut work, &fixture.journal, &old_bytes, true);
+        generations::upgrade(paths, &mut work, &release, &manifest).unwrap();
+        save_work(paths, &work).unwrap();
+        let stage = generations::stage(paths, &work).unwrap();
+        publish_stage(paths, &release, &manifest, &stage)
+            .await
+            .unwrap();
+        let attempt = Uuid::new_v4();
+        let context = json!({"schema":"app.loomex.runner.uninstall-work-context/v2","operationId":id,"attemptId":attempt,"action":"reconcile","retirementScope":"continuations","journalSha256":state::digest(&old_bytes),"receiptSha256":state::json_digest(&fixture.journal["receipt"]),"expectedIdentity":prior_identity(paths).unwrap(),"binarySha256":digest_file(&stage.join("bin/loomex-runner")).unwrap(),"expectedAssessmentSha256":null,"maintenanceGeneration":work["currentGeneration"],"releaseManifestSha256":work["releaseManifestSha256"],"stateDir":paths.state_dir,"installBase":paths.install_base,"launchAgentsDir":paths.launch_agents_dir,"singletonFd":9});
+        let context_path = paths
+            .state_dir
+            .join(format!("uninstall-work-context-{attempt}.json"));
+        state::write_json(&context_path, &context).unwrap();
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        work["attempt"] = json!({"id":attempt,"pid":child.id(),"state":"running","action":"reconcile","retirementScope":"continuations","expectedAssessmentSha256":null,"contextSha256":digest_file(&context_path).unwrap(),"maintenanceGeneration":1,"releaseManifestSha256":work["releaseManifestSha256"]});
+        child.wait().unwrap();
+        work["attemptIds"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(attempt));
+        work["phase"] = json!("qualified");
+        if !early {
+            let request = json!({"kind":"presentation_operation","operationKey":Uuid::new_v4(),"method":"interactions.respond"});
+            state::write_json(
+                &paths
+                    .state_dir
+                    .join(format!("uninstall-work-requests-{attempt}.json")),
+                &json!({"operationId":id,"attemptId":attempt,"requests":[request]}),
+            )
+            .unwrap();
+            if partial {
+                state::write_json(&paths.state_dir.join(format!("uninstall-work-checkpoint-{attempt}-0.json")), &json!({"operationId":id,"attemptId":attempt,"requestDigest":state::json_digest(&request),"result":{"remoteOutcome":"unknown"}})).unwrap();
+                state::write_json(&paths.state_dir.join(format!("uninstall-work-cache-{attempt}-0.json")), &json!({"schema":"app.loomex.runner.uninstall-work-cache-transition/v1","operationId":id,"attemptId":attempt,"index":0,"requestDigest":state::json_digest(&request),"transition":{"schema":"app.loomex.runner.uninstall-work-cache/v1","beforeSha256":"a".repeat(64),"afterSha256":"b".repeat(64)}})).unwrap();
+            }
+        }
+        let result_path = paths
+            .state_dir
+            .join(format!("uninstall-work-result-{attempt}.json"));
+        let mut result = json!({"schema":"app.loomex.runner.uninstall-work-result/v2","operationId":id,"attemptId":attempt,"ok":false,"failureCode":"UNINSTALL_WORK_NATIVE_FAILED","maintenanceGeneration":1,"releaseManifestSha256":work["releaseManifestSha256"],"contextSha256":work["attempt"]["contextSha256"],"error":{"code":"STORE_UNAVAILABLE","outcome":"unknown","recovery":"reconcile_outcome","retryable":false}});
+        state::write_json(&result_path, &result).unwrap();
+        audit(paths, &work, &old_bytes, &result).unwrap();
+        result["error"]["code"] = json!("AUTH_REQUIRED");
+        state::write_json(&result_path, &result).unwrap();
+        audit(paths, &work, &old_bytes, &result).unwrap();
+        save_work(paths, &work).unwrap();
+        drop(singleton(paths, true).unwrap());
+        (fixture, work, candidate, candidate_manifest, old_bytes)
+    }
+
+    #[tokio::test]
+    async fn inactive_failed_reconcile_qualifies_successor_without_erasing_failure() {
+        let (fixture, work, candidate, _, _) = failed_owner_fixture(false, true).await;
+        let paths = &fixture.paths;
+        let before = state_bytes(&paths.state_dir);
+        let hash = digest_file(&candidate.join("manifest.json")).unwrap();
+        assert_eq!(work["currentGeneration"], 1);
+        assert_eq!(
+            generations::candidate_transition(paths, &work, &hash, Some(&candidate)).unwrap(),
+            "eligible_successor"
+        );
+        assert_eq!(
+            before,
+            state_bytes(&paths.state_dir),
+            "inspection is read only"
+        );
+        assert!(
+            !generations::known_result(paths, &work).unwrap(),
+            "failure never becomes a successful settlement"
+        );
+        let guard = singleton(paths, false).unwrap();
+        assert!(
+            generations::candidate_transition(paths, &work, &hash, Some(&candidate)).is_err(),
+            "blocked native IO retains inherited singleton"
+        );
+        drop(guard);
+        for pid in [Value::Null, json!(std::process::id()), json!(1)] {
+            let mut pinned = work.clone();
+            pinned["attempt"]["pid"] = pid;
+            assert!(
+                generations::candidate_transition(paths, &pinned, &hash, Some(&candidate)).is_err(),
+                "live/reused/missing PID must remain pinned"
+            );
+        }
+        let mut retire = work.clone();
+        retire["attempt"]["action"] = json!("retire-local");
+        retire["attempt"]["expectedAssessmentSha256"] = json!("a".repeat(64));
+        assert!(
+            generations::candidate_transition(paths, &retire, &hash, Some(&candidate)).is_err(),
+            "failed retirement has no generic takeover authority"
+        );
+        let result_path = paths.state_dir.join(format!(
+            "uninstall-work-result-{}.json",
+            work["attempt"]["id"].as_str().unwrap()
+        ));
+        let original = regular_bytes(&result_path).unwrap();
+        for bytes in [b"{malformed".as_slice(), b"{}".as_slice()] {
+            state::atomic_write(&result_path, bytes).unwrap();
+            assert!(
+                generations::candidate_transition(paths, &work, &hash, Some(&candidate)).is_err()
+            );
+        }
+        remove_regular(&result_path).unwrap();
+        assert!(generations::candidate_transition(paths, &work, &hash, Some(&candidate)).is_err());
+        state::atomic_write(&result_path, &original).unwrap();
+        let mut changed: Value = serde_json::from_slice(&original).unwrap();
+        changed["contextSha256"] = json!("f".repeat(64));
+        state::write_json(&result_path, &changed).unwrap();
+        assert!(generations::candidate_transition(paths, &work, &hash, Some(&candidate)).is_err());
+        state::atomic_write(&result_path, &original).unwrap();
+        assert_eq!(before, state_bytes(&paths.state_dir));
+        let attempt = work["attempt"]["id"].as_str().unwrap();
+        let root = paths
+            .state_dir
+            .join("recovery-evidence")
+            .join(work["operationId"].as_str().unwrap());
+        for path in [
+            paths
+                .state_dir
+                .join(format!("uninstall-work-context-{attempt}.json")),
+            paths
+                .state_dir
+                .join(format!("uninstall-work-requests-{attempt}.json")),
+            paths
+                .state_dir
+                .join(format!("uninstall-work-checkpoint-{attempt}-0.json")),
+            paths
+                .state_dir
+                .join(format!("uninstall-work-cache-{attempt}-0.json")),
+            root.join(format!("approval-{attempt}.json")),
+            paths
+                .state_dir
+                .join(work["generations"][1]["stageName"].as_str().unwrap())
+                .join("bin/loomex-runner"),
+            PathBuf::from(work["releasePath"].as_str().unwrap()).join("manifest.json"),
+        ] {
+            let bytes = regular_bytes(&path).unwrap();
+            state::atomic_write(&path, b"{}").unwrap();
+            assert!(
+                generations::candidate_transition(paths, &work, &hash, Some(&candidate)).is_err(),
+                "tampered {path:?}"
+            );
+            state::atomic_write(&path, &bytes).unwrap();
+        }
+        assert_eq!(before, state_bytes(&paths.state_dir));
+    }
+
+    #[tokio::test]
+    async fn failed_reconcile_proof_preserves_early_and_partial_attempts_and_retirement_boundary() {
+        for early in [false, true] {
+            let (fixture, mut work, candidate, manifest, old_bytes) =
+                failed_owner_fixture(early, !early).await;
+            let paths = &fixture.paths;
+            let _lifecycle = lifecycle::LifecycleLock::acquire(paths).unwrap();
+            let guard = singleton(paths, false).unwrap();
+            let before = state_bytes(&paths.state_dir);
+            let attempt = work["attempt"]["id"].as_str().unwrap().to_owned();
+            let id = work["operationId"].clone();
+            generations::settle_failed_reconcile(paths, &mut work, &old_bytes).unwrap();
+            assert!(work["attempt"].is_null());
+            assert_eq!(work["phase"], "qualified");
+            generations::prove_inactive(paths, &work).unwrap();
+            for (path, bytes) in &before {
+                if path != Path::new("uninstall-work.json")
+                    && path != Path::new("lifecycle-operation.json")
+                {
+                    assert_eq!(
+                        &regular_bytes(&paths.state_dir.join(path)).unwrap(),
+                        bytes,
+                        "preserved {path:?}"
+                    );
+                }
+            }
+            let root = paths
+                .state_dir
+                .join("recovery-evidence")
+                .join(id.as_str().unwrap());
+            assert_eq!(
+                root.join(format!("approval-{attempt}.json")).exists(),
+                !early,
+                "early failure cannot manufacture approval"
+            );
+            let raw: Value = work_json(&paths.state_dir.join("lifecycle-operation.json")).unwrap();
+            assert_eq!(raw["schema"], lifecycle::FAILED_RECONCILE_WORK_SCHEMA);
+            generations::upgrade(paths, &mut work, &candidate, &manifest).unwrap();
+            save_work(paths, &work).unwrap();
+            assert_eq!(work["operationId"], id);
+            assert_eq!(work["currentGeneration"], 2);
+            assert!(!generations::reconciled_current(paths, &work).unwrap());
+            let mut args = Arguments {
+                work_action: Some("retire-local".into()),
+                expected_assessment_sha256: Some("a".repeat(64)),
+                ..Arguments::default()
+            };
+            assert_eq!(
+                work_state_preflight(
+                    paths,
+                    &args,
+                    &candidate,
+                    SigningTransition::Ready,
+                    &old_bytes
+                )
+                .unwrap_err()
+                .to_string(),
+                "UNINSTALL_WORK_RECONCILIATION_REQUIRED"
+            );
+            let stage = generations::stage(paths, &work).unwrap();
+            publish_stage(paths, &candidate, &manifest, &stage)
+                .await
+                .unwrap();
+            let fresh = fixture_attempt(paths, &mut work, &fixture.journal, &old_bytes, true);
+            assert_ne!(fresh.to_string(), attempt);
+            assert!(generations::reconciled_current(paths, &work).unwrap());
+            args.expected_assessment_sha256 = Some("f".repeat(64));
+            assert_eq!(
+                work_state_preflight(
+                    paths,
+                    &args,
+                    &candidate,
+                    SigningTransition::Ready,
+                    &old_bytes
+                )
+                .unwrap_err()
+                .to_string(),
+                "UNINSTALL_WORK_ASSESSMENT_CHANGED"
+            );
+            // Proof resources and audit history are independently tamper evident.
+            let proof = root.join(format!("inactive-failed-reconcile-{attempt}.json"));
+            let proof_bytes = regular_bytes(&proof).unwrap();
+            state::atomic_write(&proof, b"{}").unwrap();
+            assert!(generations::prove_inactive(paths, &work).is_err());
+            state::atomic_write(&proof, &proof_bytes).unwrap();
+            let old_result = paths
+                .state_dir
+                .join(format!("uninstall-work-result-{attempt}.json"));
+            let result_bytes = regular_bytes(&old_result).unwrap();
+            state::atomic_write(&old_result, b"{}").unwrap();
+            assert!(generations::prove_inactive(paths, &work).is_err());
+            state::atomic_write(&old_result, &result_bytes).unwrap();
+            drop(guard);
+            let journal = json!({"operationId":id,"recovery":{"oldJournalSha256":state::digest(&old_bytes),"files":manifest["payload"]["files"]}});
+            cleanup_resources(paths, &journal).unwrap();
+            cleanup_resources(paths, &journal).unwrap();
+            assert!(!paths.state_dir.join("uninstall-work.json").exists());
+            for generation in generations::records(&work).unwrap() {
+                assert!(
+                    !paths
+                        .state_dir
+                        .join(generation["stageName"].as_str().unwrap())
+                        .exists()
+                );
+            }
+            assert!(proof.exists());
+            assert_eq!(regular_bytes(&proof).unwrap(), proof_bytes);
+        }
+    }
+    #[tokio::test]
+    async fn failed_reconcile_proof_and_successor_publication_are_restartable() {
+        const CHILD: &str = "LOOMEX_TEST_FAILED_PROOF_ROOT";
+        if let Some(base) = std::env::var_os(CHILD) {
+            let base = PathBuf::from(base);
+            let paths = lifecycle::Paths {
+                state_dir: base.join("state"),
+                install_base: base.join("install"),
+                launch_agents_dir: base.join("agents"),
+            };
+            let _lifecycle = lifecycle::LifecycleLock::acquire(&paths).unwrap();
+            let _guard = singleton(&paths, false).unwrap();
+            let mut work: Value = work_json(&paths.state_dir.join("uninstall-work.json")).unwrap();
+            let old_bytes =
+                regular_bytes(&paths.state_dir.join("bootstrap-uninstall.json")).unwrap();
+            let mode = std::env::var("LOOMEX_TEST_FAILED_PROOF_MODE").unwrap();
+            let error = match mode.as_str() {
+                "settle" => {
+                    generations::settle_failed_reconcile(&paths, &mut work, &old_bytes).unwrap_err()
+                }
+                "generation" => {
+                    let candidate = base.join("release-1.2.12");
+                    let manifest = read_manifest(&candidate).unwrap();
+                    generations::upgrade(&paths, &mut work, &candidate, &manifest).unwrap();
+                    save_work(&paths, &work).unwrap_err()
+                }
+                "context" => {
+                    let context: Value =
+                        work_json(&base.join("failed-successor-context.json")).unwrap();
+                    reserve_attempt(&paths, &mut work, &context).unwrap_err()
+                }
+                "cleanup" => {
+                    let journal: Value =
+                        work_json(&base.join("failed-cleanup-journal.json")).unwrap();
+                    cleanup_resources(&paths, &journal).unwrap_err()
+                }
+                _ => panic!("invalid fixture mode"),
+            };
+            assert!(
+                error.to_string().contains("injected uninstall failure"),
+                "{error:#}"
+            );
+            return;
+        }
+        for (point, mode) in [
+            ("AFTER_WORK_FAILED_RECONCILE_PROOF", "settle"),
+            ("AFTER_WORK_FAILED_RECONCILE_SETTLEMENT", "settle"),
+            ("AFTER_WORK_GENERATION_ARCHIVES", "generation"),
+            ("AFTER_WORK_CONTEXT_RESERVATION", "context"),
+            ("AFTER_WORK_CONTEXT_PUBLICATION", "context"),
+            ("DURING_WORK_STAGE_DELETE", "cleanup"),
+            ("DURING_WORK_RESOURCE_DELETE", "cleanup"),
+        ] {
+            let (fixture, mut work, candidate, manifest, old_bytes) =
+                failed_owner_fixture(true, false).await;
+            let paths = &fixture.paths;
+            let base = paths.state_dir.parent().unwrap();
+            let failed = work["attempt"]["id"].as_str().unwrap().to_owned();
+            let failed_result = paths
+                .state_dir
+                .join(format!("uninstall-work-result-{failed}.json"));
+            let result_bytes = regular_bytes(&failed_result).unwrap();
+            let id = work["operationId"].clone();
+            let run_child = || {
+                let output=std::process::Command::new(std::env::current_exe().unwrap())
+                    .arg("--exact").arg("bootstrap_uninstall::work::tests::failed_reconcile_proof_and_successor_publication_are_restartable")
+                    .env(CHILD,base).env("LOOMEX_TEST_FAILED_PROOF_MODE",mode)
+                    .env(format!("LOOMEX_TEST_UNINSTALL_FAIL_{point}"),"1").output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{point}: {} {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            if mode == "settle" {
+                run_child();
+                work = work_json(&paths.state_dir.join("uninstall-work.json")).unwrap();
+            }
+            if !work["attempt"].is_null() {
+                let _lifecycle = lifecycle::LifecycleLock::acquire(paths).unwrap();
+                let _guard = singleton(paths, false).unwrap();
+                generations::settle_failed_reconcile(paths, &mut work, &old_bytes).unwrap();
+            }
+            generations::prove_inactive(paths, &work).unwrap();
+            if mode == "generation" {
+                run_child();
+                work = work_json(&paths.state_dir.join("uninstall-work.json")).unwrap();
+                assert_eq!(work["currentGeneration"], 1);
+            }
+            generations::upgrade(paths, &mut work, &candidate, &manifest).unwrap();
+            save_work(paths, &work).unwrap();
+            let stage = generations::stage(paths, &work).unwrap();
+            publish_stage(paths, &candidate, &manifest, &stage)
+                .await
+                .unwrap();
+            if mode == "context" {
+                let fresh = Uuid::new_v4();
+                let context = json!({"schema":"app.loomex.runner.uninstall-work-context/v2","operationId":id,"attemptId":fresh,"maintenanceGeneration":2,"releaseManifestSha256":work["releaseManifestSha256"],"stateDir":paths.state_dir,"installBase":paths.install_base,"launchAgentsDir":paths.launch_agents_dir,"journalSha256":work["journalSha256"],"receiptSha256":state::json_digest(&fixture.journal["receipt"]),"binarySha256":digest_file(&stage.join("bin/loomex-runner")).unwrap(),"action":"reconcile","retirementScope":"continuations","expectedAssessmentSha256":null,"expectedIdentity":prior_identity(paths).unwrap(),"singletonFd":9});
+                state::write_json(&base.join("failed-successor-context.json"), &context).unwrap();
+                run_child();
+                work = work_json(&paths.state_dir.join("uninstall-work.json")).unwrap();
+                assert_eq!(work["attempt"]["id"], fresh.to_string());
+                publish_reserved_context(paths, &mut work).unwrap();
+                assert_eq!(work["attempt"]["state"], "spawn_pending");
+                assert!(work["attempt"]["pid"].is_null());
+                assert!(
+                    generations::candidate_transition(paths, &work, &"f".repeat(64), None).is_err(),
+                    "unrecorded successor child cannot be replaced"
+                );
+                let result = json!({"schema":"app.loomex.runner.uninstall-work-result/v2","operationId":id,"attemptId":fresh,"ok":true,"maintenanceGeneration":2,"releaseManifestSha256":work["releaseManifestSha256"],"contextSha256":work["attempt"]["contextSha256"],"result":{"receipts":[]}});
+                state::write_json(
+                    &paths
+                        .state_dir
+                        .join(format!("uninstall-work-result-{fresh}.json")),
+                    &result,
+                )
+                .unwrap();
+                state::write_json(
+                    &paths
+                        .state_dir
+                        .join(format!("uninstall-work-requests-{fresh}.json")),
+                    &json!({"operationId":id,"attemptId":fresh,"requests":[]}),
+                )
+                .unwrap();
+                assert!(consume_cached_result(paths, &mut work, &old_bytes, &result).unwrap());
+            } else {
+                fixture_attempt(paths, &mut work, &fixture.journal, &old_bytes, true);
+            }
+            assert_eq!(work["operationId"], id);
+            assert_eq!(work["currentGeneration"], 2);
+            assert_eq!(regular_bytes(&failed_result).unwrap(), result_bytes);
+            let journal = json!({"operationId":id,"recovery":{"oldJournalSha256":state::digest(&old_bytes),"files":manifest["payload"]["files"]}});
+            state::write_json(&base.join("failed-cleanup-journal.json"), &journal).unwrap();
+            if mode == "cleanup" {
+                run_child();
+            }
+            cleanup_resources(paths, &journal).unwrap();
+            cleanup_resources(paths, &journal).unwrap();
+            assert!(!paths.state_dir.join("uninstall-work.json").exists());
+            assert_eq!(
+                regular_bytes(&paths.state_dir.join("bootstrap-uninstall.json")).unwrap(),
+                old_bytes
+            );
+            assert!(
+                paths
+                    .state_dir
+                    .join("recovery-evidence")
+                    .join(id.as_str().unwrap())
+                    .join(format!("inactive-failed-reconcile-{failed}.json"))
+                    .exists()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_reconcile_successor_preflight_accepts_fresh_scope_and_owner_journey() {
+        let (fixture, mut work, candidate, manifest, old_bytes) =
+            failed_owner_fixture(false, true).await;
+        let paths = &fixture.paths;
+        let mut args = Arguments {
+            work_action: Some("reconcile".into()),
+            retirement_scope: Some("operation-observations".into()),
+            release: Some(candidate.clone()),
+            ..Arguments::default()
+        };
+        state::private_dir(&paths.state_dir.join("operations")).unwrap();
+        state::write_json(
+            &paths
+                .state_dir
+                .join("operations")
+                .join(format!("{}.json", "f".repeat(64))),
+            &json!({"digest":"a".repeat(64),"method":"interactions.decide","status":"pending"}),
+        )
+        .unwrap();
+        let report = public_report(
+            paths,
+            &args,
+            "inspected",
+            "UNINSTALL_WORK_INSPECTED",
+            "reconcile_managed_work",
+            None,
+        );
+        assert_eq!(
+            report["preview"]["records"][0]["availableActions"],
+            json!(["reconcile"])
+        );
+        assert_eq!(
+            report["maintenanceReference"]["transition"],
+            "eligible_successor"
+        );
+        let incompatible = public_report(
+            paths,
+            &args,
+            "blocked",
+            "UNINSTALL_WORK_GENERATION_CAPABILITY_REQUIRED",
+            "select_compatible_release",
+            None,
+        );
+        assert_eq!(
+            incompatible["preview"]["records"][0]["availableActions"],
+            json!([]),
+            "incompatible candidate cannot advertise executable work"
+        );
+        let before = state_bytes(&paths.state_dir);
+        let preflight = work_state_preflight(
+            paths,
+            &args,
+            &candidate,
+            SigningTransition::Ready,
+            &old_bytes,
+        )
+        .unwrap();
+        assert_eq!(preflight["eligible"], true);
+        assert_eq!(preflight["successorAfterOriginalResult"], true);
+        assert_eq!(preflight["retirementScope"], "operation-observations");
+        assert_eq!(before, state_bytes(&paths.state_dir));
+        let old_release = PathBuf::from(work["releasePath"].as_str().unwrap());
+        assert_eq!(
+            work_state_preflight(
+                paths,
+                &args,
+                &old_release,
+                SigningTransition::Ready,
+                &old_bytes
+            )
+            .unwrap_err()
+            .to_string(),
+            "UNINSTALL_WORK_MAINTENANCE_PENDING",
+            "same-release active scope remains exact"
+        );
+        let result_path = paths.state_dir.join(format!(
+            "uninstall-work-result-{}.json",
+            work["attempt"]["id"].as_str().unwrap()
+        ));
+        let result_bytes = regular_bytes(&result_path).unwrap();
+        remove_regular(&result_path).unwrap();
+        assert_eq!(
+            work_state_preflight(
+                paths,
+                &args,
+                &candidate,
+                SigningTransition::Ready,
+                &old_bytes
+            )
+            .unwrap_err()
+            .to_string(),
+            "UNINSTALL_WORK_MAINTENANCE_PENDING",
+            "unknown original outcome cannot change scope"
+        );
+        state::atomic_write(&result_path, &result_bytes).unwrap();
+        args.expected_assessment_sha256 = Some("a".repeat(64));
+        assert_eq!(
+            work_state_preflight(
+                paths,
+                &args,
+                &candidate,
+                SigningTransition::Ready,
+                &old_bytes
+            )
+            .unwrap_err()
+            .to_string(),
+            "UNINSTALL_WORK_ASSESSMENT_CHANGED",
+            "failed reconcile cannot borrow an assessment"
+        );
+        args.expected_assessment_sha256 = None;
+        args.work_action = Some("retire-local".into());
+        assert_eq!(
+            work_state_preflight(
+                paths,
+                &args,
+                &candidate,
+                SigningTransition::Ready,
+                &old_bytes
+            )
+            .unwrap_err()
+            .to_string(),
+            "UNINSTALL_WORK_RECONCILIATION_REQUIRED"
+        );
+        args.work_action = Some("reconcile".into());
+        let _lifecycle = lifecycle::LifecycleLock::acquire(paths).unwrap();
+        let _guard = singleton(paths, false).unwrap();
+        let old_attempt = work["attempt"]["id"].clone();
+        generations::settle_failed_reconcile(paths, &mut work, &old_bytes).unwrap();
+        generations::upgrade(paths, &mut work, &candidate, &manifest).unwrap();
+        save_work(paths, &work).unwrap();
+        let stage = generations::stage(paths, &work).unwrap();
+        publish_stage(paths, &candidate, &manifest, &stage)
+            .await
+            .unwrap();
+        let fresh = Uuid::new_v4();
+        let context = json!({"schema":"app.loomex.runner.uninstall-work-context/v2","operationId":work["operationId"],"attemptId":fresh,"maintenanceGeneration":2,"releaseManifestSha256":work["releaseManifestSha256"],"stateDir":paths.state_dir,"installBase":paths.install_base,"launchAgentsDir":paths.launch_agents_dir,"journalSha256":work["journalSha256"],"receiptSha256":state::json_digest(&fixture.journal["receipt"]),"binarySha256":digest_file(&stage.join("bin/loomex-runner")).unwrap(),"action":"reconcile","retirementScope":"operation-observations","expectedAssessmentSha256":null,"expectedIdentity":prior_identity(paths).unwrap(),"singletonFd":9});
+        let path = reserve_attempt(paths, &mut work, &context).unwrap();
+        let saved: Value = work_json(&path).unwrap();
+        assert_eq!(saved, context);
+        assert_ne!(work["attempt"]["id"], old_attempt);
+        assert_eq!(work["attempt"]["retirementScope"], "operation-observations");
+        require_attempt_arguments(&work, &args).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn failed_reconcile_native_qualification_requires_prospective_and_existing_v14_capability()
+     {
+        let (fixture, mut work, _, _, old_bytes) =
+            failed_owner_fixture_with_install(true, false, true).await;
+        let paths = &fixture.paths;
+        let base = paths.state_dir.parent().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let make_candidate = |label: &str, supports: bool| {
+            let release = base.join(format!("qualified-{label}"));
+            let payload = base.join(format!("qualified-{label}-payload"));
+            state::private_dir(&release).unwrap();
+            state::private_dir(&payload).unwrap();
+            state::private_dir(&payload.join("bin")).unwrap();
+            state::private_dir(&payload.join("metadata")).unwrap();
+            for name in ["loomex", "loomex-runner", "loomex-lifecycle-bootstrap"] {
+                fs::hard_link(&executable, payload.join("bin").join(name)).unwrap();
+            }
+            state::write_json(&payload.join("metadata/project.json"),&json!({"project":"loomex-runner","version":env!("CARGO_PKG_VERSION"),"platform":"darwin-arm64"})).unwrap();
+            let capabilities = if supports {
+                json!([
+                    "uninstall-work.generations/v1",
+                    "uninstall-work.inactive-failed-reconcile/v1"
+                ])
+            } else {
+                json!(["uninstall-work.generations/v1"])
+            };
+            state::write_json(
+                &payload.join("metadata/compatibility-manifest.json"),
+                &json!({"capabilities":capabilities}),
+            )
+            .unwrap();
+            let source =
+                json!({"schema":"app.loomex.source-content/v1","sourceRevision":"a".repeat(40)});
+            let mut source_bytes = serde_json::to_vec(&source).unwrap();
+            source_bytes.push(b'\n');
+            fs::write(
+                payload.join("metadata/source-content-manifest.json"),
+                source_bytes,
+            )
+            .unwrap();
+            let mut files=["bin/loomex","bin/loomex-runner","bin/loomex-lifecycle-bootstrap","metadata/project.json","metadata/compatibility-manifest.json","metadata/source-content-manifest.json"].into_iter().map(|name| {let path=payload.join(name);let metadata=fs::metadata(&path).unwrap();json!({"path":name,"sha256":digest_file(&path).unwrap(),"size":metadata.len(),"mode":metadata.mode()&0o777})}).collect::<Vec<_>>();
+            files.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+            fs::hard_link(&executable, release.join("loomex-lifecycle-bootstrap")).unwrap();
+            let manifest = json!({"schema":"app.loomex.release/v1","project":"loomex-runner","version":env!("CARGO_PKG_VERSION"),"platform":"darwin-arm64","developmentOnly":true,"sourceRevision":"a".repeat(40),"sourceContent":{"file":"metadata/source-content-manifest.json","sha256":digest_file(&payload.join("metadata/source-content-manifest.json")).unwrap()},"payload":{"files":files},"bootstrap":{"file":"loomex-lifecycle-bootstrap","sha256":digest_file(&executable).unwrap(),"size":fs::metadata(&executable).unwrap().len()}});
+            state::write_json(&release.join("manifest.json"), &manifest).unwrap();
+            inventory(&payload, manifest["payload"]["files"].as_array().unwrap()).unwrap();
+            validate_source_binding(&payload, &manifest).unwrap();
+            bootstrap_preflight::verify_envelope(&release, &payload, &manifest).unwrap();
+            (release, payload, manifest)
+        };
+        let (missing, missing_payload, missing_manifest) = make_candidate("missing", false);
+        let (supported, supported_payload, supported_manifest) = make_candidate("supported", true);
+        let mut args = Arguments {
+            work_action: Some("inspect".into()),
+            retirement_scope: Some("operation-observations".into()),
+            expected_old_journal_sha256: Some(state::digest(&old_bytes)),
+            development_api_origin: Some("http://127.0.0.1:9".into()),
+            ..Arguments::default()
+        };
+        let before = state_bytes(&paths.state_dir);
+        assert_eq!(
+            work_preflight(paths, &args, &missing, &missing_manifest, &missing_payload)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "UNINSTALL_WORK_GENERATION_CAPABILITY_REQUIRED"
+        );
+        assert_eq!(
+            before,
+            state_bytes(&paths.state_dir),
+            "inspect missing prospective capability never creates v14 fence/proof"
+        );
+        args.work_action = Some("reconcile".into());
+        assert_eq!(
+            qualify_before_settlement(
+                paths,
+                &args,
+                &fixture.journal,
+                &old_bytes,
+                &missing,
+                &missing_manifest,
+                &missing_payload
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "UNINSTALL_WORK_GENERATION_CAPABILITY_REQUIRED"
+        );
+        assert_eq!(
+            before,
+            state_bytes(&paths.state_dir),
+            "execute refuses before settlement or native service observation"
+        );
+        let preflight = work_preflight(
+            paths,
+            &args,
+            &supported,
+            &supported_manifest,
+            &supported_payload,
+        )
+        .await
+        .unwrap();
+        assert_eq!(preflight["successorAfterOriginalResult"], true);
+        assert_eq!(preflight["retirementScope"], "operation-observations");
+        assert_eq!(before, state_bytes(&paths.state_dir));
+        args.expected_assessment_sha256 = Some("a".repeat(64));
+        assert_eq!(
+            qualify_before_settlement(
+                paths,
+                &args,
+                &fixture.journal,
+                &old_bytes,
+                &supported,
+                &supported_manifest,
+                &supported_payload
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "UNINSTALL_WORK_ASSESSMENT_CHANGED"
+        );
+        assert_eq!(
+            before,
+            state_bytes(&paths.state_dir),
+            "execute cannot consume failed owner using borrowed assessment"
+        );
+        args.expected_assessment_sha256 = None;
+        let _lifecycle = lifecycle::LifecycleLock::acquire(paths).unwrap();
+        let _guard = singleton(paths, false).unwrap();
+        generations::settle_failed_reconcile(paths, &mut work, &old_bytes).unwrap();
+        let fenced = state_bytes(&paths.state_dir);
+        args.work_action = Some("inspect".into());
+        assert_eq!(
+            qualify_work_candidate(
+                paths,
+                &args,
+                &fixture.journal,
+                &missing,
+                &missing_manifest,
+                &missing_payload
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "UNINSTALL_WORK_GENERATION_CAPABILITY_REQUIRED"
+        );
+        assert_eq!(
+            fenced,
+            state_bytes(&paths.state_dir),
+            "direct maintenance also checks existing v14"
+        );
+        qualify_work_candidate(
+            paths,
+            &args,
+            &fixture.journal,
+            &supported,
+            &supported_manifest,
+            &supported_payload,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fenced, state_bytes(&paths.state_dir));
+    }
+
+    #[tokio::test]
+    async fn work_preview_preserves_canonical_methods_and_executable_actions() {
+        let (fixture, work, candidate, _, _) = failed_owner_fixture(true, false).await;
+        let paths = &fixture.paths;
+        state::private_dir(&paths.state_dir.join("operations")).unwrap();
+        let catalog: Value =
+            serde_json::from_str(include_str!("../../contracts/method-catalog.json")).unwrap();
+        for method in ["interactions.decide", "persona.roles.create"] {
+            assert!(
+                catalog["methods"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry["name"] == method)
+            );
+            state::write_json(
+                &paths
+                    .state_dir
+                    .join("operations")
+                    .join(format!("{}.json", state::digest(method.as_bytes()))),
+                &json!({"digest":"a".repeat(64),"method":method,"status":"pending"}),
+            )
+            .unwrap();
+        }
+        let args = Arguments {
+            work_action: Some("inspect".into()),
+            release: Some(candidate),
+            ..Arguments::default()
+        };
+        let report = public_report(
+            paths,
+            &args,
+            "inspected",
+            "UNINSTALL_WORK_INSPECTED",
+            "reconcile_managed_work",
+            None,
+        );
+        let records = report["preview"]["records"].as_array().unwrap();
+        assert_eq!(records.len(), 2);
+        for method in ["interactions.decide", "persona.roles.create"] {
+            let record = records
+                .iter()
+                .find(|record| record["method"] == method)
+                .unwrap();
+            assert_eq!(
+                record["availableActions"],
+                json!(["reconcile"]),
+                "active reconcile only permits exact resumption or supported reconcile successor"
+            );
+        }
+        assert_eq!(work["attempt"]["action"], "reconcile");
+        for code in ["AUTH_REQUIRED", "AUTH_EXPIRED"] {
+            let error=require_result(&json!({"ok":false,"failureCode":"UNINSTALL_WORK_NATIVE_FAILED","error":{"code":code,"message":"PRIVATE MESSAGE","outcome":"unknown","recovery":"reconcile_outcome","retryable":false}})).unwrap_err();
+            let failure = error.downcast_ref::<WorkNativeFailure>().unwrap();
+            assert_eq!(failure.diagnostic["code"], code);
+            assert_eq!(failure.diagnostic["outcome"], "unknown");
+            assert_eq!(failure.diagnostic["recovery"], "reconcile_outcome");
+            assert!(!failure.diagnostic.to_string().contains("PRIVATE MESSAGE"));
+        }
+    }
+
     #[tokio::test]
     async fn cached_migration_failure_is_consumed_before_any_attempt_can_resume() {
         let fixture = super::super::tests::historical_fixture();

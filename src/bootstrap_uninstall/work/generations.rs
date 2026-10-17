@@ -205,6 +205,22 @@ pub(super) fn prove_inactive(paths: &lifecycle::Paths, work: &Value) -> Result<(
         }
     }
     let ids = work["attemptIds"].as_array().cloned().unwrap_or_default();
+    if let Some(proofs) = work["failedReconcileProofs"].as_object() {
+        require(
+            proofs.len() <= 64
+                && proofs.iter().all(|(attempt, hash)| {
+                    ids.iter().any(|id| id == attempt)
+                        && hash.as_str().is_some_and(valid_work_digest)
+                }),
+            "UNINSTALL_WORK_BINDING_CHANGED",
+        )?;
+    } else {
+        require(
+            work["failedReconcileProofs"].is_null(),
+            "UNINSTALL_WORK_BINDING_CHANGED",
+        )?;
+    }
+
     require(ids.len() <= 64, "UNINSTALL_WORK_AUDIT_LIMIT")?;
     let mut seen = std::collections::HashSet::new();
     let id = work["operationId"].as_str().unwrap();
@@ -240,6 +256,20 @@ pub(super) fn prove_inactive(paths: &lifecycle::Paths, work: &Value) -> Result<(
             .state_dir
             .join(format!("uninstall-work-context-{attempt}.json"));
         let context: Value = work_json(&context_path)?;
+        if !work["failedReconcileProofs"][attempt].is_null() {
+            verify_failed_proof(paths, work, attempt)?;
+            if work["lastAttempt"]["id"] == attempt {
+                require(
+                    work["lastAttempt"]
+                        == work_json::<Value>(
+                            &root.join(format!("inactive-failed-reconcile-{attempt}.json")),
+                        )?["attempt"]
+                        && work["phase"] == "qualified",
+                    "UNINSTALL_WORK_BINDING_CHANGED",
+                )?;
+            }
+            continue;
+        }
         let approval: Value = work_json(&root.join(format!("approval-{attempt}.json")))?;
         let result: Value = work_json(
             &paths
@@ -321,6 +351,13 @@ pub(super) fn prove_inactive(paths: &lifecycle::Paths, work: &Value) -> Result<(
 
 pub(super) fn reconciled_current(paths: &lifecycle::Paths, work: &Value) -> Result<bool> {
     prove_inactive(paths, work)?;
+    if work["lastAttempt"]["id"]
+        .as_str()
+        .is_some_and(|attempt| !work["failedReconcileProofs"][attempt].is_null())
+    {
+        return Ok(false);
+    }
+
     for attempt in work["attemptIds"].as_array().into_iter().flatten() {
         let attempt = attempt.as_str().context("invalid work attempt")?;
         let context: Value = work_json(
@@ -405,6 +442,390 @@ pub(super) fn known_result(paths: &lifecycle::Paths, work: &Value) -> Result<boo
     Ok(true)
 }
 
+const FAILED_RECONCILE_PROOF: &str =
+    "app.loomex.runner.uninstall-work-inactive-failed-reconcile/v1";
+
+/// Failed is a native process result, never a domain completion/no-effects proof.
+/// A missing/uncertain result or PID retains the original release ownership.
+pub(super) fn failed_reconcile_candidate(paths: &lifecycle::Paths, work: &Value) -> Result<bool> {
+    if work["schema"] != OWNER_V2 || work["attempt"]["action"] != "reconcile" {
+        return Ok(false);
+    }
+    valid_owner(work)?;
+    verify_archives(paths, work)?;
+    verify_failed_history(paths, work)?;
+    generation_cleanup::verify_known_resources(paths, work)?;
+    let attempt = work["attempt"]["id"]
+        .as_str()
+        .context("invalid work attempt")?;
+    let result_path = paths
+        .state_dir
+        .join(format!("uninstall-work-result-{attempt}.json"));
+    if !present(&result_path)? {
+        return Ok(false);
+    }
+    let result: Value = work_json(&result_path)?;
+    if result["ok"] != false || result["failureCode"] == "MANAGED_WORK_MIGRATION_CHANGED" {
+        return Ok(false);
+    }
+    exited_attempt_pid(work)?;
+    let context_path = paths
+        .state_dir
+        .join(format!("uninstall-work-context-{attempt}.json"));
+    let context: Value = work_json(&context_path)?;
+    let generation = attempt_release(paths, work, attempt)?;
+    let old_bytes = regular_bytes(&paths.state_dir.join("bootstrap-uninstall.json"))?;
+    let old: Value = serde_json::from_slice(&old_bytes)?;
+    let identity = if old["schema"] == OLD_SCHEMA {
+        prior_identity(paths)?
+    } else {
+        validated_current_identity(&old)?
+    };
+    require(
+        result["schema"] == "app.loomex.runner.uninstall-work-result/v2"
+            && result["failureCode"]
+                .as_str()
+                .is_some_and(|code| !code.is_empty() && code.len() <= 128)
+            && result["error"]["code"]
+                .as_str()
+                .is_some_and(|code| !code.is_empty() && code.len() <= 128)
+            && work["attempt"]["state"] == "running"
+            && context["schema"] == "app.loomex.runner.uninstall-work-context/v2"
+            && context["stateDir"] == json!(paths.state_dir)
+            && context["installBase"] == json!(paths.install_base)
+            && context["launchAgentsDir"] == json!(paths.launch_agents_dir)
+            && context["singletonFd"]
+                .as_i64()
+                .is_some_and(|fd| fd >= 3 && fd <= i64::from(i32::MAX))
+            && work["attemptIds"]
+                .as_array()
+                .is_some_and(|ids| ids.last() == Some(&work["attempt"]["id"]))
+            && digest_file(
+                &PathBuf::from(generation["releasePath"].as_str().unwrap()).join("manifest.json"),
+            )? == generation["releaseManifestSha256"]
+            && context["action"] == "reconcile"
+            && context["expectedAssessmentSha256"].is_null()
+            && work["attempt"]["expectedAssessmentSha256"].is_null()
+            && result["operationId"] == work["operationId"]
+            && result["attemptId"] == attempt
+            && context["maintenanceGeneration"] == work["currentGeneration"]
+            && context["maintenanceGeneration"] == work["attempt"]["maintenanceGeneration"]
+            && result["maintenanceGeneration"] == context["maintenanceGeneration"]
+            && result["releaseManifestSha256"] == generation["releaseManifestSha256"]
+            && work["attempt"]["releaseManifestSha256"] == generation["releaseManifestSha256"]
+            && result["contextSha256"] == digest_file(&context_path)?
+            && result["contextSha256"] == work["attempt"]["contextSha256"]
+            && saved_scope(&context) == saved_scope(&work["attempt"])
+            && state::digest(&old_bytes) == work["journalSha256"]
+            && context["receiptSha256"] == state::json_digest(&old["receipt"])
+            && context["expectedIdentity"] == identity
+            && context["binarySha256"]
+                == digest_file(
+                    &paths
+                        .state_dir
+                        .join(generation["stageName"].as_str().unwrap())
+                        .join("bin/loomex-runner"),
+                )?,
+        "UNINSTALL_WORK_BINDING_CHANGED",
+    )?;
+    inventory(
+        &paths
+            .state_dir
+            .join(generation["stageName"].as_str().unwrap()),
+        generation["files"]
+            .as_array()
+            .context("invalid work inventory")?,
+    )?;
+    // Approval absence is valid only before the request set was published.
+    let requests = paths
+        .state_dir
+        .join(format!("uninstall-work-requests-{attempt}.json"));
+    if !present(&requests)? {
+        let root = paths
+            .state_dir
+            .join("recovery-evidence")
+            .join(work["operationId"].as_str().unwrap());
+        require(
+            !present(&root.join(format!("approval-{attempt}.json")))?,
+            "UNINSTALL_WORK_BINDING_CHANGED",
+        )?;
+        for index in 0..256 {
+            for kind in ["checkpoint", "cache"] {
+                require(
+                    !present(
+                        &paths
+                            .state_dir
+                            .join(format!("uninstall-work-{kind}-{attempt}-{index}.json")),
+                    )?,
+                    "UNINSTALL_WORK_BINDING_CHANGED",
+                )?;
+            }
+        }
+    }
+    verify_failed_artifacts(paths, work, &context, attempt)?;
+    Ok(true)
+}
+
+fn verify_failed_artifacts(
+    paths: &lifecycle::Paths,
+    work: &Value,
+    context: &Value,
+    attempt: &str,
+) -> Result<()> {
+    let root = paths
+        .state_dir
+        .join("recovery-evidence")
+        .join(work["operationId"].as_str().unwrap());
+    let requests_path = paths
+        .state_dir
+        .join(format!("uninstall-work-requests-{attempt}.json"));
+    let request_bytes = if present(&requests_path)? {
+        Some(regular_bytes(&requests_path)?)
+    } else {
+        None
+    };
+    if let Some(bytes) = &request_bytes {
+        let requests: Value = serde_json::from_slice(bytes)?;
+        require(
+            requests["operationId"] == work["operationId"]
+                && requests["attemptId"] == attempt
+                && requests["requests"]
+                    .as_array()
+                    .is_some_and(|requests| requests.len() <= 256),
+            "UNINSTALL_WORK_BINDING_CHANGED",
+        )?;
+        let approval_path = root.join(format!("approval-{attempt}.json"));
+        if present(&approval_path)? {
+            let approval: Value = work_json(&approval_path)?;
+            require(
+                approval["schema"] == "app.loomex.runner.uninstall-work-approval/v1"
+                    && approval["operationId"] == work["operationId"]
+                    && approval["attemptId"] == attempt
+                    && approval["action"] == "reconcile"
+                    && saved_scope(&approval) == saved_scope(context)
+                    && approval["contextSha256"] == work["attempt"]["contextSha256"]
+                    && approval["originalJournalSha256"] == work["journalSha256"]
+                    && approval["releaseManifestSha256"] == context["releaseManifestSha256"]
+                    && approval["expectedAssessmentSha256"].is_null()
+                    && approval["receiptSha256"] == context["receiptSha256"]
+                    && approval["identityReference"]
+                        == state::json_digest(&context["expectedIdentity"])
+                    && approval["requestSetSha256"] == state::digest(bytes),
+                "UNINSTALL_WORK_BINDING_CHANGED",
+            )?;
+        }
+    }
+    for (private, evidence, raw) in [
+        (
+            format!("uninstall-work-requests-{attempt}.json"),
+            format!("requests-{attempt}.json"),
+            false,
+        ),
+        (
+            format!("uninstall-work-authorization-{attempt}.json"),
+            format!("native-authorization-{attempt}.json"),
+            true,
+        ),
+    ] {
+        if present(&root.join(&evidence))? {
+            let bytes = regular_bytes(&paths.state_dir.join(private))?;
+            let expected = if raw {
+                bytes
+            } else {
+                serde_json::to_vec(&audit_projection(&serde_json::from_slice::<Value>(&bytes)?))?
+            };
+            require(
+                regular_bytes(&root.join(evidence))? == expected,
+                "UNINSTALL_WORK_BINDING_CHANGED",
+            )?;
+        }
+    }
+    for index in 0..256 {
+        let record = root.join(format!("record-{attempt}-{index}.json"));
+        if present(&record)? {
+            let value: Value = work_json(
+                &paths
+                    .state_dir
+                    .join(format!("uninstall-work-checkpoint-{attempt}-{index}.json")),
+            )?;
+            require(
+                regular_bytes(&record)? == serde_json::to_vec(&audit_projection(&value))?,
+                "UNINSTALL_WORK_BINDING_CHANGED",
+            )?;
+        }
+        let cache = root.join(format!("cache-approval-{attempt}-{index}.json"));
+        if present(&cache)? {
+            let proof: Value = work_json(&cache)?;
+            require(
+                proof["schema"] == "app.loomex.runner.uninstall-work-cache-approval/v1"
+                    && proof["operationId"] == work["operationId"]
+                    && proof["attemptId"] == attempt
+                    && proof["index"] == index
+                    && proof["privateSha256"]
+                        == digest_file(
+                            &paths
+                                .state_dir
+                                .join(format!("uninstall-work-cache-{attempt}-{index}.json")),
+                        )?
+                    && proof["approvalSha256"]
+                        == digest_file(&root.join(format!("approval-{attempt}.json")))?,
+                "UNINSTALL_WORK_BINDING_CHANGED",
+            )?;
+        }
+    }
+    attempt_audits(paths, work, attempt)?;
+    Ok(())
+}
+
+fn attempt_audits(paths: &lifecycle::Paths, work: &Value, attempt: &str) -> Result<Vec<Value>> {
+    let root = paths
+        .state_dir
+        .join("recovery-evidence")
+        .join(work["operationId"].as_str().context("invalid work owner")?);
+    let mut files = vec![];
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| refusal("UNINSTALL_WORK_BINDING_CHANGED"))?;
+        if name.contains(attempt) && !name.starts_with("inactive-failed-reconcile-") {
+            let hash = digest_file(&entry.path())?;
+            if let Some(encoded) = name.strip_prefix(&format!("resolution-{attempt}-")) {
+                require(
+                    encoded.strip_suffix(".json") == Some(hash.as_str()),
+                    "UNINSTALL_WORK_BINDING_CHANGED",
+                )?;
+            }
+            files.push(json!({"name":name,"sha256":hash}));
+        }
+    }
+    require(files.len() <= 1024, "UNINSTALL_WORK_AUDIT_LIMIT")?;
+    files.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    Ok(files)
+}
+
+/// Called only by the qualified lifecycle owner with the quiescent singleton.
+pub(super) fn settle_failed_reconcile(
+    paths: &lifecycle::Paths,
+    work: &mut Value,
+    old_bytes: &[u8],
+) -> Result<()> {
+    require(
+        failed_reconcile_candidate(paths, work)?,
+        "UNINSTALL_WORK_MAINTENANCE_PENDING",
+    )?;
+    let id = Uuid::parse_str(work["operationId"].as_str().context("invalid work owner")?)?;
+    let old: Value = serde_json::from_slice(old_bytes)?;
+    let fence_digest = old["fenceJournalSha256"]
+        .as_str()
+        .unwrap_or(work["journalSha256"].as_str().unwrap());
+    lifecycle::fence_inactive_failed_reconcile_locked(paths, id, fence_digest)?;
+    let attempt = work["attempt"]["id"].as_str().unwrap().to_owned();
+    let result: Value = work_json(
+        &paths
+            .state_dir
+            .join(format!("uninstall-work-result-{attempt}.json")),
+    )?;
+    audit(paths, work, old_bytes, &result)?;
+    let proof = json!({"schema":FAILED_RECONCILE_PROOF,"operationId":id,"attempt":work["attempt"],"journalSha256":work["journalSha256"],"generation":attempt_release(paths,work,&attempt)?,"resources":generation_cleanup::attempt_resources(paths,&attempt)?,"auditFiles":attempt_audits(paths,work,&attempt)?,"disposition":"inactive_failed_reconcile","remoteOutcome":"unknown"});
+    let bytes = serde_json::to_vec(&proof)?;
+    let root = paths
+        .state_dir
+        .join("recovery-evidence")
+        .join(id.to_string());
+    immutable_copy(
+        &root.join(format!("inactive-failed-reconcile-{attempt}.json")),
+        &bytes,
+    )?;
+    fault("AFTER_WORK_FAILED_RECONCILE_PROOF")?;
+    if work["failedReconcileProofs"].is_null() {
+        work["failedReconcileProofs"] = json!({});
+    }
+    work["failedReconcileProofs"][&attempt] = json!(state::digest(&bytes));
+    work["lastAttempt"] = work["attempt"].take();
+    work["attempt"] = Value::Null;
+    work["phase"] = json!("qualified");
+    save_work(paths, work)?;
+    fault("AFTER_WORK_FAILED_RECONCILE_SETTLEMENT")?;
+    Ok(())
+}
+
+pub(super) fn verify_failed_proof(
+    paths: &lifecycle::Paths,
+    work: &Value,
+    attempt: &str,
+) -> Result<()> {
+    let root = paths
+        .state_dir
+        .join("recovery-evidence")
+        .join(work["operationId"].as_str().context("invalid work owner")?);
+    let proof_bytes =
+        regular_bytes(&root.join(format!("inactive-failed-reconcile-{attempt}.json")))?;
+    let proof: Value = serde_json::from_slice(&proof_bytes)?;
+    require(
+        proof["schema"] == FAILED_RECONCILE_PROOF
+            && proof["operationId"] == work["operationId"]
+            && proof["attempt"]["id"] == attempt
+            && proof["attempt"]["action"] == "reconcile"
+            && proof["attempt"]["state"] == "running"
+            && proof["attempt"]["pid"]
+                .as_i64()
+                .is_some_and(|pid| pid > 1 && pid <= i64::from(i32::MAX))
+            && proof["journalSha256"] == work["journalSha256"]
+            && proof["generation"] == attempt_release(paths, work, attempt)?
+            && proof["disposition"] == "inactive_failed_reconcile"
+            && proof["remoteOutcome"] == "unknown"
+            && work["failedReconcileProofs"][attempt] == state::digest(&proof_bytes)
+            && proof["resources"] == json!(generation_cleanup::attempt_resources(paths, attempt)?)
+            && proof["auditFiles"] == json!(attempt_audits(paths, work, attempt)?),
+        "UNINSTALL_WORK_BINDING_CHANGED",
+    )?;
+    let result: Value = work_json(
+        &paths
+            .state_dir
+            .join(format!("uninstall-work-result-{attempt}.json")),
+    )?;
+    let context_path = paths
+        .state_dir
+        .join(format!("uninstall-work-context-{attempt}.json"));
+    let context: Value = work_json(&context_path)?;
+    require(
+        result["ok"] == false
+            && result["schema"] == "app.loomex.runner.uninstall-work-result/v2"
+            && result["operationId"] == work["operationId"]
+            && result["attemptId"] == attempt
+            && result["contextSha256"] == digest_file(&context_path)?
+            && result["contextSha256"] == proof["attempt"]["contextSha256"]
+            && result["maintenanceGeneration"] == context["maintenanceGeneration"]
+            && result["releaseManifestSha256"] == proof["generation"]["releaseManifestSha256"],
+        "UNINSTALL_WORK_BINDING_CHANGED",
+    )?;
+    Ok(())
+}
+
+fn verify_failed_history(paths: &lifecycle::Paths, work: &Value) -> Result<()> {
+    if let Some(proofs) = work["failedReconcileProofs"].as_object() {
+        require(proofs.len() <= 64, "UNINSTALL_WORK_AUDIT_LIMIT")?;
+        for (attempt, hash) in proofs {
+            require(
+                hash.as_str().is_some_and(valid_work_digest)
+                    && work["attemptIds"]
+                        .as_array()
+                        .is_some_and(|ids| ids.iter().any(|id| id == attempt)),
+                "UNINSTALL_WORK_BINDING_CHANGED",
+            )?;
+            verify_failed_proof(paths, work, attempt)?;
+        }
+    } else {
+        require(
+            work["failedReconcileProofs"].is_null(),
+            "UNINSTALL_WORK_BINDING_CHANGED",
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn candidate_transition(
     paths: &lifecycle::Paths,
     work: &Value,
@@ -412,6 +833,7 @@ pub(super) fn candidate_transition(
     release: Option<&Path>,
 ) -> Result<&'static str> {
     valid_owner(work)?;
+    verify_failed_history(paths, work)?;
     require(
         digest_file(&paths.state_dir.join("bootstrap-uninstall.json"))? == work["journalSha256"],
         "UNINSTALL_WORK_BINDING_CHANGED",
@@ -422,6 +844,16 @@ pub(super) fn candidate_transition(
         });
     if !work["attempt"].is_null() {
         if !same {
+            if failed_reconcile_candidate(paths, work)? {
+                // Observation only. Native work holding the inherited singleton
+                // (including blocked store IO) still pins the old attempt.
+                let _guard = singleton(paths, false)
+                    .map_err(|_| refusal("UNINSTALL_WORK_MAINTENANCE_PENDING"))?;
+                jobs_quiescent(paths)?;
+                let old: Value = work_json(&paths.state_dir.join("bootstrap-uninstall.json"))?;
+                verify_recorded_process_exit(&old)?;
+                return Ok("eligible_successor");
+            }
             require(
                 known_result(paths, work)?,
                 "UNINSTALL_WORK_MAINTENANCE_PENDING",
@@ -543,6 +975,7 @@ pub(super) fn stage(paths: &lifecycle::Paths, work: &Value) -> Result<PathBuf> {
 }
 pub(super) fn verified_stage(paths: &lifecycle::Paths, work: &Value) -> Result<PathBuf> {
     verify_archives(paths, work)?;
+    verify_failed_history(paths, work)?;
     let stage = stage(paths, work)?;
     let generations = records(work)?;
     inventory(

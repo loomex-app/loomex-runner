@@ -624,6 +624,8 @@ fn maintenance_failure(stderr: &[u8]) -> anyhow::Error {
                     | "STORE_INVALID"
                     | "STORE_OWNER_BUSY"
                     | "STORE_UNAVAILABLE"
+                    | "AUTH_REQUIRED"
+                    | "AUTH_EXPIRED"
                     | "AUTH_IDENTITY_CHANGED"
                     | "AUTH_RECONCILIATION_REQUIRED"
                     | "AUTH_RECOVERY_PENDING"
@@ -3442,6 +3444,24 @@ mod tests {
             assert_eq!(projected["failureCategory"], category);
             assert_eq!(projected["nativeOsStatus"], -36);
             assert_eq!(projected["remoteRevocation"], "not_dispatched");
+        }
+    }
+    #[test]
+    fn maintenance_auth_failures_preserve_conservative_outcomes_and_correlations() {
+        for code in ["AUTH_REQUIRED", "AUTH_EXPIRED"] {
+            let mut envelope = state::safe_error(code, false);
+            assert_eq!(envelope["outcome"], "unknown");
+            assert_eq!(envelope["recovery"], "reconcile_outcome");
+            let correlation = envelope["correlationId"].clone();
+            envelope["message"] = json!("PRIVATE AUTH TEXT");
+            envelope["error"] = json!({"token":"PRIVATE"});
+            let output = maintenance_failure(&serde_json::to_vec(&envelope).unwrap()).to_string();
+            let projected: Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(projected["code"], code);
+            assert_eq!(projected["outcome"], "unknown");
+            assert_eq!(projected["recovery"], "reconcile_outcome");
+            assert_eq!(projected["correlationId"], correlation);
+            assert!(!output.contains("PRIVATE"));
         }
     }
     #[test]
