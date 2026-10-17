@@ -645,9 +645,219 @@ fn bounded_owner_reference(v: &Value) -> Result<Option<Value>> {
     let adoption = v["adoptionStarted"]
         .as_bool()
         .context("owner adoption missing")?;
+    let operation = if schema == "app.loomex.runner.bootstrap-uninstall/v2" {
+        work_operation_id(&v["operationId"])?
+    } else {
+        None
+    };
     Ok(Some(
-        serde_json::json!({"owner":"bootstrap_uninstall","journalSchema":schema,"journalSha256":sha,"phase":phase,"adoptionStarted":adoption}),
+        serde_json::json!({"owner":"bootstrap_uninstall","journalSchema":schema,"journalSha256":sha,"phase":phase,"adoptionStarted":adoption,"operationId":operation}),
     ))
+}
+fn bounded_maintenance_reference(value: &Value) -> Result<Option<Value>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    ensure!(
+        value["schema"] == "app.loomex.runner.uninstall-work-reference/v1",
+        "unsupported maintenance reference schema"
+    );
+    let operation =
+        work_operation_id(&value["operationId"])?.context("maintenance operation missing")?;
+    let attempt = work_operation_id(
+        value
+            .get("attemptId")
+            .context("maintenance attempt missing")?,
+    )?;
+    let generation = value["generation"]
+        .as_u64()
+        .context("maintenance generation missing")?;
+    let diagnostic_only = matches!(
+        value["transition"].as_str(),
+        Some("blocked" | "unsupported")
+    );
+    for field in [
+        "ownerSha256",
+        "journalSha256",
+        "releaseManifestSha256",
+        "candidateManifestSha256",
+        "releasePathSha256",
+        "candidateReleasePathSha256",
+    ] {
+        ensure!(
+            value[field].as_str().is_some_and(|s| hex_string(s, 64))
+                || (diagnostic_only
+                    && matches!(
+                        field,
+                        "releaseManifestSha256"
+                            | "candidateManifestSha256"
+                            | "releasePathSha256"
+                            | "candidateReleasePathSha256"
+                    )
+                    && value[field].is_null()),
+            "invalid maintenance binding"
+        );
+    }
+    ensure!(
+        matches!(
+            value["phase"].as_str(),
+            Some("qualified" | "settled" | "review_required")
+        ) || (diagnostic_only && value["phase"].is_null()),
+        "unsupported maintenance phase"
+    );
+    ensure!(
+        matches!(
+            value["transition"].as_str(),
+            Some(
+                "current_release"
+                    | "eligible_successor"
+                    | "resume_original_attempt"
+                    | "review_required"
+                    | "blocked"
+                    | "unsupported"
+            )
+        ),
+        "unsupported maintenance transition"
+    );
+    Ok(Some(
+        serde_json::json!({"schema":"app.loomex.runner.uninstall-work-reference/v1","operationId":operation,"attemptId":attempt,"generation":generation,"ownerSha256":value["ownerSha256"],"journalSha256":value["journalSha256"],"releaseManifestSha256":value["releaseManifestSha256"],"candidateManifestSha256":value["candidateManifestSha256"],"releasePathSha256":value["releasePathSha256"],"candidateReleasePathSha256":value["candidateReleasePathSha256"],"phase":value["phase"],"transition":value["transition"]}),
+    ))
+}
+fn bounded_native_diagnostic(value: &Value) -> Option<Value> {
+    let code = value["code"].as_str().filter(|s| {
+        matches!(
+            *s,
+            "STORE_ACCESS_REQUIRED"
+                | "STORE_ACCESS_DENIED"
+                | "STORE_OPERATION_PENDING"
+                | "STORE_INVALID"
+                | "STORE_OWNER_BUSY"
+                | "STORE_UNAVAILABLE"
+                | "AUTH_IDENTITY_CHANGED"
+                | "AUTH_RECONCILIATION_REQUIRED"
+                | "AUTH_RECOVERY_PENDING"
+                | "AUTH_LOGOUT_FAILED"
+                | "INVALID_API_ORIGIN"
+                | "DAEMON_ALREADY_RUNNING"
+        )
+    })?;
+    let stage = value["failureStage"].as_str().filter(|s| {
+        matches!(
+            *s,
+            "identity_probe"
+                | "credential_owner"
+                | "operation_admission"
+                | "protected_store_read"
+                | "logout_intent"
+                | "remote_revocation"
+                | "identity_verification"
+                | "revocation_evidence"
+                | "protected_store_clear"
+                | "protected_store_delete"
+                | "authority_reconciliation"
+                | "credential_store"
+                | "maintenance_daemon"
+        )
+    });
+    let category = value["failureCategory"].as_str().filter(|s| {
+        matches!(
+            *s,
+            "access_required"
+                | "access_denied"
+                | "native_operation_pending"
+                | "invalid_store"
+                | "owner_busy"
+                | "identity_mismatch"
+                | "unresolved_authority"
+                | "operation_busy"
+                | "remote_unconfirmed"
+                | "native_os_error"
+                | "native_io_timeout"
+                | "native_worker_failed"
+                | "serialization_timeout"
+                | "unavailable"
+        )
+    });
+    Some(
+        serde_json::json!({"code":code,"failureStage":stage,"failureCategory":category,"nativeOsStatus":value["nativeOsStatus"].as_i64().and_then(|n|i32::try_from(n).ok())}),
+    )
+}
+fn require_maintenance_continuity(
+    before: Option<&Value>,
+    after: Option<&Value>,
+    operation: Option<&str>,
+    action: &str,
+    successor_after_original_result: bool,
+) -> Result<()> {
+    let Some(after) = after else {
+        ensure!(before.is_none(), "maintenance reference disappeared");
+        return Ok(());
+    };
+    ensure!(
+        operation.is_none() || operation == after["operationId"].as_str(),
+        "maintenance operation differs from report"
+    );
+    let Some(before) = before else {
+        return Ok(());
+    };
+    for field in [
+        "operationId",
+        "journalSha256",
+        "candidateManifestSha256",
+        "candidateReleasePathSha256",
+    ] {
+        ensure!(before[field] == after[field], "maintenance binding changed");
+    }
+    let settled_successor =
+        before["transition"] == "eligible_successor" && before["attemptId"].is_null();
+    let original_result_successor = successor_after_original_result
+        && before["transition"] == "resume_original_attempt"
+        && before["attemptId"].is_string()
+        && before["attemptId"] != after["attemptId"];
+    let successor = (settled_successor || original_result_successor)
+        && action == "reconcile"
+        && before["generation"] != after["generation"];
+    if successor {
+        ensure!(
+            (before["releaseManifestSha256"] != before["candidateManifestSha256"]
+                || before["releasePathSha256"] != before["candidateReleasePathSha256"])
+                && after["releaseManifestSha256"] == before["candidateManifestSha256"]
+                && after["releasePathSha256"] == before["candidateReleasePathSha256"]
+                && before["generation"].as_u64().and_then(|g| g.checked_add(1))
+                    == after["generation"].as_u64()
+                && matches!(
+                    after["transition"].as_str(),
+                    Some("current_release" | "resume_original_attempt" | "review_required")
+                ),
+            "unverified successor generation"
+        );
+    } else {
+        for field in [
+            "generation",
+            "releaseManifestSha256",
+            "releasePathSha256",
+            "operationId",
+        ] {
+            ensure!(before[field] == after[field], "maintenance owner changed");
+        }
+        if action == "inspect" {
+            for field in ["ownerSha256", "phase", "attemptId"] {
+                ensure!(
+                    before[field] == after[field],
+                    "inspection maintenance owner changed"
+                );
+            }
+        }
+        if before["transition"] == "resume_original_attempt" {
+            ensure!(
+                before["attemptId"] == after["attemptId"]
+                    || (after["attemptId"].is_null()
+                        && matches!(after["phase"].as_str(), Some("settled" | "review_required"))),
+                "maintenance attempt changed"
+            );
+        }
+    }
+    Ok(())
 }
 fn bounded_assessment(v: &Value) -> Result<Option<Value>> {
     if v.is_null() {
@@ -926,6 +1136,10 @@ fn retain_diagnostics(value: &Value, completion: &mut Completion) -> Result<()> 
             .as_ref()
             .map(|assessment| assessment["resolved"] == true);
     }
+    if let Some(reference) = value.get("maintenanceReference") {
+        completion.maintenance_reference = bounded_maintenance_reference(reference)?;
+    }
+    completion.native_diagnostic = bounded_native_diagnostic(&value["nativeDiagnostic"]);
     if let Some(preview) = value.get("preview") {
         completion.preview = bounded_work_preview(preview)?;
     }
@@ -959,6 +1173,16 @@ fn owner_preflight(
         out.status.success() && value["artifact"]["eligible"] == true && eligible,
         "ineligible owner preflight response"
     );
+    if work_mode && !value["maintenanceReference"].is_null() {
+        let candidate = value["artifact"]["manifestSha256"]
+            .as_str()
+            .context("native maintenance artifact binding missing")?;
+        ensure!(
+            hex_string(candidate, 64)
+                && value["maintenanceReference"]["candidateManifestSha256"] == candidate,
+            "native maintenance artifact binding differs"
+        );
+    }
     Ok(value)
 }
 fn preflight_owners(
@@ -1011,6 +1235,8 @@ struct Completion {
     host_registration: &'static str,
     guidance: Option<String>,
     owner_reference: Option<Value>,
+    maintenance_reference: Option<Value>,
+    native_diagnostic: Option<Value>,
     assessment: Option<Value>,
     retirement_scope: Option<String>,
     action_completed: Option<bool>,
@@ -1020,7 +1246,7 @@ struct Completion {
 impl Default for Completion {
     fn default() -> Self {
         Self {
-            schema: "app.loomex.paired-install-result/v3",
+            schema: "app.loomex.paired-install-result/v4",
             phase: "artifact-verification",
             outcome: "blocked",
             operation_id: None,
@@ -1031,6 +1257,8 @@ impl Default for Completion {
             host_registration: "not-attempted",
             guidance: None,
             owner_reference: None,
+            maintenance_reference: None,
+            native_diagnostic: None,
             assessment: None,
             retirement_scope: None,
             action_completed: None,
@@ -1042,7 +1270,7 @@ impl Default for Completion {
 fn failure_report(c: &Completion) -> Value {
     let message = match c.phase {
         "runner-preflight" => {
-            "Runner installed eligibility was rejected by the native lifecycle owner. Inspect its preflight result and retry this exact release set."
+            "Runner eligibility requires the indicated native owner action. Inspect retained uninstall work, reconcile with the reviewed release when eligible, then review a fresh assessment before retirement."
         }
         "plugin-preflight" => {
             "Plugin installed eligibility was rejected by the plugin lifecycle owner. Inspect its preflight result and retry this exact release set."
@@ -1051,7 +1279,7 @@ fn failure_report(c: &Completion) -> Value {
             "Runner activation or recovery is unconfirmed. Resolve the native lifecycle owner before retrying this exact release set."
         }
         "runner-uninstall-work" => {
-            "Retained uninstall work requires its verified native maintenance owner. Review the bounded assessment and retry the same release and journal binding."
+            "Retained uninstall work requires the indicated native maintenance action. Inspect and reconcile with the reviewed release; review a fresh assessment before authorizing retirement. Resume an active original attempt with its original release."
         }
         "plugin-activation" => {
             "Plugin installation is incomplete; the healthy runner remains installed. Retry this exact release set to resume the plugin owner."
@@ -1065,6 +1293,9 @@ fn failure_report(c: &Completion) -> Value {
         "namespace-preflight" => {
             "Paired install bases overlap another owner's installed or state namespace. Select distinct bases outside the other owner's managed paths."
         }
+        "cache-locator-preflight" => {
+            "Artifact cache locator is not canonical. Use a canonical absolute --cache-dir without dot components, redundant separators, or symlink ancestors."
+        }
         "cache-persistence" => {
             "Verified artifact cache could not be retained. Retry this exact release set after resolving the cache issue."
         }
@@ -1072,7 +1303,7 @@ fn failure_report(c: &Completion) -> Value {
             "Release-set verification failed. Review the exact artifacts and invocation before retrying."
         }
     };
-    serde_json::json!({"schema":c.schema,"ok":false,"outcome":c.outcome,"operationId":c.operation_id,"nextAction":c.next_action,"reasonCode":c.reason_code,"ownerReference":c.owner_reference,"assessment":c.assessment,"retirementScope":c.retirement_scope,"actionCompleted":c.action_completed,"cleanupEligible":c.cleanup_eligible,"preview":c.preview,"category":"PAIRED_INSTALL_REJECTED","phase":c.phase,"completion":c,"message":message})
+    serde_json::json!({"schema":c.schema,"ok":false,"outcome":c.outcome,"operationId":c.operation_id,"nextAction":c.next_action,"reasonCode":c.reason_code,"ownerReference":c.owner_reference,"maintenanceReference":c.maintenance_reference,"nativeDiagnostic":c.native_diagnostic,"assessment":c.assessment,"retirementScope":c.retirement_scope,"actionCompleted":c.action_completed,"cleanupEligible":c.cleanup_eligible,"preview":c.preview,"category":"PAIRED_INSTALL_REJECTED","phase":c.phase,"completion":c,"message":message})
 }
 fn valid_operation_id(id: &str) -> bool {
     !id.is_empty()
@@ -1191,8 +1422,13 @@ fn uninstall_work_result(
     let value: Value =
         serde_json::from_slice(&out.stdout).context("unsupported uninstall work response")?;
     ensure!(
-        value["schema"] == "app.loomex.runner.bootstrap-uninstall-work/v1"
-            && value["action"] == action,
+        matches!(
+            value["schema"].as_str(),
+            Some(
+                "app.loomex.runner.bootstrap-uninstall-work/v1"
+                    | "app.loomex.runner.bootstrap-uninstall-work/v2"
+            )
+        ) && value["action"] == action,
         "unsupported uninstall work schema or action"
     );
     require_work_scope(&value, scope)?;
@@ -1251,6 +1487,56 @@ fn uninstall_work_result(
             .get("operationId")
             .context("uninstall work operation missing")?,
     )?;
+    let maintenance = bounded_maintenance_reference(&value["maintenanceReference"])?;
+    let prior_maintenance = bounded_maintenance_reference(&preflight["maintenanceReference"])?;
+    if value["schema"] == "app.loomex.runner.bootstrap-uninstall-work/v1" {
+        ensure!(
+            maintenance.is_none() && prior_maintenance.is_none(),
+            "legacy work report cannot authorize maintenance handover"
+        );
+    }
+    if value["schema"] == "app.loomex.runner.bootstrap-uninstall-work/v2"
+        && !rejected
+        && action != "inspect"
+    {
+        ensure!(
+            maintenance.is_some(),
+            "native maintenance reference missing"
+        );
+    }
+    if let Some(maintenance) = &maintenance {
+        if let Some(reference) = &reference {
+            ensure!(
+                maintenance["journalSha256"] == reference["journalSha256"],
+                "maintenance journal differs from bootstrap owner"
+            );
+        }
+        if let Some(candidate) = preflight["artifact"]["manifestSha256"].as_str() {
+            ensure!(
+                maintenance["candidateManifestSha256"] == candidate,
+                "maintenance candidate differs from preflight"
+            );
+        }
+    }
+    require_maintenance_continuity(
+        prior_maintenance.as_ref(),
+        maintenance.as_ref(),
+        operation.as_deref(),
+        action,
+        preflight["uninstallWorkEligibility"]["eligible"] == true
+            && preflight["uninstallWorkEligibility"]["successorAfterOriginalResult"] == true,
+    )?;
+    if !rejected && action != "inspect" {
+        ensure!(
+            maintenance.as_ref().is_none_or(|m| !matches!(
+                m["transition"].as_str(),
+                Some("blocked" | "unsupported")
+            )),
+            "diagnostic maintenance reference cannot authorize work"
+        );
+    }
+    completion.maintenance_reference = maintenance;
+    completion.native_diagnostic = bounded_native_diagnostic(&value["nativeDiagnostic"]);
     if let Some(reference) = &reference {
         let expected = bounded_owner_reference(&preflight["ownerReference"])?
             .context("uninstall work preflight owner missing")?;
@@ -1339,7 +1625,7 @@ fn uninstall_work_result(
 }
 
 fn result_report(c: &Completion) -> Value {
-    serde_json::json!({"schema":c.schema,"ok":c.outcome == "completed","outcome":c.outcome,"operationId":c.operation_id,"nextAction":c.next_action,"reasonCode":c.reason_code,"ownerReference":c.owner_reference,"assessment":c.assessment,"retirementScope":c.retirement_scope,"actionCompleted":c.action_completed,"cleanupEligible":c.cleanup_eligible,"preview":c.preview,"phase":c.phase,"completion":c})
+    serde_json::json!({"schema":c.schema,"ok":c.outcome == "completed","outcome":c.outcome,"operationId":c.operation_id,"nextAction":c.next_action,"reasonCode":c.reason_code,"ownerReference":c.owner_reference,"maintenanceReference":c.maintenance_reference,"nativeDiagnostic":c.native_diagnostic,"assessment":c.assessment,"retirementScope":c.retirement_scope,"actionCompleted":c.action_completed,"cleanupEligible":c.cleanup_eligible,"preview":c.preview,"phase":c.phase,"completion":c})
 }
 // Resolve existing aliases component by component while retaining normalized
 // missing suffixes. This reads metadata only and never creates an install root.
@@ -1465,17 +1751,50 @@ fn validate_install_namespaces(runner: &Path, plugin: &Path, runner_state: &Path
     }
     Ok(())
 }
+// Cache locators are immutable native release bindings. Reject aliases instead
+// of normalizing them after a preflight has published a different locator hash.
+fn validate_cache_locator(path: &Path) -> Result<()> {
+    const GUIDANCE: &str =
+        "use a canonical absolute --cache-dir without dot components or redundant separators";
+    ensure!(path.is_absolute(), GUIDANCE);
+    let mut lexical = PathBuf::new();
+    for component in path.components() {
+        match component {
+            PathComponent::RootDir | PathComponent::Normal(_) => {
+                lexical.push(component.as_os_str())
+            }
+            _ => bail!(GUIDANCE),
+        }
+    }
+    ensure!(lexical.as_os_str() == path.as_os_str(), GUIDANCE);
+    let mut nearest_existing = None;
+    for ancestor in path.ancestors() {
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) => {
+                ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "artifact cache ancestor symlink forbidden; use a canonical absolute --cache-dir"
+                );
+                if nearest_existing.is_none() {
+                    nearest_existing = Some(ancestor);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if let Some(existing) = nearest_existing {
+        ensure!(
+            fs::canonicalize(existing)?.as_os_str() == existing.as_os_str(),
+            GUIDANCE
+        );
+    }
+    Ok(())
+}
 // Existing complete cache bytes may carry a pending owner's exact release-path binding.
 // Reading it must not repair, chmod, create, or remove any entry.
 fn preflight_root<'a>(stage: &'a Path, cache: &'a Path) -> Result<&'a Path> {
-    for ancestor in cache.ancestors() {
-        if fs::symlink_metadata(ancestor).is_ok() {
-            ensure!(
-                !fs::symlink_metadata(ancestor)?.file_type().is_symlink(),
-                "artifact cache ancestor symlink forbidden"
-            );
-        }
-    }
+    validate_cache_locator(cache)?;
     if !cache.exists() {
         return Ok(stage);
     }
@@ -1568,15 +1887,7 @@ fn directory_inventory_impl(
     Ok(out)
 }
 fn persist_cache(stage: &Path, cache: &Path) -> Result<()> {
-    ensure!(cache.is_absolute(), "artifact cache must be absolute");
-    for ancestor in cache.ancestors() {
-        if ancestor.exists() {
-            ensure!(
-                !fs::symlink_metadata(ancestor)?.file_type().is_symlink(),
-                "artifact cache ancestor symlink forbidden"
-            );
-        }
-    }
+    validate_cache_locator(cache)?;
     let expected = directory_inventory(stage)?;
     let parent = cache.parent().context("cache parent unavailable")?;
     fs::create_dir_all(parent)?;
@@ -1955,15 +2266,16 @@ fn install(completion: &mut Completion) -> Result<()> {
     if verify_only {
         println!(
             "{}",
-            serde_json::json!({"schema":"app.loomex.paired-install-result/v3","ok":true,"outcome":"completed","operationId":null,"nextAction":"none","reasonCode":"ARTIFACT_VERIFIED","mode":"verify-only","artifactIntegrity":true,"installedEligibilityVerified":false})
+            serde_json::json!({"schema":"app.loomex.paired-install-result/v4","ok":true,"outcome":"completed","operationId":null,"nextAction":"none","reasonCode":"ARTIFACT_VERIFIED","mode":"verify-only","artifactIntegrity":true,"installedEligibilityVerified":false})
         );
         return Ok(());
     }
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME unavailable")?);
     ensure!(home.is_absolute(), "HOME must be absolute");
-    let cache = cache
-        .unwrap_or_else(|| home.join("Library/Caches/Loomex/release-sets"))
-        .join(&expected);
+    let cache_base = cache.unwrap_or_else(|| home.join("Library/Caches/Loomex/release-sets"));
+    completion.phase = "cache-locator-preflight";
+    validate_cache_locator(&cache_base)?;
+    let cache = cache_base.join(&expected);
     let mut plugin_base = home.join("Library/Application Support/Loomex/plugin");
     let mut runner_base = home.join("Library/Application Support/Loomex/runner");
     let mut runner_args = vec![
@@ -2086,6 +2398,12 @@ fn install(completion: &mut Completion) -> Result<()> {
     if uninstall_work.is_some() {
         completion.phase = "runner-preflight";
         require_work_scope(&native, retirement_scope)?;
+        if !native["maintenanceReference"].is_null() {
+            ensure!(
+                native["artifact"]["manifestSha256"] == s.components.runner.manifest_sha256,
+                "native maintenance artifact differs from release set"
+            );
+        }
     }
     if uninstall_work.is_some() && authorize_keychain_transition {
         completion.phase = "runner-preflight";
@@ -2173,7 +2491,7 @@ fn install(completion: &mut Completion) -> Result<()> {
         .into();
         println!(
             "{}",
-            serde_json::json!({"schema":completion.schema,"ok":!restore_required,"outcome":completion.outcome,"operationId":completion.operation_id,"nextAction":completion.next_action,"reasonCode":completion.reason_code,"mode":"preflight-only","artifactIntegrity":true,"installedEligibilityVerified":true,"runnerOnly":runner_only,"hostRegistrationVerified":false})
+            serde_json::json!({"schema":completion.schema,"ok":!restore_required,"outcome":completion.outcome,"operationId":completion.operation_id,"nextAction":completion.next_action,"reasonCode":completion.reason_code,"maintenanceReference":completion.maintenance_reference,"ownerReference":completion.owner_reference,"nativeDiagnostic":completion.native_diagnostic,"mode":"preflight-only","artifactIntegrity":true,"installedEligibilityVerified":true,"runnerOnly":runner_only,"hostRegistrationVerified":false})
         );
         return Ok(());
     }
@@ -2343,6 +2661,30 @@ mod tests {
         }
     }
     #[test]
+    fn maintenance_diagnostics_and_inspection_operation_are_bounded() {
+        let reference = serde_json::json!({"schema":"app.loomex.runner.uninstall-work-reference/v1","operationId":"11111111-1111-4111-8111-111111111111","attemptId":null,"generation":0,"ownerSha256":"a".repeat(64),"journalSha256":"b".repeat(64),"releaseManifestSha256":"c".repeat(64),"candidateManifestSha256":"c".repeat(64),"releasePathSha256":"d".repeat(64),"candidateReleasePathSha256":"d".repeat(64),"phase":"settled","transition":"current_release","private":"SECRET"});
+        let safe = bounded_maintenance_reference(&reference).unwrap().unwrap();
+        assert!(!safe.to_string().contains("SECRET"));
+        assert!(
+            require_maintenance_continuity(
+                Some(&safe),
+                Some(&safe),
+                Some("22222222-2222-4222-8222-222222222222"),
+                "inspect",
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            require_maintenance_continuity(Some(&safe), Some(&safe), None, "inspect", false)
+                .is_ok()
+        );
+        let diagnostic = bounded_native_diagnostic(&serde_json::json!({"code":"STORE_ACCESS_DENIED","failureStage":"SECRET","failureCategory":"SECRET","private":"SECRET"})).unwrap();
+        assert_eq!(diagnostic["code"], "STORE_ACCESS_DENIED");
+        assert!(diagnostic["failureStage"].is_null() && diagnostic["failureCategory"].is_null());
+        assert!(!diagnostic.to_string().contains("SECRET"));
+    }
+    #[test]
     fn bounded_diagnostics_preserve_historical_reference_without_fabricating_operation() {
         let value = serde_json::json!({"reasonCode":"MANAGED_WORK_UNRESOLVED","nextAction":"reconcile_managed_work","operationId":null,"ownerReference":{"owner":"bootstrap_uninstall","journalSchema":"app.loomex.runner.bootstrap-uninstall/v1","journalSha256":"a".repeat(64),"phase":"prepared","adoptionStarted":false,"secret":"SECRET"},"assessment":{"schema":"app.loomex.runner.managed-state-assessment/v1","assessmentDigest":"b".repeat(64),"resolved":false,"blockers":[{"category":"presentation_delivery_pending","count":13,"references":["c".repeat(64)],"secret":"SECRET"},{"category":"follow_pending","count":14,"references":[]}]}});
         let mut completion = Completion::default();
@@ -2355,6 +2697,7 @@ mod tests {
         )
         .unwrap();
         assert!(completion.owner_reference.is_some());
+        assert!(completion.owner_reference.as_ref().unwrap()["operationId"].is_null());
         assert!(completion.assessment.is_some());
         let public = serde_json::to_string(&failure_report(&completion)).unwrap();
         assert!(!public.contains("SECRET"));
@@ -2544,6 +2887,24 @@ mod tests {
             );
             assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
         }
+    }
+    #[test]
+    fn cache_locator_rejects_lexical_and_symlink_aliases_without_writes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temporary.path()).unwrap();
+        let canonical = root.join("cache");
+        assert!(validate_cache_locator(&canonical).is_ok());
+        for suffix in ["./cache", "missing/../cache", "cache/", "cache//nested"] {
+            assert!(
+                validate_cache_locator(&PathBuf::from(format!("{}/{suffix}", root.display())))
+                    .is_err()
+            );
+        }
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        std::os::unix::fs::symlink(&root, root.join("alias")).unwrap();
+        assert!(validate_cache_locator(&root.join("alias/cache")).is_err());
+        assert!(validate_cache_locator(&root.join("alias/../cache")).is_err());
+        assert!(!canonical.exists());
     }
     #[test]
     fn cache_preflight_reads_complete_exact_cache_without_repair() {

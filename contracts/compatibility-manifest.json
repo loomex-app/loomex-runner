@@ -119,6 +119,7 @@
     "recovery.coordination/v1",
     "transfer.chunked/v1",
     "transfer.response-utf8/v1",
+    "uninstall-work.generations/v1",
     "workflow.queue-observation/v1",
     "workflows.atomic-draft-create/v1",
     "workflows.canonical-authoring-contract/v1",
@@ -132,7 +133,7 @@
       "path": "contracts/backend-routes.json"
     },
     "methodCatalog": {
-      "digest": "sha256:382ac50d0724e61e838c9ed75321b93672b721d565da578e2f34504dd369f33d",
+      "digest": "sha256:ce4485d614ab755098371d3876b9db00eea9d5a0411898b28d01f66fc03afa85",
       "path": "contracts/method-catalog.json"
     }
   },
@@ -1719,7 +1720,7 @@
   "schemaVersion": "loomex.runner.compatibility-manifest/v1",
   "summary": {
     "backendRouteCount": 76,
-    "capabilityCount": 124,
+    "capabilityCount": 125,
     "methodClassifications": {
       "backend-auth": 7,
       "backend-proxy": 55,

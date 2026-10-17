@@ -10,6 +10,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -84,7 +85,9 @@ class ContinuationContractTests(unittest.TestCase):
         self.assertEqual(len(self.schemas), 3)
         self.assertTrue(all(schema == self.schemas[NAMES[0]] for schema in self.schemas.values()))
         pin = json.loads((PLUGIN / "contracts/contract-pin.json").read_text())
-        self.assertEqual(pin["version"], "1.2.9")
+        version = re.search(r'^version = "([^"]+)"$', (ROOT / "Cargo.toml").read_text(), re.MULTILINE)
+        self.assertIsNotNone(version)
+        self.assertEqual(pin["version"], version.group(1))
         for filename in ("method-catalog.json", "compatibility-manifest.json"):
             self.assertEqual((ROOT / "contracts" / filename).read_bytes(), (PLUGIN / "contracts" / filename).read_bytes())
         for filename, expected in pin["files"].items():

@@ -125,6 +125,10 @@ const PENDING_UPDATE_RETIREMENT_SCHEMA: &str = "app.loomex.runner.lifecycle-oper
 const UNINSTALL_FENCE_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v8";
 const UNINSTALL_WORK_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v10";
 const OPERATION_OBSERVATION_WORK_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v11";
+// Generation owners cannot be interpreted by controllers that only understand
+// a single release-bound maintenance attempt. The v12 retirement envelope stays
+// unchanged when retained denial evidence is present.
+pub const GENERATION_UNINSTALL_WORK_SCHEMA: &str = "app.loomex.runner.lifecycle-operation/v13";
 const LOCK_NAME: &str = "lifecycle.lock";
 const OPERATION_NAME: &str = "lifecycle-operation.json";
 const NATIVE_EXECUTABLES: &[&str] = &["/bin/launchctl"];
@@ -477,7 +481,10 @@ impl Operation {
         );
         if matches!(
             self.schema.as_str(),
-            UNINSTALL_FENCE_SCHEMA | UNINSTALL_WORK_SCHEMA | OPERATION_OBSERVATION_WORK_SCHEMA
+            UNINSTALL_FENCE_SCHEMA
+                | UNINSTALL_WORK_SCHEMA
+                | OPERATION_OBSERVATION_WORK_SCHEMA
+                | GENERATION_UNINSTALL_WORK_SCHEMA
         ) {
             let fence = self
                 .uninstall_fence
@@ -488,7 +495,9 @@ impl Operation {
                     && ((self.schema == UNINSTALL_FENCE_SCHEMA && self.phase == "bootstrap_owned")
                         || (matches!(
                             self.schema.as_str(),
-                            UNINSTALL_WORK_SCHEMA | OPERATION_OBSERVATION_WORK_SCHEMA
+                            UNINSTALL_WORK_SCHEMA
+                                | OPERATION_OBSERVATION_WORK_SCHEMA
+                                | GENERATION_UNINSTALL_WORK_SCHEMA
                         ) && self.phase == "work_maintenance"))
                     && self.package.is_none()
                     && self.previous_target.is_none()
@@ -2599,7 +2608,10 @@ pub fn begin_uninstall_fence_locked(paths: &Paths, id: Uuid, journal_sha256: &st
 pub fn begin_uninstall_work_locked(paths: &Paths, id: Uuid, digest: &str) -> Result<()> {
     begin_uninstall_fence_locked(paths, id, digest)?;
     let mut operation: Operation = state::read_json(&paths.operation())?;
-    if operation.schema != OPERATION_OBSERVATION_WORK_SCHEMA {
+    if !matches!(
+        operation.schema.as_str(),
+        OPERATION_OBSERVATION_WORK_SCHEMA | GENERATION_UNINSTALL_WORK_SCHEMA
+    ) {
         operation.schema = UNINSTALL_WORK_SCHEMA.into();
     }
     operation.phase = "work_maintenance".into();
@@ -2615,7 +2627,22 @@ pub fn fence_operation_observation_work_locked(paths: &Paths, id: Uuid) -> Resul
         operation.id == id && operation.phase == "work_maintenance",
         "LIFECYCLE_OPERATION_PENDING"
     );
-    operation.schema = OPERATION_OBSERVATION_WORK_SCHEMA.into();
+    if operation.schema != GENERATION_UNINSTALL_WORK_SCHEMA {
+        operation.schema = OPERATION_OBSERVATION_WORK_SCHEMA.into();
+    }
+    save_operation(paths, &operation)
+}
+
+/// Caller holds LifecycleLock and has verified the existing owner before an
+/// atomic generation transition. Repeated maintenance entry preserves v13.
+pub fn adopt_uninstall_work_generation_locked(
+    paths: &Paths,
+    id: Uuid,
+    journal_sha256: &str,
+) -> Result<()> {
+    begin_uninstall_work_locked(paths, id, journal_sha256)?;
+    let mut operation: Operation = state::read_json(&paths.operation())?;
+    operation.schema = GENERATION_UNINSTALL_WORK_SCHEMA.into();
     save_operation(paths, &operation)
 }
 
@@ -2628,16 +2655,28 @@ pub fn require_operation_observation_capability(paths: &Paths, target: &Path) ->
         evidence || !previous.as_ref().is_some_and(|old| old.minimum_reader),
         "OPERATION_RETIREMENT_EVIDENCE_REQUIRED"
     );
-    if !evidence {
+    let generation_owner = read_optional::<Value>(&paths.state_dir.join("uninstall-work.json"))?
+        .is_some_and(|owner| owner["schema"] == "app.loomex.runner.uninstall-work/v2");
+    if !evidence && !generation_owner {
         return Ok(());
     }
     let manifest: Value = state::read_json(&target.join("metadata/compatibility-manifest.json"))?;
     ensure!(
-        manifest["capabilities"]
-            .as_array()
-            .is_some_and(|values| values
-                .iter()
-                .any(|value| value == "operation-cache.retirement-fence/v1")),
+        !generation_owner
+            || manifest["capabilities"]
+                .as_array()
+                .is_some_and(|values| values
+                    .iter()
+                    .any(|value| value == "uninstall-work.generations/v1")),
+        "UNINSTALL_WORK_GENERATION_CAPABILITY_REQUIRED"
+    );
+    ensure!(
+        !evidence
+            || manifest["capabilities"]
+                .as_array()
+                .is_some_and(|values| values
+                    .iter()
+                    .any(|value| value == "operation-cache.retirement-fence/v1")),
         "OPERATION_RETIREMENT_CAPABILITY_REQUIRED"
     );
     Ok(())
@@ -7312,6 +7351,99 @@ mod tests {
             state::read_json::<Value>(&paths.operation()).unwrap()["schema"],
             OPERATION_RETIREMENT_READER_SCHEMA
         );
+    }
+
+    #[test]
+    fn generation_maintenance_preserves_v13_and_outer_retirement_envelope() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        let id = Uuid::new_v4();
+        let digest = "a".repeat(64);
+        adopt_uninstall_work_generation_locked(&paths, id, &digest).unwrap();
+        for _ in 0..3 {
+            begin_uninstall_work_locked(&paths, id, &digest).unwrap();
+            fence_operation_observation_work_locked(&paths, id).unwrap();
+            adopt_uninstall_work_generation_locked(&paths, id, &digest).unwrap();
+            let raw: Value = state::read_json(&paths.operation()).unwrap();
+            assert_eq!(raw["schema"], GENERATION_UNINSTALL_WORK_SCHEMA);
+            let operation: Operation = serde_json::from_value(raw).unwrap();
+            operation.validate().unwrap();
+            // Frozen pre-generation lifecycle validators accept v10/v11 only.
+            assert!(
+                ![UNINSTALL_WORK_SCHEMA, OPERATION_OBSERVATION_WORK_SCHEMA]
+                    .contains(&operation.schema.as_str())
+            );
+        }
+        let before = fs::read(paths.operation()).unwrap();
+        assert!(adopt_uninstall_work_generation_locked(&paths, Uuid::new_v4(), &digest).is_err());
+        assert!(adopt_uninstall_work_generation_locked(&paths, id, &"b".repeat(64)).is_err());
+        assert_eq!(fs::read(paths.operation()).unwrap(), before);
+
+        let slot = "a".repeat(64);
+        let original = serde_json::to_vec(
+            &json!({"method":"interactions.respond","digest":"b".repeat(64),"status":"pending"}),
+        )
+        .unwrap();
+        let provenance = json!({"operationId":id,"attemptId":Uuid::new_v4(),"journalSha256":digest,"receiptSha256":"b".repeat(64),"expectedAssessmentSha256":"c".repeat(64),"requestSetSha256":"d".repeat(64),"contextSha256":"e".repeat(64),"installationId":"fixture-install","retirementScope":"operation-observations","canonicalObservation":{"remoteOutcome":"unknown","safeReason":"missing_binding"}});
+        let evidence =
+            crate::operation_cache::retirement_evidence(&slot, &original, &provenance).unwrap();
+        let evidence_path = paths
+            .state_dir
+            .join(crate::operation_cache::retirement_relative(&slot).unwrap());
+        state::private_dir(evidence_path.parent().unwrap()).unwrap();
+        state::write_json(&evidence_path, &evidence).unwrap();
+        for _ in 0..3 {
+            adopt_uninstall_work_generation_locked(&paths, id, &digest).unwrap();
+            begin_uninstall_work_locked(&paths, id, &digest).unwrap();
+            fence_operation_observation_work_locked(&paths, id).unwrap();
+            let raw: Value = state::read_json(&paths.operation()).unwrap();
+            assert_eq!(raw["schema"], OPERATION_RETIREMENT_READER_SCHEMA);
+            assert_eq!(raw["logicalSchema"], GENERATION_UNINSTALL_WORK_SCHEMA);
+            assert_eq!(
+                raw["minimumReaderCapability"],
+                "operation-cache.retirement-fence/v1"
+            );
+            let operation: Operation = serde_json::from_value(raw).unwrap();
+            operation.validate().unwrap();
+        }
+        fs::remove_file(evidence_path).unwrap();
+        assert_eq!(
+            adopt_uninstall_work_generation_locked(&paths, id, &digest)
+                .unwrap_err()
+                .to_string(),
+            "OPERATION_RETIREMENT_EVIDENCE_REQUIRED"
+        );
+    }
+
+    #[test]
+    fn generation_owner_requires_compatible_activation_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(temp.path());
+        state::private_dir(&paths.state_dir).unwrap();
+        state::write_json(
+            &paths.state_dir.join("uninstall-work.json"),
+            &json!({"schema":"app.loomex.runner.uninstall-work/v2"}),
+        )
+        .unwrap();
+        let target = temp.path().join("candidate");
+        fs::create_dir_all(target.join("metadata")).unwrap();
+        state::write_json(
+            &target.join("metadata/compatibility-manifest.json"),
+            &json!({"capabilities":["operation-cache.retirement-fence/v1"]}),
+        )
+        .unwrap();
+        assert_eq!(
+            require_operation_observation_capability(&paths, &target)
+                .unwrap_err()
+                .to_string(),
+            "UNINSTALL_WORK_GENERATION_CAPABILITY_REQUIRED"
+        );
+        state::write_json(
+            &target.join("metadata/compatibility-manifest.json"),
+            &json!({"capabilities":["uninstall-work.generations/v1"]}),
+        )
+        .unwrap();
+        require_operation_observation_capability(&paths, &target).unwrap();
     }
 
     #[test]

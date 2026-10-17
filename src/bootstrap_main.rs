@@ -1607,7 +1607,7 @@ fn preflight_failure(error: &anyhow::Error) -> Value {
         return json!({"category":"owner_validation","reasonCode":reason,"nextAction":"inspect_lifecycle_status","message":"The exact lifecycle owner could not authorize this recovery."});
     }
     if let Some(error) = error.downcast_ref::<bootstrap_uninstall::WorkRefusal>() {
-        return json!({"category":"uninstall_work","reasonCode":error.0,"nextAction":if error.0=="UNINSTALL_WORK_MAINTENANCE_PENDING" {"resume_uninstall_work"} else {"inspect_uninstall_work"},"message":"The retained uninstall work requires its exact maintenance owner."});
+        return json!({"category":"uninstall_work","reasonCode":error.0,"nextAction":if error.0=="UNINSTALL_WORK_MAINTENANCE_PENDING" {"resume_uninstall_work"} else {"inspect_uninstall_work"},"message":"Inspect retained work and reconcile an eligible successor. Resume an active attempt with its original release; review a fresh assessment before retirement."});
     }
     if let Some(error) = error.downcast_ref::<uninstall_state::ManagedStateError>() {
         use uninstall_state::BlockerCategory::*;

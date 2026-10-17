@@ -12,6 +12,13 @@ mod domain_reconciliation;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WorkContext {
     schema: String,
+    #[serde(default)]
+    maintenance_generation: Option<u64>,
+    #[serde(default)]
+    release_manifest_sha256: Option<String>,
+    // The parent binds these exact immutable context bytes externally.
+    #[serde(skip)]
+    context_sha256: String,
     operation_id: uuid::Uuid,
     attempt_id: uuid::Uuid,
     state_dir: PathBuf,
@@ -33,6 +40,123 @@ struct WorkContext {
 
 fn default_retirement_scope() -> String {
     "continuations".into()
+}
+
+fn generation_context(context: &WorkContext) -> bool {
+    context.schema == "app.loomex.runner.uninstall-work-context/v2"
+}
+
+fn validate_context_owner(context: &WorkContext, owner: &Value, digest: &str) -> Result<()> {
+    ensure!(
+        owner["operationId"] == context.operation_id.to_string()
+            && owner["attempt"]["id"] == context.attempt_id.to_string()
+            && owner["journalSha256"] == context.journal_sha256
+            && owner["attempt"]["contextSha256"] == digest,
+        "LIFECYCLE_OPERATION_PENDING"
+    );
+    if generation_context(context) {
+        let generation = context.maintenance_generation.context("INVALID_REQUEST")?;
+        let manifest = context
+            .release_manifest_sha256
+            .as_deref()
+            .context("INVALID_REQUEST")?;
+        ensure!(
+            valid_work_digest(manifest)
+                && owner["schema"] == "app.loomex.runner.uninstall-work/v2"
+                && matches!(
+                    owner["attempt"]["state"].as_str(),
+                    Some("spawn_pending" | "running")
+                )
+                && owner["currentGeneration"].as_u64() == Some(generation)
+                && owner["attempt"]["maintenanceGeneration"].as_u64() == Some(generation)
+                && owner["attempt"]["releaseManifestSha256"] == manifest
+                && owner["releaseManifestSha256"] == manifest
+                && owner["generations"].as_array().is_some_and(|generations| {
+                    generations
+                        .iter()
+                        .filter(|entry| entry["generation"].as_u64() == Some(generation))
+                        .count()
+                        == 1
+                        && generations.iter().any(|entry| {
+                            entry["generation"].as_u64() == Some(generation)
+                                && entry["releaseManifestSha256"] == manifest
+                                && entry["releasePath"] == owner["releasePath"]
+                        })
+                }),
+            "LIFECYCLE_OPERATION_PENDING"
+        );
+    } else {
+        ensure!(
+            context.schema == "app.loomex.runner.uninstall-work-context/v1"
+                && context.maintenance_generation.is_none()
+                && context.release_manifest_sha256.is_none()
+                && owner["schema"] == "app.loomex.runner.uninstall-work/v1",
+            "LIFECYCLE_OPERATION_PENDING"
+        );
+    }
+    Ok(())
+}
+
+fn valid_work_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn current_context_owner(context: &WorkContext) -> Result<()> {
+    let owner: Value = serde_json::from_slice(&read_private(
+        &context.state_dir.join("uninstall-work.json"),
+        16 * 1024 * 1024,
+    )?)?;
+    let bytes = read_private(
+        &context.state_dir.join(format!(
+            "uninstall-work-context-{}.json",
+            context.attempt_id
+        )),
+        262144,
+    )?;
+    let digest = state::digest(&bytes);
+    ensure!(
+        digest == context.context_sha256,
+        "LIFECYCLE_OPERATION_PENDING"
+    );
+    validate_context_owner(context, &owner, &digest)
+}
+
+// v1 records remain byte-compatible with their original historical attempt.
+// v2 records add the immutable release/generation/context binding without
+// replacing the original request, idempotency key, candidate digest or scope.
+fn bind_record(context: &WorkContext, mut value: Value) -> Value {
+    if generation_context(context) {
+        value["maintenanceGeneration"] = json!(context.maintenance_generation);
+        value["releaseManifestSha256"] = json!(context.release_manifest_sha256);
+        value["contextSha256"] = json!(context.context_sha256);
+    }
+    value
+}
+fn validate_record_binding(context: &WorkContext, value: &Value) -> Result<()> {
+    if generation_context(context) {
+        ensure!(
+            value["maintenanceGeneration"].as_u64() == context.maintenance_generation
+                && value["releaseManifestSha256"].as_str()
+                    == context.release_manifest_sha256.as_deref()
+                && value["contextSha256"] == context.context_sha256,
+            "MANAGED_WORK_CHANGED"
+        );
+    } else {
+        ensure!(
+            [
+                "maintenanceGeneration",
+                "releaseManifestSha256",
+                "contextSha256"
+            ]
+            .iter()
+            .all(|field| value.get(field).is_none()),
+            "MANAGED_WORK_CHANGED"
+        );
+    }
+    Ok(())
 }
 
 fn result_path(context: &WorkContext) -> PathBuf {
@@ -294,6 +418,7 @@ fn frozen_cache_transition(
             && value["requestDigest"] == state::json_digest(request),
         "MANAGED_WORK_CHANGED"
     );
+    validate_record_binding(context, &value)?;
     control::maintenance_cache_validate(request, &value["transition"])?;
     Ok(Some(value["transition"].clone()))
 }
@@ -350,6 +475,9 @@ fn settle_cache(
     request: &Value,
     receipt: &Value,
 ) -> Result<()> {
+    if generation_context(context) {
+        current_context_owner(context)?;
+    }
     let saved: Value = serde_json::from_slice(&read_private(
         &context.state_dir.join(format!(
             "uninstall-work-requests-{}.json",
@@ -417,7 +545,10 @@ fn settle_cache(
     if !path.try_exists()? {
         immutable_json(
             &path,
-            &json!({"schema":"app.loomex.runner.uninstall-work-cache-transition/v1","operationId":context.operation_id,"attemptId":context.attempt_id,"index":index,"requestDigest":state::json_digest(request),"transition":transition}),
+            &bind_record(
+                context,
+                json!({"schema":"app.loomex.runner.uninstall-work-cache-transition/v1","operationId":context.operation_id,"attemptId":context.attempt_id,"index":index,"requestDigest":state::json_digest(request),"transition":transition}),
+            ),
         )?;
     }
     verify_dependencies(context, &saved)?;
@@ -589,6 +720,7 @@ fn scoped_requests(context: &WorkContext, values: &[Value]) -> Result<Vec<Value>
                     == context.retirement_scope,
             "MANAGED_WORK_CHANGED"
         );
+        validate_record_binding(context, &saved)?;
         verify_dependencies(context, &saved)?;
         return Ok(saved["requests"]
             .as_array()
@@ -634,7 +766,10 @@ fn scoped_requests(context: &WorkContext, values: &[Value]) -> Result<Vec<Value>
     }
     immutable_json(
         &path,
-        &json!({"schema":"app.loomex.runner.uninstall-work-requests/v1","operationId":context.operation_id,"attemptId":context.attempt_id,"candidateSetDigest":candidate_set_digest(values),"retirementScope":context.retirement_scope,"dependenciesDigest":dependencies_digest(&context.state_dir)?,"dependencyEntries":dependency_entries(&context.state_dir)?,"acceptanceDependencies":crate::uninstall_state::maintenance_acceptance_dependencies(&context.state_dir)?,"requests":requests}),
+        &bind_record(
+            context,
+            json!({"schema":"app.loomex.runner.uninstall-work-requests/v1","operationId":context.operation_id,"attemptId":context.attempt_id,"candidateSetDigest":candidate_set_digest(values),"retirementScope":context.retirement_scope,"dependenciesDigest":dependencies_digest(&context.state_dir)?,"dependencyEntries":dependency_entries(&context.state_dir)?,"acceptanceDependencies":crate::uninstall_state::maintenance_acceptance_dependencies(&context.state_dir)?,"requests":requests}),
+        ),
     )?;
     Ok(requests)
 }
@@ -644,11 +779,17 @@ fn record_settlement(
     request: &Value,
     receipt: &Value,
 ) -> Result<()> {
+    if generation_context(context) {
+        current_context_owner(context)?;
+    }
     let path = context.state_dir.join(format!(
         "uninstall-work-checkpoint-{}-{index}.json",
         context.attempt_id
     ));
-    let value = json!({"schema":"app.loomex.runner.uninstall-work-record/v1","operationId":context.operation_id,"attemptId":context.attempt_id,"index":index,"requestDigest":state::json_digest(request),"receipt":receipt});
+    let value = bind_record(
+        context,
+        json!({"schema":"app.loomex.runner.uninstall-work-record/v1","operationId":context.operation_id,"attemptId":context.attempt_id,"index":index,"requestDigest":state::json_digest(request),"receipt":receipt}),
+    );
     if path.try_exists()? {
         ensure!(
             serde_json::from_slice::<Value>(&read_private(&path, 16 * 1024 * 1024)?)? == value,
@@ -664,6 +805,9 @@ fn settle_operation_observation(
     request: &Value,
     observation: &Value,
 ) -> Result<Value> {
+    if generation_context(context) {
+        current_context_owner(context)?;
+    }
     let slot = request["legacySlot"]
         .as_str()
         .context("MANAGED_WORK_CHANGED")?;
@@ -733,6 +877,9 @@ fn operation_receipt(context: &WorkContext, request: &Value) -> Result<Value> {
 /// Publication is private, immutable and crash atomic. The original observation
 /// stays untouched until the independently qualified uninstall inventory runs.
 fn retire_operation(context: &WorkContext, request: &Value, observation: &Value) -> Result<Value> {
+    if generation_context(context) {
+        current_context_owner(context)?;
+    }
     ensure!(
         context.action == "retire-local" && context.retirement_scope == "operation-observations",
         "INVALID_REQUEST"
@@ -828,6 +975,7 @@ fn settled(
             && value["index"] == index,
         "MANAGED_WORK_CHANGED"
     );
+    validate_record_binding(context, &value)?;
     let candidate = values
         .iter()
         .find(|candidate| {
@@ -1005,6 +1153,9 @@ fn settle_domain_locally(
     request: &Value,
     receipt: &Value,
 ) -> Result<Value> {
+    if generation_context(context) {
+        current_context_owner(context)?;
+    }
     verify_current_domain(presentation, request)?;
     settle_cache(context, index, request, receipt)?;
     apply(&None, presentation, request, Some(receipt))
@@ -1021,6 +1172,9 @@ async fn execute_with_services(
     api: &Api,
     auth: &Auth,
 ) -> Result<Value> {
+    if generation_context(context) {
+        current_context_owner(context)?;
+    }
     let resuming = context
         .state_dir
         .join(format!(
@@ -1051,6 +1205,9 @@ async fn execute_with_services(
     );
     let mut values = crate::uninstall_state::maintenance_preview(&context.state_dir)?;
     enrich_candidates(context, &mut values)?;
+    if generation_context(context) {
+        current_context_owner(context)?;
+    }
     let requests = scoped_requests(context, &values)?;
     for candidate in &requests {
         if candidate["kind"] == "operation_cache" && candidate["binding"].is_null() {
@@ -1126,6 +1283,9 @@ async fn execute_with_services(
     let mut receipts = Vec::new();
     let mut domain_pending = false;
     for (index, request) in requests.iter().enumerate() {
+        if generation_context(context) {
+            current_context_owner(context)?;
+        }
         if let Some(receipt) = settled(context, index, request, &values)? {
             receipts.push(receipt);
             continue;
@@ -1183,10 +1343,16 @@ async fn execute_with_services(
                 settle_domain_locally(context, index, &presentation, request, &observation)?
             } else {
                 let observation = read_run(api, auth, request, &context.expected_identity).await?;
+                if generation_context(context) {
+                    current_context_owner(context)?;
+                }
                 apply(&follow, &presentation, request, Some(&observation))?
             }
         } else {
             ensure!(context.action == "retire-local", "INVALID_REQUEST");
+            if generation_context(context) {
+                current_context_owner(context)?;
+            }
             apply(&follow, &presentation, request, None)?
         };
         record_settlement(context, index, request, &receipt)?;
@@ -1199,10 +1365,15 @@ async fn execute_with_services(
 }
 
 pub async fn run(path: &Path) -> Result<Value> {
-    let context: WorkContext = serde_json::from_slice(&read_private(path, 262144)?)?;
+    let context_bytes = read_private(path, 262144)?;
+    let mut context: WorkContext = serde_json::from_slice(&context_bytes)?;
+    context.context_sha256 = state::digest(&context_bytes);
     ensure!(
-        context.schema == "app.loomex.runner.uninstall-work-context/v1"
-            && matches!(context.action.as_str(), "reconcile" | "retire-local")
+        matches!(
+            context.schema.as_str(),
+            "app.loomex.runner.uninstall-work-context/v1"
+                | "app.loomex.runner.uninstall-work-context/v2"
+        ) && matches!(context.action.as_str(), "reconcile" | "retire-local")
             && matches!(
                 context.retirement_scope.as_str(),
                 "continuations" | "operation-observations"
@@ -1236,15 +1407,9 @@ pub async fn run(path: &Path) -> Result<Value> {
     );
     let owner: Value = serde_json::from_slice(&read_private(
         &context.state_dir.join("uninstall-work.json"),
-        262144,
+        16 * 1024 * 1024,
     )?)?;
-    ensure!(
-        owner["operationId"] == context.operation_id.to_string()
-            && owner["attempt"]["id"] == context.attempt_id.to_string()
-            && owner["journalSha256"] == context.journal_sha256
-            && owner["attempt"]["contextSha256"] == state::digest(&read_private(path, 262144)?),
-        "LIFECYCLE_OPERATION_PENDING"
-    );
+    validate_context_owner(&context, &owner, &context.context_sha256)?;
     ensure!(
         state::digest(&std::fs::read(std::env::current_exe()?)?) == context.binary_sha256,
         "UNSAFE_STATE"
@@ -1256,6 +1421,8 @@ pub async fn run(path: &Path) -> Result<Value> {
     operation.validate()?;
     ensure!(
         operation.id == context.operation_id
+            && (!generation_context(&context)
+                || operation.schema == crate::lifecycle::GENERATION_UNINSTALL_WORK_SCHEMA)
             && operation.phase == "work_maintenance"
             && operation
                 .uninstall_fence
@@ -1278,7 +1445,9 @@ pub async fn run(path: &Path) -> Result<Value> {
         delete_credential: false,
     };
     let lock = Arc::new(singleton(&credential_context)?);
+    current_context_owner(&context)?;
     let result = execute(&context, &lock).await;
+    current_context_owner(&context)?;
     let report = match result {
         Ok(value) => {
             json!({"schema":"app.loomex.runner.uninstall-work-result/v1","operationId":context.operation_id,"attemptId":context.attempt_id,"ok":true,"result":value})
@@ -1302,6 +1471,10 @@ pub async fn run(path: &Path) -> Result<Value> {
     };
     // Native/store workers retain lock ownership until runtime shutdown. The
     // parent still requires observed child exit before treating this as settled.
+    let mut report = bind_record(&context, report);
+    if generation_context(&context) {
+        report["schema"] = json!("app.loomex.runner.uninstall-work-result/v2");
+    }
     state::write_json(&result_path(&context), &report)?;
     Ok(report)
 }
@@ -1315,6 +1488,9 @@ mod tests {
         let dir = canonical.as_path();
         WorkContext {
             schema: "app.loomex.runner.uninstall-work-context/v1".into(),
+            maintenance_generation: None,
+            release_manifest_sha256: None,
+            context_sha256: String::new(),
             operation_id: Uuid::new_v4(),
             attempt_id: Uuid::new_v4(),
             state_dir: dir.into(),
@@ -1335,6 +1511,189 @@ mod tests {
             authorize_keychain_transition: false,
         }
     }
+    #[test]
+    fn child_generation_context_rejects_stale_owner_and_exact_binding_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut ctx = context(temp.path(), "reconcile");
+        ctx.schema = "app.loomex.runner.uninstall-work-context/v2".into();
+        ctx.maintenance_generation = Some(2);
+        ctx.release_manifest_sha256 = Some("d".repeat(64));
+        ctx.context_sha256 = "e".repeat(64);
+        let owner = json!({"schema":"app.loomex.runner.uninstall-work/v2","operationId":ctx.operation_id,"journalSha256":ctx.journal_sha256,"currentGeneration":2,"releasePath":"/fixture/release","releaseManifestSha256":ctx.release_manifest_sha256,"generations":[{"generation":1,"releasePath":"/fixture/old","releaseManifestSha256":"f".repeat(64)},{"generation":2,"releasePath":"/fixture/release","releaseManifestSha256":ctx.release_manifest_sha256}],"attempt":{"id":ctx.attempt_id,"state":"spawn_pending","contextSha256":ctx.context_sha256,"maintenanceGeneration":2,"releaseManifestSha256":ctx.release_manifest_sha256}});
+        validate_context_owner(&ctx, &owner, &ctx.context_sha256).unwrap();
+        for pointer in [
+            "/currentGeneration",
+            "/attempt/maintenanceGeneration",
+            "/attempt/state",
+            "/attempt/contextSha256",
+            "/attempt/releaseManifestSha256",
+            "/releaseManifestSha256",
+            "/generations/1/releaseManifestSha256",
+            "/generations/1/releasePath",
+            "/attempt/id",
+            "/operationId",
+        ] {
+            let mut changed = owner.clone();
+            *changed.pointer_mut(pointer).unwrap() = json!("changed");
+            assert!(
+                validate_context_owner(&ctx, &changed, &ctx.context_sha256).is_err(),
+                "{pointer}"
+            );
+        }
+        assert!(validate_context_owner(&ctx, &owner, &"f".repeat(64)).is_err());
+        let mut duplicate = owner.clone();
+        duplicate["generations"]
+            .as_array_mut()
+            .unwrap()
+            .push(owner["generations"][1].clone());
+        assert!(validate_context_owner(&ctx, &duplicate, &ctx.context_sha256).is_err());
+    }
+
+    #[test]
+    fn late_child_cannot_publish_checkpoint_after_generation_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut ctx = context(temp.path(), "reconcile");
+        ctx.schema = "app.loomex.runner.uninstall-work-context/v2".into();
+        ctx.maintenance_generation = Some(2);
+        ctx.release_manifest_sha256 = Some("d".repeat(64));
+        let context_bytes = b"immutable exact context snapshot";
+        ctx.context_sha256 = state::digest(context_bytes);
+        let context_path = ctx
+            .state_dir
+            .join(format!("uninstall-work-context-{}.json", ctx.attempt_id));
+        state::atomic_write(&context_path, context_bytes).unwrap();
+        let mut owner = json!({"schema":"app.loomex.runner.uninstall-work/v2","operationId":ctx.operation_id,"journalSha256":ctx.journal_sha256,"currentGeneration":2,"releasePath":"/fixture/release","releaseManifestSha256":ctx.release_manifest_sha256,"generations":[{"generation":2,"releasePath":"/fixture/release","releaseManifestSha256":ctx.release_manifest_sha256}],"attempt":{"id":ctx.attempt_id,"state":"spawn_pending","contextSha256":ctx.context_sha256,"maintenanceGeneration":2,"releaseManifestSha256":ctx.release_manifest_sha256}});
+        let owner_path = ctx.state_dir.join("uninstall-work.json");
+        state::write_json(&owner_path, &owner).unwrap();
+        current_context_owner(&ctx).unwrap();
+        owner["currentGeneration"] = json!(3);
+        state::write_json(&owner_path, &owner).unwrap();
+        let before = std::fs::read(&owner_path).unwrap();
+        assert!(
+            record_settlement(
+                &ctx,
+                0,
+                &json!({"idempotencyKey":Uuid::new_v4()}),
+                &json!({"remoteOutcome":"terminal"})
+            )
+            .is_err()
+        );
+        assert!(
+            !ctx.state_dir
+                .join(format!(
+                    "uninstall-work-checkpoint-{}-0.json",
+                    ctx.attempt_id
+                ))
+                .exists()
+        );
+        assert_eq!(std::fs::read(&owner_path).unwrap(), before);
+        owner["currentGeneration"] = json!(2);
+        state::write_json(&owner_path, &owner).unwrap();
+        state::atomic_write(&context_path, b"replacement context").unwrap();
+        assert!(current_context_owner(&ctx).is_err());
+    }
+
+    #[test]
+    fn reserved_generation_context_cannot_run_or_publish_even_when_file_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut ctx = context(temp.path(), "reconcile");
+        ctx.schema = "app.loomex.runner.uninstall-work-context/v2".into();
+        ctx.maintenance_generation = Some(2);
+        ctx.release_manifest_sha256 = Some("d".repeat(64));
+        let context_bytes = b"reserved immutable context snapshot";
+        ctx.context_sha256 = state::digest(context_bytes);
+        let context_path = ctx
+            .state_dir
+            .join(format!("uninstall-work-context-{}.json", ctx.attempt_id));
+        state::atomic_write(&context_path, context_bytes).unwrap();
+        let mut owner = json!({"schema":"app.loomex.runner.uninstall-work/v2","operationId":ctx.operation_id,"journalSha256":ctx.journal_sha256,"currentGeneration":2,"releasePath":"/fixture/release","releaseManifestSha256":ctx.release_manifest_sha256,"generations":[{"generation":2,"releasePath":"/fixture/release","releaseManifestSha256":ctx.release_manifest_sha256}],"attempt":{"id":ctx.attempt_id,"state":"context_pending","pendingContext":String::from_utf8_lossy(context_bytes),"contextSha256":ctx.context_sha256,"maintenanceGeneration":2,"releaseManifestSha256":ctx.release_manifest_sha256}});
+        let owner_path = ctx.state_dir.join("uninstall-work.json");
+        state::write_json(&owner_path, &owner).unwrap();
+        let before = std::fs::read(&owner_path).unwrap();
+        assert!(current_context_owner(&ctx).is_err());
+        assert!(
+            record_settlement(
+                &ctx,
+                0,
+                &json!({"idempotencyKey":Uuid::new_v4()}),
+                &json!({"remoteOutcome":"terminal"})
+            )
+            .is_err()
+        );
+        assert!(
+            !ctx.state_dir
+                .join(format!(
+                    "uninstall-work-checkpoint-{}-0.json",
+                    ctx.attempt_id
+                ))
+                .exists()
+        );
+        assert!(!result_path(&ctx).exists());
+        assert_eq!(std::fs::read(&owner_path).unwrap(), before);
+        assert_eq!(std::fs::read(&context_path).unwrap(), context_bytes);
+        owner["attempt"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pendingContext");
+        for state in ["spawn_pending", "running"] {
+            owner["attempt"]["state"] = json!(state);
+            state::write_json(&owner_path, &owner).unwrap();
+            current_context_owner(&ctx).unwrap();
+        }
+        for state in [Value::Null, json!("settled"), json!("context_pending")] {
+            owner["attempt"]["state"] = state;
+            assert!(validate_context_owner(&ctx, &owner, &ctx.context_sha256).is_err());
+        }
+        owner["attempt"].as_object_mut().unwrap().remove("state");
+        assert!(validate_context_owner(&ctx, &owner, &ctx.context_sha256).is_err());
+    }
+
+    #[test]
+    fn child_v1_only_resumes_its_exact_historical_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut ctx = context(temp.path(), "reconcile");
+        let mut owner = json!({"schema":"app.loomex.runner.uninstall-work/v1","operationId":ctx.operation_id,"journalSha256":ctx.journal_sha256,"attempt":{"id":ctx.attempt_id,"contextSha256":"e".repeat(64)}});
+        validate_context_owner(&ctx, &owner, &"e".repeat(64)).unwrap();
+        owner["schema"] = json!("app.loomex.runner.uninstall-work/v2");
+        owner["currentGeneration"] = json!(1);
+        assert!(validate_context_owner(&ctx, &owner, &"e".repeat(64)).is_err());
+        owner["schema"] = json!("app.loomex.runner.uninstall-work/v1");
+        ctx.maintenance_generation = Some(1);
+        assert!(validate_context_owner(&ctx, &owner, &"e".repeat(64)).is_err());
+        ctx.maintenance_generation = None;
+        ctx.release_manifest_sha256 = Some("d".repeat(64));
+        assert!(validate_context_owner(&ctx, &owner, &"e".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn child_generation_records_preserve_original_requests_and_reject_late_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut ctx = context(temp.path(), "reconcile");
+        let original = json!({"schema":"app.loomex.runner.uninstall-work-requests/v1","operationId":ctx.operation_id,"attemptId":ctx.attempt_id,"retirementScope":"continuations","requests":[{"idempotencyKey":Uuid::new_v4(),"method":"runs.get","operationKey":"original"}]});
+        assert_eq!(bind_record(&ctx, original.clone()), original);
+        validate_record_binding(&ctx, &original).unwrap();
+        ctx.schema = "app.loomex.runner.uninstall-work-context/v2".into();
+        ctx.maintenance_generation = Some(2);
+        ctx.release_manifest_sha256 = Some("d".repeat(64));
+        ctx.context_sha256 = "e".repeat(64);
+        let record = bind_record(&ctx, original.clone());
+        validate_record_binding(&ctx, &record).unwrap();
+        assert_eq!(record["requests"], original["requests"]);
+        assert_eq!(record["retirementScope"], original["retirementScope"]);
+        for field in [
+            "maintenanceGeneration",
+            "releaseManifestSha256",
+            "contextSha256",
+        ] {
+            let mut changed = record.clone();
+            changed[field] = json!("changed");
+            assert!(validate_record_binding(&ctx, &changed).is_err(), "{field}");
+        }
+        assert!(validate_record_binding(&ctx, &original).is_err());
+        ctx.schema = "app.loomex.runner.uninstall-work-context/v1".into();
+        assert!(validate_record_binding(&ctx, &record).is_err());
+    }
+
     fn observation(run: &Value) -> Value {
         json!({"snapshot":{"execution":{"id":run,"status":"running"},"events":[],"latestSequence":0,"hasMoreEvents":false}})
     }

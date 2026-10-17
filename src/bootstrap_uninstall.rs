@@ -16,7 +16,8 @@ const OLD_SCHEMA: &str = "app.loomex.runner.bootstrap-uninstall/v1";
 #[path = "bootstrap_uninstall/work.rs"]
 mod work;
 pub(super) use work::{
-    WorkRefusal, run_work, valid_work_digest, work_owner_reference, work_preflight,
+    WorkRefusal, run_work, valid_work_digest, work_maintenance_reference, work_owner_reference,
+    work_preflight,
 };
 
 fn regular_bytes(path: &Path) -> Result<Vec<u8>> {

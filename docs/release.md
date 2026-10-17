@@ -103,3 +103,16 @@ Production builds also require explicit LOOMEX_API_ORIGIN and LOOMEX_WEB_APP_ORI
 See [public distribution](public-distribution.md) for the separate frozen release-set contract and unified native installer. The production gate uses sibling `runner-source` and `component-inputs` checkouts so clean runner qualification includes no nested Git repositories. The preview workflow reuses the required gate, preserves build-before-export ordering and emits build-once reviewable assets. Public staging and publication require separate exact-digest operator checkpoints; no GitHub release is created by the build workflow.
 
 Public local development qualification uses `scripts/build-release.sh --unsigned-development --local-development-api-origin http://127.0.0.1:28080/` from clean committed source with `LOOMEX_API_ORIGIN` unset. Its `metadata/local-development-origin.json` is part of the artifact inventory and binds the optional compiled frontend origin exactly. This is an unsigned development release, including when the existing local identity signs its native executables. The release-set v2 profile delegates to the existing bootstrap `--development-api-origin` option and retains both unsafe preview opt-ins. A compatible local backend must already be running; publication and local installation use the same reviewed artifact bytes.
+
+Cross-release retained-work recovery uses the existing Inspect and Reconcile
+commands. The paired result contract is `app.loomex.paired-install-result/v4`;
+maintenance ownership is reported separately from historical bootstrap ownership
+through `app.loomex.runner.uninstall-work-reference/v1`. Native work v2 reports
+support verified successor generations; legacy v1 reports remain readable without
+cross-release handover authority. Inspect is read-only. A settled older generation
+requires Reconcile with the verified candidate, followed by a fresh Inspect and
+retirement review. Active or uncertain attempts retain their original release.
+Maintenance completion does not install a candidate or prove cleanup eligibility;
+after work resolves, use the existing uninstall recovery flow. Fixture transport
+tests verify delegation and projection only; native recovery tests establish the
+owner-generation transition.

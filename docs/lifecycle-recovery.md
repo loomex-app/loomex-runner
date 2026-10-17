@@ -29,7 +29,7 @@ It checks both selected component owners before activation. Healthy partial
 installation is preserved: plugin or registration failure does not roll back a
 healthy runner. Retry the same release set and component installation bases.
 
-The paired CLI result uses `app.loomex.paired-install-result/v3`. Exit 0 means
+The paired CLI result uses `app.loomex.paired-install-result/v4`. Exit 0 means
 completion, exit 3 means a verified pending lifecycle operation, and exit 1 means
 blocked or unconfirmed. A known active-work or service-stop pause is not a new
 health failure. Inspect the exact operation, finish the indicated native resume,
@@ -43,6 +43,9 @@ only the matching marker. Unknown markers and competing operations stay protecte
 ## Exact artifact-cache restoration
 
 Pending operations can refer to their original stable release-cache paths.
+Use a canonical absolute `--cache-dir` without dot components, redundant separators,
+or symlink ancestors. The installer refuses aliases before publishing a release
+locator or dispatching native work; it does not rewrite an existing owner binding.
 Read-only preflight reports `cache_restore_required` if those prerequisites are
 missing; it never repairs them. Installation can restore missing known bytes
 from the same fully verified release set while retaining those exact paths.
@@ -160,10 +163,24 @@ persistent cache or installed state. Historical owner references report the jour
 schema, digest, phase and whether adoption started; an absent operation ID remains
 null. It does not invent a new operation to describe historical ownership.
 
-Use `--uninstall-work reconcile` with the same release and journal binding to ask
-the verified owner for supported reconciliation. This mode can inspect eligible
-retained work even when deletion is blocked. Remote observations and explicit
-delivery evidence determine resolution. Unavailable or ambiguous observations stay
+The separate `maintenanceReference` identifies the maintenance operation, generation,
+release and candidate manifest digests, hashed release locators, and any original
+attempt. Locator hashes distinguish release caches even when the runner manifest
+is unchanged; raw release paths are not published in this reference. `ownerReference` continues
+to identify the historical bootstrap uninstall; its absent operation ID remains
+null. Inspect reports whether the reviewed release is current, an eligible
+successor, or must resume the original attempt. Inspection does not change either
+owner or the retained state.
+
+Use `--uninstall-work reconcile` with the reviewed release and original journal
+binding to ask the verified owner for supported reconciliation. When an older
+maintenance generation is settled and has no active or uncertain attempt, Reconcile
+can create the next generation for the verified candidate. An active or uncertain
+attempt stays pinned to its original release. After a successor is selected, Inspect
+again and review its fresh assessment before authorizing any local retirement.
+An assessment approved for the older generation cannot authorize the successor.
+This mode can inspect eligible retained work even when deletion is blocked.
+Remote observations and explicit delivery evidence determine resolution. Unavailable or ambiguous observations stay
 protected; clean-reinstall approval supplies no missing acknowledgement.
 
 When supported reconciliation cannot resolve retained local continuation records,

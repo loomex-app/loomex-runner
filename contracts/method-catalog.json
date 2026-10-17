@@ -14042,6 +14042,7 @@
     "workflows.atomic-draft-create/v1",
     "workflows.canonical-authoring-contract/v1",
     "workflows.patch.notes-preserve/v1",
-    "workflows.runtime-draft-mutations/v1"
+    "workflows.runtime-draft-mutations/v1",
+    "uninstall-work.generations/v1"
   ]
 }

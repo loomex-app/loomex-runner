@@ -420,8 +420,18 @@ async fn inspect(args: &Arguments, report: &mut Value) -> Result<()> {
     let paths = paths(args)?;
     report["recoveryOwnership"] = bootstrap_uninstall::recovery_ownership(&paths);
     report["ownerReference"] = bootstrap_uninstall::work_owner_reference(&paths);
+    report["maintenanceReference"] =
+        bootstrap_uninstall::work_maintenance_reference(&paths, None, None);
     let release = fs::canonicalize(args.release.as_ref().context("release is required")?)?;
     let manifest = read_manifest(&release)?;
+    report["maintenanceReference"] = bootstrap_uninstall::work_maintenance_reference(
+        &paths,
+        fs::read(release.join("manifest.json"))
+            .ok()
+            .map(|bytes| state::digest(&bytes))
+            .as_deref(),
+        Some(args.expected_release_path.as_deref().unwrap_or(&release)),
+    );
     verify_artifact(&release, &manifest, args).await?;
     let version = manifest["version"]
         .as_str()
@@ -469,10 +479,16 @@ async fn inspect(args: &Arguments, report: &mut Value) -> Result<()> {
         (None, None)
     };
     report["artifact"] = json!({"eligible":true,"version":version,"manifestSha256":state::digest(&fs::read(release.join("manifest.json"))?)});
+    report["maintenanceReference"] = bootstrap_uninstall::work_maintenance_reference(
+        &paths,
+        report["artifact"]["manifestSha256"].as_str(),
+        Some(args.expected_release_path.as_deref().unwrap_or(&release)),
+    );
     if args.work_action.is_some() {
         let work = bootstrap_uninstall::work_preflight(&paths, args, &release, &manifest, &payload)
             .await?;
         report["ownerReference"] = work["ownerReference"].clone();
+        report["maintenanceReference"] = work["maintenanceReference"].clone();
         report["retirementScope"] = work["retirementScope"].clone();
         report["assessment"] = work
             .get("assessment")
@@ -549,7 +565,7 @@ fn publish_work_eligibility(report: &mut Value, work: &Value) -> Result<()> {
                 .context(OwnerDiagnostic::BindingMismatch),
         );
     }
-    report["uninstallWorkEligibility"] = json!({"eligible":true,"readOnly":true,"retirementScope":work["retirementScope"],"signingTransition":signing,"accessAttempted":false,"nativeAccessVerified":false});
+    report["uninstallWorkEligibility"] = json!({"eligible":true,"readOnly":true,"retirementScope":work["retirementScope"],"signingTransition":signing,"successorAfterOriginalResult":work["successorAfterOriginalResult"]==true,"accessAttempted":false,"nativeAccessVerified":false});
     Ok(())
 }
 

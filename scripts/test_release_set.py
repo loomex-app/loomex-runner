@@ -219,6 +219,9 @@ class SchemaTests(unittest.TestCase):
                 self.assertIn(line,notes)
             self.assertIn('/releases/download/runner-v1.2.7-plugin-v1.2.3/install.sh',notes)
             self.assertNotIn('/releases/latest/',notes)
+            self.assertNotIn('cross-release recovery',historical)
+            for text in ['existing Inspect and Reconcile actions','settled maintenance generation','pinned to their original release','approve a fresh assessment','no takeover command','Native recovery acceptance remains a separate validation step']:
+                self.assertIn(text,notes)
             self.assertEqual(notes,pack.release_notes(manifest,digest))
 
     def test_local_deployment_is_explicit_and_loopback_only(self):
@@ -557,7 +560,7 @@ esac
         self.env['FIXTURE_ACTIVATION']=json.dumps({'schema':'app.loomex.runner.bootstrap-activation/v1','outcome':'pending','reasonCode':'ACTIVE_WORK_PENDING','operationId':'fixture-operation','nextAction':'resume_native_operation'})
         self.env['FIXTURE_HEALTH_FAIL']='1'
         result=self.invoke();self.assertEqual(result.returncode,3,result.stderr)
-        report=json.loads(result.stdout);self.assertEqual(report['schema'],'app.loomex.paired-install-result/v3')
+        report=json.loads(result.stdout);self.assertEqual(report['schema'],'app.loomex.paired-install-result/v4')
         self.assertEqual(report['outcome'],'pending');self.assertEqual(report['operationId'],'fixture-operation')
         self.assertEqual(report['nextAction'],'resume_native_operation');self.assertFalse(self.plugin.exists())
         self.assertEqual(report['completion']['plugin'],'not-attempted')
@@ -599,6 +602,32 @@ esac
         self.assertEqual(report['phase'],'runner-activation')
         self.assertEqual(report['completion']['plugin'],'not-attempted')
         self.assertFalse(self.plugin.exists());self.assert_no_owner()
+
+    def test_incomplete_cache_rejects_lexical_aliases_before_native_dispatch(self):
+        flags=self.maintenance_fixture()
+        for suffix in ['missing/../new-cache','./new-cache','new-cache/','new-cache//nested']:
+            alias=str(self.root)+'/'+suffix
+            result=self.invoke(flags+['--cache-dir',alias]);self.assertEqual(result.returncode,1,result.stdout)
+            report=json.loads(result.stderr);self.assertEqual(report['phase'],'cache-locator-preflight');self.assertIn('canonical absolute --cache-dir',report['message'])
+            self.assertFalse((self.state/'work.log').exists());self.assertFalse((self.state/'preflights.log').exists())
+            self.assertFalse((self.root/'new-cache').exists());self.assertFalse((self.root/'cache').exists());self.assertFalse((self.root/'missing').exists());self.assert_no_owner()
+
+    def test_incomplete_cache_canonical_locator_matches_native_binding(self):
+        flags=self.maintenance_fixture();base=self.root/'canonical-cache';release=base/pack.sha(self.assets/'release-set.json')/'runner'
+        locator=hashlib.sha256(str(release).encode()).hexdigest()
+        for name in ['FIXTURE_RUNNER_PREFLIGHT_JSON','FIXTURE_WORK_RESULT']:
+            value=json.loads(self.env[name]);value['maintenanceReference'].update(releasePathSha256=locator,candidateReleasePathSha256=locator);self.env[name]=json.dumps(value)
+        result=self.invoke(flags+['--cache-dir',str(base)]);self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(result.stdout)['maintenanceReference']['candidateReleasePathSha256'],locator)
+        args=(self.state/'runner-preflight-args.log').read_text().splitlines()[-1].split();self.assertEqual(args[args.index('--expected-release-path')+1],str(release))
+        work=(self.state/'work.log').read_text().splitlines()[-1].split();self.assertEqual(work[0],str(release));self.assertTrue(release.is_dir());self.assert_no_owner()
+
+    def test_cache_symlink_parent_alias_cannot_be_normalized_away(self):
+        flags=self.maintenance_fixture();target=self.root/'target';target.mkdir();alias=self.root/'alias';alias.symlink_to(target,target_is_directory=True)
+        for path in [str(alias)+'/../escaped-cache',str(alias)+'/cache']:
+            result=self.invoke(flags+['--cache-dir',path]);self.assertEqual(result.returncode,1,result.stdout)
+            self.assertEqual(json.loads(result.stderr)['phase'],'cache-locator-preflight');self.assertFalse((self.state/'work.log').exists());self.assertFalse((self.state/'preflights.log').exists())
+            self.assertFalse((self.root/'escaped-cache').exists());self.assertFalse((target/'cache').exists());self.assertTrue(alias.is_symlink());self.assert_no_owner()
 
     def test_cache_symlink_or_unexpected_entries_are_preserved(self):
         self.env['FIXTURE_PLUGIN_FAIL']='1';self.assertEqual(self.invoke().returncode,1)
@@ -678,6 +707,109 @@ esac
         if action=='retire-local':flags+=['--expected-assessment-sha256','b'*64]
         return flags
 
+    def maintenance_fixture(self, action='reconcile', outcome='completed'):
+        flags=self.work_fixture(action,outcome)
+        reference={'schema':'app.loomex.runner.uninstall-work-reference/v1','operationId':'11111111-1111-4111-8111-111111111111','ownerSha256':'c'*64,'journalSha256':'a'*64,'phase':'settled','generation':0,'releaseManifestSha256':self.manifest['components']['runner']['manifestSha256'],'candidateManifestSha256':self.manifest['components']['runner']['manifestSha256'],'releasePathSha256':'1'*64,'candidateReleasePathSha256':'1'*64,'attemptId':None,'transition':'current_release'}
+        for name in ['FIXTURE_RUNNER_PREFLIGHT_JSON','FIXTURE_WORK_RESULT']:
+            value=json.loads(self.env[name]);value['maintenanceReference']=copy.deepcopy(reference)
+            if name=='FIXTURE_RUNNER_PREFLIGHT_JSON':value['artifact']['manifestSha256']=reference['candidateManifestSha256']
+            if name=='FIXTURE_WORK_RESULT':
+                value.update(schema='app.loomex.runner.bootstrap-uninstall-work/v2',operationId=reference['operationId'],reasonCode='UNINSTALL_WORK_COMPLETED',nextAction='reconcile_managed_work')
+            self.env[name]=json.dumps(value)
+        return flags
+
+    def test_maintenance_operation_is_pinned_before_bootstrap_adoption(self):
+        flags=self.maintenance_fixture()
+        value=json.loads(self.env['FIXTURE_WORK_RESULT']);value['operationId']='22222222-2222-4222-8222-222222222222';value['maintenanceReference']['operationId']=value['operationId']
+        self.env['FIXTURE_WORK_RESULT']=json.dumps(value)
+        result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout)
+        self.assertEqual(json.loads(result.stderr)['outcome'],'unconfirmed');self.assert_no_owner()
+
+    def test_successor_requires_exact_generation_and_candidate_binding(self):
+        flags=self.maintenance_fixture()
+        before=json.loads(self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']);before['maintenanceReference'].update(transition='eligible_successor',releaseManifestSha256='e'*64)
+        self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']=json.dumps(before)
+        after=json.loads(self.env['FIXTURE_WORK_RESULT']);after['maintenanceReference'].update(generation=1,ownerSha256='f'*64);after['operationId']=after['maintenanceReference']['operationId']
+        for broken in ['generation','candidateManifestSha256','operationId',None]:
+            value=copy.deepcopy(after)
+            if broken=='generation':value['maintenanceReference'][broken]=2
+            if broken=='candidateManifestSha256':value['maintenanceReference'][broken]='e'*64
+            if broken=='operationId':value['maintenanceReference'][broken]='22222222-2222-4222-8222-222222222222';value['operationId']=value['maintenanceReference'][broken]
+            self.env['FIXTURE_WORK_RESULT']=json.dumps(value)
+            result=self.invoke(flags);self.assertEqual(result.returncode,0 if broken is None else 1,result.stderr)
+            if broken is None:
+                report=json.loads(result.stdout);self.assertEqual(report['maintenanceReference']['generation'],1);self.assertFalse(report['cleanupEligible'])
+        self.assert_no_owner();self.assertFalse((self.state/'runner-args.log').exists())
+
+    def test_original_attempt_requires_native_complete_result_before_successor(self):
+        flags=self.maintenance_fixture()
+        before=json.loads(self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']);before['maintenanceReference'].update(transition='resume_original_attempt',phase='qualified',attemptId='33333333-3333-4333-8333-333333333333',releaseManifestSha256='e'*64)
+        after=json.loads(self.env['FIXTURE_WORK_RESULT']);after['maintenanceReference'].update(generation=1,ownerSha256='f'*64)
+        self.env['FIXTURE_WORK_RESULT']=json.dumps(after)
+        for verified in [False,True]:
+            before['uninstallWorkEligibility']['successorAfterOriginalResult']=verified;self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']=json.dumps(before)
+            result=self.invoke(flags);self.assertEqual(result.returncode,0 if verified else 1,result.stderr)
+        self.assert_no_owner()
+
+    def test_same_manifest_successor_requires_distinct_verified_locator(self):
+        flags=self.maintenance_fixture()
+        before=json.loads(self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']);before['maintenanceReference'].update(transition='eligible_successor',releasePathSha256='2'*64)
+        after=json.loads(self.env['FIXTURE_WORK_RESULT']);after['maintenanceReference'].update(generation=1,ownerSha256='f'*64)
+        self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']=json.dumps(before)
+        for broken in ['candidateReleasePathSha256','releasePathSha256','generation',None]:
+            value=copy.deepcopy(after)
+            if broken=='candidateReleasePathSha256':value['maintenanceReference'][broken]='3'*64
+            if broken=='releasePathSha256':value['maintenanceReference'][broken]='2'*64
+            if broken=='generation':value['maintenanceReference'][broken]=2
+            self.env['FIXTURE_WORK_RESULT']=json.dumps(value)
+            result=self.invoke(flags);self.assertEqual(result.returncode,0 if broken is None else 1,result.stderr)
+            self.assertNotIn(str(self.root),result.stdout)
+        before['maintenanceReference']['releasePathSha256']='1'*64;self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']=json.dumps(before)
+        result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout)
+        self.assert_no_owner()
+
+    def test_original_attempt_locator_cannot_change_without_known_result(self):
+        flags=self.maintenance_fixture()
+        before=json.loads(self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']);before['maintenanceReference'].update(transition='resume_original_attempt',phase='qualified',attemptId='33333333-3333-4333-8333-333333333333',releasePathSha256='2'*64)
+        after=json.loads(self.env['FIXTURE_WORK_RESULT']);after['maintenanceReference'].update(generation=1,ownerSha256='f'*64)
+        self.env['FIXTURE_WORK_RESULT']=json.dumps(after)
+        for proven in [False,True]:
+            before['uninstallWorkEligibility']['successorAfterOriginalResult']=proven;self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']=json.dumps(before)
+            result=self.invoke(flags);self.assertEqual(result.returncode,0 if proven else 1,result.stderr)
+        # The same generation always retains its exact original locator.
+        after['maintenanceReference'].update(generation=0,transition='resume_original_attempt',phase='qualified',attemptId=before['maintenanceReference']['attemptId'])
+        self.env['FIXTURE_WORK_RESULT']=json.dumps(after)
+        result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout);self.assert_no_owner()
+
+    def test_handover_requires_verified_packaged_artifact_before_mutation(self):
+        flags=self.maintenance_fixture()
+        before=json.loads(self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']);before['maintenanceReference'].update(transition='eligible_successor',releasePathSha256='2'*64)
+        after=json.loads(self.env['FIXTURE_WORK_RESULT']);after['maintenanceReference'].update(generation=1,ownerSha256='f'*64);self.env['FIXTURE_WORK_RESULT']=json.dumps(after)
+        for candidate in [None,'e'*64]:
+            value=copy.deepcopy(before)
+            if candidate is None:del value['artifact']['manifestSha256']
+            else:value['artifact']['manifestSha256']=candidate
+            self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']=json.dumps(value)
+            result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout);self.assertFalse((self.state/'work.log').exists())
+        value=copy.deepcopy(before);value['artifact']['manifestSha256']='e'*64;value['maintenanceReference']['candidateManifestSha256']='e'*64
+        self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']=json.dumps(value)
+        result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout);self.assertFalse((self.state/'work.log').exists());self.assert_no_owner()
+
+    def test_v1_report_has_no_cross_release_authority(self):
+        flags=self.maintenance_fixture();value=json.loads(self.env['FIXTURE_WORK_RESULT']);value['schema']='app.loomex.runner.bootstrap-uninstall-work/v1';self.env['FIXTURE_WORK_RESULT']=json.dumps(value)
+        result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout);self.assert_no_owner()
+
+    def test_maintenance_reference_and_native_diagnostic_are_bounded_on_failure(self):
+        flags=self.maintenance_fixture('reconcile','blocked')
+        value=json.loads(self.env['FIXTURE_WORK_RESULT']);value.update(outcome='blocked',reasonCode='OWNER_AUTHORIZATION_REQUIRED',nextAction='inspect_uninstall_work',nativeDiagnostic={'code':'STORE_ACCESS_REQUIRED','failureStage':'protected_store_read','failureCategory':'access_required','nativeOsStatus':-25308,'private':'SECRET','stderr':'SECRET'})
+        value['maintenanceReference']['private']='SECRET';self.env['FIXTURE_WORK_RESULT']=json.dumps(value);self.env['FIXTURE_WORK_EXIT']='1'
+        result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout);report=json.loads(result.stderr)
+        self.assertEqual(report['nativeDiagnostic']['failureCategory'],'access_required');self.assertEqual(report['nativeDiagnostic']['failureStage'],'protected_store_read');self.assertEqual(report['maintenanceReference']['generation'],0);self.assertNotIn('SECRET',result.stderr)
+        # A nonzero native preflight retains the same bounded reference, without dispatching work.
+        preflight=json.loads(self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']);preflight.update(reasonCode='OWNER_AUTHORIZATION_REQUIRED',nextAction='inspect_uninstall_work',nativeDiagnostic=value['nativeDiagnostic']);preflight['maintenanceReference']['private']='SECRET'
+        self.env['FIXTURE_RUNNER_PREFLIGHT_JSON']=json.dumps(preflight);self.env['FIXTURE_RUNNER_PREFLIGHT_EXIT']='1'
+        result=self.invoke(flags);self.assertEqual(result.returncode,1,result.stdout);report=json.loads(result.stderr);self.assertEqual(report['maintenanceReference']['generation'],0);self.assertNotIn('SECRET',result.stderr)
+
     def test_uninstall_work_inspection_preserves_historical_null_operation_and_13_14_chain(self):
         result=self.invoke(self.work_fixture())
         self.assertEqual(result.returncode,0,result.stderr)
@@ -706,7 +838,7 @@ esac
             self.assertEqual(args[args.index('--retirement-scope')+1],'continuations')
             self.assertEqual(args[args.index('--expected-old-journal-sha256')+1],'a'*64)
         report=json.loads(result.stdout)
-        self.assertEqual(report['schema'],'app.loomex.paired-install-result/v3')
+        self.assertEqual(report['schema'],'app.loomex.paired-install-result/v4')
         self.assertEqual(report['retirementScope'],'continuations')
         self.assertFalse(report['actionCompleted']);self.assertFalse(report['cleanupEligible'])
 
