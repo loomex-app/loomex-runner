@@ -285,18 +285,14 @@ fn valid_recovery_arguments(command: &str, args: &Arguments) -> bool {
 }
 
 fn paths(args: &Arguments) -> Result<lifecycle::Paths> {
-    let mut paths = lifecycle::Paths::from_environment()?;
-    if let Some(value) = &args.install_base {
-        paths.install_base = absolute(value)?;
-    }
-    if let Some(value) = &args.state_dir {
-        paths.state_dir = absolute(value)?;
-    }
-    if let Some(value) = &args.launch_agents_dir {
-        paths.launch_agents_dir = absolute(value)?;
-    }
-    paths.validate()?;
-    Ok(paths)
+    lifecycle::Paths::from_environment_with_overrides(
+        args.install_base.as_deref().map(absolute).transpose()?,
+        args.state_dir.as_deref().map(absolute).transpose()?,
+        args.launch_agents_dir
+            .as_deref()
+            .map(absolute)
+            .transpose()?,
+    )
 }
 
 fn absolute(path: &Path) -> Result<PathBuf> {
@@ -1344,7 +1340,7 @@ async fn install(args: Arguments) -> Result<()> {
             &paths.state_dir.join("install-receipt.json"),
             &json!({"schema":"app.loomex.runner.install-receipt/v2","version":version,"versionPath":target,"launchAgent":paths.launch_agents_dir.join("app.loomex.runner.plist"),"bootstrapSha256":state::digest(&fs::read(bootstrap)?),"developmentOnly":manifest["developmentOnly"],"developmentApiOrigin":origin,"providerExecutables":providers}),
         )?;
-        remove_regular(&bootstrap_journal)?;
+        remove_install_journal(&bootstrap_journal)?;
         if args.json {
             emit_activation(&args, "completed", "ACTIVATION_COMPLETED", "none")?;
         } else {
@@ -1478,6 +1474,14 @@ fn remove_regular(path: &Path) -> Result<()> {
     }
     fs::remove_file(path)?;
     Ok(())
+}
+
+fn remove_install_journal(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => remove_regular(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn json_output_requested() -> bool {
@@ -1791,6 +1795,23 @@ async fn run() -> Result<()> {
 #[cfg(test)]
 mod pending_stop_tests {
     use super::*;
+    #[test]
+    fn completed_install_journal_cleanup_is_idempotent_and_rejects_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = root.path().join("bootstrap-install.json");
+        fs::write(&journal, b"{}").unwrap();
+        remove_install_journal(&journal).unwrap();
+        remove_install_journal(&journal).unwrap();
+        let unrelated = root.path().join("unrelated");
+        fs::write(&unrelated, b"preserve").unwrap();
+        std::os::unix::fs::symlink(&unrelated, &journal).unwrap();
+        assert!(remove_install_journal(&journal).is_err());
+        assert_eq!(fs::read(&unrelated).unwrap(), b"preserve");
+        fs::remove_file(&journal).unwrap();
+        fs::create_dir(&journal).unwrap();
+        assert!(remove_install_journal(&journal).is_err());
+        assert!(journal.is_dir());
+    }
     #[test]
     fn work_capability_preflight_refusals_preserve_fixed_code_and_selection_action() {
         for code in [

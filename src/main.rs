@@ -417,17 +417,11 @@ async fn run_lifecycle(arguments: Vec<String>) -> Result<()> {
             "INVALID_ARGUMENT"
         );
     }
-    let mut paths = lifecycle::Paths::from_environment()?;
-    if let Some(path) = install_base {
-        paths.install_base = path;
-    }
-    if let Some(path) = state_dir {
-        paths.state_dir = path;
-    }
-    if let Some(path) = launch_agents_dir {
-        paths.launch_agents_dir = path;
-    }
-    paths.validate()?;
+    let paths = lifecycle::Paths::from_environment_with_overrides(
+        install_base,
+        state_dir,
+        launch_agents_dir,
+    )?;
     let value = match action.as_str() {
         "status" => {
             let mut status = lifecycle::status(&paths)?;

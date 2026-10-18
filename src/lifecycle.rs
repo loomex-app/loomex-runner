@@ -892,13 +892,21 @@ pub struct Paths {
 
 impl Paths {
     pub fn from_environment() -> Result<Self> {
+        Self::from_environment_with_overrides(None, None, None)
+    }
+
+    pub fn from_environment_with_overrides(
+        install_base: Option<PathBuf>,
+        state_dir: Option<PathBuf>,
+        launch_agents_dir: Option<PathBuf>,
+    ) -> Result<Self> {
         let home = PathBuf::from(std::env::var_os("HOME").context("HOME is missing")?);
-        let install_base = std::env::var_os("LOOMEX_INSTALL_BASE")
-            .map(PathBuf::from)
+        let install_base = install_base
+            .or_else(|| std::env::var_os("LOOMEX_INSTALL_BASE").map(PathBuf::from))
             .unwrap_or_else(|| home.join("Library/Application Support/Loomex/runner"));
-        let state_dir = state::state_dir()?;
-        let launch_agents_dir = std::env::var_os("LOOMEX_LAUNCH_AGENTS_DIR")
-            .map(PathBuf::from)
+        let state_dir = state_dir.map(Ok).unwrap_or_else(state::state_dir)?;
+        let launch_agents_dir = launch_agents_dir
+            .or_else(|| std::env::var_os("LOOMEX_LAUNCH_AGENTS_DIR").map(PathBuf::from))
             .unwrap_or_else(|| home.join("Library/LaunchAgents"));
         let paths = Self {
             install_base,
@@ -7777,6 +7785,54 @@ mod tests {
             }
             assert!(started.elapsed() < Duration::from_secs(2));
         }
+    }
+
+    #[test]
+    fn explicit_paths_override_unselected_unsafe_environment_before_validation() {
+        const CHILD: &str = "LOOMEX_TEST_EXPLICIT_PATHS_ROOT";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            assert!(Paths::from_environment().is_err());
+            let paths = Paths::from_environment_with_overrides(
+                Some(root.join("install")),
+                Some(root.join("state")),
+                Some(root.join("agents")),
+            )
+            .unwrap();
+            assert_eq!(paths.install_base, root.join("install"));
+            assert_eq!(paths.state_dir, root.join("state"));
+            assert_eq!(paths.launch_agents_dir, root.join("agents"));
+            assert!(!paths.install_base.exists());
+            assert!(!paths.state_dir.exists());
+            assert!(!paths.launch_agents_dir.exists());
+            assert!(
+                Paths::from_environment_with_overrides(
+                    Some(root.join("unsafe")),
+                    Some(root.join("state")),
+                    Some(root.join("agents"))
+                )
+                .is_err()
+            );
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        fs::create_dir(root.join("unsafe")).unwrap();
+        fs::set_permissions(root.join("unsafe"), fs::Permissions::from_mode(0o777)).unwrap();
+        std::os::unix::fs::symlink(root.join("unsafe"), root.join("linked")).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "lifecycle::tests::explicit_paths_override_unselected_unsafe_environment_before_validation", "--nocapture"])
+            .env(CHILD, &root)
+            .env("LOOMEX_INSTALL_BASE", root.join("unsafe"))
+            .env("LOOMEX_STATE_DIR", "relative-unselected-state")
+            .env("LOOMEX_LAUNCH_AGENTS_DIR", root.join("linked"))
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn paths(root: &Path) -> Paths {

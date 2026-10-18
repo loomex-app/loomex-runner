@@ -228,7 +228,12 @@ fn installed_eligibility(
         // A first install may have staged ownership before its receipt. The
         // lifecycle package identity below must authorize that exact retry.
         (None, Some(owned)) => {
-            let staged_receipt = json!({"schema":"app.loomex.runner.install-receipt/v2", "launchAgent":paths.launch_agents_dir.join("app.loomex.runner.plist")});
+            let staged_receipt = json!({
+                "schema":"app.loomex.runner.install-receipt/v2",
+                "version":package.version,
+                "versionPath":package.target,
+                "launchAgent":paths.launch_agents_dir.join("app.loomex.runner.plist")
+            });
             validate_owned_installation(paths, &staged_receipt, owned, false)?;
         }
         _ => bail!("incomplete owned installation metadata"),
@@ -823,6 +828,63 @@ mod tests {
         .unwrap();
         assert_eq!(value["ready"], true);
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+    #[test]
+    fn staged_first_install_can_retry_without_a_receipt_or_state_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(root.path()).unwrap();
+        let paths = lifecycle::Paths {
+            install_base: base.join("install"),
+            state_dir: base.join("state"),
+            launch_agents_dir: base.join("agents"),
+        };
+        let target = paths.install_base.join("versions/1.2.3");
+        fs::create_dir_all(target.join("bin")).unwrap();
+        fs::create_dir(&paths.state_dir).unwrap();
+        let binary = target.join("bin/loomex-runner");
+        fs::write(&binary, b"candidate").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let files = json!([{"path":"bin/loomex-runner", "sha256":state::digest(b"candidate"), "size":9, "mode":0o700}]);
+        let package = lifecycle::PackageIdentity {
+            version: "1.2.3".into(),
+            target: target.clone(),
+            manifest_sha256: "a".repeat(64),
+        };
+        let configuration = json!({"schema":"app.loomex.runner.bootstrap-install/v1", "version":package.version, "target":target, "manifestSha256":package.manifest_sha256, "developmentApiOrigin":"http://127.0.0.1:28080/", "providerExecutables":{}});
+        let owned = json!({"schema":"app.loomex.runner.owned-versions/v1", "paths":[target], "inventories":[{"path":target,"files":files}]});
+        let owned_path = paths.state_dir.join("owned-versions.json");
+        let journal_path = paths.state_dir.join("bootstrap-install.json");
+        state::write_json(&owned_path, &owned).unwrap();
+        state::write_json(&journal_path, &configuration).unwrap();
+        let before = (
+            fs::read(&owned_path).unwrap(),
+            fs::read(&journal_path).unwrap(),
+        );
+        let manifest = json!({"payload":{"files":files}});
+        let result = installed_eligibility(&paths, &package, &manifest, &configuration).unwrap();
+        assert_eq!(result["ready"], true);
+        assert_eq!(fs::read(&owned_path).unwrap(), before.0);
+        assert_eq!(fs::read(&journal_path).unwrap(), before.1);
+        assert_eq!(fs::read_dir(&paths.state_dir).unwrap().count(), 2);
+        assert!(!paths.install_base.join("current").exists());
+
+        fs::write(&binary, b"tampered!").unwrap();
+        assert!(installed_eligibility(&paths, &package, &manifest, &configuration).is_err());
+        fs::write(&binary, b"candidate").unwrap();
+        let mut other = package.clone();
+        other.version = "1.2.4".into();
+        other.target = paths.install_base.join("versions/1.2.4");
+        assert!(installed_eligibility(&paths, &other, &manifest, &configuration).is_err());
+        fs::remove_file(&journal_path).unwrap();
+        let incomplete =
+            installed_eligibility(&paths, &package, &manifest, &configuration).unwrap();
+        assert_eq!(incomplete["ready"], false);
+        assert!(
+            incomplete["blockers"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("incomplete_owned_installation"))
+        );
     }
     #[test]
     fn same_version_payload_mismatch_is_blocked_without_mutation() {
