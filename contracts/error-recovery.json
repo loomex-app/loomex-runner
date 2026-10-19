@@ -265,6 +265,46 @@
     "AUTH_RECOVERY_REFERENCE_MISMATCH": {
       "recovery": "refresh_authority",
       "outcome": "rejected"
+    },
+    "PERSONA_MEMORY_RESPONSE_INVALID": {
+      "recovery": "reconcile_outcome",
+      "outcome": "unknown"
+    },
+    "PERSONA_MEMORY_READ_SEQUENCE_INVALID": {
+      "recovery": "refresh_authority",
+      "outcome": "rejected"
+    },
+    "PERSONA_MEMORY_CHECKSUM_MISMATCH": {
+      "recovery": "refresh_authority",
+      "outcome": "rejected"
+    },
+    "PERSONA_MEMORY_READ_LIMIT": {
+      "recovery": "correct_input",
+      "outcome": "rejected"
+    },
+    "PERSONA_MEMORY_READ_ONLY": {
+      "recovery": "correct_input",
+      "outcome": "rejected"
+    },
+    "PERSONA_DISCUSSION_CONTRACT_INVALID": {
+      "recovery": "prepare_again",
+      "outcome": "rejected"
+    },
+    "PERSONA_DISCUSSION_PROVIDER_UNSUPPORTED": {
+      "recovery": "select_supported_provider",
+      "outcome": "rejected"
+    },
+    "PERSONA_DISCUSSION_FRESH_CONTEXT_REQUIRED": {
+      "recovery": "prepare_again",
+      "outcome": "rejected"
+    },
+    "PERSONA_DISCUSSION_REVIEW_INVALID": {
+      "recovery": "prepare_again",
+      "outcome": "rejected"
+    },
+    "PERSONA_DISCUSSION_REVIEW_UNREPRESENTABLE": {
+      "recovery": "prepare_again",
+      "outcome": "rejected"
     }
   }
 }

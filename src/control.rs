@@ -90,6 +90,10 @@ struct AuthoringRequestOwner<'a> {
     account: &'a str,
     expected: Option<&'a crate::auth::BoundCredentialOwner>,
 }
+struct ReadDispatch {
+    admission: Option<crate::memory_wire::ReadAdmission>,
+    delivery: Option<crate::memory_wire::ReadDelivery>,
+}
 
 pub struct Daemon {
     pub dir: PathBuf,
@@ -102,6 +106,9 @@ pub struct Daemon {
     pub execution: Arc<crate::jobs::supervisor::ExecutionSupervisor>,
     pub fingerprints: crate::fingerprint::FingerprintService,
     mutation_keys: std::sync::Mutex<HashMap<String, MutationKey>>,
+    memory_pages: Arc<std::sync::Mutex<crate::memory_wire::MemoryReadState>>,
+    memory_read_admission: Arc<tokio::sync::Semaphore>,
+    memory_read_lifecycle: Arc<crate::memory_wire::ReadLifecycle>,
     start_handoff_locks: std::sync::Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
     preparation_handoff_locks: std::sync::Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
     lifecycle_draining: AtomicBool,
@@ -111,6 +118,14 @@ pub struct Daemon {
     test_provider_paths: std::sync::Mutex<Option<ProviderPaths>>,
 }
 struct ControlWriter<'a>(&'a Daemon);
+// A read's caller may disappear while a bounded filesystem worker still owns
+// its ticket. Keep daemon drain/shutdown accounting until that owner finalizes.
+struct OwnedReadControl(Arc<crate::jobs::supervisor::ExecutionSupervisor>);
+impl Drop for OwnedReadControl {
+    fn drop(&mut self) {
+        self.0.end_control();
+    }
+}
 impl Drop for ControlWriter<'_> {
     fn drop(&mut self) {
         self.0.execution.end_control();
@@ -144,6 +159,11 @@ impl Daemon {
             execution: Arc::new(crate::jobs::supervisor::ExecutionSupervisor::new(draining)),
             fingerprints: crate::fingerprint::FingerprintService::default(),
             mutation_keys: std::sync::Mutex::new(HashMap::new()),
+            memory_pages: Arc::new(std::sync::Mutex::new(
+                crate::memory_wire::MemoryReadState::default(),
+            )),
+            memory_read_admission: Arc::new(tokio::sync::Semaphore::new(64)),
+            memory_read_lifecycle: Arc::default(),
             start_handoff_locks: std::sync::Mutex::new(HashMap::new()),
             preparation_handoff_locks: std::sync::Mutex::new(HashMap::new()),
             lifecycle_draining: AtomicBool::new(draining),
@@ -152,6 +172,36 @@ impl Daemon {
             #[cfg(test)]
             test_provider_paths: std::sync::Mutex::new(None),
         })
+    }
+    async fn dispose_memory_reads(
+        &self,
+        ticket: Option<crate::memory_wire::ReadTicket>,
+        mode: &str,
+    ) -> Result<()> {
+        let transition = ticket
+            .is_none()
+            .then(|| self.memory_read_lifecycle.transition());
+        self.execution.begin_control();
+        let keep = OwnedReadControl(self.execution.clone());
+        let pages = self.memory_pages.clone();
+        let mode = mode.to_owned();
+        crate::fingerprint::REQUEST_CANCELLATION
+            .scope(
+                crate::fingerprint::Cancellation::default(),
+                self.fingerprints.filesystem(move |_| {
+                    let _transition = transition;
+                    let _keep = keep;
+                    let mut pages = pages.lock().map_err(|_| anyhow::anyhow!("INTERNAL"))?;
+                    match ticket {
+                        None => pages.invalidate(),
+                        Some(ticket) if mode == "owner" => pages.invalidate_owner(&ticket),
+                        Some(ticket) if mode == "release" => pages.release(&ticket),
+                        Some(ticket) => pages.abort(&ticket),
+                    }
+                    Ok(())
+                }),
+            )
+            .await
     }
     pub fn fingerprint_diagnostics(&self) -> Value {
         self.fingerprints.diagnostics()
@@ -201,7 +251,7 @@ impl Daemon {
                 } else {
                     false
                 };
-                providers.insert(name.into(), json!({"path":path,"adapter":adapter,"checksumSha256":fingerprint.checksum,"sizeBytes":fingerprint.size,"modifiedNanos":fingerprint.modified_nanos,"executionPolicy":"host_user/v1","capabilities":{"ai.persona-memory/v1":qualified_codex_cli,"execution.workspace-set/v1":name == "codex" && qualified_codex_cli}}));
+                providers.insert(name.into(), json!({"path":path,"adapter":adapter,"checksumSha256":fingerprint.checksum,"sizeBytes":fingerprint.size,"modifiedNanos":fingerprint.modified_nanos,"executionPolicy":"host_user/v1","capabilities":{"ai.persona-memory/v1":qualified_codex_cli,"ai.persona-memory/v2":qualified_codex_cli && crate::jobs::persona_memory::V2_PROVIDER_QUALIFIED,"ai.persona-discussion/v1":qualified_codex_cli && crate::jobs::persona_memory::DISCUSSION_PROVIDER_QUALIFIED,"execution.workspace-set/v1":name == "codex" && qualified_codex_cli}}));
                 files.push(fingerprint);
             }
         }
@@ -262,6 +312,20 @@ impl Daemon {
         key: Option<&str>,
         request_owner: AuthoringRequestOwner<'_>,
     ) -> Result<Value> {
+        Ok(self
+            .native_authoring_backend_canonical(org, method, path, body, key, request_owner)
+            .await?
+            .0)
+    }
+    async fn native_authoring_backend_canonical(
+        &self,
+        org: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        key: Option<&str>,
+        request_owner: AuthoringRequestOwner<'_>,
+    ) -> Result<(Value, String)> {
         let AuthoringRequestOwner { account, expected } = request_owner;
         if let Some(expected) = expected {
             ensure!(
@@ -276,7 +340,7 @@ impl Daemon {
         self.auth.verify_bound_owner(&owner).await?;
         let result = self
             .api
-            .request(method, path, body, Some(&credential), key)
+            .request_canonical(method, path, body, Some(&credential), key)
             .await;
         self.auth.verify_bound_owner(&owner).await?;
         Ok(result?)
@@ -420,6 +484,21 @@ impl Daemon {
                     })
             })
             .flatten();
+        // Capture before selected-context resolution, credential acquisition,
+        // operation locks, or any other relevant suspension point.
+        let mut read_dispatch = ReadDispatch {
+            admission: if method == "personas.memory.read" {
+                Some(
+                    self.memory_read_lifecycle
+                        .capture(self.memory_read_admission.clone())?,
+                )
+            } else {
+                None
+            },
+            delivery: None,
+        };
+        let _read_transition = matches!(method, "organizations.select" | "auth.logout")
+            .then(|| self.memory_read_lifecycle.transition());
         // Capture organization before waiting for any operation. The handler never
         // substitutes a later active organization into this operation's identity.
         let scope = if method.starts_with("auth.")
@@ -602,12 +681,21 @@ impl Daemon {
             crate::operation_cache::deny_retired_slot(&self.dir, &legacy_scoped_slot)?;
         }
         let pending_record = if let Some(key) = key.filter(|_| operation.is_some()) {
+            let mut cache_schema = entry["inputSchema"].clone();
+            // An absent new transport offer keeps the historical create schema
+            // fingerprint, so accepted v1 receipts remain readable unchanged.
+            if method == "personas.chat_context.create" {
+                cache_schema["properties"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("transportMemoryContract");
+            }
             let mut binding = crate::operation_cache::binding(
                 method,
                 key,
                 &identity,
-                &entry["inputSchema"],
-                &params,
+                &cache_schema,
+                &semantic_operation_params(method, &params),
                 crate::operation_cache::BindingOrigin {
                     organization: scope.as_deref(),
                     account: bound_account.as_deref(),
@@ -737,8 +825,8 @@ impl Daemon {
                     let query =
                         json!({"operation":operation,"idempotencyKey":params["idempotencyKey"]});
                     let (verb, route, body) = backend_route("personas.operations.get", &query)?;
-                    let receipt = self
-                        .native_authoring_backend(
+                    let (receipt, raw) = self
+                        .native_authoring_backend_canonical(
                             scope.as_deref().context("ORGANIZATION_REQUIRED")?,
                             &verb,
                             &route,
@@ -763,11 +851,30 @@ impl Daemon {
                             && receipt["response"].is_object(),
                         "NETWORK_AMBIGUOUS"
                     );
-                    let response = receipt
+                    let mut response = receipt
                         .get("response")
                         .cloned()
                         .context("BACKEND_PROTOCOL_ERROR")?;
                     verify_persona_creation(method, &params, &response)?;
+                    if matches!(method, "personas.memory.write" | "personas.memory.update")
+                        && response["result"]["schemaVersion"] == crate::jobs::persona_memory::V2
+                    {
+                        let raw: std::collections::HashMap<
+                            String,
+                            Box<serde_json::value::RawValue>,
+                        > = serde_json::from_str(&raw)?;
+                        let canonical = crate::memory_wire::canonical_result(
+                            raw.get("response")
+                                .context("PERSONA_MEMORY_RESPONSE_INVALID")?
+                                .get(),
+                        )?;
+                        crate::memory_wire::validate_result(
+                            method.rsplit('.').next().unwrap(),
+                            &response["result"],
+                            &canonical,
+                        )?;
+                        response["canonicalText"] = json!(canonical);
+                    }
                     Some(response)
                 } else if let Some(result) = record.get("result") {
                     Some(result.clone())
@@ -967,6 +1074,7 @@ impl Daemon {
                         scope.as_deref(),
                         scoped_account.as_deref(),
                         native_owner.as_ref(),
+                        &mut read_dispatch,
                     ),
                 )
                 .await;
@@ -1045,7 +1153,10 @@ impl Daemon {
         if method == "daemon.drain" {
             Ok(self.drain_status())
         } else {
-            Ok(result)
+            match read_dispatch.delivery {
+                Some(delivery) => delivery.accept(result),
+                None => Ok(result),
+            }
         }
     }
     /// Compare every retained execution identity before a spool replaces the
@@ -1224,13 +1335,40 @@ impl Daemon {
     /// much larger than a useful human review. Project only facts needed to
     /// identify the reviewed version and its resolved provider models; the
     /// original binding and digest remain untouched for commit/reconciliation.
-    fn preparation_review_projection(review: &Value) -> Value {
+    fn preparation_review_projection(review: &Value) -> Result<Value> {
         let mut projected = review.clone();
         let Some(binding) = projected.get_mut("binding").and_then(Value::as_object_mut) else {
-            return projected;
+            return Ok(projected);
         };
+        let discussions = if let Some(items) = binding
+            .get("workflowClosureReview")
+            .and_then(|r| r.get("discussions"))
+        {
+            items
+                .as_array()
+                .context("PERSONA_DISCUSSION_REVIEW_INVALID")?
+                .iter()
+                .map(|item| {
+                    safe_discussion_review(item).context("PERSONA_DISCUSSION_REVIEW_INVALID")
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let has_discussions = binding
+            .get("workflowClosureReview")
+            .and_then(|review| review.get("discussions"))
+            .is_some();
         let Some(closure) = binding.remove("workflowClosure") else {
-            return projected;
+            if has_discussions {
+                binding.get_mut("workflowClosureReview").unwrap()["discussions"] =
+                    json!(discussions);
+                ensure!(
+                    serde_json::to_vec(&projected)?.len() <= MAX_FRAME,
+                    "PERSONA_DISCUSSION_REVIEW_UNREPRESENTABLE"
+                );
+            }
+            return Ok(projected);
         };
         let root_workflow = binding.get("workflowId").and_then(Value::as_str);
         let root_version = binding.get("versionId").and_then(Value::as_str);
@@ -1258,19 +1396,26 @@ impl Daemon {
                     version = entry["version"].as_u64();
                 }
                 if let Some(dependencies) = entry["nodeDependencies"].as_object() {
-                    for snapshot in dependencies.values() {
-                        let resolution = &snapshot["modelResolution"];
-                        let Some(name) = resolution["provider"].as_str() else {
-                            continue;
-                        };
-                        let Some(model) = resolution["runtimeModel"].as_str() else {
-                            continue;
-                        };
-                        if seen.insert((name.to_owned(), model.to_owned())) {
-                            if name.len() <= 64 && model.len() <= 128 && providers.len() < 32 {
-                                providers.push(json!({"name":name,"model":model}));
-                            } else {
-                                providers_truncated = true;
+                    for parent in dependencies.values() {
+                        for snapshot in std::iter::once(parent).chain(
+                            parent["discussion"]["participants"]
+                                .as_array()
+                                .into_iter()
+                                .flatten(),
+                        ) {
+                            let resolution = &snapshot["modelResolution"];
+                            let Some(name) = resolution["provider"].as_str() else {
+                                continue;
+                            };
+                            let Some(model) = resolution["runtimeModel"].as_str() else {
+                                continue;
+                            };
+                            if seen.insert((name.to_owned(), model.to_owned())) {
+                                if name.len() <= 64 && model.len() <= 128 && providers.len() < 32 {
+                                    providers.push(json!({"name":name,"model":model}));
+                                } else {
+                                    providers_truncated = true;
+                                }
                             }
                         }
                     }
@@ -1286,11 +1431,16 @@ impl Daemon {
                 "rootVersion":version,
                 "providers":providers,
                 "personas":personas,
+                "discussions":discussions,
                 "providerCount":provider_count,
                 "providersTruncated":providers_truncated,
             }),
         );
-        projected
+        ensure!(
+            serde_json::to_vec(&projected)?.len() <= MAX_FRAME,
+            "PERSONA_DISCUSSION_REVIEW_UNREPRESENTABLE"
+        );
+        Ok(projected)
     }
     async fn handle(
         &self,
@@ -1299,6 +1449,7 @@ impl Daemon {
         scope: Option<&str>,
         account: Option<&str>,
         native_owner: Option<&crate::auth::BoundCredentialOwner>,
+        read_dispatch: &mut ReadDispatch,
     ) -> Result<Value> {
         let key = p.get("idempotencyKey").and_then(Value::as_str);
         match method {
@@ -1378,6 +1529,7 @@ impl Daemon {
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
+                self.dispose_memory_reads(None, "all").await?;
                 let result = self.auth.logout().await?;
                 let mut public = self.public.lock().await;
                 public.active_organization = None;
@@ -1387,6 +1539,7 @@ impl Daemon {
             "organizations.list" => return self.auth.organizations().await,
             "organizations.select" => {
                 let org = required(p, "organizationId")?;
+                self.dispose_memory_reads(None, "all").await?;
                 let result = self.auth.select(org, key.unwrap()).await?;
                 let mut public = self.public.lock().await;
                 public.active_organization = Some(org.into());
@@ -1656,6 +1809,130 @@ impl Daemon {
                     },
                 )
                 .await
+            } else if method == "personas.chat_context.create"
+                && p["transportMemoryContract"] == crate::jobs::persona_memory::V2
+            {
+                let credential = self.auth.credential(&org).await?;
+                self.api
+                    .request_persona_context(&route, body, &credential, key)
+                    .await
+                    .map_err(Into::into)
+            } else if method == "personas.memory.read" {
+                let admission = read_dispatch.admission.take().context("INTERNAL")?;
+                let credential = match self.auth.credential(&org).await {
+                    Ok(credential) => credential,
+                    Err(error) => {
+                        self.dispose_memory_reads(None, "all").await?;
+                        return Err(error);
+                    }
+                };
+                let (credential, owner) = match self
+                    .auth
+                    .owner_bound_credential(&org, None, Some(&credential.subject))
+                    .await
+                {
+                    Ok(bound) => bound,
+                    Err(error) => {
+                        self.dispose_memory_reads(None, "all").await?;
+                        return Err(error);
+                    }
+                };
+                let scope = state::json_digest(&json!([
+                    org,
+                    credential.subject,
+                    p["personId"],
+                    p["conversationId"],
+                    p["chatId"]
+                ]));
+                let api = self.api.clone();
+                let auth = self.auth.clone();
+                let arguments = p["arguments"].clone();
+                let task_arguments = arguments.clone();
+                let key = key.map(str::to_owned);
+                let task_owner = owner.clone();
+                self.execution.begin_control();
+                let keep = OwnedReadControl(self.execution.clone());
+                let waiter = admission.spawn(
+                    self.memory_pages.clone(),
+                    self.fingerprints.clone(),
+                    crate::memory_wire::ReadTarget {
+                        owner,
+                        scope,
+                        arguments,
+                    },
+                    keep,
+                    move |request, ticket| async move {
+                        request.lease.check()?;
+                        let (mut value, raw) = match api
+                            .request_canonical(
+                                &verb,
+                                &route,
+                                body,
+                                Some(&credential),
+                                key.as_deref(),
+                            )
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(error) => {
+                                request.transport_failed();
+                                return Err(error.into());
+                            }
+                        };
+                        request.lease.check()?;
+                        if let Err(error) = auth.verify_bound_owner(&task_owner).await {
+                            request.invalidate_owner(ticket.clone()).await?;
+                            return Err(error);
+                        }
+                        if value["result"]["schemaVersion"] == crate::jobs::persona_memory::V2 {
+                            let canonical = crate::memory_wire::canonical_result(&raw)?;
+                            request
+                                .finish(
+                                    ticket.clone(),
+                                    task_arguments,
+                                    value["result"].clone(),
+                                    Some(canonical.clone()),
+                                )
+                                .await?;
+                            if let Err(error) = auth.verify_bound_owner(&task_owner).await {
+                                request.invalidate_owner(ticket).await?;
+                                return Err(error);
+                            }
+                            value["canonicalText"] = json!(canonical);
+                            Ok((value, false))
+                        } else {
+                            auth.verify_bound_owner(&task_owner).await?;
+                            Ok((value, true))
+                        }
+                    },
+                );
+                let (value, delivery) = waiter.ready().await?;
+                read_dispatch.delivery = Some(delivery);
+                Ok(value)
+            } else if matches!(
+                method,
+                "personas.memory.search" | "personas.memory.write" | "personas.memory.update"
+            ) {
+                let credential = self.auth.credential(&org).await?;
+                match self
+                    .api
+                    .request_canonical(&verb, &route, body, Some(&credential), key)
+                    .await
+                {
+                    Ok((mut value, raw)) => {
+                        if value["result"]["schemaVersion"] == crate::jobs::persona_memory::V2 {
+                            let canonical = crate::memory_wire::canonical_result(&raw)?;
+                            crate::memory_wire::validate_result(
+                                method.rsplit('.').next().unwrap(),
+                                &value["result"],
+                                &canonical,
+                            )?;
+                            value["canonicalText"] = json!(canonical);
+                        }
+                        Ok(value)
+                    }
+                    Err(error) => Err(error.into()),
+                }
             } else {
                 self.backend(&org, &verb, &route, body, key).await
             };
@@ -2495,7 +2772,7 @@ impl Daemon {
             "completed",
         );
         let enriching = Instant::now();
-        let projection = Self::preparation_review_projection(&sealed);
+        let projection = Self::preparation_review_projection(&sealed)?;
         self.fingerprints.record_stage(
             method,
             "review_enrichment",
@@ -2605,7 +2882,7 @@ impl Daemon {
         {
             return Ok(stale("workspace_changed", "prepare_again"));
         }
-        if self.provider_snapshot().await? != record["providers"] {
+        if !provider_snapshot_matches(&record["providers"], &self.provider_snapshot().await?) {
             return Ok(stale("provider_changed", "prepare_again"));
         }
         ensure!(
@@ -2625,7 +2902,7 @@ impl Daemon {
         }
         self.require_prepared_workspaces(&record, org).await?;
         Ok(
-            json!({"status":"valid","operation":operation,"preparation":Self::preparation_review_projection(&review)}),
+            json!({"status":"valid","operation":operation,"preparation":Self::preparation_review_projection(&review)?}),
         )
     }
 
@@ -3028,10 +3305,10 @@ impl Daemon {
         let expected = if review["binding"].get("workflowClosure").is_some() {
             sealed["review"].clone()
         } else {
-            Self::preparation_review_projection(&sealed["review"])
+            Self::preparation_review_projection(&sealed["review"])?
         };
         Ok(*review == expected
-            && current["preparation"] == Self::preparation_review_projection(&sealed["review"]))
+            && current["preparation"] == Self::preparation_review_projection(&sealed["review"])?)
     }
 
     async fn expire_start_handoff(&self, path: &Path, record: &mut Value) -> Result<()> {
@@ -3633,7 +3910,7 @@ impl Daemon {
             bail!("PRECONDITION_FAILED");
         }
         self.require_prepared_workspaces(&record, org).await?;
-        if record["providers"] != self.provider_snapshot().await? {
+        if !provider_snapshot_matches(&record["providers"], &self.provider_snapshot().await?) {
             bail!("PRECONDITION_FAILED")
         }
         let (account, installation) = self.auth.current_child_identity(org).await?;
@@ -3654,6 +3931,7 @@ impl Daemon {
             "PRECONDITION_FAILED"
         );
         self.require_prepared_workspaces(&record, org).await?;
+        Self::preparation_review_projection(&record["review"])?;
         verify_persona_memory_binding(&record["binding"], &record["providers"], false)?;
         // The separate confirmation authorizes this exact preparation before the
         // backend can enqueue a job. A lost response never removes this grant.
@@ -4289,6 +4567,15 @@ pub(crate) fn verify_native_authoring_start(method: &str, result: &Value) -> Res
     );
     Ok(())
 }
+fn semantic_operation_params(method: &str, params: &Value) -> Value {
+    let mut semantic = params.clone();
+    if method == "personas.chat_context.create" {
+        if let Some(object) = semantic.as_object_mut() {
+            object.remove("transportMemoryContract");
+        }
+    }
+    semantic
+}
 fn operation_cache_identity(
     method: &str,
     params: &Value,
@@ -4296,7 +4583,7 @@ fn operation_cache_identity(
     account: Option<&str>,
 ) -> String {
     state::json_digest(
-        &json!({"method":method,"params":params,"organizationId":organization,"accountSubject":account}),
+        &json!({"method":method,"params":semantic_operation_params(method,params),"organizationId":organization,"accountSubject":account}),
     )
 }
 fn operation_cache_scoped_key(
@@ -5123,13 +5410,18 @@ pub fn backend_route(method: &str, p: &Value) -> Result<(String, String, Option<
             ("GET", "v1/personas/".into())
         }
         "personas.get" => ("GET", format!("v1/personas/{}/", required(p, "personId")?)),
-        "personas.chat_context.create" => (
-            "POST",
-            format!(
-                "v1/personas/{}/chat-context/create/",
-                required(p, "personId")?
-            ),
-        ),
+        "personas.chat_context.create" => {
+            body.as_object_mut()
+                .unwrap()
+                .remove("transportMemoryContract");
+            (
+                "POST",
+                format!(
+                    "v1/personas/{}/chat-context/create/",
+                    required(p, "personId")?
+                ),
+            )
+        }
         "personas.chat_context.get" => (
             "POST",
             format!("v1/personas/{}/chat-context/", required(p, "personId")?),
@@ -5344,55 +5636,286 @@ fn safe_persona_review(item: &Value) -> Option<Value> {
     Some(Value::Object(safe))
 }
 
+fn safe_discussion_review(item: &Value) -> Option<Value> {
+    let id = item["workflowVersionId"].as_str()?;
+    Uuid::parse_str(id).ok()?;
+    let mut result = json!({"workflowVersionId":id});
+    for key in ["nodeKey", "configDigest"] {
+        let value = item[key].as_str()?;
+        if value.is_empty() {
+            return None;
+        }
+        result[key] = json!(value);
+    }
+    if !lowercase_sha256(result["configDigest"].as_str()?) {
+        return None;
+    }
+    if ![
+        "ordered",
+        "independent_then_discuss",
+        "proposal_critique",
+        "voting",
+    ]
+    .contains(&item["mode"].as_str()?)
+    {
+        return None;
+    }
+    if !(1..=10).contains(&item["maxRounds"].as_u64()?)
+        || !item["finalMemoryProposals"].is_boolean()
+    {
+        return None;
+    }
+    for key in ["mode", "maxRounds", "finalMemoryProposals"] {
+        result[key] = item[key].clone();
+    }
+    for key in ["moderatorSlot", "synthesizerSlot"] {
+        if !item[key].is_null() && item[key].as_str().is_none_or(|s| s.is_empty()) {
+            return None;
+        }
+        result[key] = item[key].clone();
+    }
+    let budget = &item["contextBudget"];
+    if budget["accountingContract"] != "o200k_base/v1"
+        || !(1..=65536).contains(&budget["maxTokens"].as_u64()?)
+        || !(1..=524288).contains(&budget["maxBytes"].as_u64()?)
+    {
+        return None;
+    }
+    result["contextBudget"] = json!({"accountingContract":"o200k_base/v1","maxTokens":budget["maxTokens"],"maxBytes":budget["maxBytes"]});
+    let voting = &item["voting"];
+    if voting.is_null() {
+        result["voting"] = Value::Null;
+    } else {
+        if !["majority", "unanimity"].contains(&voting["rule"].as_str()?) {
+            return None;
+        }
+        let mut options = Vec::new();
+        let configured = voting["options"].as_array()?;
+        if !(2..=32).contains(&configured.len()) {
+            return None;
+        }
+        for option in configured {
+            let id = option["id"].as_str()?;
+            let label = option["label"].as_str()?;
+            if id.is_empty() || label.is_empty() {
+                return None;
+            }
+            options.push(json!({"id":id,"label":label}));
+        }
+        result["voting"] = json!({"rule":voting["rule"],"options":options});
+    }
+    let participants = item["participants"].as_array()?;
+    if !(2..=8).contains(&participants.len()) {
+        return None;
+    }
+    let mut members = Vec::new();
+    for participant in participants {
+        let mut member = json!({});
+        for key in ["personId", "roleId"] {
+            let id = participant[key].as_str()?;
+            Uuid::parse_str(id).ok()?;
+            member[key] = json!(id);
+        }
+        for key in [
+            "slotKey",
+            "selectionKey",
+            "personName",
+            "roleName",
+            "provider",
+            "model",
+            "configDigest",
+        ] {
+            let text = participant[key].as_str()?;
+            member[key] = json!(text);
+        }
+        if !lowercase_sha256(member["configDigest"].as_str()?) {
+            return None;
+        }
+        let effort = &participant["reasoningEffort"];
+        if !effort.is_null() && effort.as_str().is_none_or(|s| s.len() > 32) {
+            return None;
+        }
+        member["reasoningEffort"] = effort.clone();
+        members.push(member);
+    }
+    result["participants"] = json!(members);
+    Some(result)
+}
+
+/// Preserve the reviewed provider identity while permitting only the two new
+/// capability keys absent from a historical snapshot. Never rewrite the seal or
+/// ignore changed original values, unknown additions, providers or executable facts.
+pub(crate) fn provider_snapshot_matches(stored: &Value, current: &Value) -> bool {
+    let (Some(old), Some(fresh)) = (stored.as_object(), current.as_object()) else {
+        return false;
+    };
+    if old.len() != fresh.len() {
+        return false;
+    }
+    let mut projected = current.clone();
+    for (name, provider) in old {
+        let Some(previous) = provider.as_object() else {
+            return false;
+        };
+        let Some(now) = fresh.get(name).and_then(Value::as_object) else {
+            return false;
+        };
+        match (previous.get("capabilities"), now.get("capabilities")) {
+            (Some(Value::Object(caps)), Some(Value::Object(new_caps))) => {
+                for key in ["ai.persona-memory/v2", "ai.persona-discussion/v1"] {
+                    if let Some(value) = new_caps.get(key) {
+                        if !value.is_boolean() {
+                            return false;
+                        }
+                    }
+                    if let Some(value) = caps.get(key) {
+                        if !value.is_boolean() {
+                            return false;
+                        }
+                    }
+                    if !caps.contains_key(key) {
+                        projected[name]["capabilities"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove(key);
+                    }
+                }
+            }
+            (None, None) => {}
+            _ => return false,
+        }
+    }
+    projected == *stored
+}
+
 fn verify_persona_memory_binding(
     binding: &Value,
     providers: &Value,
     newly_prepared: bool,
 ) -> Result<()> {
-    const CONTRACT: &str = "ai.persona-memory/v1";
-    let declared = match binding.get("personaMemoryContract") {
-        None => false,
-        Some(value) if value == CONTRACT => true,
+    const V1: &str = "ai.persona-memory/v1";
+    const V2: &str = "ai.persona-memory/v2";
+    let contract = match binding.get("personaMemoryContract") {
+        None => None,
+        Some(Value::String(version)) if [V1, V2].contains(&version.as_str()) => {
+            Some(version.as_str())
+        }
         Some(_) => bail!("PERSONA_MEMORY_CONTRACT_INVALID"),
     };
+    fn member(
+        snapshot: &Value,
+        providers: &Value,
+        contract: Option<&str>,
+        newly: bool,
+        discussion: bool,
+    ) -> Result<()> {
+        let memory = &snapshot["node"]["config"]["_memoryContext"];
+        let bridge = memory.get("bridge");
+        ensure!(
+            contract.is_some() || (!newly && bridge.is_none()),
+            "PERSONA_MEMORY_CONTRACT_INVALID"
+        );
+        let Some(contract) = contract else {
+            return Ok(());
+        };
+        if memory["enabled"] != true {
+            ensure!(bridge.is_none(), "PERSONA_MEMORY_CONTRACT_INVALID");
+            return Ok(());
+        }
+        ensure!(
+            !discussion || contract == "ai.persona-memory/v2",
+            "PERSONA_MEMORY_CONTRACT_INVALID"
+        );
+        ensure!(
+            bridge == Some(&json!({"schemaVersion":contract,"required":true})),
+            "PERSONA_MEMORY_CONTRACT_INVALID"
+        );
+        let provider = snapshot["modelResolution"]["provider"]
+            .as_str()
+            .context("PERSONA_MEMORY_PROVIDER_UNSUPPORTED")?;
+        ensure!(
+            provider == "codex" && providers[provider]["capabilities"][contract] == true,
+            "PERSONA_MEMORY_PROVIDER_UNSUPPORTED"
+        );
+        Ok(())
+    }
     if let Some(closure) = binding["workflowClosure"].as_array() {
         for workflow in closure {
             if let Some(nodes) = workflow["nodeDependencies"].as_object() {
                 for snapshot in nodes.values() {
-                    if snapshot["node"]["type"] != "person" {
+                    let kind = &snapshot["node"]["type"];
+                    if kind != "person" && kind != "persona_discussion" {
                         continue;
                     }
                     ensure!(
                         workflow["workflowVersionId"] == binding["versionId"],
                         "PERSONA_SUBWORKFLOW_UNSUPPORTED"
                     );
-                    let memory = &snapshot["node"]["config"]["_memoryContext"];
-                    let bridge = memory.get("bridge");
-                    ensure!(
-                        declared || (!newly_prepared && bridge.is_none()),
-                        "PERSONA_MEMORY_CONTRACT_INVALID"
-                    );
-                    // Historical closures without negotiation keep their original
-                    // execution behavior; they never acquire a new memory bridge.
-                    if !declared {
+                    if kind == "person" {
+                        member(snapshot, providers, contract, newly_prepared, false)?;
                         continue;
                     }
-                    if memory["enabled"] != true {
-                        ensure!(bridge.is_none(), "PERSONA_MEMORY_CONTRACT_INVALID");
-                        continue;
+                    let discussion = &snapshot["discussion"];
+                    ensure!(
+                        discussion["capability"]
+                            == json!({"schemaVersion":"ai.persona-discussion/v1","required":true}),
+                        "PERSONA_DISCUSSION_CONTRACT_INVALID"
+                    );
+                    let slots = snapshot["node"]["config"]["participants"]
+                        .as_array()
+                        .context("PERSONA_DISCUSSION_CONTRACT_INVALID")?;
+                    let participants = discussion["participants"]
+                        .as_array()
+                        .context("PERSONA_DISCUSSION_CONTRACT_INVALID")?;
+                    ensure!(
+                        (2..=8).contains(&participants.len()) && participants.len() == slots.len(),
+                        "PERSONA_DISCUSSION_CONTRACT_INVALID"
+                    );
+                    let mut seen = std::collections::HashSet::new();
+                    for (slot, participant) in slots.iter().zip(participants) {
+                        let person = participant["person"]["id"]
+                            .as_str()
+                            .context("PERSONA_DISCUSSION_CONTRACT_INVALID")?;
+                        ensure!(
+                            Uuid::parse_str(person).is_ok()
+                                && seen.insert(person)
+                                && participant["slotKey"] == slot["key"]
+                                && participant["role"]["id"] == slot["roleId"]
+                                && participant["person"]["organizationId"]
+                                    == binding["organizationId"]
+                                && participant["selectionKey"]
+                                    .as_str()
+                                    .is_some_and(|key| !key.is_empty()),
+                            "PERSONA_DISCUSSION_CONTRACT_INVALID"
+                        );
+                        let config = &participant["node"]["config"];
+                        let mut readonly = participant["proposalPolicy"].clone();
+                        readonly["writeMemory"] = json!(false);
+                        ensure!(
+                            config["sessionPolicy"] == "new_each_run"
+                                && config["toolAccessPolicy"] == "read_only"
+                                && config["onUnavailable"] == "fail_execution"
+                                && participant["turnPolicy"] == readonly
+                                && config["_memoryContext"]["policy"] == readonly,
+                            "PERSONA_DISCUSSION_CONTRACT_INVALID"
+                        );
+                        let provider = participant["modelResolution"]["provider"]
+                            .as_str()
+                            .context("PERSONA_DISCUSSION_PROVIDER_UNSUPPORTED")?;
+                        ensure!(
+                            provider == "codex"
+                                && providers[provider]["capabilities"]["ai.persona-discussion/v1"]
+                                    == true,
+                            "PERSONA_DISCUSSION_PROVIDER_UNSUPPORTED"
+                        );
+                        member(participant, providers, contract, newly_prepared, true)?;
                     }
-                    ensure!(
-                        bridge == Some(&json!({"schemaVersion":CONTRACT,"required":true})),
-                        "PERSONA_MEMORY_CONTRACT_INVALID"
-                    );
-                    let provider = snapshot["modelResolution"]["provider"]
-                        .as_str()
-                        .context("PERSONA_MEMORY_PROVIDER_UNSUPPORTED")?;
-                    ensure!(
-                        provider == "codex"
-                            && providers[provider]["capabilities"][CONTRACT] == true,
-                        "PERSONA_MEMORY_PROVIDER_UNSUPPORTED"
-                    );
+                    for field in ["moderatorSlot", "synthesizerSlot"] {
+                        ensure!(
+                            discussion[field] == snapshot["node"]["config"][field],
+                            "PERSONA_DISCUSSION_CONTRACT_INVALID"
+                        );
+                    }
                 }
             }
         }
@@ -5462,7 +5985,9 @@ fn provider_snapshot_with(
         if let Some(path) = resolve(adapter)? {
             let fingerprint = crate::fingerprint::synchronous(&path)?;
             let checksum = fingerprint.checksum;
-            providers.insert(name.into(),json!({"path":path,"adapter":adapter,"checksumSha256":checksum,"sizeBytes":fingerprint.size,"modifiedNanos":fingerprint.modified_nanos,"executionPolicy":"host_user/v1","capabilities":{"ai.persona-memory/v1":name == "codex" && crate::jobs::persona_memory::qualified_executable(&path),"execution.workspace-set/v1":name == "codex" && crate::jobs::persona_memory::qualified_executable(&path)}}));
+            let qualified =
+                name == "codex" && crate::jobs::persona_memory::qualified_executable(&path);
+            providers.insert(name.into(),json!({"path":path,"adapter":adapter,"checksumSha256":checksum,"sizeBytes":fingerprint.size,"modifiedNanos":fingerprint.modified_nanos,"executionPolicy":"host_user/v1","capabilities":{"ai.persona-memory/v1":qualified,"ai.persona-memory/v2":qualified && crate::jobs::persona_memory::V2_PROVIDER_QUALIFIED,"ai.persona-discussion/v1":qualified && crate::jobs::persona_memory::DISCUSSION_PROVIDER_QUALIFIED,"execution.workspace-set/v1":qualified}}));
         }
     }
     Ok(Value::Object(providers))
@@ -8355,6 +8880,162 @@ mod conformance {
     }
 
     #[tokio::test]
+    async fn old_v1_preparation_inspection_and_commit_survive_only_known_capability_additions() {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let d = fixture(
+            temp.path(),
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap(),
+        );
+        let executable = temp.path().join("codex");
+        std::fs::write(&executable, b"#!/bin/sh\nexit 99\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        *d.test_provider_paths.lock().unwrap() = Some(vec![(
+            "codex",
+            "codex",
+            Some(executable.canonicalize().unwrap()),
+        )]);
+        let mut params = headless_preparation_fixture(&d, temp.path()).await;
+        let path = temp.path().join("preparations").join(format!(
+            "{}.json",
+            params["preparationId"].as_str().unwrap()
+        ));
+        let mut old: Value = state::read_json(&path).unwrap();
+        old["binding"]["personaMemoryContract"] = json!("ai.persona-memory/v1");
+        old["review"]["binding"] = old["binding"].clone();
+        for key in ["ai.persona-memory/v2", "ai.persona-discussion/v1"] {
+            old["providers"]["codex"]["capabilities"]
+                .as_object_mut()
+                .unwrap()
+                .remove(key);
+        }
+        state::write_json(&path, &old).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            d.dispatch(
+                "preparations.get",
+                json!({"preparationId":params["preparationId"]})
+            )
+            .await
+            .unwrap()["status"],
+            "valid"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        params["confirmationKey"] = old["confirmationKey"].clone();
+        for change in [
+            "original_capability",
+            "checksum",
+            "model",
+            "unknown_capability",
+            "new_provider",
+            "removed_provider",
+            "missing_field",
+            "recorded_v2",
+        ] {
+            let mut invalid = old.clone();
+            match change {
+                "original_capability" => {
+                    invalid["providers"]["codex"]["capabilities"]["ai.persona-memory/v1"] =
+                        json!(true)
+                }
+                "checksum" => invalid["providers"]["codex"]["checksumSha256"] = json!("changed"),
+                "model" => invalid["providers"]["codex"]["model"] = json!("changed-model"),
+                "unknown_capability" => {
+                    invalid["providers"]["codex"]["capabilities"]["unknown/v1"] = json!(false)
+                }
+                "new_provider" => invalid["providers"]["other"] = json!({}),
+                "removed_provider" => {
+                    invalid["providers"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("codex");
+                }
+                "missing_field" => {
+                    invalid["providers"]["codex"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("path");
+                }
+                "recorded_v2" => {
+                    invalid["providers"]["codex"]["capabilities"]["ai.persona-memory/v2"] =
+                        json!(true)
+                }
+                _ => unreachable!(),
+            }
+            state::write_json(&path, &invalid).unwrap();
+            let unchanged = std::fs::read(&path).unwrap();
+            assert_eq!(
+                d.dispatch(
+                    "preparations.get",
+                    json!({"preparationId":params["preparationId"]})
+                )
+                .await
+                .unwrap()["status"],
+                "stale",
+                "{change}"
+            );
+            assert!(
+                d.commit(
+                    "runs.commit",
+                    "11111111-1111-4111-8111-111111111111",
+                    &params
+                )
+                .await
+                .is_err(),
+                "{change}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), unchanged, "{change}");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), listener.accept())
+                    .await
+                    .is_err(),
+                "{change} sent a commit"
+            );
+        }
+        state::write_json(&path, &old).unwrap();
+        let preparation = params["preparationId"].clone();
+        let run = Uuid::new_v4();
+        let backend = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                let count = stream.read(&mut buf).await.unwrap();
+                bytes.extend_from_slice(&buf[..count]);
+                if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&bytes[..end]);
+                    let len = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .and_then(|n| n.parse::<usize>().ok())
+                        })
+                        .unwrap();
+                    if bytes.len() >= end + 4 + len {
+                        let body: Value =
+                            serde_json::from_slice(&bytes[end + 4..end + 4 + len]).unwrap();
+                        assert_eq!(body["preparationId"], preparation);
+                        break;
+                    }
+                }
+            }
+            let body=json!({"data":{"execution":{"id":run},"preparationId":preparation,"executionPolicy":"host_user/v1"}}).to_string();
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
+        });
+        d.commit(
+            "runs.commit",
+            "11111111-1111-4111-8111-111111111111",
+            &params,
+        )
+        .await
+        .unwrap();
+        backend.await.unwrap();
+        let accepted: Value = state::read_json(&path).unwrap();
+        assert_eq!(accepted["providers"], old["providers"]);
+        assert_eq!(accepted["binding"], old["binding"]);
+    }
+    #[tokio::test]
     async fn deployment_rejection_keeps_exact_start_handoff_approved_for_explicit_retry() {
         let temp = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -10696,7 +11377,7 @@ mod conformance {
             assert_eq!(restored["operation"], operation);
             assert_eq!(
                 restored["preparation"],
-                Daemon::preparation_review_projection(&record["review"])
+                Daemon::preparation_review_projection(&record["review"]).unwrap()
             );
         }
         drop(d);
@@ -11387,6 +12068,119 @@ mod persona_contract_tests {
         }
     }
     #[test]
+    fn discussion_review_retains_all_decisions_and_fails_explicitly_when_unrepresentable() {
+        let member = |slot: &str| json!({"slotKey":slot,"selectionKey":"discussion:%F0%9F%99%82".repeat(40),"personId":Uuid::new_v4(),"personName":"🙂".repeat(255),"roleId":Uuid::new_v4(),"roleName":"نقش".repeat(80),"provider":"codex","model":"fixed-model","reasoningEffort":"medium","configDigest":"b".repeat(64)});
+        let row = json!({"workflowVersionId":Uuid::new_v4(),"nodeKey":"discussion_one","mode":"voting","maxRounds":3,"moderatorSlot":null,"synthesizerSlot":"two","contextBudget":{"accountingContract":"o200k_base/v1","maxTokens":16384,"maxBytes":131072},"finalMemoryProposals":true,"voting":{"rule":"majority","options":[{"id":"a","label":"رای🙂".repeat(1800)},{"id":"b","label":"Other"}]},"participants":[member("one"),member("two")],"configDigest":"a".repeat(64),"privatePrompt":"must not be copied"});
+        let mut second = row.clone();
+        second["nodeKey"] = json!("discussion_two");
+        second["mode"] = json!("ordered");
+        second["voting"] = Value::Null;
+        let review = json!({"binding":{"workflowClosure":[],"workflowClosureReview":{"discussions":[row,second]}}});
+        let projected = Daemon::preparation_review_projection(&review).unwrap();
+        let items = projected["binding"]["workflowClosureReview"]["discussions"]
+            .as_array()
+            .unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[0]["voting"],
+            review["binding"]["workflowClosureReview"]["discussions"][0]["voting"]
+        );
+        assert_eq!(
+            items[0]["participants"],
+            review["binding"]["workflowClosureReview"]["discussions"][0]["participants"]
+        );
+        assert!(items[1]["voting"].is_null());
+        assert!(!projected.to_string().contains("privatePrompt"));
+        let mut invalid = review.clone();
+        invalid["binding"]["workflowClosureReview"]["discussions"][0]["mode"] =
+            json!("unsupported");
+        assert_eq!(
+            Daemon::preparation_review_projection(&invalid)
+                .unwrap_err()
+                .to_string(),
+            "PERSONA_DISCUSSION_REVIEW_INVALID"
+        );
+        let mut already_projected = invalid.clone();
+        already_projected["binding"]
+            .as_object_mut()
+            .unwrap()
+            .remove("workflowClosure");
+        assert_eq!(
+            Daemon::preparation_review_projection(&already_projected)
+                .unwrap_err()
+                .to_string(),
+            "PERSONA_DISCUSSION_REVIEW_INVALID"
+        );
+        let mut huge = review;
+        huge["binding"]["workflowClosureReview"]["discussions"][0]["voting"]["options"][0]["label"] =
+            json!("x".repeat(MAX_FRAME));
+        assert_eq!(
+            Daemon::preparation_review_projection(&huge)
+                .unwrap_err()
+                .to_string(),
+            "PERSONA_DISCUSSION_REVIEW_UNREPRESENTABLE"
+        );
+    }
+    #[test]
+    fn capability_upgrade_projection_is_narrow_and_keeps_original_false_and_identity_fields() {
+        let old = json!({"codex":{"path":"/fixed/codex","adapter":"codex","checksumSha256":"fixed","sizeBytes":7,"modifiedNanos":"9","executionPolicy":"host_user/v1","model":"fixed-model","workspace":"/fixed/workspace","capabilities":{"ai.persona-memory/v1":false}}});
+        let mut fresh = old.clone();
+        fresh["codex"]["capabilities"]["ai.persona-memory/v2"] = json!(true);
+        fresh["codex"]["capabilities"]["ai.persona-discussion/v1"] = json!(false);
+        assert!(provider_snapshot_matches(&old, &fresh));
+        assert!(!provider_snapshot_matches(&Value::Null, &Value::Null));
+        for key in [
+            "path",
+            "adapter",
+            "checksumSha256",
+            "sizeBytes",
+            "modifiedNanos",
+            "executionPolicy",
+            "model",
+            "workspace",
+        ] {
+            let mut changed = fresh.clone();
+            changed["codex"][key] = json!("changed");
+            assert!(!provider_snapshot_matches(&old, &changed), "{key}");
+            changed["codex"].as_object_mut().unwrap().remove(key);
+            assert!(!provider_snapshot_matches(&old, &changed), "missing {key}");
+        }
+        for change in [
+            "v1",
+            "unknown",
+            "new_provider",
+            "removed_provider",
+            "malformed",
+            "recorded_false",
+        ] {
+            let mut stored = old.clone();
+            let mut changed = fresh.clone();
+            match change {
+                "v1" => changed["codex"]["capabilities"]["ai.persona-memory/v1"] = json!(true),
+                "unknown" => changed["codex"]["capabilities"]["future.unknown/v1"] = json!(true),
+                "new_provider" => changed["claude"] = json!({}),
+                "removed_provider" => {
+                    changed.as_object_mut().unwrap().remove("codex");
+                }
+                "malformed" => changed["codex"]["capabilities"]["ai.persona-memory/v2"] = json!({}),
+                "recorded_false" => {
+                    stored["codex"]["capabilities"]["ai.persona-memory/v2"] = json!(false)
+                }
+                _ => unreachable!(),
+            }
+            assert!(!provider_snapshot_matches(&stored, &changed), "{change}");
+        }
+        let mut recorded = fresh.clone();
+        recorded["codex"]["capabilities"]["ai.persona-memory/v2"] = json!(false);
+        assert!(provider_snapshot_matches(&recorded, &recorded));
+        let mut removed = recorded.clone();
+        removed["codex"]["capabilities"]
+            .as_object_mut()
+            .unwrap()
+            .remove("ai.persona-memory/v2");
+        assert!(!provider_snapshot_matches(&recorded, &removed));
+    }
+    #[test]
     fn persona_memory_is_strict_and_routes_preserve_original_mutation_key() {
         let ids = json!({"personId":Uuid::new_v4(),"conversationId":Uuid::new_v4(),"chatId":Uuid::new_v4(),"arguments":{"content":"stable fact","type":"fact"},"idempotencyKey":Uuid::new_v4()});
         assert!(validate_params(&ids, &input("personas.memory.write")).is_ok());
@@ -11519,6 +12313,649 @@ mod persona_contract_tests {
                 .to_string(),
             "PERSONA_MEMORY_CONTRACT_INVALID"
         );
+    }
+    #[tokio::test]
+    async fn persona_transport_offer_is_private_and_legacy_create_omits_header() {
+        for offer in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api = Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+            let daemon = Daemon::new(
+                tmp.path().into(),
+                api.clone(),
+                Auth::test_enrolled(api, "org", "runner"),
+            )
+            .unwrap();
+            daemon.public.lock().await.active_organization = Some("org".into());
+            let mut params = json!({"personId":Uuid::new_v4(),"idempotencyKey":Uuid::new_v4()});
+            if offer {
+                params["transportMemoryContract"] = json!(crate::jobs::persona_memory::V2);
+            }
+            let server = tokio::spawn(async move {
+                let (socket, header, body) = request(&listener).await;
+                assert_eq!(
+                    header
+                        .to_ascii_lowercase()
+                        .contains("x-loomex-persona-memory-contract: ai.persona-memory/v2"),
+                    offer
+                );
+                assert!(body.get("transportMemoryContract").is_none());
+                response(socket, json!({"data":{"contractVersion":"loomex.ai-persona-chat/v1","person":{},"role":null,"conversation":{},"memory":{},"configDigest":"fixed","effectiveConfig":{}}})).await;
+            });
+            assert_eq!(
+                daemon
+                    .dispatch("personas.chat_context.create", params)
+                    .await
+                    .unwrap(),
+                json!({"contractVersion":"loomex.ai-persona-chat/v1","person":{},"role":null,"conversation":{},"memory":{},"configDigest":"fixed","effectiveConfig":{}})
+            );
+            server.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn private_offer_never_changes_accepted_or_pending_original_create_semantics() {
+        for (first, second, lost) in [
+            (false, true, false),
+            (true, false, false),
+            (false, false, false),
+            (true, true, false),
+            (false, true, true),
+            (true, false, true),
+            (false, false, true),
+            (true, true, true),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api = Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+            let daemon = Daemon::new(
+                tmp.path().into(),
+                api.clone(),
+                Auth::test_enrolled(api, "org", "runner"),
+            )
+            .unwrap();
+            daemon.public.lock().await.active_organization = Some("org".into());
+            let public = json!({"personId":Uuid::new_v4(),"chatId":Uuid::new_v4(),"idempotencyKey":Uuid::new_v4()});
+            let mut initial = public.clone();
+            if first {
+                initial["transportMemoryContract"] = json!(crate::jobs::persona_memory::V2);
+            }
+            let mut repeated = public.clone();
+            if second {
+                repeated["transportMemoryContract"] = json!(crate::jobs::persona_memory::V2);
+            }
+            let mut context = json!({"contractVersion":"loomex.ai-persona-chat/v1","person":{"id":public["personId"]},"role":null,"conversation":{"conversationId":Uuid::new_v4(),"chatId":public["chatId"]},"memory":{},"configDigest":"a".repeat(64),"effectiveConfig":{}});
+            if first {
+                context["memory"]["memoryContract"] = json!(crate::jobs::persona_memory::V2);
+            }
+            let expected = context.clone();
+            let key = public["idempotencyKey"].clone();
+            let backend = tokio::spawn(async move {
+                let (stream, header, body) = request(&listener).await;
+                assert!(header.contains("/chat-context/create/"));
+                assert_eq!(
+                    header
+                        .to_ascii_lowercase()
+                        .contains("x-loomex-persona-memory-contract:"),
+                    first
+                );
+                assert!(body.get("transportMemoryContract").is_none());
+                if lost {
+                    drop(stream)
+                } else {
+                    response(stream, json!({"data":context})).await;
+                }
+                let (stream, header, _) = request(&listener).await;
+                assert!(header.starts_with("GET "));
+                assert!(header.contains("/personas/operations/chat_context.create/"));
+                assert!(
+                    !header
+                        .to_ascii_lowercase()
+                        .contains("x-loomex-persona-memory-contract:")
+                );
+                response(stream,json!({"data":{"operation":"chat_context.create","key":key,"status":"completed","requestDigest":"b".repeat(64),"response":context}})).await;
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            let first_result = daemon
+                .dispatch("personas.chat_context.create", initial)
+                .await;
+            if lost {
+                assert_eq!(first_result.unwrap_err().to_string(), "NETWORK_AMBIGUOUS");
+            } else {
+                assert_eq!(first_result.unwrap(), expected);
+            }
+            assert_eq!(
+                daemon
+                    .dispatch("personas.chat_context.create", repeated.clone())
+                    .await
+                    .unwrap(),
+                expected,
+                "first={first} second={second} lost={lost}"
+            );
+            for changed in ["personId", "chatId"] {
+                let mut invalid = repeated.clone();
+                invalid[changed] = json!(Uuid::new_v4());
+                assert_eq!(
+                    daemon
+                        .dispatch("personas.chat_context.create", invalid)
+                        .await
+                        .unwrap_err()
+                        .to_string(),
+                    "IDEMPOTENCY_CONFLICT"
+                );
+            }
+            repeated["unknownPublicArgument"] = json!(true);
+            assert_eq!(
+                daemon
+                    .dispatch("personas.chat_context.create", repeated)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "INVALID_REQUEST"
+            );
+            for row in crate::operation_cache::inspect(tmp.path()).unwrap() {
+                assert!(!row.to_string().contains("transportMemoryContract"));
+            }
+            backend.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn actual_v2_write_update_receipts_recover_exact_canonical_text_without_mutation_replay()
+    {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/persona-memory-v2-producer.json"
+        ))
+        .unwrap();
+        for operation in ["write", "update"] {
+            for lost in [false, true] {
+                let case = fixture["cases"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|case| case["name"] == format!("{operation}_receipt"))
+                    .unwrap();
+                let canonical = case["canonicalText"].as_str().unwrap().to_owned();
+                let expected = json!({"result":case["result"],"canonicalText":canonical});
+                let tmp = tempfile::tempdir().unwrap();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let api =
+                    Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                        .unwrap();
+                let daemon = Daemon::new(
+                    tmp.path().into(),
+                    api.clone(),
+                    Auth::test_enrolled(api, "org", "runner"),
+                )
+                .unwrap();
+                daemon.public.lock().await.active_organization = Some("org".into());
+                let key = Uuid::new_v4();
+                let method = format!("personas.memory.{operation}");
+                let mut args = json!({"content":"fixed synthetic memory"});
+                if operation == "update" {
+                    args["memoryId"] = case["result"]["memory"]["id"].clone();
+                }
+                let params = json!({"personId":Uuid::new_v4(),"conversationId":Uuid::new_v4(),"chatId":Uuid::new_v4(),"arguments":args,"idempotencyKey":key});
+                let backend = tokio::spawn(async move {
+                    let (mut stream, head, body) = request(&listener).await;
+                    assert!(head.contains(&format!("/memory-tools/{operation}/")));
+                    assert_eq!(body["idempotencyKey"], key.to_string());
+                    if lost {
+                        drop(stream)
+                    } else {
+                        let body = format!("{{\"data\":{{\"result\":{canonical}}}}}");
+                        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
+                    }
+                    let (mut stream, head, _) = request(&listener).await;
+                    assert!(head.starts_with("GET "));
+                    assert!(
+                        head.contains(&format!("/personas/operations/memory.{operation}/{key}/"))
+                    );
+                    let body = format!(
+                        "{{\"data\":{{\"operation\":\"memory.{operation}\",\"key\":\"{key}\",\"status\":\"completed\",\"requestDigest\":\"{}\",\"response\":{{\"result\":{canonical}}}}}}}",
+                        "a".repeat(64)
+                    );
+                    stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
+                    assert!(
+                        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                            .await
+                            .is_err()
+                    );
+                });
+                let result = daemon.dispatch(&method, params.clone()).await;
+                if lost {
+                    assert_eq!(result.unwrap_err().to_string(), "NETWORK_AMBIGUOUS");
+                } else {
+                    assert_eq!(result.unwrap(), expected);
+                }
+                assert_eq!(daemon.dispatch(&method, params).await.unwrap(), expected);
+                backend.await.unwrap();
+            }
+        }
+    }
+    async fn lifecycle_reply(mut stream: tokio::net::TcpStream, result: Value) {
+        let body = json!({"data":result}).to_string();
+        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
+    }
+    fn lifecycle_read_page() -> Value {
+        let document = r#"{"id":"11111111-1111-4111-8111-111111111111","revision":4,"content":"synthetic lifecycle fixture"}"#;
+        json!({"ok":true,"tool":"person_memory.read","schemaVersion":"ai.persona-memory/v2",
+            "memoryId":"11111111-1111-4111-8111-111111111111","revision":4,
+            "budget":{"accountingContract":"o200k_base/v1","maxTokens":2048,"maxBytes":16384},
+            "page":{"text":&document[..20],"encoding":"application/json; fragment=unicode-codepoints",
+                "start":0,"end":20,"totalChars":document.len(),"documentSha256":state::digest(document.as_bytes()),
+                "complete":false,"nextCursor":"next-lifecycle-page"}})
+    }
+    fn lifecycle_read_params() -> Value {
+        json!({"personId":Uuid::new_v4(),"conversationId":Uuid::new_v4(),"chatId":Uuid::new_v4(),
+            "arguments":{"memoryId":"11111111-1111-4111-8111-111111111111"}})
+    }
+    fn lifecycle_read_last_page() -> Value {
+        let document = r#"{"id":"11111111-1111-4111-8111-111111111111","revision":4,"content":"synthetic lifecycle fixture"}"#;
+        let mut value = lifecycle_read_page();
+        value["page"]["text"] = json!(&document[20..]);
+        value["page"]["start"] = json!(20);
+        value["page"]["end"] = json!(document.len());
+        value["page"]["complete"] = json!(true);
+        value["page"]["nextCursor"] = Value::Null;
+        value
+    }
+    #[tokio::test]
+    async fn daemon_chat_late_http_cannot_publish_after_logout_org_or_auth_owner_changes() {
+        for drift in [
+            "logout",
+            "organization",
+            "account",
+            "installation",
+            "device",
+            "pending",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api = Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+            let daemon = Arc::new(
+                Daemon::new(
+                    tmp.path().into(),
+                    api.clone(),
+                    Auth::test_enrolled(api, "org", "original"),
+                )
+                .unwrap(),
+            );
+            daemon.public.lock().await.active_organization = Some("org".into());
+            let active = daemon.clone();
+            let backend = tokio::spawn(async move {
+                let (stream, head, _) = request(&listener).await;
+                assert!(head.contains("/memory-tools/read/"));
+                lifecycle_reply(stream, json!({"result":lifecycle_read_page()})).await;
+                let (held, head, _) = request(&listener).await;
+                assert!(head.contains("/memory-tools/read/"));
+                match drift {
+                    "logout" => {
+                        let change = tokio::spawn(async move {
+                            active
+                                .dispatch("auth.logout", json!({"idempotencyKey":Uuid::new_v4()}))
+                                .await
+                        });
+                        let (stream, head, _) = request(&listener).await;
+                        assert!(head.contains("/device-authorities/logout/"));
+                        lifecycle_reply(stream, json!({"revoked":true})).await;
+                        change.await.unwrap().unwrap();
+                    }
+                    "organization" => {
+                        active
+                            .auth
+                            .test_add_enrolled_child(
+                                "33333333-3333-4333-8333-333333333333",
+                                "other-account",
+                            )
+                            .await
+                            .unwrap();
+                        active.dispatch("organizations.select",json!({"organizationId":"33333333-3333-4333-8333-333333333333","idempotencyKey":Uuid::new_v4()})).await.unwrap();
+                    }
+                    "device" => active.auth.test_bound_owner_device_change().await.unwrap(),
+                    "pending" => {
+                        active
+                            .auth
+                            .test_fingerprint_access_near_expiry("org")
+                            .await
+                            .unwrap();
+                        let refresh =
+                            tokio::spawn(async move { active.auth.credential("org").await });
+                        let (mut stream, head, _) = request(&listener).await;
+                        assert!(head.contains("/delegations/refresh/"));
+                        let body = json!({"error":{"code":"REFRESH_REJECTED"}}).to_string();
+                        stream.write_all(format!("HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
+                        assert!(refresh.await.unwrap().is_err());
+                    }
+                    _ => active
+                        .auth
+                        .test_fingerprint_identity_drift(
+                            "org",
+                            (drift == "installation").then_some("replacement-installation"),
+                            (drift == "account").then_some("replacement-account"),
+                        )
+                        .await
+                        .unwrap(),
+                }
+                lifecycle_reply(held, json!({"result":lifecycle_read_last_page()})).await;
+            });
+            let mut args = lifecycle_read_params();
+            daemon
+                .dispatch("personas.memory.read", args.clone())
+                .await
+                .unwrap();
+            args["arguments"]["cursor"] = json!("next-lifecycle-page");
+            let result = daemon.dispatch("personas.memory.read", args).await;
+            assert!(
+                result.is_err(),
+                "{drift}: stale private result must not publish"
+            );
+            backend.await.unwrap();
+            assert!(daemon.memory_pages.lock().unwrap().is_empty(), "{drift}");
+        }
+    }
+    #[tokio::test]
+    async fn daemon_chat_late_worker_and_disconnect_cannot_restore_disposed_private_state() {
+        for cancel in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api = Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+            let daemon = Arc::new(
+                Daemon::new(
+                    tmp.path().into(),
+                    api.clone(),
+                    Auth::test_enrolled(api, "org", "original"),
+                )
+                .unwrap(),
+            );
+            daemon.public.lock().await.active_organization = Some("org".into());
+            let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+            let active = daemon.clone();
+            let backend = tokio::spawn(async move {
+                let (stream, _, _) = request(&listener).await;
+                lifecycle_reply(stream, json!({"result":lifecycle_read_page()})).await;
+                let (stream, _, _) = request(&listener).await;
+                let gate = active.fingerprints.test_hold_filesystem();
+                assert!(gate_tx.send(gate).is_ok());
+                lifecycle_reply(stream, json!({"result":lifecycle_read_last_page()})).await;
+            });
+            let mut args = lifecycle_read_params();
+            daemon
+                .dispatch("personas.memory.read", args.clone())
+                .await
+                .unwrap();
+            args["arguments"]["cursor"] = json!("next-lifecycle-page");
+            let cancellation = crate::fingerprint::Cancellation::default();
+            let token = cancellation.clone();
+            let active = daemon.clone();
+            let pending = tokio::spawn(async move {
+                crate::fingerprint::REQUEST_CANCELLATION
+                    .scope(token, active.dispatch("personas.memory.read", args))
+                    .await
+            });
+            let gate = gate_rx.await.unwrap();
+            struct ReleaseGate(Arc<crate::fingerprint::TestGate>);
+            impl Drop for ReleaseGate {
+                fn drop(&mut self) {
+                    self.0.release();
+                }
+            }
+            let _release = ReleaseGate(gate.clone());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while gate.entered.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            daemon.fingerprints.test_clear_filesystem_hold();
+            if cancel {
+                cancellation.cancel();
+            } else {
+                daemon
+                    .auth
+                    .test_add_enrolled_child("33333333-3333-4333-8333-333333333333", "other")
+                    .await
+                    .unwrap();
+                daemon
+                    .dispatch(
+                        "organizations.select",
+                        json!({"organizationId":"33333333-3333-4333-8333-333333333333","idempotencyKey":Uuid::new_v4()}),
+                    )
+                    .await
+                    .unwrap();
+            }
+            gate.release();
+            assert!(pending.await.unwrap().is_err());
+            backend.await.unwrap();
+            assert!(daemon.memory_pages.lock().unwrap().is_empty());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while daemon.fingerprint_diagnostics()["inFlight"] != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                daemon.fingerprint_diagnostics()["peakWorkers"]
+                    .as_u64()
+                    .unwrap()
+                    <= 2
+            );
+        }
+    }
+    #[tokio::test]
+    async fn daemon_chat_wrong_cursor_is_rejected_before_http_and_preserves_valid_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = Arc::new(
+            Daemon::new(
+                tmp.path().into(),
+                api.clone(),
+                Auth::test_enrolled(api, "org", "original"),
+            )
+            .unwrap(),
+        );
+        daemon.public.lock().await.active_organization = Some("org".into());
+        let mut args = lifecycle_read_params();
+        let active = daemon.clone();
+        let first_args = args.clone();
+        let first =
+            tokio::spawn(async move { active.dispatch("personas.memory.read", first_args).await });
+        let (stream, _, _) = request(&listener).await;
+        lifecycle_reply(stream, json!({"result":lifecycle_read_page()})).await;
+        first.await.unwrap().unwrap();
+        args["arguments"]["cursor"] = json!("wrong-cursor");
+        assert_eq!(
+            daemon
+                .dispatch("personas.memory.read", args.clone())
+                .await
+                .unwrap_err()
+                .to_string(),
+            "PERSONA_MEMORY_READ_SEQUENCE_INVALID"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), listener.accept())
+                .await
+                .is_err()
+        );
+        args["arguments"]["cursor"] = json!("next-lifecycle-page");
+        let active = daemon.clone();
+        let next = tokio::spawn(async move { active.dispatch("personas.memory.read", args).await });
+        let (stream, _, _) = request(&listener).await;
+        lifecycle_reply(stream, json!({"result":lifecycle_read_last_page()})).await;
+        next.await.unwrap().unwrap();
+        assert!(daemon.memory_pages.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn daemon_logout_disposes_before_remote_dispatch_and_preserves_accepted_receipt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = Arc::new(
+            Daemon::new(
+                tmp.path().into(),
+                api.clone(),
+                Auth::test_enrolled(api, "org", "original"),
+            )
+            .unwrap(),
+        );
+        daemon.public.lock().await.active_organization = Some("org".into());
+        let active = daemon.clone();
+        let first = tokio::spawn(async move {
+            active
+                .dispatch("personas.memory.read", lifecycle_read_params())
+                .await
+        });
+        let (stream, _, _) = request(&listener).await;
+        lifecycle_reply(stream, json!({"result":lifecycle_read_page()})).await;
+        first.await.unwrap().unwrap();
+        let gate = daemon.fingerprints.test_hold_filesystem();
+        struct ReleaseGate(Arc<crate::fingerprint::TestGate>);
+        impl Drop for ReleaseGate {
+            fn drop(&mut self) {
+                self.0.release();
+            }
+        }
+        let _release = ReleaseGate(gate.clone());
+        let active = daemon.clone();
+        let logout = tokio::spawn(async move {
+            active
+                .dispatch("auth.logout", json!({"idempotencyKey":Uuid::new_v4()}))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while gate.entered.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), listener.accept())
+                .await
+                .is_err()
+        );
+        daemon.fingerprints.test_clear_filesystem_hold();
+        gate.release();
+        let (stream, head, _) = request(&listener).await;
+        assert!(head.contains("/device-authorities/logout/"));
+        assert!(daemon.memory_pages.lock().unwrap().is_empty());
+        lifecycle_reply(stream, json!({"revoked":true})).await;
+        assert_eq!(logout.await.unwrap().unwrap()["revoked"], true);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn daemon_chat_partial_read_is_disposed_by_actual_logout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = Daemon::new(
+            tmp.path().into(),
+            api.clone(),
+            Auth::test_enrolled(api, "11111111-1111-4111-8111-111111111111", "runner"),
+        )
+        .unwrap();
+        daemon.public.lock().await.active_organization =
+            Some("11111111-1111-4111-8111-111111111111".into());
+        let backend = tokio::spawn(async move {
+            let (stream, head, _) = request(&listener).await;
+            assert!(head.contains("/memory-tools/read/"));
+            lifecycle_reply(stream, json!({"result":lifecycle_read_page()})).await;
+            let (stream, head, _) = request(&listener).await;
+            assert!(head.contains("/device-authorities/logout/"));
+            lifecycle_reply(stream, json!({"revoked":true})).await;
+        });
+        daemon
+            .dispatch("personas.memory.read", lifecycle_read_params())
+            .await
+            .unwrap();
+        assert_eq!(daemon.memory_pages.lock().unwrap().len(), 1);
+        daemon
+            .dispatch("auth.logout", json!({"idempotencyKey":Uuid::new_v4()}))
+            .await
+            .unwrap();
+        backend.await.unwrap();
+        assert!(
+            daemon.memory_pages.lock().unwrap().is_empty(),
+            "logout must dispose anonymous partial read descriptors"
+        );
+    }
+    #[tokio::test]
+    async fn abandoned_chat_contexts_cannot_permanently_exhaust_read_admission() {
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = Daemon::new(
+            tmp.path().into(),
+            api.clone(),
+            Auth::test_enrolled(api, "11111111-1111-4111-8111-111111111111", "runner"),
+        )
+        .unwrap();
+        daemon.public.lock().await.active_organization =
+            Some("11111111-1111-4111-8111-111111111111".into());
+        let backend = tokio::spawn(async move {
+            for _ in 0..65 {
+                let (stream, head, _) = request(&listener).await;
+                assert!(head.contains("/memory-tools/read/"));
+                lifecycle_reply(stream, json!({"result":lifecycle_read_page()})).await;
+            }
+        });
+        for _ in 0..64 {
+            daemon
+                .dispatch("personas.memory.read", lifecycle_read_params())
+                .await
+                .unwrap();
+        }
+        assert_eq!(daemon.memory_pages.lock().unwrap().len(), 64);
+        let result = daemon
+            .dispatch("personas.memory.read", lifecycle_read_params())
+            .await;
+        backend.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "new explicit read must reclaim abandoned bounded state: {result:?}"
+        );
+        assert!(daemon.memory_pages.lock().unwrap().len() <= 64);
+    }
+    #[tokio::test]
+    async fn v2_chat_wire_keeps_canonical_text_and_source_work_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api =
+            Api::for_test_origin(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let daemon = Daemon::new(
+            tmp.path().into(),
+            api.clone(),
+            Auth::test_enrolled(api, "org", "runner"),
+        )
+        .unwrap();
+        daemon.public.lock().await.active_organization = Some("org".into());
+        let canonical = r#"{"schemaVersion":"ai.persona-memory/v2","ok":true,"tool":"person_memory.search","memoryIds":[],"items":[],"snapshotId":null,"omittedCount":0,"truncated":true,"sourceWork":{"limited":true,"maxArtifactBytes":4194304,"maxTextBytes":4194304,"maxArtifacts":8},"budget":{"accountingContract":"o200k_base/v1","maxTokens":4096,"maxBytes":32768}}"#;
+        let server = tokio::spawn(async move {
+            let (mut socket, _, _) = request(&listener).await;
+            let body = format!("{{\"data\":{{\"result\":{canonical}}}}}");
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
+        });
+        let result=daemon.dispatch("personas.memory.search",json!({"personId":Uuid::new_v4(),"conversationId":Uuid::new_v4(),"chatId":Uuid::new_v4(),"arguments":{"query":"fixed"}})).await.unwrap();
+        assert_eq!(result["canonicalText"], canonical);
+        assert_eq!(result["result"]["sourceWork"]["limited"], true);
+        server.await.unwrap();
     }
     #[tokio::test]
     async fn persona_spool_is_bound_to_current_org_child_and_signed_in_state() {

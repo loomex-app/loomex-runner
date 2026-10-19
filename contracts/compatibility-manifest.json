@@ -112,6 +112,7 @@
     "method:workspaces.list",
     "method:workspaces.revoke",
     "operation-cache.retirement-fence/v1",
+    "personas.memory-transport/v2",
     "presentation.continuation-resolution/v1",
     "presentation.delivery/v2",
     "presentation.sessions.restore/v1",
@@ -134,7 +135,7 @@
       "path": "contracts/backend-routes.json"
     },
     "methodCatalog": {
-      "digest": "sha256:e9932c4d4e302853a71ce46baca5fa5036919b97ed7d3fe6f0e53f1cedfcf308",
+      "digest": "sha256:064a1b9aab988bfe09586268fd42f977b7ace42fb57f2bb2de35955d3a1998ab",
       "path": "contracts/method-catalog.json"
     }
   },
@@ -632,7 +633,7 @@
     {
       "classification": "backend-proxy",
       "idempotent": true,
-      "inputSchemaDigest": "sha256:9d32ffe1021318849e3487dff89247421383dae6fbd9e87594aeca19f2ed9894",
+      "inputSchemaDigest": "sha256:81d9e77c2fb1a070e856864dc48823592424698bd51150a3dbdffd5886ef3108",
       "mutating": true,
       "name": "personas.chat_context.create",
       "outputSchemaDigest": "sha256:28c4cbb98e2b9f406b3d7af27899fb79c2d62692264ee5159a1ca37e1c0ce599",
@@ -692,10 +693,10 @@
     {
       "classification": "backend-proxy",
       "idempotent": true,
-      "inputSchemaDigest": "sha256:790d736ff5e872eedd5aa2af2d8d8ecc651dc83b5dac14b3cc962d2f0cbe551d",
+      "inputSchemaDigest": "sha256:dd584777ee8e281094ae62aa496026673fe16bf0733e8e55e2d8e0893df64faa",
       "mutating": false,
       "name": "personas.memory.read",
-      "outputSchemaDigest": "sha256:3d41bf32659b317b98a39b9998395745ed6ddbeefff62708d4d6310e71eca164",
+      "outputSchemaDigest": "sha256:4f2212c0f1a629f8a351075030cd4f73e90962643ac2cbe5030f7674511b03e6",
       "routeIds": [
         "persona.memory.tool"
       ],
@@ -707,7 +708,7 @@
       "inputSchemaDigest": "sha256:033e326947b48278543aa14a46f6e7d2d9754c92cbafea3ab5a4ba8221fde022",
       "mutating": false,
       "name": "personas.memory.search",
-      "outputSchemaDigest": "sha256:3d41bf32659b317b98a39b9998395745ed6ddbeefff62708d4d6310e71eca164",
+      "outputSchemaDigest": "sha256:4f2212c0f1a629f8a351075030cd4f73e90962643ac2cbe5030f7674511b03e6",
       "routeIds": [
         "persona.memory.tool"
       ],
@@ -719,7 +720,7 @@
       "inputSchemaDigest": "sha256:23080a7c3ca1fdf93816523c5876ad577f102f4516cd0517c93e6beb87d3ba6e",
       "mutating": true,
       "name": "personas.memory.update",
-      "outputSchemaDigest": "sha256:3d41bf32659b317b98a39b9998395745ed6ddbeefff62708d4d6310e71eca164",
+      "outputSchemaDigest": "sha256:4f2212c0f1a629f8a351075030cd4f73e90962643ac2cbe5030f7674511b03e6",
       "routeIds": [
         "persona.memory.tool"
       ],
@@ -731,7 +732,7 @@
       "inputSchemaDigest": "sha256:25f632ce8967fefa69b700d95c111970dde47712a256aee2d0acac67da9bad9f",
       "mutating": true,
       "name": "personas.memory.write",
-      "outputSchemaDigest": "sha256:3d41bf32659b317b98a39b9998395745ed6ddbeefff62708d4d6310e71eca164",
+      "outputSchemaDigest": "sha256:4f2212c0f1a629f8a351075030cd4f73e90962643ac2cbe5030f7674511b03e6",
       "routeIds": [
         "persona.memory.tool"
       ],
@@ -1721,7 +1722,7 @@
   "schemaVersion": "loomex.runner.compatibility-manifest/v1",
   "summary": {
     "backendRouteCount": 76,
-    "capabilityCount": 126,
+    "capabilityCount": 127,
     "methodClassifications": {
       "backend-auth": 7,
       "backend-proxy": 55,

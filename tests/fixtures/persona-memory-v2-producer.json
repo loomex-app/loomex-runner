@@ -1,0 +1,242 @@
+{
+  "schemaVersion": "loomex.memory-wire-fixtures/v1",
+  "producer": "actual RunnerPersonaMemoryToolView + RunnerPersonaOperationView HTTP responses",
+  "cases": [
+    {
+      "name": "write",
+      "method": "write",
+      "result": {
+        "ok": true,
+        "tool": "person_memory.write",
+        "schemaVersion": "ai.persona-memory/v2",
+        "memory": {
+          "id": "e4e14805-406f-453a-bf80-46eea4049095",
+          "type": "fact",
+          "status": "candidate"
+        },
+        "budget": {
+          "accountingContract": "o200k_base/v1",
+          "maxTokens": 4096,
+          "maxBytes": 32768
+        }
+      },
+      "canonicalText": "{\"ok\":true,\"tool\":\"person_memory.write\",\"schemaVersion\":\"ai.persona-memory/v2\",\"memory\":{\"id\":\"e4e14805-406f-453a-bf80-46eea4049095\",\"type\":\"fact\",\"status\":\"candidate\"},\"budget\":{\"accountingContract\":\"o200k_base/v1\",\"maxTokens\":4096,\"maxBytes\":32768}}"
+    },
+    {
+      "name": "search",
+      "method": "search",
+      "result": {
+        "ok": true,
+        "tool": "person_memory.search",
+        "schemaVersion": "ai.persona-memory/v2",
+        "memoryIds": [
+          "e4e14805-406f-453a-bf80-46eea4049095"
+        ],
+        "items": [
+          {
+            "id": "e4e14805-406f-453a-bf80-46eea4049095",
+            "revision": 3,
+            "type": "fact",
+            "summary": "",
+            "matchedPassage": "The user prefers concise review status.",
+            "passageStart": 0,
+            "passageEnd": 39,
+            "contentChars": 39,
+            "chunkId": "1ca31a04db623b36effec361ff594df86882bc725c95152340cb6c30794b0aa6:0",
+            "chunkOrdinal": 0,
+            "chunkerVersion": "memory-text/v1",
+            "generation": "1ca31a04db623b36effec361ff594df86882bc725c95152340cb6c30794b0aa6",
+            "title": "",
+            "source": {
+              "type": "memory",
+              "id": "e4e14805-406f-453a-bf80-46eea4049095",
+              "checksum": "8382aa14d315048d456e2c98fef725473f1c81f482e210cd130c49f67a3cb025",
+              "artifactId": null,
+              "artifactVersionId": null,
+              "artifactVersion": null
+            },
+            "truncated": false,
+            "score": 3.449035812672176,
+            "provenance": {
+              "personId": "dbaa64a4-b2c7-4f43-9dcb-d83e5e261985",
+              "workflowId": null,
+              "conversationId": "dc2d4a99-31d2-46cb-8154-069529305068",
+              "chatId": "989933de-0466-41e7-a755-dacdfee80f13",
+              "sourceType": "person_memory_tool",
+              "sourceId": null,
+              "artifactId": null,
+              "artifactChunkId": "",
+              "sourceHash": "c2a1651f50fa986c91a8c3372b1af36e8e00a3b22a252fae7d26fa78e3abac70"
+            }
+          }
+        ],
+        "snapshotId": null,
+        "omittedCount": 0,
+        "truncated": false,
+        "budget": {
+          "accountingContract": "o200k_base/v1",
+          "maxTokens": 4096,
+          "maxBytes": 32768
+        },
+        "sourceWork": {
+          "limited": false,
+          "maxArtifactBytes": 4194304,
+          "maxTextBytes": 4194304,
+          "maxArtifacts": 8
+        }
+      },
+      "canonicalText": "{\"ok\":true,\"tool\":\"person_memory.search\",\"schemaVersion\":\"ai.persona-memory/v2\",\"memoryIds\":[\"e4e14805-406f-453a-bf80-46eea4049095\"],\"items\":[{\"id\":\"e4e14805-406f-453a-bf80-46eea4049095\",\"revision\":3,\"type\":\"fact\",\"summary\":\"\",\"matchedPassage\":\"The user prefers concise review status.\",\"passageStart\":0,\"passageEnd\":39,\"contentChars\":39,\"chunkId\":\"1ca31a04db623b36effec361ff594df86882bc725c95152340cb6c30794b0aa6:0\",\"chunkOrdinal\":0,\"chunkerVersion\":\"memory-text/v1\",\"generation\":\"1ca31a04db623b36effec361ff594df86882bc725c95152340cb6c30794b0aa6\",\"title\":\"\",\"source\":{\"type\":\"memory\",\"id\":\"e4e14805-406f-453a-bf80-46eea4049095\",\"checksum\":\"8382aa14d315048d456e2c98fef725473f1c81f482e210cd130c49f67a3cb025\",\"artifactId\":null,\"artifactVersionId\":null,\"artifactVersion\":null},\"truncated\":false,\"score\":3.449035812672176,\"provenance\":{\"personId\":\"dbaa64a4-b2c7-4f43-9dcb-d83e5e261985\",\"workflowId\":null,\"conversationId\":\"dc2d4a99-31d2-46cb-8154-069529305068\",\"chatId\":\"989933de-0466-41e7-a755-dacdfee80f13\",\"sourceType\":\"person_memory_tool\",\"sourceId\":null,\"artifactId\":null,\"artifactChunkId\":\"\",\"sourceHash\":\"c2a1651f50fa986c91a8c3372b1af36e8e00a3b22a252fae7d26fa78e3abac70\"}}],\"snapshotId\":null,\"omittedCount\":0,\"truncated\":false,\"budget\":{\"accountingContract\":\"o200k_base/v1\",\"maxTokens\":4096,\"maxBytes\":32768},\"sourceWork\":{\"limited\":false,\"maxArtifactBytes\":4194304,\"maxTextBytes\":4194304,\"maxArtifacts\":8}}"
+    },
+    {
+      "name": "read",
+      "method": "read",
+      "result": {
+        "ok": true,
+        "tool": "person_memory.read",
+        "schemaVersion": "ai.persona-memory/v2",
+        "memoryId": "e4e14805-406f-453a-bf80-46eea4049095",
+        "revision": 3,
+        "page": {
+          "text": "{\"id\":\"e4e14805-406f-453a-bf80-46eea4049095\",\"type\":\"fact\",\"subtype\":null,\"content\":\"The user prefers concise review status.\",\"summary\":\"\",\"confidence\":0.85,\"importance\":0.5,\"status\":\"active\",\"conflictStatus\":\"resolved\",\"sourceType\":\"person_memory_tool\",\"sourceExcerpt\":\"The user prefers concise review status.\",\"score\":1.0,\"scoreReasons\":[\"direct_read\"],\"metadata\":{\"operation\":\"write\",\"tool\":\"person_memory.write\",\"auditEvent\":{\"type\":\"person_memory.tool_call\",\"tool\":\"person_memory.write\",\"operation\":\"write\",\"callId\":null,\"nodeExecutionId\":null,\"executionId\":null,\"workflowId\":null,\"conversationId\":\"dc2d4a99-31d2-46cb-8154-069529305068\",\"chatId\":\"989933de-0466-41e7-a755-dacdfee80f13\",\"personId\":\"dbaa64a4-b2c7-4f43-9dcb-d83e5e261985\",\"argumentsSummary\":{\"type\":\"\",\"contentLength\":39,\"hasSummary\":false,\"importance\":null,\"confidence\":null},\"memoryIds\":[],\"createdMemoryIds\":[],\"snapshotId\":null,\"ok\":true,\"error\":null},\"personaApproval\":{\"schemaVersion\":1,\"required\":true,\"approvedContentDigest\":\"97b11b47eeb542f264c6b8cf92659b720f5f18800ef95a8fdf337e2e99f734ff\",\"reviewId\":\"3f12e2d5-7017-4ddc-98f7-b877a812adab\"}},\"normalizedContent\":\"\",\"revision\":3,\"provenance\":{\"personId\":\"dbaa64a4-b2c7-4f43-9dcb-d83e5e261985\",\"workflowId\":null,\"conversationId\":\"dc2d4a99-31d2-46cb-8154-069529305068\",\"chatId\":\"989933de-0466-41e7-a755-dacdfee80f13\",\"sourceType\":\"person_memory_tool\",\"sourceId\":null,\"artifactId\":null,\"artifactChunkId\":\"\",\"sourceHash\":\"c2a1651f50fa986c91a8c3372b1af36e8e00a3b22a252fae7d26fa78e3abac70\"}}",
+          "encoding": "application/json; fragment=unicode-codepoints",
+          "start": 0,
+          "end": 1512,
+          "totalChars": 1512,
+          "documentSha256": "ce3ffffe90672a248a44aa80992817e40281c2c7477fd38cca4ddba5dc264273",
+          "complete": true,
+          "nextCursor": null
+        },
+        "budget": {
+          "accountingContract": "o200k_base/v1",
+          "maxTokens": 2048,
+          "maxBytes": 16384
+        }
+      },
+      "canonicalText": "{\"ok\":true,\"tool\":\"person_memory.read\",\"schemaVersion\":\"ai.persona-memory/v2\",\"memoryId\":\"e4e14805-406f-453a-bf80-46eea4049095\",\"revision\":3,\"page\":{\"text\":\"{\\\"id\\\":\\\"e4e14805-406f-453a-bf80-46eea4049095\\\",\\\"type\\\":\\\"fact\\\",\\\"subtype\\\":null,\\\"content\\\":\\\"The user prefers concise review status.\\\",\\\"summary\\\":\\\"\\\",\\\"confidence\\\":0.85,\\\"importance\\\":0.5,\\\"status\\\":\\\"active\\\",\\\"conflictStatus\\\":\\\"resolved\\\",\\\"sourceType\\\":\\\"person_memory_tool\\\",\\\"sourceExcerpt\\\":\\\"The user prefers concise review status.\\\",\\\"score\\\":1.0,\\\"scoreReasons\\\":[\\\"direct_read\\\"],\\\"metadata\\\":{\\\"operation\\\":\\\"write\\\",\\\"tool\\\":\\\"person_memory.write\\\",\\\"auditEvent\\\":{\\\"type\\\":\\\"person_memory.tool_call\\\",\\\"tool\\\":\\\"person_memory.write\\\",\\\"operation\\\":\\\"write\\\",\\\"callId\\\":null,\\\"nodeExecutionId\\\":null,\\\"executionId\\\":null,\\\"workflowId\\\":null,\\\"conversationId\\\":\\\"dc2d4a99-31d2-46cb-8154-069529305068\\\",\\\"chatId\\\":\\\"989933de-0466-41e7-a755-dacdfee80f13\\\",\\\"personId\\\":\\\"dbaa64a4-b2c7-4f43-9dcb-d83e5e261985\\\",\\\"argumentsSummary\\\":{\\\"type\\\":\\\"\\\",\\\"contentLength\\\":39,\\\"hasSummary\\\":false,\\\"importance\\\":null,\\\"confidence\\\":null},\\\"memoryIds\\\":[],\\\"createdMemoryIds\\\":[],\\\"snapshotId\\\":null,\\\"ok\\\":true,\\\"error\\\":null},\\\"personaApproval\\\":{\\\"schemaVersion\\\":1,\\\"required\\\":true,\\\"approvedContentDigest\\\":\\\"97b11b47eeb542f264c6b8cf92659b720f5f18800ef95a8fdf337e2e99f734ff\\\",\\\"reviewId\\\":\\\"3f12e2d5-7017-4ddc-98f7-b877a812adab\\\"}},\\\"normalizedContent\\\":\\\"\\\",\\\"revision\\\":3,\\\"provenance\\\":{\\\"personId\\\":\\\"dbaa64a4-b2c7-4f43-9dcb-d83e5e261985\\\",\\\"workflowId\\\":null,\\\"conversationId\\\":\\\"dc2d4a99-31d2-46cb-8154-069529305068\\\",\\\"chatId\\\":\\\"989933de-0466-41e7-a755-dacdfee80f13\\\",\\\"sourceType\\\":\\\"person_memory_tool\\\",\\\"sourceId\\\":null,\\\"artifactId\\\":null,\\\"artifactChunkId\\\":\\\"\\\",\\\"sourceHash\\\":\\\"c2a1651f50fa986c91a8c3372b1af36e8e00a3b22a252fae7d26fa78e3abac70\\\"}}\",\"encoding\":\"application/json; fragment=unicode-codepoints\",\"start\":0,\"end\":1512,\"totalChars\":1512,\"documentSha256\":\"ce3ffffe90672a248a44aa80992817e40281c2c7477fd38cca4ddba5dc264273\",\"complete\":true,\"nextCursor\":null},\"budget\":{\"accountingContract\":\"o200k_base/v1\",\"maxTokens\":2048,\"maxBytes\":16384}}"
+    },
+    {
+      "name": "update",
+      "method": "update",
+      "result": {
+        "ok": true,
+        "tool": "person_memory.update",
+        "schemaVersion": "ai.persona-memory/v2",
+        "memory": {
+          "id": "a1e0acb6-eabb-4de9-89fd-33db04fb993c",
+          "type": "fact",
+          "status": "candidate"
+        },
+        "budget": {
+          "accountingContract": "o200k_base/v1",
+          "maxTokens": 4096,
+          "maxBytes": 32768
+        }
+      },
+      "canonicalText": "{\"ok\":true,\"tool\":\"person_memory.update\",\"schemaVersion\":\"ai.persona-memory/v2\",\"memory\":{\"id\":\"a1e0acb6-eabb-4de9-89fd-33db04fb993c\",\"type\":\"fact\",\"status\":\"candidate\"},\"budget\":{\"accountingContract\":\"o200k_base/v1\",\"maxTokens\":4096,\"maxBytes\":32768}}"
+    },
+    {
+      "name": "search_rejected",
+      "method": "search",
+      "result": {
+        "ok": false,
+        "tool": "person_memory.search",
+        "schemaVersion": "ai.persona-memory/v2",
+        "error": "Persona memory operation was rejected; inspect current context and policy.",
+        "budget": {
+          "accountingContract": "o200k_base/v1",
+          "maxTokens": 4096,
+          "maxBytes": 32768
+        }
+      },
+      "canonicalText": "{\"ok\":false,\"tool\":\"person_memory.search\",\"schemaVersion\":\"ai.persona-memory/v2\",\"error\":\"Persona memory operation was rejected; inspect current context and policy.\",\"budget\":{\"accountingContract\":\"o200k_base/v1\",\"maxTokens\":4096,\"maxBytes\":32768}}"
+    },
+    {
+      "name": "read_rejected",
+      "method": "read",
+      "result": {
+        "ok": false,
+        "tool": "person_memory.read",
+        "schemaVersion": "ai.persona-memory/v2",
+        "error": "Persona memory operation was rejected; inspect current context and policy.",
+        "budget": {
+          "accountingContract": "o200k_base/v1",
+          "maxTokens": 2048,
+          "maxBytes": 16384
+        }
+      },
+      "canonicalText": "{\"ok\":false,\"tool\":\"person_memory.read\",\"schemaVersion\":\"ai.persona-memory/v2\",\"error\":\"Persona memory operation was rejected; inspect current context and policy.\",\"budget\":{\"accountingContract\":\"o200k_base/v1\",\"maxTokens\":2048,\"maxBytes\":16384}}"
+    },
+    {
+      "name": "write_rejected",
+      "method": "write",
+      "result": {
+        "ok": false,
+        "tool": "person_memory.write",
+        "schemaVersion": "ai.persona-memory/v2",
+        "error": "Persona memory operation was rejected; inspect current context and policy.",
+        "budget": {
+          "accountingContract": "o200k_base/v1",
+          "maxTokens": 4096,
+          "maxBytes": 32768
+        }
+      },
+      "canonicalText": "{\"ok\":false,\"tool\":\"person_memory.write\",\"schemaVersion\":\"ai.persona-memory/v2\",\"error\":\"Persona memory operation was rejected; inspect current context and policy.\",\"budget\":{\"accountingContract\":\"o200k_base/v1\",\"maxTokens\":4096,\"maxBytes\":32768}}"
+    },
+    {
+      "name": "update_rejected",
+      "method": "update",
+      "result": {
+        "ok": false,
+        "tool": "person_memory.update",
+        "schemaVersion": "ai.persona-memory/v2",
+        "error": "Persona memory operation was rejected; inspect current context and policy.",
+        "budget": {
+          "accountingContract": "o200k_base/v1",
+          "maxTokens": 4096,
+          "maxBytes": 32768
+        }
+      },
+      "canonicalText": "{\"ok\":false,\"tool\":\"person_memory.update\",\"schemaVersion\":\"ai.persona-memory/v2\",\"error\":\"Persona memory operation was rejected; inspect current context and policy.\",\"budget\":{\"accountingContract\":\"o200k_base/v1\",\"maxTokens\":4096,\"maxBytes\":32768}}"
+    },
+    {
+      "name": "write_receipt",
+      "method": "write",
+      "result": {
+        "ok": true,
+        "tool": "person_memory.write",
+        "schemaVersion": "ai.persona-memory/v2",
+        "memory": {
+          "id": "e4e14805-406f-453a-bf80-46eea4049095",
+          "type": "fact",
+          "status": "candidate"
+        },
+        "budget": {
+          "accountingContract": "o200k_base/v1",
+          "maxTokens": 4096,
+          "maxBytes": 32768
+        }
+      },
+      "canonicalText": "{\"ok\":true,\"tool\":\"person_memory.write\",\"schemaVersion\":\"ai.persona-memory/v2\",\"memory\":{\"id\":\"e4e14805-406f-453a-bf80-46eea4049095\",\"type\":\"fact\",\"status\":\"candidate\"},\"budget\":{\"accountingContract\":\"o200k_base/v1\",\"maxTokens\":4096,\"maxBytes\":32768}}"
+    },
+    {
+      "name": "update_receipt",
+      "method": "update",
+      "result": {
+        "ok": true,
+        "tool": "person_memory.update",
+        "schemaVersion": "ai.persona-memory/v2",
+        "memory": {
+          "id": "a1e0acb6-eabb-4de9-89fd-33db04fb993c",
+          "type": "fact",
+          "status": "candidate"
+        },
+        "budget": {
+          "accountingContract": "o200k_base/v1",
+          "maxTokens": 4096,
+          "maxBytes": 32768
+        }
+      },
+      "canonicalText": "{\"ok\":true,\"tool\":\"person_memory.update\",\"schemaVersion\":\"ai.persona-memory/v2\",\"memory\":{\"id\":\"a1e0acb6-eabb-4de9-89fd-33db04fb993c\",\"type\":\"fact\",\"status\":\"candidate\"},\"budget\":{\"accountingContract\":\"o200k_base/v1\",\"maxTokens\":4096,\"maxBytes\":32768}}"
+    }
+  ]
+}

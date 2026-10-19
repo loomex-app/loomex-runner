@@ -594,6 +594,14 @@ impl TestGate {
 }
 #[cfg(test)]
 impl FingerprintService {
+    pub(crate) fn test_hold_filesystem(&self) -> Arc<TestGate> {
+        let gate = Arc::new(TestGate::default());
+        *self.0.test_filesystem_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+    pub(crate) fn test_clear_filesystem_hold(&self) {
+        *self.0.test_filesystem_gate.lock().unwrap() = None;
+    }
     pub(crate) fn test_hold(&self) -> Arc<TestGate> {
         let gate = Arc::new(TestGate::default());
         *self.0.test_gate.lock().unwrap() = Some(gate.clone());

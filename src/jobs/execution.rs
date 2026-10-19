@@ -89,7 +89,18 @@ pub(super) async fn execute_job(
     } else {
         Some(command_request(&authorized, id, path, journal.clone())?)
     };
+    if payload.get("discussionTurn").is_some() {
+        ensure!(
+            persona_memory::DISCUSSION_PROVIDER_QUALIFIED,
+            "PERSONA_DISCUSSION_PROVIDER_UNSUPPORTED"
+        );
+    }
     let memory_server = if persona_memory::enabled(payload) {
+        ensure!(
+            persona_memory::selected_version(payload)? != persona_memory::V2
+                || persona_memory::V2_PROVIDER_QUALIFIED,
+            "PERSONA_MEMORY_PROVIDER_UNSUPPORTED"
+        );
         let provider = payload["provider"]
             .as_str()
             .context("PERSONA_MEMORY_PROVIDER_UNSUPPORTED")?;

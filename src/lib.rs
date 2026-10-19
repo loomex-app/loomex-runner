@@ -18,3 +18,5 @@ pub mod state;
 pub mod uninstall_state;
 pub mod workflow_patch;
 pub mod workspace_set;
+
+pub(crate) mod memory_wire;

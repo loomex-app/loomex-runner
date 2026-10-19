@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::ensure;
 
 #[cfg(test)]
 pub(super) async fn require_execution_authorization(
@@ -77,7 +78,7 @@ async fn read_execution_authority(
     {
         bail!("LOCAL_EXECUTION_AUTHORIZATION_REQUIRED")
     }
-    if record["providers"] != providers {
+    if !crate::control::provider_snapshot_matches(&record["providers"], &providers) {
         bail!("PROVIDER_CONFIGURATION_CHANGED")
     }
     // The refresh/reconciliation above is complete before projecting ANY local
@@ -100,6 +101,7 @@ async fn read_execution_authority(
             "WORKSPACE_DENIED"
         );
     }
+    validate_persona_job_binding(binding, payload)?;
     // Reject an unbound output root before any command or provider can launch.
     if let Some(declarations) = payload["artifactOutputs"].as_array() {
         for declaration in declarations {
@@ -128,6 +130,186 @@ async fn read_execution_authority(
         identity,
     })
 }
+fn validate_persona_job_binding(binding: &Value, payload: &Value) -> Result<()> {
+    let discussion = payload.get("discussionTurn");
+    let memory = payload.get("memoryBridge");
+    if discussion.is_none() && memory.is_none() {
+        return Ok(());
+    }
+    let input: Value = serde_json::from_str(
+        payload["providerInput"]
+            .as_str()
+            .context("PERSONA_MEMORY_CONTRACT_INVALID")?,
+    )?;
+    ensure!(
+        input["schemaVersion"] == "loomex.provider-input/v1",
+        "PERSONA_MEMORY_CONTRACT_INVALID"
+    );
+    if memory.is_some() {
+        let version = persona_memory::selected_version(payload)?;
+        ensure!(
+            binding["personaMemoryContract"] == version
+                && input["memory"]["schemaVersion"] == version
+                && input["memory"]["scope"] == "sealed_job",
+            "PERSONA_MEMORY_CONTRACT_INVALID"
+        );
+        let writes = input["memory"]["writeMemory"]
+            .as_bool()
+            .context("PERSONA_MEMORY_CONTRACT_INVALID")?;
+        ensure!(
+            input["memory"]["operations"]
+                == if writes {
+                    json!(["search", "read", "write", "update"])
+                } else {
+                    json!(["search", "read"])
+                },
+            "PERSONA_MEMORY_CONTRACT_INVALID"
+        );
+    }
+    let Some(turn) = discussion else {
+        let selected = binding["workflowClosure"]
+            .as_array()
+            .context("PERSONA_MEMORY_CONTRACT_INVALID")?
+            .iter()
+            .filter(|w| w["workflowVersionId"] == binding["versionId"])
+            .filter_map(|w| w["nodeDependencies"].as_object())
+            .flat_map(|nodes| nodes.values())
+            .find(|s| {
+                s["node"]["key"] == input["context"]["node"]["key"] && s["node"]["type"] == "person"
+            })
+            .context("PERSONA_MEMORY_CONTRACT_INVALID")?;
+        ensure!(
+            selected["person"]["id"] == input["persona"]["id"]
+                && selected["modelResolution"]["provider"] == payload["provider"]
+                && selected["node"]["config"]["_memoryContext"]["bridge"]
+                    == payload["memoryBridge"]
+                && selected["node"]["config"]["_memoryContext"]["policy"]["writeMemory"]
+                    == input["memory"]["writeMemory"],
+            "PERSONA_MEMORY_CONTRACT_INVALID"
+        );
+        return Ok(());
+    };
+    ensure!(
+        turn.as_object().is_some_and(|o| o.len() == 9)
+            && turn["schemaVersion"] == "loomex.persona-discussion.turn/v1"
+            && turn["memoryAccess"] == "read_only",
+        "PERSONA_DISCUSSION_CONTRACT_INVALID"
+    );
+    for key in ["discussionId", "turnId", "operationKey"] {
+        Uuid::parse_str(
+            turn[key]
+                .as_str()
+                .context("PERSONA_DISCUSSION_CONTRACT_INVALID")?,
+        )?;
+    }
+    ensure!(
+        turn["sequence"].as_u64().is_some_and(|n| n > 0)
+            && turn["round"].as_u64().is_some_and(|n| n <= 10)
+            && [
+                "discuss",
+                "propose",
+                "revise",
+                "independent",
+                "critique",
+                "ballot",
+                "moderate",
+                "synthesize",
+                "proposal"
+            ]
+            .contains(
+                &turn["phase"]
+                    .as_str()
+                    .context("PERSONA_DISCUSSION_CONTRACT_INVALID")?
+            ),
+        "PERSONA_DISCUSSION_CONTRACT_INVALID"
+    );
+    ensure!(
+        payload.get("publicStatus").is_none()
+            && input["context"]["node"]["type"] == "persona_discussion",
+        "PERSONA_DISCUSSION_CONTRACT_INVALID"
+    );
+    let own = &input["context"]["nodeInput"];
+    ensure!(
+        own["freshContext"] == true
+            && own["memoryAuthority"] == "read_only"
+            && own["turn"]["phase"] == turn["phase"]
+            && own["turn"]["round"] == turn["round"]
+            && own["turn"]["slotKey"] == turn["slotKey"]
+            && own["turn"]["personId"] == input["persona"]["id"],
+        "PERSONA_DISCUSSION_CONTRACT_INVALID"
+    );
+    let argv = payload["command"].as_array().context("INVALID_COMMAND")?;
+    ensure!(
+        payload["provider"] == "codex"
+            && argv
+                .iter()
+                .take(argv.len().saturating_sub(1))
+                .any(|arg| arg == "exec")
+            && !argv
+                .iter()
+                .take(argv.len().saturating_sub(1))
+                .any(|a| a == "resume" || a == "--resume" || a == "--conversation"),
+        "PERSONA_DISCUSSION_FRESH_CONTEXT_REQUIRED"
+    );
+    if memory.is_some() {
+        ensure!(
+            input["memory"]["writeMemory"] == false
+                && payload["memoryBridge"]["schemaVersion"] == persona_memory::V2,
+            "PERSONA_MEMORY_READ_ONLY"
+        );
+    }
+    let closure = binding["workflowClosure"]
+        .as_array()
+        .context("PERSONA_DISCUSSION_CONTRACT_INVALID")?;
+    let snapshot = closure
+        .iter()
+        .filter(|w| w["workflowVersionId"] == binding["versionId"])
+        .filter_map(|w| w["nodeDependencies"].as_object())
+        .flat_map(|nodes| nodes.values())
+        .find(|s| {
+            s["node"]["key"] == input["context"]["node"]["key"]
+                && s["node"]["type"] == "persona_discussion"
+        })
+        .context("PERSONA_DISCUSSION_CONTRACT_INVALID")?;
+    let participant = snapshot["discussion"]["participants"]
+        .as_array()
+        .context("PERSONA_DISCUSSION_CONTRACT_INVALID")?
+        .iter()
+        .find(|p| p["slotKey"] == turn["slotKey"])
+        .context("PERSONA_DISCUSSION_CONTRACT_INVALID")?;
+    ensure!(
+        participant["person"]["id"] == input["persona"]["id"]
+            && participant["modelResolution"]["provider"] == payload["provider"]
+            && participant["turnPolicy"]["writeMemory"] == false,
+        "PERSONA_DISCUSSION_CONTRACT_INVALID"
+    );
+    let models = argv
+        .windows(2)
+        .filter(|pair| pair[0] == "--model")
+        .collect::<Vec<_>>();
+    ensure!(
+        models.len() == 1 && models[0][1] == participant["modelResolution"]["runtimeModel"],
+        "PERSONA_DISCUSSION_CONTRACT_INVALID"
+    );
+    if let Some(effort) = participant["modelResolution"]["reasoningEffort"].as_str() {
+        let configured = argv
+            .windows(2)
+            .filter(|pair| {
+                pair[0] == "-c"
+                    && pair[1]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with("model_reasoning_effort="))
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            configured.len() == 1
+                && configured[0][1] == format!("model_reasoning_effort=\"{effort}\""),
+            "PERSONA_DISCUSSION_CONTRACT_INVALID"
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn verify_payload_digest(job: &Value) -> Result<()> {
     let mut stable_payload = job["payload"]
         .as_object()
@@ -560,5 +742,116 @@ mod fingerprint_revalidation_tests {
             assert_eq!(daemon.fingerprint_diagnostics()["started"], 0);
             assert_eq!(state::read_json::<Value>(&path).unwrap(), record);
         }
+    }
+}
+
+#[cfg(test)]
+mod persona_binding_tests {
+    use super::*;
+    fn fixture() -> (Value, Value) {
+        let person = Uuid::new_v4();
+        let slot = "critic";
+        let participant = json!({"slotKey":slot,"person":{"id":person},"modelResolution":{"provider":"codex","runtimeModel":"fixed-model"},"turnPolicy":{"writeMemory":false}});
+        let binding = json!({"versionId":"root","personaMemoryContract":persona_memory::V2,"workflowClosure":[{"workflowVersionId":"root","nodeDependencies":{"panel":{"node":{"key":"panel","type":"persona_discussion"},"discussion":{"participants":[participant]}}}}]});
+        let turn = json!({"schemaVersion":"loomex.persona-discussion.turn/v1","discussionId":Uuid::new_v4(),"turnId":Uuid::new_v4(),"operationKey":Uuid::new_v4(),"phase":"critique","round":1,"slotKey":slot,"sequence":3,"memoryAccess":"read_only"});
+        let input = json!({"schemaVersion":"loomex.provider-input/v1","persona":{"id":person},"context":{"node":{"type":"persona_discussion","key":"panel"},"nodeInput":{"freshContext":true,"memoryAuthority":"read_only","turn":{"phase":"critique","round":1,"slotKey":slot,"personId":person}}},"memory":{"schemaVersion":persona_memory::V2,"scope":"sealed_job","writeMemory":false,"operations":["search","read"]}});
+        let text = input.to_string();
+        let payload = json!({"provider":"codex","memoryBridge":{"schemaVersion":persona_memory::V2,"required":true},"providerInput":text,"discussionTurn":turn,"command":["codex","--add-dir","/fixture/additional","exec","--model","fixed-model",text]});
+        (binding, payload)
+    }
+    #[test]
+    fn fresh_discussion_owns_exact_slot_model_and_read_only_memory_version() {
+        let (binding, payload) = fixture();
+        assert!(validate_persona_job_binding(&binding, &payload).is_ok());
+        for change in [
+            "person", "slot", "resume", "write", "version", "status", "model",
+        ] {
+            let mut p = payload.clone();
+            let mut input: Value =
+                serde_json::from_str(p["providerInput"].as_str().unwrap()).unwrap();
+            match change {
+                "person" => input["persona"]["id"] = json!(Uuid::new_v4()),
+                "slot" => p["discussionTurn"]["slotKey"] = json!("peer"),
+                "resume" => p["command"][4] = json!("resume"),
+                "write" => input["memory"]["writeMemory"] = json!(true),
+                "version" => p["memoryBridge"]["schemaVersion"] = json!(persona_memory::SCHEMA),
+                "status" => {
+                    p["publicStatus"] =
+                        json!({"schemaVersion":"ai.public-status/v1","enabled":true})
+                }
+                "model" => p["command"][5] = json!("substitute-model"),
+                _ => unreachable!(),
+            }
+            p["providerInput"] = json!(input.to_string());
+            assert!(
+                validate_persona_job_binding(&binding, &p).is_err(),
+                "{change}"
+            );
+        }
+    }
+    #[test]
+    fn historical_jobs_never_gain_a_bridge_from_current_capability() {
+        assert!(
+            validate_persona_job_binding(
+                &json!({"personaMemoryContract":persona_memory::V2}),
+                &json!({"command":["/usr/bin/true"]})
+            )
+            .is_ok()
+        );
+        let (mut binding, payload) = fixture();
+        binding["personaMemoryContract"] = json!(persona_memory::SCHEMA);
+        assert!(validate_persona_job_binding(&binding, &payload).is_err());
+    }
+}
+
+#[cfg(test)]
+mod capability_upgrade_authority_tests {
+    use super::*;
+    #[tokio::test]
+    async fn old_v1_record_admits_additive_capabilities_without_rewriting_seal() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let api = crate::api::Api::for_test_origin("http://127.0.0.1:9").unwrap();
+        let daemon = Daemon::new(
+            temp.path().join("state"),
+            api.clone(),
+            crate::auth::Auth::test_enrolled(api, "org", "runner"),
+        )
+        .unwrap();
+        let install = daemon.auth.installation_id().await.unwrap();
+        daemon
+            .public
+            .lock()
+            .await
+            .grants
+            .push(crate::state::WorkspaceGrant::new(&workspace, "org", &install, "key").unwrap());
+        let old = json!({"codex":{"path":"/fixed/codex","adapter":"codex","checksumSha256":"fixed","sizeBytes":7,"modifiedNanos":"9","executionPolicy":"host_user/v1","capabilities":{"ai.persona-memory/v1":true}}});
+        let mut upgraded = old.clone();
+        upgraded["codex"]["capabilities"]["ai.persona-memory/v2"] = json!(true);
+        upgraded["codex"]["capabilities"]["ai.persona-discussion/v1"] = json!(true);
+        let prep = Uuid::new_v4();
+        let config = json!({"requested":{},"installed":old});
+        let binding = json!({"executionPolicy":"host_user/v1","providerConfiguration":config,"personaMemoryContract":"ai.persona-memory/v1"});
+        let record = json!({"organizationId":"org","accountSubject":"runner","installationId":install,"workspacePath":workspace,"bindingDigest":"fixed-binding","providers":old,"binding":binding,"commitAuthorization":{"preparationId":prep,"bindingDigest":"fixed-binding"}});
+        let path = daemon.dir.join("preparations").join(format!("{prep}.json"));
+        state::write_json(&path, &record).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut job = crate::jobs::protocol_tests::journal();
+        job.job["payload"] = json!({"executionPolicy":"host_user/v1","providerConfiguration":config,"workspacePath":workspace,"preparationId":prep,"bindingDigest":"fixed-binding"});
+        assert!(
+            read_execution_authority(&daemon, &job, upgraded.clone())
+                .await
+                .is_ok()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        upgraded["codex"]["capabilities"]["ai.persona-memory/v1"] = json!(false);
+        assert!(
+            read_execution_authority(&daemon, &job, upgraded)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 }

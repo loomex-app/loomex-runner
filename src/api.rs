@@ -56,6 +56,7 @@ struct PreparedRequest {
     url: Url,
     body: Vec<u8>,
     idempotency_key: Option<String>,
+    persona_memory_offer: bool,
 }
 
 const MAX_VALIDATION_ISSUES: usize = 32;
@@ -423,6 +424,32 @@ impl Api {
         self.send_prepared(&prepared, credential).await
     }
 
+    /// Keep the backend's complete model-facing data serialization byte-for-byte.
+    /// Parsing a Value alone would reorder keys and alter bounded token accounting.
+    pub(crate) async fn request_canonical(
+        &self,
+        method: &str,
+        route: &str,
+        body: Option<Value>,
+        credential: Option<&SignedCredential>,
+        key: Option<&str>,
+    ) -> Result<(Value, String), ApiError> {
+        let prepared = self.prepare_request(method, route, body, key)?;
+        self.send_prepared_canonical(&prepared, credential).await
+    }
+
+    pub(crate) async fn request_persona_context(
+        &self,
+        route: &str,
+        body: Option<Value>,
+        credential: &SignedCredential,
+        key: Option<&str>,
+    ) -> Result<Value, ApiError> {
+        let mut prepared = self.prepare_request("POST", route, body, key)?;
+        prepared.persona_memory_offer = true;
+        self.send_prepared(&prepared, Some(credential)).await
+    }
+
     /// A proof retry is permitted only for an authenticated, pre-handler stale
     /// proof rejection and an unchanged job authority. The exact domain bytes
     /// and idempotency key are prepared once; only the transport proof changes.
@@ -448,6 +475,37 @@ impl Api {
                     return Err(ApiError::new("RUNNER_JOB_LEASE_CONFLICT", false));
                 }
                 self.send_prepared(&prepared, Some(credential)).await
+            }
+            result => result,
+        }
+    }
+
+    pub(crate) async fn request_job_canonical_with_stale_proof_retry<F>(
+        &self,
+        method: &str,
+        route: &str,
+        body: Option<Value>,
+        credential: &SignedCredential,
+        idempotency_key: Option<&str>,
+        authority_unchanged: F,
+    ) -> Result<(Value, String), ApiError>
+    where
+        F: Fn() -> bool,
+    {
+        let prepared = self.prepare_request(method, route, body, idempotency_key)?;
+        if !authority_unchanged() {
+            return Err(ApiError::new("RUNNER_JOB_LEASE_CONFLICT", false));
+        }
+        match self
+            .send_prepared_canonical(&prepared, Some(credential))
+            .await
+        {
+            Err(error) if error.status == Some(422) && error.code == "RUNNER_PROOF_STALE" => {
+                if !authority_unchanged() {
+                    return Err(ApiError::new("RUNNER_JOB_LEASE_CONFLICT", false));
+                }
+                self.send_prepared_canonical(&prepared, Some(credential))
+                    .await
             }
             result => result,
         }
@@ -490,6 +548,7 @@ impl Api {
             url,
             body: bytes,
             idempotency_key: idempotency_key.map(str::to_owned),
+            persona_memory_offer: false,
         })
     }
 
@@ -498,6 +557,14 @@ impl Api {
         prepared: &PreparedRequest,
         credential: Option<&SignedCredential>,
     ) -> Result<Value, ApiError> {
+        Ok(self.send_prepared_canonical(prepared, credential).await?.0)
+    }
+
+    async fn send_prepared_canonical(
+        &self,
+        prepared: &PreparedRequest,
+        credential: Option<&SignedCredential>,
+    ) -> Result<(Value, String), ApiError> {
         let mut request = self
             .client
             .request(prepared.method.clone(), prepared.url.clone())
@@ -507,6 +574,9 @@ impl Api {
             ))
             .header("Accept", "application/json")
             .header("X-Loomex-Capabilities", "workflow.queue-observation/v1");
+        if prepared.persona_memory_offer {
+            request = request.header("X-Loomex-Persona-Memory-Contract", "ai.persona-memory/v2");
+        }
         if let Some(key) = &prepared.idempotency_key {
             request = request.header("Idempotency-Key", key);
         }
@@ -538,15 +608,28 @@ impl Api {
             .map_err(|_| ApiError::new("NETWORK_UNAVAILABLE", true))?;
         let status = response.status().as_u16();
         if status == 202 {
-            return Ok(json!({"pending":true}));
+            return Ok((json!({"pending":true}), "{\"pending\":true}".into()));
         }
-        let payload = response.json::<Value>().await.map_err(|_| {
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|_| ApiError::new("INVALID_API_RESPONSE", true))?;
+        let payload = serde_json::from_slice::<Value>(&bytes).map_err(|_| {
             ApiError::new(
                 "INVALID_API_RESPONSE",
                 status >= 500 || (200..300).contains(&status),
             )
         })?;
-        parse_envelope(status, payload)
+        let value = parse_envelope(status, payload)?;
+        let envelope: std::collections::HashMap<String, Box<serde_json::value::RawValue>> =
+            serde_json::from_slice(&bytes)
+                .map_err(|_| ApiError::new("INVALID_API_RESPONSE", true))?;
+        let text = envelope
+            .get("data")
+            .ok_or_else(|| ApiError::new("INVALID_API_RESPONSE", true))?
+            .get()
+            .to_owned();
+        Ok((value, text))
     }
 }
 fn parse_envelope(status: u16, payload: Value) -> Result<Value, ApiError> {

@@ -56,7 +56,7 @@ mod recovery;
 use recovery::*;
 
 fn runner_manifest_with_memory(memory: bool) -> Value {
-    json!({"version":env!("CARGO_PKG_VERSION"),"executionPolicies":["host_user/v1"],"jobKinds":["shell.exec","command.run","http.request"],"capabilities":{"shell.exec":true,"command.run":true,"http.request":true,"ai.public-status/v1":LIVE_PROVIDER_QUALIFIED,"ai.persona-memory/v1":memory,"codex.native-projected-json/v3":true,"execution.workspace-set/v1":true},"httpResultContracts":[HTTP_RESULT_SCHEMA],"concurrency":null,"executionSeconds":null,"outputBytes":null,"artifactBytes":null})
+    json!({"version":env!("CARGO_PKG_VERSION"),"executionPolicies":["host_user/v1"],"jobKinds":["shell.exec","command.run","http.request"],"capabilities":{"shell.exec":true,"command.run":true,"http.request":true,"ai.public-status/v1":LIVE_PROVIDER_QUALIFIED,"personas.memory-transport/v2":true,"ai.persona-memory/v1":memory,"ai.persona-memory/v2":memory && persona_memory::V2_PROVIDER_QUALIFIED,"ai.persona-discussion/v1":memory && persona_memory::DISCUSSION_PROVIDER_QUALIFIED,"codex.native-projected-json/v3":true,"execution.workspace-set/v1":true},"httpResultContracts":[HTTP_RESULT_SCHEMA],"concurrency":null,"executionSeconds":null,"outputBytes":null,"artifactBytes":null})
 }
 async fn runner_manifest(daemon: &Daemon) -> Result<Value> {
     Ok(runner_manifest_with_memory(

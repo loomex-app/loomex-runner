@@ -27,7 +27,8 @@ struct Capability {
 }
 
 pub(super) fn enabled(job: &Value) -> bool {
-    job["payload"]["publicStatus"] == json!({"schemaVersion":SCHEMA,"enabled":true})
+    job["payload"].get("discussionTurn").is_none()
+        && job["payload"]["publicStatus"] == json!({"schemaVersion":SCHEMA,"enabled":true})
 }
 
 pub(super) fn codex_opted_in(job: &Value) -> bool {
