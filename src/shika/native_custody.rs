@@ -161,6 +161,106 @@ fn keychain_paths(list: &CFArray<CFType>) -> Option<Vec<std::path::PathBuf>> {
     }
     Some(result)
 }
+type DomainPaths = [Vec<std::path::PathBuf>; 4];
+fn current_domain_paths() -> Option<DomainPaths> {
+    let mut preference = -1;
+    if unsafe { SecKeychainGetPreferenceDomain(&mut preference) } != 0 || preference != 0 {
+        return None;
+    }
+    let mut domains = Vec::new();
+    for id in 0..4 {
+        let mut raw: CFArrayRef = std::ptr::null();
+        if unsafe { SecKeychainCopyDomainSearchList(id, &mut raw) } != 0 || raw.is_null() {
+            return None;
+        }
+        let list = unsafe { CFArray::<CFType>::wrap_under_create_rule(raw) };
+        domains.push(keychain_paths(&list)?);
+    }
+    domains.try_into().ok()
+}
+fn known_system_path() -> Option<std::path::PathBuf> {
+    std::path::Path::new("/Library/Keychains/System.keychain")
+        .canonicalize()
+        .ok()
+}
+fn approved_common_domains(domains: &DomainPaths, system: &std::path::Path) -> bool {
+    domains[1].as_slice() == [system] && domains[2].as_slice() == [system] && domains[3].is_empty()
+}
+fn item_options(service: &str, account: &str) -> security_framework::passwords::PasswordOptions {
+    use core_foundation::string::CFString;
+    use security_framework::passwords::PasswordOptions;
+    use security_framework_sys::item::kSecUseAuthenticationUI;
+    unsafe extern "C" {
+        static kSecUseAuthenticationUIFail: core_foundation::string::CFStringRef;
+    }
+    let mut options = PasswordOptions::new_generic_password(service, account);
+    #[allow(deprecated)]
+    options.query.push(unsafe {
+        (
+            CFString::wrap_under_get_rule(kSecUseAuthenticationUI),
+            CFString::wrap_under_get_rule(kSecUseAuthenticationUIFail).into_CFType(),
+        )
+    });
+    options
+}
+fn scoped_item_options(
+    service: &str,
+    account: &str,
+    keychain: &SecKeychain,
+) -> security_framework::passwords::PasswordOptions {
+    use core_foundation::string::CFString;
+    use security_framework_sys::item::kSecMatchSearchList;
+    let mut options = item_options(service, account);
+    let list = CFArray::from_CFTypes(&[keychain.clone()]);
+    #[allow(deprecated)]
+    options.query.push(unsafe {
+        (
+            CFString::wrap_under_get_rule(kSecMatchSearchList),
+            list.into_CFType(),
+        )
+    });
+    options
+}
+fn require_system_tuple_absent(keychain: &SecKeychain, service: &str, account: &str) {
+    use core_foundation::dictionary::CFDictionary;
+    use security_framework_sys::{base::errSecItemNotFound, keychain_item::SecItemCopyMatching};
+    let options = scoped_item_options(service, account, keychain);
+    #[allow(deprecated)]
+    let query = CFDictionary::from_CFType_pairs(&options.query);
+    // No return-data attribute and no result pointer: check presence only.
+    let status = unsafe { SecItemCopyMatching(query.as_concrete_TypeRef(), std::ptr::null_mut()) };
+    assert!(
+        status == errSecItemNotFound,
+        "FIXTURE_SYSTEM_TUPLE_NOT_CONFIRMED_ABSENT"
+    );
+}
+fn create_sentinel(keychain: &SecKeychain) {
+    use core_foundation::{data::CFData, dictionary::CFDictionary, string::CFString};
+    use security_framework_sys::{
+        item::{kSecUseKeychain, kSecValueData},
+        keychain_item::SecItemAdd,
+    };
+    let mut options = item_options("app.loomex.runner.v1", "installation");
+    #[allow(deprecated)]
+    {
+        options.query.push(unsafe {
+            (
+                CFString::wrap_under_get_rule(kSecUseKeychain),
+                keychain.clone().into_CFType(),
+            )
+        });
+        options.query.push(unsafe {
+            (
+                CFString::wrap_under_get_rule(kSecValueData),
+                CFData::from_buffer(b"synthetic-sentinel").into_CFType(),
+            )
+        });
+        let attributes = CFDictionary::from_CFType_pairs(&options.query);
+        let status = unsafe { SecItemAdd(attributes.as_concrete_TypeRef(), std::ptr::null_mut()) };
+        // Create-only: duplicates or any other failure never fall back to update.
+        assert!(status == 0, "FIXTURE_SENTINEL_ADD_FAILED");
+    }
+}
 // Diagnostic reads only keychain references and path metadata inside the disposable VM.
 // Every emitted value is a fixed category, count or boolean; paths are never printed.
 fn diagnose_search(
@@ -266,9 +366,32 @@ fn verify_selection(opened: &SecKeychain, diagnostic: Option<(&CFArray<CFType>, 
     if let Some((prior, previous)) = diagnostic {
         diagnose_search(&actual, &expected, prior, previous);
     }
-    assert_eq!(actual.len(), 1, "FIXTURE_SEARCH_COUNT");
+    let system = known_system_path().expect("FIXTURE_SYSTEM_PATH_UNAVAILABLE");
+    assert!(system != expected, "FIXTURE_SYSTEM_EQUALS_FIXTURE");
+    let domains = current_domain_paths().expect("FIXTURE_DOMAIN_UNAVAILABLE");
+    assert!(
+        domains[0].as_slice() == [expected.as_path()],
+        "FIXTURE_USER_DOMAIN_MISMATCH"
+    );
+    assert!(
+        approved_common_domains(&domains, &system),
+        "FIXTURE_SHARED_DOMAIN_MISMATCH"
+    );
+    assert_eq!(actual.len(), 2, "FIXTURE_SEARCH_COUNT");
     let paths = keychain_paths(&actual).expect("FIXTURE_SEARCH_PATH_UNAVAILABLE");
-    assert!(paths.first() == Some(&expected), "FIXTURE_SEARCH_MISMATCH");
+    assert!(
+        paths.as_slice() == [expected.as_path(), system.as_path()],
+        "FIXTURE_SEARCH_MISMATCH"
+    );
+    let system_item = actual.get(1).expect("FIXTURE_SYSTEM_REFERENCE_MISSING");
+    assert!(
+        system_item.type_of() == SecKeychain::type_id(),
+        "FIXTURE_SYSTEM_REFERENCE_INVALID"
+    );
+    let system_ref =
+        unsafe { SecKeychain::wrap_under_get_rule(system_item.as_CFTypeRef() as SecKeychainRef) };
+    require_system_tuple_absent(&system_ref, "app.shika.loomex.runner.v1", "protected-state");
+    require_system_tuple_absent(&system_ref, "app.loomex.runner.v1", "installation");
 }
 
 fn expected_state(count: usize) -> Journal {
@@ -300,6 +423,7 @@ fn verify_child() {
 struct Fixture {
     previous: SecKeychain,
     search: CFArray<CFType>,
+    domains: DomainPaths,
     temporary: Option<SecKeychain>,
     attempted: bool,
     cleaned: bool,
@@ -338,8 +462,14 @@ impl Fixture {
                 },
             )
             .unwrap_or(false);
+        let domains_verified = current_domain_paths().as_ref() == Some(&self.domains);
         self.cleaned = true;
-        default_ok && search_ok && deletion_ok && search_verified && default_verified
+        default_ok
+            && search_ok
+            && deletion_ok
+            && search_verified
+            && default_verified
+            && domains_verified
     }
 }
 impl Drop for Fixture {
@@ -412,6 +542,23 @@ fn native_custody_disposable_ci() {
     assert_eq!(unsafe { SecKeychainCopySearchList(&mut search_ref) }, 0);
     assert!(!search_ref.is_null());
     let search = unsafe { CFArray::<CFType>::wrap_under_create_rule(search_ref) };
+    let domains = current_domain_paths().expect("FIXTURE_PRE_DOMAIN_UNAVAILABLE");
+    let system = known_system_path().expect("FIXTURE_SYSTEM_PATH_UNAVAILABLE");
+    assert!(
+        approved_common_domains(&domains, &system),
+        "FIXTURE_PRE_SHARED_DOMAIN_MISMATCH"
+    );
+    let prior_effective = keychain_paths(&search).expect("FIXTURE_PRE_SEARCH_PATH_UNAVAILABLE");
+    let expected_effective: Vec<_> = domains[3]
+        .iter()
+        .chain(domains[0].iter())
+        .chain(domains[2].iter())
+        .cloned()
+        .collect();
+    assert!(
+        prior_effective == expected_effective,
+        "FIXTURE_PRE_SEARCH_MISMATCH"
+    );
     let initial_ui = SecKeychain::user_interaction_allowed().expect("UI state");
     let no_ui = if initial_ui {
         Some(SecKeychain::disable_user_interaction().expect("disable UI"))
@@ -421,6 +568,7 @@ fn native_custody_disposable_ci() {
     let mut fixture = Fixture {
         previous,
         search,
+        domains,
         temporary: None,
         attempted: false,
         cleaned: false,
@@ -446,32 +594,9 @@ fn native_custody_disposable_ci() {
     );
     verify_selection(temporary, Some((&fixture.search, &fixture.previous)));
 
-    // Synthetic Loomex namespace sentinel, inside the fixture keychain only.
-    use security_framework::passwords::{
-        PasswordOptions, delete_generic_password_options, generic_password,
-        set_generic_password_options,
-    };
-    fn scoped_options(service: &str, account: &str) -> PasswordOptions {
-        use core_foundation::string::CFString;
-        use security_framework_sys::item::kSecUseAuthenticationUI;
-        unsafe extern "C" {
-            static kSecUseAuthenticationUIFail: core_foundation::string::CFStringRef;
-        }
-        let mut options = PasswordOptions::new_generic_password(service, account);
-        #[allow(deprecated)]
-        options.query.push(unsafe {
-            (
-                CFString::wrap_under_get_rule(kSecUseAuthenticationUI),
-                CFString::wrap_under_get_rule(kSecUseAuthenticationUIFail).into_CFType(),
-            )
-        });
-        options
-    }
-    fn sentinel_options() -> PasswordOptions {
-        scoped_options("app.loomex.runner.v1", "installation")
-    }
-    set_generic_password_options(b"synthetic-sentinel", sentinel_options())
-        .expect("sentinel create");
+    // Create-only fixture-scoped synthetic sentinel, never an unscoped update.
+    use security_framework::passwords::{delete_generic_password_options, generic_password};
+    create_sentinel(temporary);
     let store = NativeStore;
     assert!(store.load().expect("initial load").is_none());
     let mut state = journal();
@@ -558,19 +683,42 @@ fn native_custody_disposable_ci() {
         std::thread::sleep(Duration::from_millis(20));
     }
     drop(child);
-    assert!(generic_password(sentinel_options()).expect("sentinel load") == b"synthetic-sentinel");
-    // Exact Shika tuple in the exclusive disposable keychain/search list.
-    delete_generic_password_options(scoped_options(
+    verify_selection(
+        fixture.temporary.as_ref().expect("fixture handle"),
+        Some((&fixture.search, &fixture.previous)),
+    );
+    assert!(
+        generic_password(scoped_item_options(
+            "app.loomex.runner.v1",
+            "installation",
+            fixture.temporary.as_ref().expect("fixture handle")
+        ))
+        .expect("sentinel load")
+            == b"synthetic-sentinel"
+    );
+    // Delete the exact Shika tuple only from the explicit fixture keychain.
+    delete_generic_password_options(scoped_item_options(
         "app.shika.loomex.runner.v1",
         "protected-state",
+        fixture.temporary.as_ref().expect("fixture handle"),
     ))
     .expect("Shika delete");
     assert!(store.load().expect("post-delete load").is_none());
     assert!(
-        generic_password(sentinel_options()).expect("sentinel after delete")
+        generic_password(scoped_item_options(
+            "app.loomex.runner.v1",
+            "installation",
+            fixture.temporary.as_ref().expect("fixture handle")
+        ))
+        .expect("sentinel after delete")
             == b"synthetic-sentinel"
     );
-    delete_generic_password_options(sentinel_options()).expect("sentinel delete");
+    delete_generic_password_options(scoped_item_options(
+        "app.loomex.runner.v1",
+        "installation",
+        fixture.temporary.as_ref().expect("fixture handle"),
+    ))
+    .expect("sentinel delete");
     assert!(
         fixture.cleanup(),
         "restore or fixture deletion failed; VM must be discarded"

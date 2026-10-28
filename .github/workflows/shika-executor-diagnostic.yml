@@ -9,52 +9,8 @@ permissions:
   contents: read
 
 jobs:
-  baseline-macos-26:
+  current-macos-26-serialized:
     runs-on: macos-26
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-        with:
-          ref: 479980bcd1b820ed65f6f0834bc834988060d6b4
-          persist-credentials: false
-      - name: Verify checkout
-        run: test "$(git rev-parse HEAD)" = 479980bcd1b820ed65f6f0834bc834988060d6b4
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # reviewed master 2026-10-04
-        with:
-          toolchain: 1.88.0
-          targets: aarch64-apple-darwin
-      - name: Verify architecture and test source
-        shell: bash
-        run: |
-          test "$(uname -m)" = arm64
-          test "$(rustc -vV | sed -n 's/^host: //p')" = aarch64-apple-darwin
-          printf '%s  %s\n' 94f3451e74cf2bf3e00ed5911ed06925f06cd17f7de29b55a45d5f25c234b2c3 tests/executor.rs | shasum -a 256 -c
-      - name: Run unchanged executor test
-        shell: bash
-        run: |
-          set -o pipefail
-          umask 077
-          log=$(mktemp "$RUNNER_TEMP/shika-executor-baseline.XXXXXX")
-          set +e
-          cargo test --locked --test executor detached_child_is_reported_as_indeterminate_effects -- --exact --nocapture --test-threads=1 2>&1 | tee "$log"
-          statuses=("${PIPESTATUS[@]}")
-          set -e
-          awk '
-            /^running 1 test$/ { running++ }
-            /^test detached_child_is_reported_as_indeterminate_effects \.\.\./ {
-              selected++; pending=1
-              if ($0 ~ / (ok|FAILED)$/) { result++; pending=0 }
-              next
-            }
-            pending && /^(ok|FAILED)$/ { result++; pending=0 }
-            /^test result: (ok|FAILED)\. (1 passed; 0 failed|0 passed; 1 failed);/ { summary++ }
-            END { exit !(running == 1 && selected == 1 && result == 1 && summary == 1) }
-          ' "$log"
-          test "${statuses[1]}" -eq 0
-          exit "${statuses[0]}"
-
-  current-macos-15:
-    runs-on: macos-15
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -75,26 +31,20 @@ jobs:
           test "$(uname -m)" = arm64
           test "$(rustc -vV | sed -n 's/^host: //p')" = aarch64-apple-darwin
           printf '%s  %s\n' 94f3451e74cf2bf3e00ed5911ed06925f06cd17f7de29b55a45d5f25c234b2c3 tests/executor.rs | shasum -a 256 -c
-      - name: Run unchanged executor test
+      - name: Run unchanged serialized executor suite
         shell: bash
         run: |
           set -o pipefail
           umask 077
-          log=$(mktemp "$RUNNER_TEMP/shika-executor-current.XXXXXX")
+          log=$(mktemp "$RUNNER_TEMP/shika-executor-serialized.XXXXXX")
           set +e
-          cargo test --locked --test executor detached_child_is_reported_as_indeterminate_effects -- --exact --nocapture --test-threads=1 2>&1 | tee "$log"
+          cargo test --locked --test executor -- --nocapture --test-threads=1 2>&1 | tee "$log"
           statuses=("${PIPESTATUS[@]}")
           set -e
+          if [ "${statuses[0]}" -ne 0 ]; then exit "${statuses[0]}"; fi
+          if [ "${statuses[1]}" -ne 0 ]; then exit "${statuses[1]}"; fi
           awk '
-            /^running 1 test$/ { running++ }
-            /^test detached_child_is_reported_as_indeterminate_effects \.\.\./ {
-              selected++; pending=1
-              if ($0 ~ / (ok|FAILED)$/) { result++; pending=0 }
-              next
-            }
-            pending && /^(ok|FAILED)$/ { result++; pending=0 }
-            /^test result: (ok|FAILED)\. (1 passed; 0 failed|0 passed; 1 failed);/ { summary++ }
-            END { exit !(running == 1 && selected == 1 && result == 1 && summary == 1) }
+            /^running 19 tests$/ { running++ }
+            /^test result: ok\. 17 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out;/ { summary++ }
+            END { exit !(running == 1 && summary == 1) }
           ' "$log"
-          test "${statuses[1]}" -eq 0
-          exit "${statuses[0]}"
