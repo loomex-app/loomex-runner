@@ -6,7 +6,7 @@ use super::{
 };
 use core_foundation::{
     array::{CFArray, CFArrayRef},
-    base::{CFEqual, CFType, TCFType},
+    base::{CFType, TCFType},
 };
 use security_framework::os::macos::keychain::{CreateOptions, SecKeychain};
 use security_framework_sys::base::SecKeychainRef;
@@ -22,6 +22,8 @@ unsafe extern "C" {
     fn SecKeychainSetSearchList(list: CFArrayRef) -> i32;
     fn SecKeychainSetDefault(kc: SecKeychainRef) -> i32;
     fn SecKeychainDelete(kc: SecKeychainRef) -> i32;
+    fn SecKeychainGetPath(kc: SecKeychainRef, length: *mut u32, path: *mut std::ffi::c_char)
+    -> i32;
 }
 
 fn guard() {
@@ -120,16 +122,63 @@ fn validate_child(root: &std::path::Path) {
     // Only after filesystem validation, verify both native selections before any store call.
     verify_selection(&SecKeychain::open(path).expect("open fixture"));
 }
-fn verify_selection(opened: &SecKeychain) {
-    let current = SecKeychain::default().expect("default fixture");
-    assert!(unsafe { CFEqual(opened.as_CFTypeRef(), current.as_CFTypeRef()) != 0 });
-    let expected = CFArray::from_CFTypes(&[opened.clone()]);
-    let mut raw: CFArrayRef = std::ptr::null();
-    assert_eq!(unsafe { SecKeychainCopySearchList(&mut raw) }, 0);
-    assert!(!raw.is_null());
-    let actual = unsafe { CFArray::<CFType>::wrap_under_create_rule(raw) };
-    assert!(unsafe { CFEqual(actual.as_CFTypeRef(), expected.as_CFTypeRef()) != 0 });
+// Security.framework returns opaque references: compare canonical file identities,
+// never debug-print the references, paths, or any keychain contents.
+fn keychain_path(kc: &SecKeychain) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut buffer = vec![0u8; 4096];
+    let mut length = buffer.len() as u32;
+    let status = unsafe {
+        SecKeychainGetPath(
+            kc.as_concrete_TypeRef(),
+            &mut length,
+            buffer.as_mut_ptr().cast(),
+        )
+    };
+    if status != 0 || length == 0 || length as usize > buffer.len() {
+        return None;
+    }
+    buffer.truncate(length as usize);
+    if buffer.contains(&0) {
+        return None;
+    }
+    let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(buffer));
+    if !path.is_absolute() {
+        return None;
+    }
+    path.canonicalize().ok()
 }
+fn keychain_paths(list: &CFArray<CFType>) -> Option<Vec<std::path::PathBuf>> {
+    let mut result = Vec::with_capacity(list.len() as usize);
+    for item in list.iter() {
+        if item.type_of() != SecKeychain::type_id() {
+            return None;
+        }
+        let kc = unsafe { SecKeychain::wrap_under_get_rule(item.as_CFTypeRef() as SecKeychainRef) };
+        result.push(keychain_path(&kc)?);
+    }
+    Some(result)
+}
+fn verify_selection(opened: &SecKeychain) {
+    let expected = keychain_path(opened).expect("FIXTURE_PATH_UNAVAILABLE");
+    let current = SecKeychain::default().expect("FIXTURE_DEFAULT_UNAVAILABLE");
+    assert!(
+        keychain_path(&current).as_ref() == Some(&expected),
+        "FIXTURE_DEFAULT_MISMATCH"
+    );
+    let mut raw: CFArrayRef = std::ptr::null();
+    assert_eq!(
+        unsafe { SecKeychainCopySearchList(&mut raw) },
+        0,
+        "FIXTURE_SEARCH_UNAVAILABLE"
+    );
+    assert!(!raw.is_null(), "FIXTURE_SEARCH_UNAVAILABLE");
+    let actual = unsafe { CFArray::<CFType>::wrap_under_create_rule(raw) };
+    assert_eq!(actual.len(), 1, "FIXTURE_SEARCH_COUNT");
+    let paths = keychain_paths(&actual).expect("FIXTURE_SEARCH_PATH_UNAVAILABLE");
+    assert!(paths.first() == Some(&expected), "FIXTURE_SEARCH_MISMATCH");
+}
+
 fn expected_state(count: usize) -> Journal {
     let mut state = journal();
     state.pending = Some(operation());
@@ -182,12 +231,20 @@ impl Fixture {
         let status = unsafe { SecKeychainCopySearchList(&mut raw) };
         let search_verified = if status == 0 && !raw.is_null() {
             let actual = unsafe { CFArray::<CFType>::wrap_under_create_rule(raw) };
-            unsafe { CFEqual(actual.as_CFTypeRef(), self.search.as_CFTypeRef()) != 0 }
+            match (keychain_paths(&actual), keychain_paths(&self.search)) {
+                (Some(actual), Some(expected)) => actual == expected,
+                _ => false,
+            }
         } else {
             false
         };
         let default_verified = SecKeychain::default()
-            .map(|v| unsafe { CFEqual(v.as_CFTypeRef(), self.previous.as_CFTypeRef()) != 0 })
+            .map(
+                |v| match (keychain_path(&v), keychain_path(&self.previous)) {
+                    (Some(actual), Some(expected)) => actual == expected,
+                    _ => false,
+                },
+            )
             .unwrap_or(false);
         self.cleaned = true;
         default_ok && search_ok && deletion_ok && search_verified && default_verified
