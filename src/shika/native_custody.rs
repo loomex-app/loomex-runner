@@ -22,6 +22,8 @@ unsafe extern "C" {
     fn SecKeychainSetSearchList(list: CFArrayRef) -> i32;
     fn SecKeychainSetDefault(kc: SecKeychainRef) -> i32;
     fn SecKeychainDelete(kc: SecKeychainRef) -> i32;
+    fn SecKeychainGetPreferenceDomain(domain: *mut i32) -> i32;
+    fn SecKeychainCopyDomainSearchList(domain: i32, list: *mut CFArrayRef) -> i32;
     fn SecKeychainGetPath(kc: SecKeychainRef, length: *mut u32, path: *mut std::ffi::c_char)
     -> i32;
 }
@@ -120,7 +122,7 @@ fn validate_child(root: &std::path::Path) {
     let md = std::fs::symlink_metadata(&path).expect("fixture keychain missing");
     assert!(md.is_file() && !md.file_type().is_symlink() && md.uid() == unsafe { libc::geteuid() });
     // Only after filesystem validation, verify both native selections before any store call.
-    verify_selection(&SecKeychain::open(path).expect("open fixture"));
+    verify_selection(&SecKeychain::open(path).expect("open fixture"), None);
 }
 // Security.framework returns opaque references: compare canonical file identities,
 // never debug-print the references, paths, or any keychain contents.
@@ -159,7 +161,94 @@ fn keychain_paths(list: &CFArray<CFType>) -> Option<Vec<std::path::PathBuf>> {
     }
     Some(result)
 }
-fn verify_selection(opened: &SecKeychain) {
+// Diagnostic reads only keychain references and path metadata inside the disposable VM.
+// Every emitted value is a fixed category, count or boolean; paths are never printed.
+fn diagnose_search(
+    actual: &CFArray<CFType>,
+    expected: &std::path::Path,
+    prior: &CFArray<CFType>,
+    prior_default: &SecKeychain,
+) {
+    let prior_paths = keychain_paths(prior);
+    let prior_default_path = keychain_path(prior_default);
+    let system_path = std::path::Path::new("/Library/Keychains/System.keychain")
+        .canonicalize()
+        .ok();
+    let mut domain = -1i32;
+    let domain_status = unsafe { SecKeychainGetPreferenceDomain(&mut domain) };
+    let domain_label = if domain_status != 0 {
+        "unavailable"
+    } else {
+        match domain {
+            0 => "user",
+            1 => "system",
+            2 => "common",
+            3 => "dynamic",
+            _ => "unknown",
+        }
+    };
+    eprintln!(
+        "FIXTURE_DIAG preference_domain={domain_label} effective_count={}",
+        actual.len()
+    );
+    let mut lists = Vec::new();
+    for (id, label) in [(0, "user"), (1, "system"), (2, "common"), (3, "dynamic")] {
+        let mut raw: CFArrayRef = std::ptr::null();
+        let status = unsafe { SecKeychainCopyDomainSearchList(id, &mut raw) };
+        if status != 0 || raw.is_null() {
+            eprintln!("FIXTURE_DIAG domain={label} status=unavailable");
+            lists.push(None);
+        } else {
+            let list = unsafe { CFArray::<CFType>::wrap_under_create_rule(raw) };
+            eprintln!("FIXTURE_DIAG domain={label} count={}", list.len());
+            lists.push(keychain_paths(&list));
+        }
+    }
+    // Bound output, including for unexpected runner configurations.
+    for (index, item) in actual.iter().take(16).enumerate() {
+        let path = if item.type_of() == SecKeychain::type_id() {
+            let kc =
+                unsafe { SecKeychain::wrap_under_get_rule(item.as_CFTypeRef() as SecKeychainRef) };
+            keychain_path(&kc)
+        } else {
+            None
+        };
+        if let Some(path) = path {
+            let compare = |candidate: Option<&std::path::PathBuf>| match candidate {
+                Some(value) if value == &path => "yes",
+                Some(_) => "no",
+                None => "unknown",
+            };
+            let prior = match &prior_paths {
+                Some(v) if v.contains(&path) => "yes",
+                Some(_) => "no",
+                None => "unknown",
+            };
+            let member = |i: usize| match &lists[i] {
+                Some(v) if v.contains(&path) => "yes",
+                Some(_) => "no",
+                None => "unknown",
+            };
+            eprintln!(
+                "FIXTURE_DIAG entry={index} fixture={} prior={} prior_default={} known_system={} user={} system={} common={} dynamic={}",
+                if path == expected { "yes" } else { "no" },
+                prior,
+                compare(prior_default_path.as_ref()),
+                compare(system_path.as_ref()),
+                member(0),
+                member(1),
+                member(2),
+                member(3)
+            );
+        } else {
+            eprintln!("FIXTURE_DIAG entry={index} class=path_unavailable");
+        }
+    }
+    if actual.len() > 16 {
+        eprintln!("FIXTURE_DIAG entries=truncated");
+    }
+}
+fn verify_selection(opened: &SecKeychain, diagnostic: Option<(&CFArray<CFType>, &SecKeychain)>) {
     let expected = keychain_path(opened).expect("FIXTURE_PATH_UNAVAILABLE");
     let current = SecKeychain::default().expect("FIXTURE_DEFAULT_UNAVAILABLE");
     assert!(
@@ -174,6 +263,9 @@ fn verify_selection(opened: &SecKeychain) {
     );
     assert!(!raw.is_null(), "FIXTURE_SEARCH_UNAVAILABLE");
     let actual = unsafe { CFArray::<CFType>::wrap_under_create_rule(raw) };
+    if let Some((prior, previous)) = diagnostic {
+        diagnose_search(&actual, &expected, prior, previous);
+    }
     assert_eq!(actual.len(), 1, "FIXTURE_SEARCH_COUNT");
     let paths = keychain_paths(&actual).expect("FIXTURE_SEARCH_PATH_UNAVAILABLE");
     assert!(paths.first() == Some(&expected), "FIXTURE_SEARCH_MISMATCH");
@@ -352,7 +444,7 @@ fn native_custody_disposable_ci() {
         unsafe { SecKeychainSetSearchList(one.as_concrete_TypeRef()) },
         0
     );
-    verify_selection(temporary);
+    verify_selection(temporary, Some((&fixture.search, &fixture.previous)));
 
     // Synthetic Loomex namespace sentinel, inside the fixture keychain only.
     use security_framework::passwords::{
