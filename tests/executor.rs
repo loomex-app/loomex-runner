@@ -557,12 +557,65 @@ async fn post_spawn_panic_cleans_up_owned_guardian_without_target_dispatch() {
     assert!(!root.path().join("should-not-exist").exists());
 }
 
+#[test]
+#[ignore = "execution fixture invoked by detached-child test"]
+fn execution_fixture_detached_child() {
+    let mut pipe = [-1; 2];
+    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "fixture pipe");
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        panic!("fixture fork failed");
+    }
+    if child == 0 {
+        unsafe {
+            libc::close(pipe[0]);
+            if libc::setsid() < 0 {
+                libc::_exit(1);
+            }
+            let signal = b"R";
+            if libc::write(pipe[1], signal.as_ptr().cast(), 1) != 1 {
+                libc::_exit(1);
+            }
+            libc::close(pipe[1]);
+            libc::sleep(10);
+            libc::_exit(0);
+        }
+    }
+    unsafe { libc::close(pipe[1]) };
+    let mut poll = libc::pollfd {
+        fd: pipe[0],
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ready = unsafe { libc::poll(&mut poll, 1, 2_000) } == 1 && poll.revents & libc::POLLIN != 0;
+    let mut signal = [0_u8; 1];
+    let notified = ready && unsafe { libc::read(pipe[0], signal.as_mut_ptr().cast(), 1) } == 1;
+    unsafe { libc::close(pipe[0]) };
+    let separated = notified
+        && signal == *b"R"
+        && unsafe { libc::getsid(child) } == child
+        && unsafe { libc::getpgid(child) } == child
+        && unsafe { libc::getsid(0) } != child
+        && unsafe { libc::getpgrp() } != child;
+    if !separated || fs::write("detached.pid", child.to_string()).is_err() {
+        // Do not signal an uncertain PID. The child exits after one bounded
+        // sleep; a non-child or still-running result leaves reaping unconfirmed.
+        let reaped = unsafe { libc::waitpid(child, std::ptr::null_mut(), libc::WNOHANG) } == child;
+        if reaped {
+            panic!("detached fixture readiness failed; child reaped");
+        }
+        panic!("detached fixture readiness failed; child reaping unconfirmed");
+    }
+}
+
 #[tokio::test]
 async fn detached_child_is_reported_as_indeterminate_effects() {
     let root = tempfile::tempdir().unwrap();
-    let mut req = request(root.path(), "unused");
-    req.argv = vec!["/usr/bin/python3".into(), "-c".into(),
-        "import os,time; p=os.fork();\nif p == 0:\n os.setsid(); open('detached.pid','w').write(str(os.getpid())); time.sleep(10)\nelse:\n time.sleep(0.1)".into()];
+    let req = fixture_request(root.path(), "execution_fixture_detached_child");
     let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(4),
         run(req, Arc::new(AtomicBool::new(false))),

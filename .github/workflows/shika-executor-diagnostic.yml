@@ -30,7 +30,7 @@ jobs:
         run: |
           test "$(uname -m)" = arm64
           test "$(rustc -vV | sed -n 's/^host: //p')" = aarch64-apple-darwin
-          printf '%s  %s\n' 472dbcc07579ff16bcb6fbc16aba537bf950c8b851d0ce9e157c9b48967363df tests/executor.rs | shasum -a 256 -c
+          printf '%s  %s\n' 79b4e09a590569df1efab919c773695d84ffceaa2a0f14e9bbbdddb7949e4b5a tests/executor.rs | shasum -a 256 -c
       - name: Run unchanged serialized executor suite
         shell: bash
         run: |
@@ -44,7 +44,7 @@ jobs:
           if [ "${statuses[0]}" -ne 0 ]; then exit "${statuses[0]}"; fi
           if [ "${statuses[1]}" -ne 0 ]; then exit "${statuses[1]}"; fi
           awk '
-            /^running 19 tests$/ { running++ }
-            /^test result: ok\. 17 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out;/ { summary++ }
+            /^running 20 tests$/ { running++ }
+            /^test result: ok\. 17 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out;/ { summary++ }
             END { exit !(running == 1 && summary == 1) }
           ' "$log"
