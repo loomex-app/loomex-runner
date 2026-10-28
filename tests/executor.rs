@@ -563,13 +563,21 @@ async fn detached_child_is_reported_as_indeterminate_effects() {
     let mut req = request(root.path(), "unused");
     req.argv = vec!["/usr/bin/python3".into(), "-c".into(),
         "import os,time; p=os.fork();\nif p == 0:\n os.setsid(); open('detached.pid','w').write(str(os.getpid())); time.sleep(10)\nelse:\n time.sleep(0.1)".into()];
-    let result = tokio::time::timeout(
+    let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(4),
         run(req, Arc::new(AtomicBool::new(false))),
     )
-    .await
-    .unwrap()
-    .unwrap();
+    .await;
+    let result = outcome
+        .unwrap_or_else(|_| {
+            panic!(
+                "executor timed out; post-cancellation diagnostics: {}; target status {}; detached.pid present: {}",
+                readiness_diagnostics(root.path()),
+                bounded_contents(&root.path().join("spool/target-status.json")),
+                fs::symlink_metadata(root.path().join("detached.pid")).is_ok(),
+            )
+        })
+        .unwrap();
     assert_eq!(result.exit_code, Some(0));
     assert!(result.descendant_cleanup.contains("indeterminate"));
     let pid: i32 = fs::read_to_string(root.path().join("detached.pid"))
