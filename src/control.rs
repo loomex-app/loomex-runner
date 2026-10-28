@@ -126,6 +126,101 @@ impl Drop for OwnedReadControl {
         self.0.end_control();
     }
 }
+async fn run_shika_blocking<F>(budget: std::time::Duration, operation: F) -> Result<Value>
+where
+    F: FnOnce() -> Result<Value> + Send + 'static,
+{
+    // Dropping a JoinHandle does not cancel a started blocking operation. Its
+    // closure owns all serialization and lifecycle guards through completion.
+    let task = tokio::task::spawn_blocking(operation);
+    tokio::time::timeout(budget, task)
+        .await
+        .map_err(|_| anyhow::anyhow!("SHIKA_OPERATION_PENDING"))?
+        .map_err(|_| anyhow::anyhow!("SHIKA_OPERATION_PENDING"))?
+}
+#[cfg(test)]
+mod shika_worker_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn timeout_retains_worker_owner_and_drain_until_late_completion() {
+        let supervisor = Arc::new(crate::jobs::supervisor::ExecutionSupervisor::new(false));
+        let owner = Arc::new(tokio::sync::Mutex::new(()));
+        supervisor.begin_control();
+        let admission = OwnedReadControl(supervisor.clone());
+        let worker_owner = owner.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let wait = tokio::spawn(run_shika_blocking(
+            std::time::Duration::from_millis(100),
+            move || {
+                let admission = admission;
+                let owner = worker_owner.blocking_lock_owned();
+                let _ = started_tx.send(());
+                release_rx.recv().unwrap();
+                drop(owner);
+                drop(admission);
+                let _ = done_tx.send(());
+                Ok(json!({"status":"settled"}))
+            },
+        ));
+        started_rx.await.unwrap();
+        assert_eq!(
+            wait.await.unwrap().unwrap_err().to_string(),
+            "SHIKA_OPERATION_PENDING"
+        );
+        assert_eq!(supervisor.managed_work(), 1);
+        assert!(owner.try_lock().is_err());
+        release_tx.send(()).unwrap();
+        done_rx.await.unwrap();
+        assert_eq!(supervisor.managed_work(), 0);
+        assert!(owner.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn late_worker_holds_auth_gate_without_replacing_manual_installation() {
+        let api = Api::for_test_origin("http://127.0.0.1:9").unwrap();
+        let auth = Auth::test_unauthed(api);
+        let original = auth.installation_id().await.unwrap();
+        let worker_auth = auth.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let wait = tokio::spawn(run_shika_blocking(
+            std::time::Duration::from_millis(100),
+            move || {
+                runtime.block_on(async move {
+                    let guard = worker_auth.existing_installation().await?;
+                    let _ = started_tx.send(());
+                    release_rx.recv().map_err(|_| anyhow::anyhow!("INTERNAL"))?;
+                    guard.verify().await?;
+                    drop(guard);
+                    let _ = done_tx.send(());
+                    Ok(json!({}))
+                })
+            },
+        ));
+        started_rx.await.unwrap();
+        assert_eq!(
+            wait.await.unwrap().unwrap_err().to_string(),
+            "SHIKA_OPERATION_PENDING"
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                auth.test_hold_credential_gate()
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(auth.installation_id().await.unwrap(), original);
+        release_tx.send(()).unwrap();
+        done_rx.await.unwrap();
+        assert_eq!(auth.installation_id().await.unwrap(), original);
+    }
+}
 impl Drop for ControlWriter<'_> {
     fn drop(&mut self) {
         self.0.execution.end_control();
@@ -447,6 +542,25 @@ impl Daemon {
             .find(|entry| entry["name"] == method)
             .context("METHOD_NOT_FOUND")?;
         validate_params(&params, &entry["inputSchema"])?;
+        if method.starts_with("shika.v2.") {
+            // Capture the Shika owner and selected credential before any
+            // asynchronous context resolution or generic cache lookup. Native
+            // Keychain calls run only on the blocking worker, which retains
+            // the Shika/auth owners and an owned drain admission after timeout.
+            let _writer = self.control_writer(method, entry["mutating"] == true)?;
+            self.execution.begin_control();
+            let admission = OwnedReadControl(self.execution.clone());
+            let auth = self.auth.clone();
+            let method_owned = method.to_owned();
+            let params_owned = params.clone();
+            let runtime = tokio::runtime::Handle::current();
+            let result = run_shika_blocking(std::time::Duration::from_secs(25), move || {
+                let _admission = admission;
+                runtime.block_on(crate::shika::dispatch(&method_owned, &params_owned, &auth))
+            })
+            .await?;
+            return normalize_catalog_output(result, &entry["outputSchema"]);
+        }
         if method == "editor.start" {
             ensure!(
                 lowercase_sha256(required(&params, "expectedDefinitionChecksum")?),
@@ -501,7 +615,8 @@ impl Daemon {
             .then(|| self.memory_read_lifecycle.transition());
         // Capture organization before waiting for any operation. The handler never
         // substitutes a later active organization into this operation's identity.
-        let scope = if method.starts_with("auth.")
+        let scope = if method.starts_with("shika.v2.")
+            || method.starts_with("auth.")
             || method.starts_with("connection.")
             || method == "daemon.drain"
         {
@@ -576,7 +691,8 @@ impl Daemon {
         // Start issue and approval have runner-owned lifecycle records rather
         // than generic operation-cache entries. A lost response must be
         // reconciled against that exact record; it never authorizes a replay.
-        let operation = (!method.starts_with("recovery.")
+        let operation = (!method.starts_with("shika.v2.")
+            && !method.starts_with("recovery.")
             && !matches!(
                 method,
                 "auth.scope_upgrade"
@@ -6250,6 +6366,7 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
     let mut negotiated = false;
     let mut validation_errors_negotiated = false;
     let mut recovery_errors_negotiated = false;
+    let mut negotiated_method_capabilities: Vec<String> = Vec::new();
     let mut queue_observation_negotiated = false;
     let mut continuation_resolution_negotiated = false;
     loop {
@@ -6289,6 +6406,7 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
                         negotiated = false;
                         validation_errors_negotiated = false;
                         recovery_errors_negotiated = false;
+                        negotiated_method_capabilities.clear();
                         queue_observation_negotiated = false;
                         continuation_resolution_negotiated = false;
                     }
@@ -6340,6 +6458,17 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
                                         .is_some_and(|caps| {
                                             caps.contains(&json!("error.recovery/v1"))
                                         });
+                                negotiated_method_capabilities =
+                                    request["params"]["requiredCapabilities"]
+                                        .as_array()
+                                        .map(|caps| {
+                                            caps.iter()
+                                                .filter_map(Value::as_str)
+                                                .filter(|s| s.starts_with("method:"))
+                                                .map(String::from)
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
                                 validation_errors_negotiated =
                                     request["params"]["requiredCapabilities"]
                                         .as_array()
@@ -6351,15 +6480,13 @@ async fn connection(stream: UnixStream, daemon: Arc<Daemon>) -> Result<()> {
                             json!({"protocol":PROTOCOL,"id":id,"result":result})
                         }
                         Err(error) => {
-                            let mut projected = rpc_public_error(&error);
-                            // Credential diagnostics are available through the
-                            // deliberate local maintenance surface. Existing RPC
-                            // clients negotiate only workflow validation data.
-                            if !validation_errors_negotiated
-                                || crate::auth::cleanup_error_metadata(&error).is_some()
-                            {
-                                projected.as_object_mut().unwrap().remove("data");
-                            }
+                            let projected = rpc_error_for_client(
+                                &error,
+                                request["method"].as_str().unwrap_or(""),
+                                recovery_errors_negotiated,
+                                &negotiated_method_capabilities,
+                                validation_errors_negotiated,
+                            );
                             json!({"protocol":PROTOCOL,"id":id,"error":projected})
                         }
                     }
@@ -6447,6 +6574,12 @@ pub fn public_error(error: &anyhow::Error) -> (String, bool, Option<Value>) {
 /// Stage-aware errors preserve uncertainty after a remote side effect. A local
 /// store code alone cannot establish that a cleanup was never dispatched.
 pub fn public_error_record(error: &anyhow::Error) -> Value {
+    if let Some(denial) = error.downcast_ref::<crate::shika::LocalDenial>() {
+        let mut record = state::safe_error_with_data(denial.code(), false, Some(denial.data()));
+        record["recovery"] = json!("refresh_authority");
+        record["outcome"] = json!("rejected");
+        return record;
+    }
     if let Some(record) = crate::maintenance::delegated_error_record(error) {
         return record;
     }
@@ -6461,6 +6594,31 @@ pub fn public_error_record(error: &anyhow::Error) -> Value {
         });
     }
     result
+}
+pub(crate) fn rpc_error_for_client(
+    error: &anyhow::Error,
+    method: &str,
+    recovery: bool,
+    method_caps: &[String],
+    validation: bool,
+) -> Value {
+    let mut projected = rpc_public_error(error);
+    if let Some(denial) = error.downcast_ref::<crate::shika::LocalDenial>() {
+        let qualified = recovery
+            && denial.data()["method"] == method
+            && method_caps
+                .iter()
+                .any(|cap| cap == &format!("method:{method}"));
+        if !qualified {
+            let fields = projected.as_object_mut().unwrap();
+            fields.remove("data");
+            fields.remove("outcome");
+            fields.remove("recovery");
+        }
+    } else if !validation || crate::auth::cleanup_error_metadata(error).is_some() {
+        projected.as_object_mut().unwrap().remove("data");
+    }
+    projected
 }
 pub(crate) fn rpc_public_error(error: &anyhow::Error) -> Value {
     let mut projected = public_error_record(error);

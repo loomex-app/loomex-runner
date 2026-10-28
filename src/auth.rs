@@ -654,6 +654,31 @@ pub struct Auth {
     credential_owner: Option<Arc<std::fs::File>>,
     listeners: Arc<Mutex<BTreeMap<String, JoinHandle<()>>>>,
 }
+
+/// A read-only existing installation identity held under the normal auth
+/// operation gate. It never initializes or persists Loomex credentials.
+pub(crate) struct ExistingInstallation<'a> {
+    auth: &'a Auth,
+    _guard: tokio::sync::MutexGuard<'a, ()>,
+    installation_id: String,
+}
+impl ExistingInstallation<'_> {
+    pub(crate) fn id(&self) -> &str {
+        &self.installation_id
+    }
+    pub(crate) async fn verify(&self) -> Result<()> {
+        let state = self
+            .auth
+            .load()
+            .await?
+            .ok_or_else(|| anyhow!("SHIKA_INSTALLATION_UNAVAILABLE"))?;
+        ensure!(
+            state.installation_id == self.installation_id,
+            "SHIKA_INSTALLATION_CHANGED"
+        );
+        Ok(())
+    }
+}
 impl Auth {
     #[cfg(test)]
     pub(crate) fn test_unauthed(api: Api) -> Self {
@@ -939,6 +964,27 @@ impl Auth {
             }
         };
         Ok(state.installation_id)
+    }
+    pub(crate) async fn existing_installation(&self) -> Result<ExistingInstallation<'_>> {
+        let guard = self.auth_guard().await?;
+        let state = self
+            .load()
+            .await?
+            .ok_or_else(|| anyhow!("SHIKA_INSTALLATION_UNAVAILABLE"))?;
+        ensure!(
+            !state.installation_id.is_empty()
+                && state.installation_id.chars().count() <= 512
+                && !state
+                    .installation_id
+                    .chars()
+                    .any(|c| (c as u32) <= 0x1f || c == '\u{7f}'),
+            "SHIKA_INSTALLATION_UNAVAILABLE"
+        );
+        Ok(ExistingInstallation {
+            auth: self,
+            _guard: guard,
+            installation_id: state.installation_id,
+        })
     }
     pub async fn enrolled_organizations(&self) -> Result<Vec<String>> {
         let Some(state) = self.load().await? else {
@@ -6110,6 +6156,39 @@ mod tests {
             credential_owner: None,
             listeners: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+    #[tokio::test]
+    async fn existing_installation_missing_is_read_only() {
+        let store = Arc::new(MemoryStore::default());
+        let auth = auth_with_store(store.clone());
+        assert!(auth.existing_installation().await.is_err());
+        assert!(store.load().unwrap().is_none());
+    }
+    #[tokio::test]
+    async fn existing_installation_guard_serializes_and_detects_drift() {
+        let store = Arc::new(MemoryStore::default());
+        let mut state = ProtectedState::fresh();
+        let original = state.installation_id.clone();
+        store.save(&serde_json::to_vec(&state).unwrap()).unwrap();
+        let auth = auth_with_store(store.clone());
+        let captured = auth.existing_installation().await.unwrap();
+        assert_eq!(captured.id(), original);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), auth.operation_lock.lock())
+                .await
+                .is_err()
+        );
+        // Synthetic out-of-band tampering models changed protected state even
+        // though ordinary auth mutations must wait for the held gate.
+        state.installation_id = uuid::Uuid::new_v4().to_string();
+        store.save(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(
+            captured.verify().await.unwrap_err().to_string(),
+            "SHIKA_INSTALLATION_CHANGED"
+        );
+        drop(captured);
+        let next = auth.existing_installation().await.unwrap();
+        assert_eq!(next.id(), state.installation_id);
     }
     #[tokio::test]
     async fn denied_store_reports_connection_category_without_starting_auth() {

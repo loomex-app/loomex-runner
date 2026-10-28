@@ -13940,6 +13940,1273 @@
           }
         ]
       }
+    },
+    {
+      "name": "shika.v2.pairing.start",
+      "mutating": true,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "origin": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "Canonical exact configured HTTP(S) origin; semantic policy applies."
+          },
+          "uiOrigin": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "Canonical exact configured HTTP(S) origin; semantic policy applies."
+          },
+          "requestedScopes": {
+            "type": "array",
+            "items": {
+              "enum": [
+                "shika.read",
+                "shika.write",
+                "shika.execute"
+              ]
+            },
+            "minItems": 1,
+            "maxItems": 3,
+            "uniqueItems": true
+          },
+          "operationKey": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+          }
+        },
+        "required": [
+          "origin",
+          "uiOrigin",
+          "requestedScopes",
+          "operationKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "pairing": {
+            "type": "object",
+            "properties": {
+              "schemaVersion": {
+                "const": "shika.pairing/v1"
+              },
+              "pairingId": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+              },
+              "operationKey": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+              },
+              "origin": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "description": "Canonical exact configured HTTP(S) origin; semantic policy applies."
+              },
+              "deviceId": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+              },
+              "installationId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "pattern": "^[^\\u0000-\\u001f\\u007f]+(?![\\s\\S])"
+              },
+              "proofKeyThumbprint": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
+              },
+              "codeChallenge": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048](?![\\s\\S])"
+              },
+              "createdAt": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z(?![\\s\\S])"
+              },
+              "expiresAt": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z(?![\\s\\S])"
+              },
+              "status": {
+                "enum": [
+                  "pending",
+                  "approved",
+                  "consumed",
+                  "cancelled",
+                  "expired"
+                ]
+              },
+              "actorId": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "workspaceId": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "exchangeOperationKey": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "schemaVersion",
+              "pairingId",
+              "operationKey",
+              "origin",
+              "deviceId",
+              "installationId",
+              "proofKeyThumbprint",
+              "codeChallenge",
+              "createdAt",
+              "expiresAt",
+              "status",
+              "actorId",
+              "workspaceId",
+              "exchangeOperationKey"
+            ],
+            "additionalProperties": false
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "uiOrigin": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "Canonical exact configured HTTP(S) origin; semantic policy applies."
+          },
+          "requestedScopes": {
+            "type": "array",
+            "items": {
+              "enum": [
+                "shika.read",
+                "shika.write",
+                "shika.execute"
+              ]
+            },
+            "minItems": 1,
+            "maxItems": 3,
+            "uniqueItems": true
+          },
+          "browserUrl": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "approvalRevision": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reapprovalRequired": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "pairing",
+          "revision",
+          "uiOrigin",
+          "requestedScopes",
+          "browserUrl",
+          "approvalRevision",
+          "reapprovalRequired"
+        ],
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "pairing": {
+                  "properties": {
+                    "status": {
+                      "enum": [
+                        "approved",
+                        "consumed"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                }
+              },
+              "required": [
+                "pairing"
+              ]
+            },
+            "then": {
+              "properties": {
+                "approvalRevision": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "reapprovalRequired": {
+                  "const": true
+                }
+              },
+              "required": [
+                "reapprovalRequired"
+              ]
+            },
+            "then": {
+              "properties": {
+                "pairing": {
+                  "properties": {
+                    "status": {
+                      "const": "approved"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "shika.v2.pairing.get",
+      "mutating": false,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "pairingId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+          }
+        },
+        "required": [
+          "pairingId"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "pairing": {
+            "type": "object",
+            "properties": {
+              "schemaVersion": {
+                "const": "shika.pairing/v1"
+              },
+              "pairingId": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+              },
+              "operationKey": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+              },
+              "origin": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "description": "Canonical exact configured HTTP(S) origin; semantic policy applies."
+              },
+              "deviceId": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+              },
+              "installationId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "pattern": "^[^\\u0000-\\u001f\\u007f]+(?![\\s\\S])"
+              },
+              "proofKeyThumbprint": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
+              },
+              "codeChallenge": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048](?![\\s\\S])"
+              },
+              "createdAt": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z(?![\\s\\S])"
+              },
+              "expiresAt": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z(?![\\s\\S])"
+              },
+              "status": {
+                "enum": [
+                  "pending",
+                  "approved",
+                  "consumed",
+                  "cancelled",
+                  "expired"
+                ]
+              },
+              "actorId": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "workspaceId": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "exchangeOperationKey": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "schemaVersion",
+              "pairingId",
+              "operationKey",
+              "origin",
+              "deviceId",
+              "installationId",
+              "proofKeyThumbprint",
+              "codeChallenge",
+              "createdAt",
+              "expiresAt",
+              "status",
+              "actorId",
+              "workspaceId",
+              "exchangeOperationKey"
+            ],
+            "additionalProperties": false
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "uiOrigin": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "Canonical exact configured HTTP(S) origin; semantic policy applies."
+          },
+          "requestedScopes": {
+            "type": "array",
+            "items": {
+              "enum": [
+                "shika.read",
+                "shika.write",
+                "shika.execute"
+              ]
+            },
+            "minItems": 1,
+            "maxItems": 3,
+            "uniqueItems": true
+          },
+          "browserUrl": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "approvalRevision": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reapprovalRequired": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "pairing",
+          "revision",
+          "uiOrigin",
+          "requestedScopes",
+          "browserUrl",
+          "approvalRevision",
+          "reapprovalRequired"
+        ],
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "pairing": {
+                  "properties": {
+                    "status": {
+                      "enum": [
+                        "approved",
+                        "consumed"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                }
+              },
+              "required": [
+                "pairing"
+              ]
+            },
+            "then": {
+              "properties": {
+                "approvalRevision": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "reapprovalRequired": {
+                  "const": true
+                }
+              },
+              "required": [
+                "reapprovalRequired"
+              ]
+            },
+            "then": {
+              "properties": {
+                "pairing": {
+                  "properties": {
+                    "status": {
+                      "const": "approved"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "shika.v2.pairing.cancel",
+      "mutating": true,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "resourceId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+          },
+          "expectedRevision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "operationKey": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+          }
+        },
+        "required": [
+          "resourceId",
+          "expectedRevision",
+          "operationKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "pairing": {
+            "type": "object",
+            "properties": {
+              "schemaVersion": {
+                "const": "shika.pairing/v1"
+              },
+              "pairingId": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+              },
+              "operationKey": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+              },
+              "origin": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "description": "Canonical exact configured HTTP(S) origin; semantic policy applies."
+              },
+              "deviceId": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+              },
+              "installationId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "pattern": "^[^\\u0000-\\u001f\\u007f]+(?![\\s\\S])"
+              },
+              "proofKeyThumbprint": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
+              },
+              "codeChallenge": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048](?![\\s\\S])"
+              },
+              "createdAt": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z(?![\\s\\S])"
+              },
+              "expiresAt": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z(?![\\s\\S])"
+              },
+              "status": {
+                "enum": [
+                  "pending",
+                  "approved",
+                  "consumed",
+                  "cancelled",
+                  "expired"
+                ]
+              },
+              "actorId": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "workspaceId": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "exchangeOperationKey": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "schemaVersion",
+              "pairingId",
+              "operationKey",
+              "origin",
+              "deviceId",
+              "installationId",
+              "proofKeyThumbprint",
+              "codeChallenge",
+              "createdAt",
+              "expiresAt",
+              "status",
+              "actorId",
+              "workspaceId",
+              "exchangeOperationKey"
+            ],
+            "additionalProperties": false
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "uiOrigin": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "Canonical exact configured HTTP(S) origin; semantic policy applies."
+          },
+          "requestedScopes": {
+            "type": "array",
+            "items": {
+              "enum": [
+                "shika.read",
+                "shika.write",
+                "shika.execute"
+              ]
+            },
+            "minItems": 1,
+            "maxItems": 3,
+            "uniqueItems": true
+          },
+          "browserUrl": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "approvalRevision": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reapprovalRequired": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "pairing",
+          "revision",
+          "uiOrigin",
+          "requestedScopes",
+          "browserUrl",
+          "approvalRevision",
+          "reapprovalRequired"
+        ],
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "pairing": {
+                  "properties": {
+                    "status": {
+                      "enum": [
+                        "approved",
+                        "consumed"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                }
+              },
+              "required": [
+                "pairing"
+              ]
+            },
+            "then": {
+              "properties": {
+                "approvalRevision": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "reapprovalRequired": {
+                  "const": true
+                }
+              },
+              "required": [
+                "reapprovalRequired"
+              ]
+            },
+            "then": {
+              "properties": {
+                "pairing": {
+                  "properties": {
+                    "status": {
+                      "const": "approved"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "shika.v2.pairing.exchange",
+      "mutating": true,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "pairingId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+          },
+          "expectedRevision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "operationKey": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+          }
+        },
+        "required": [
+          "pairingId",
+          "expectedRevision",
+          "operationKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "schemaVersion": {
+            "const": "shika.connection/v1"
+          },
+          "connectionId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "origin": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "Canonical exact configured HTTP(S) origin; semantic policy applies."
+          },
+          "actorId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+          },
+          "workspaceId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+          },
+          "deviceId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+          },
+          "installationId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "^[^\\u0000-\\u001f\\u007f]+(?![\\s\\S])"
+          },
+          "proofKeyThumbprint": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
+          },
+          "credentialRevision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "status": {
+            "enum": [
+              "active",
+              "refreshing",
+              "revoked",
+              "expired"
+            ]
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "enum": [
+                "shika.read",
+                "shika.write",
+                "shika.execute"
+              ]
+            },
+            "minItems": 1,
+            "maxItems": 3,
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "schemaVersion",
+          "connectionId",
+          "revision",
+          "origin",
+          "actorId",
+          "workspaceId",
+          "deviceId",
+          "installationId",
+          "proofKeyThumbprint",
+          "credentialRevision",
+          "status",
+          "scopes"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "shika.v2.connection.get",
+      "mutating": false,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "state": {
+                "const": "active"
+              },
+              "connection": {
+                "allOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "schemaVersion": {
+                        "const": "shika.connection/v1"
+                      },
+                      "connectionId": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+                      },
+                      "revision": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 9007199254740991
+                      },
+                      "origin": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 512,
+                        "description": "Canonical exact configured HTTP(S) origin; semantic policy applies."
+                      },
+                      "actorId": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+                      },
+                      "workspaceId": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+                      },
+                      "deviceId": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+                      },
+                      "installationId": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 512,
+                        "pattern": "^[^\\u0000-\\u001f\\u007f]+(?![\\s\\S])"
+                      },
+                      "proofKeyThumbprint": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
+                      },
+                      "credentialRevision": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 9007199254740991
+                      },
+                      "status": {
+                        "enum": [
+                          "active",
+                          "refreshing",
+                          "revoked",
+                          "expired"
+                        ]
+                      },
+                      "scopes": {
+                        "type": "array",
+                        "items": {
+                          "enum": [
+                            "shika.read",
+                            "shika.write",
+                            "shika.execute"
+                          ]
+                        },
+                        "minItems": 1,
+                        "maxItems": 3,
+                        "uniqueItems": true
+                      }
+                    },
+                    "required": [
+                      "schemaVersion",
+                      "connectionId",
+                      "revision",
+                      "origin",
+                      "actorId",
+                      "workspaceId",
+                      "deviceId",
+                      "installationId",
+                      "proofKeyThumbprint",
+                      "credentialRevision",
+                      "status",
+                      "scopes"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "status": {
+                        "const": "active"
+                      }
+                    },
+                    "required": [
+                      "status"
+                    ]
+                  }
+                ]
+              }
+            },
+            "required": [
+              "state",
+              "connection"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "state": {
+                "enum": [
+                  "unpaired",
+                  "disconnect_pending"
+                ]
+              },
+              "connection": {
+                "type": "null"
+              }
+            },
+            "required": [
+              "state",
+              "connection"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "shika.v2.connection.revoke",
+      "mutating": true,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "resourceId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+          },
+          "expectedRevision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "operationKey": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+          }
+        },
+        "required": [
+          "resourceId",
+          "expectedRevision",
+          "operationKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "schemaVersion": {
+            "const": "shika.connection/v1"
+          },
+          "connectionId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "origin": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "Canonical exact configured HTTP(S) origin; semantic policy applies."
+          },
+          "actorId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+          },
+          "workspaceId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+          },
+          "deviceId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+          },
+          "installationId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "^[^\\u0000-\\u001f\\u007f]+(?![\\s\\S])"
+          },
+          "proofKeyThumbprint": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
+          },
+          "credentialRevision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "status": {
+            "enum": [
+              "active",
+              "refreshing",
+              "revoked",
+              "expired"
+            ]
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "enum": [
+                "shika.read",
+                "shika.write",
+                "shika.execute"
+              ]
+            },
+            "minItems": 1,
+            "maxItems": 3,
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "schemaVersion",
+          "connectionId",
+          "revision",
+          "origin",
+          "actorId",
+          "workspaceId",
+          "deviceId",
+          "installationId",
+          "proofKeyThumbprint",
+          "credentialRevision",
+          "status",
+          "scopes"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "shika.v2.connection.refresh",
+      "mutating": true,
+      "idempotent": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "resourceId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+          },
+          "expectedRevision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "operationKey": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+          }
+        },
+        "required": [
+          "resourceId",
+          "expectedRevision",
+          "operationKey"
+        ],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "schemaVersion": {
+            "const": "shika.connection/v1"
+          },
+          "connectionId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "origin": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "Canonical exact configured HTTP(S) origin; semantic policy applies."
+          },
+          "actorId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+          },
+          "workspaceId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+          },
+          "deviceId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\\s\\S])"
+          },
+          "installationId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "^[^\\u0000-\\u001f\\u007f]+(?![\\s\\S])"
+          },
+          "proofKeyThumbprint": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
+          },
+          "credentialRevision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "status": {
+            "enum": [
+              "active",
+              "refreshing",
+              "revoked",
+              "expired"
+            ]
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "enum": [
+                "shika.read",
+                "shika.write",
+                "shika.execute"
+              ]
+            },
+            "minItems": 1,
+            "maxItems": 3,
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "schemaVersion",
+          "connectionId",
+          "revision",
+          "origin",
+          "actorId",
+          "workspaceId",
+          "deviceId",
+          "installationId",
+          "proofKeyThumbprint",
+          "credentialRevision",
+          "status",
+          "scopes"
+        ],
+        "additionalProperties": false
+      }
     }
   ],
   "capabilities": [
@@ -14069,6 +15336,13 @@
     "workflows.runtime-draft-mutations/v1",
     "uninstall-work.generations/v1",
     "uninstall-work.inactive-failed-reconcile/v1",
-    "personas.memory-transport/v2"
+    "personas.memory-transport/v2",
+    "method:shika.v2.pairing.start",
+    "method:shika.v2.pairing.get",
+    "method:shika.v2.pairing.cancel",
+    "method:shika.v2.pairing.exchange",
+    "method:shika.v2.connection.get",
+    "method:shika.v2.connection.revoke",
+    "method:shika.v2.connection.refresh"
   ]
 }

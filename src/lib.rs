@@ -14,6 +14,7 @@ pub mod presentation;
 pub mod progress;
 pub mod recovery;
 pub mod retention;
+pub(crate) mod shika;
 pub mod state;
 pub mod uninstall_state;
 pub mod workflow_patch;
