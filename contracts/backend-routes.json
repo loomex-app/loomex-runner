@@ -1110,6 +1110,41 @@
       "routeIds": [
         "persona.personas.create"
       ]
+    },
+    {
+      "method": "shika.v2.pairing.start",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "shika.v2.pairing.get",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "shika.v2.pairing.cancel",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "shika.v2.pairing.exchange",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "shika.v2.connection.get",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "shika.v2.connection.revoke",
+      "classification": "local-control",
+      "routeIds": []
+    },
+    {
+      "method": "shika.v2.connection.refresh",
+      "classification": "local-control",
+      "routeIds": []
     }
   ]
 }

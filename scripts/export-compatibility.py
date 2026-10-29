@@ -75,18 +75,48 @@ def require_string_list(value: Any, where: str) -> list[str]:
     return value
 
 
-def validate_schema(value: Any, where: str) -> None:
+def validate_schema(value: Any, where: str, *, output: bool = False,
+                    fragment: bool = False, conditional: bool = False,
+                    depth: int = 0, budget: list[int] | None = None) -> None:
+    if output:
+        if budget is None:
+            budget = [10000]
+        budget[0] -= 1
+        if depth > 64 or budget[0] < 0:
+            fail(f"{where}: output schema exceeds structural limits")
     schema = require_object(value, where)
+    if fragment:
+        if "properties" in schema:
+            if set(schema) - {"properties", "required"} or not schema["properties"]:
+                fail(f"{where}: invalid conditional object fragment")
+        elif not set(schema) & {"type", "const", "enum"} or set(schema) - {
+            "type", "const", "enum", "minimum", "maximum"
+        }:
+            fail(f"{where}: invalid conditional value fragment")
     allowed = {
         "type", "properties", "required", "additionalProperties", "items", "oneOf",
         "const", "enum", "format", "minLength", "maxLength", "minimum", "minItems",
-        "uniqueItems", "maximum", "maxItems", "pattern",
+        "uniqueItems", "maximum", "maxItems", "pattern", "description",
     }
+    if output:
+        allowed |= {"anyOf", "allOf", "if", "then"}
     unknown = set(schema) - allowed
     if unknown:
         fail(f"{where}: unsupported schema keywords: {', '.join(sorted(unknown))}")
-    if not set(schema) & {"type", "const", "enum", "oneOf"}:
+    if not set(schema) & {"type", "const", "enum", "oneOf"} and not (
+        output and ("anyOf" in schema or "allOf" in schema
+                    or (conditional and "if" in schema and "then" in schema)
+                    or (fragment and bool(schema.get("properties"))))
+    ):
         fail(f"{where}: schema must declare type, const, enum, or oneOf")
+    if "description" in schema and not isinstance(schema["description"], str):
+        fail(f"{where}.description: expected string")
+    if "if" in schema or "then" in schema:
+        if not output or not conditional or set(schema) != {"if", "then"}:
+            fail(f"{where}: if and then must occur together in an allOf branch")
+        for key in ("if", "then"):
+            validate_schema(schema[key], f"{where}.{key}", output=True, fragment=True,
+                            depth=depth + 1, budget=budget)
     if "type" in schema:
         allowed_types = {"object", "array", "string", "integer", "number", "boolean", "null"}
         declared_types = schema["type"] if isinstance(schema["type"], list) else [schema["type"]]
@@ -97,19 +127,24 @@ def validate_schema(value: Any, where: str) -> None:
         for name, child in properties.items():
             if not isinstance(name, str) or not name:
                 fail(f"{where}.properties: invalid property name")
-            validate_schema(child, f"{where}.properties.{name}")
+            validate_schema(child, f"{where}.properties.{name}", output=output,
+                            fragment=fragment, depth=depth + 1, budget=budget)
     if "required" in schema:
         required = require_string_list(schema["required"], f"{where}.required")
         if "properties" in schema and not set(required).issubset(schema["properties"]):
             fail(f"{where}.required: references undeclared property")
     if "items" in schema:
-        validate_schema(schema["items"], f"{where}.items")
-    if "oneOf" in schema:
-        alternatives = schema["oneOf"]
+        validate_schema(schema["items"], f"{where}.items", output=output,
+                        depth=depth + 1, budget=budget)
+    for keyword in ("oneOf", "anyOf", "allOf") if output else ("oneOf",):
+        if keyword not in schema:
+            continue
+        alternatives = schema[keyword]
         if not isinstance(alternatives, list) or len(alternatives) < 2:
-            fail(f"{where}.oneOf: expected at least two schemas")
+            fail(f"{where}.{keyword}: expected at least two schemas")
         for index, child in enumerate(alternatives):
-            validate_schema(child, f"{where}.oneOf[{index}]")
+            validate_schema(child, f"{where}.{keyword}[{index}]", output=output,
+                            conditional=keyword == "allOf", depth=depth + 1, budget=budget)
     if "enum" in schema:
         values = schema["enum"]
         if not isinstance(values, list) or not values:
@@ -150,7 +185,7 @@ def validate_catalog(catalog: dict[str, Any]) -> dict[str, dict[str, Any]]:
         if "transportRetry" in method and method["transportRetry"] not in {"before_response_once", "never_after_send"}:
             fail(f"method catalog.methods[{index}].transportRetry: unsupported retry classification")
         validate_schema(method.get("inputSchema"), f"method catalog.methods[{index}].inputSchema")
-        validate_schema(method.get("outputSchema"), f"method catalog.methods[{index}].outputSchema")
+        validate_schema(method.get("outputSchema"), f"method catalog.methods[{index}].outputSchema", output=True)
         by_name[name] = method
     # Negotiation is mandatory before capability discovery, so it is intentionally
     # not itself advertised as a `method:` capability.

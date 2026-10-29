@@ -4,6 +4,8 @@ Current workspace installation and delivery status: [authoritative reliability s
 
 Each runner release contains a private native `loomex-runner` daemon and a thin public `loomex` CLI for macOS arm64. The CLI cannot start daemon, worker, or supervisor modes. It installs without root privileges under `~/Library/Application Support/Loomex/runner`, keeps explicit state under `~/.local/share/loomex/runner`, listens on its per-user control socket, and runs `loomex-runner` as LaunchAgent `app.loomex.runner`. The package records its project, version, platform, and state-schema metadata; it preserves existing supported installation state and initializes the versioned presentation database on first use.
 
+The compatibility route descriptor covers static Loomex runner-control backend routes. Its `local-control` classification does not guarantee that a method is offline: Shika pairing and connection methods can contact their separately configured Shika service.
+
 The production release workflow requires a cross-component qualification before
 the runner is signed or published. Its manual inputs identify the plugin and
 backend repositories plus their full 40-character commit SHAs. The qualification

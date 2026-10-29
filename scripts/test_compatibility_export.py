@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import subprocess
 import tempfile
 import unittest
@@ -18,6 +19,56 @@ MANIFEST = ROOT / "contracts" / "compatibility-manifest.json"
 
 
 class CompatibilityExportTests(unittest.TestCase):
+    def test_shika_schema_syntax_and_policy_are_explicit(self) -> None:
+        spec = importlib.util.spec_from_file_location("compatibility_export", EXPORTER)
+        self.assertIsNotNone(spec)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        catalog = json.loads(CATALOG.read_text())
+        methods = [method for method in catalog["methods"] if method["name"].startswith("shika.v2.")]
+        self.assertEqual(len(methods), 7)
+        for method in methods:
+            with self.subTest(method=method["name"]):
+                before = json.dumps(method, sort_keys=True)
+                module.validate_schema(method["inputSchema"], "input")
+                module.validate_schema(method["outputSchema"], "output", output=True)
+                self.assertEqual(json.dumps(method, sort_keys=True), before)
+                self.assertIs(method["appOnly"], False)
+                self.assertEqual(method["transportRetry"], "never_after_send")
+                binding = next(item for item in json.loads(ROUTES.read_text())["methodBindings"]
+                               if item["method"] == method["name"])
+                self.assertEqual((binding["classification"], binding["routeIds"]), ("local-control", []))
+
+    def test_schema_extensions_reject_malformed_or_input_composition(self) -> None:
+        spec = importlib.util.spec_from_file_location("compatibility_export", EXPORTER)
+        self.assertIsNotNone(spec)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        invalid = [
+            {"type": "string", "description": 7},
+            {"anyOf": []},
+            {"allOf": [{"if": {"properties": {"x": {"const": True}}}}, {"type": "object"}]},
+            {"allOf": [{"if": {}, "then": {}}, {"type": "object"}]},
+            {"allOf": [{"type": "object", "unknown": True}, {"type": "object"}]},
+            {"allOf": [{"if": {"properties": {"x": {"const": True}}, "additionalProperties": False},
+                        "then": {"properties": {"x": {"const": True}}}}, {"type": "object"}]},
+            {"type": "object", "if": {"properties": {"x": {"const": True}}},
+             "then": {"properties": {"x": {"const": True}}}},
+        ]
+        for schema in invalid:
+            with self.subTest(schema=schema), self.assertRaises(module.ContractError):
+                module.validate_schema(schema, "output", output=True)
+        with self.assertRaises(module.ContractError):
+            module.validate_schema({"anyOf": [{"type": "string"}, {"type": "null"}]}, "input")
+        with self.assertRaises(module.ContractError):
+            module.validate_schema({"type": "string", "description": False}, "input")
+        module.validate_schema({"type": "string", "description": "annotation"}, "input")
+        nested = {"type": "string"}
+        for _ in range(66):
+            nested = {"type": "array", "items": nested}
+        with self.assertRaises(module.ContractError):
+            module.validate_schema(nested, "output", output=True)
+
     def run_export(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [str(EXPORTER), *args],

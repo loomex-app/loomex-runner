@@ -98,6 +98,13 @@
     "method:runs.start_handoff.issue",
     "method:runs.start_handoff.restore",
     "method:runs.wait",
+    "method:shika.v2.connection.get",
+    "method:shika.v2.connection.refresh",
+    "method:shika.v2.connection.revoke",
+    "method:shika.v2.pairing.cancel",
+    "method:shika.v2.pairing.exchange",
+    "method:shika.v2.pairing.get",
+    "method:shika.v2.pairing.start",
     "method:status.get",
     "method:workflow.operations.get",
     "method:workflows.activate",
@@ -131,11 +138,11 @@
   "catalogVersion": "0.3.9",
   "generatedFrom": {
     "backendRoutes": {
-      "digest": "sha256:c6de4001ffe328dc6eb73587a11b8e830dd05b65a2b7828393b5eee304550708",
+      "digest": "sha256:1048e4513d9c8985bd460813873a18469188d02ce27a1ab747ef7dcf4c4fa052",
       "path": "contracts/backend-routes.json"
     },
     "methodCatalog": {
-      "digest": "sha256:064a1b9aab988bfe09586268fd42f977b7ace42fb57f2bb2de35955d3a1998ab",
+      "digest": "sha256:2fc8e05dc11526d07f079b8e7241aee12d6556ef6ba2f8d644ababef8adc46e9",
       "path": "contracts/method-catalog.json"
     }
   },
@@ -1115,6 +1122,76 @@
     {
       "classification": "local-control",
       "idempotent": true,
+      "inputSchemaDigest": "sha256:d0157ce84790721854763c7480015e84f7cb0c7fde53afb21c3a42908805bf35",
+      "mutating": false,
+      "name": "shika.v2.connection.get",
+      "outputSchemaDigest": "sha256:181db18ecc4519a9c1fe5ad7fa0986a92e511dfef8c8cc4084fc6dc2c65e618f",
+      "routeIds": [],
+      "transportRetry": "never_after_send"
+    },
+    {
+      "classification": "local-control",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:4aeb5164a91526aecbf540314c377e2e3f2d1f286274fbc294c9753736404d33",
+      "mutating": true,
+      "name": "shika.v2.connection.refresh",
+      "outputSchemaDigest": "sha256:dfd0a0c172b0dc5940639b100aa4b4c91f43d629a88de3ca65c9a9b34c019400",
+      "routeIds": [],
+      "transportRetry": "never_after_send"
+    },
+    {
+      "classification": "local-control",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:4aeb5164a91526aecbf540314c377e2e3f2d1f286274fbc294c9753736404d33",
+      "mutating": true,
+      "name": "shika.v2.connection.revoke",
+      "outputSchemaDigest": "sha256:dfd0a0c172b0dc5940639b100aa4b4c91f43d629a88de3ca65c9a9b34c019400",
+      "routeIds": [],
+      "transportRetry": "never_after_send"
+    },
+    {
+      "classification": "local-control",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:4aeb5164a91526aecbf540314c377e2e3f2d1f286274fbc294c9753736404d33",
+      "mutating": true,
+      "name": "shika.v2.pairing.cancel",
+      "outputSchemaDigest": "sha256:e4895ff1022e0e94ee92e3b59218fc044f6680b0bb3546e1fb5c7ac04aac34ef",
+      "routeIds": [],
+      "transportRetry": "never_after_send"
+    },
+    {
+      "classification": "local-control",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:21646d877be82ab591c5e09fb20e67942541ab3de0bd121bff52a7045245e01d",
+      "mutating": true,
+      "name": "shika.v2.pairing.exchange",
+      "outputSchemaDigest": "sha256:dfd0a0c172b0dc5940639b100aa4b4c91f43d629a88de3ca65c9a9b34c019400",
+      "routeIds": [],
+      "transportRetry": "never_after_send"
+    },
+    {
+      "classification": "local-control",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:941e3d4cd372a4179e859af4a4fab8b74f20f443f8c80cbaaf067564568403e5",
+      "mutating": false,
+      "name": "shika.v2.pairing.get",
+      "outputSchemaDigest": "sha256:e4895ff1022e0e94ee92e3b59218fc044f6680b0bb3546e1fb5c7ac04aac34ef",
+      "routeIds": [],
+      "transportRetry": "never_after_send"
+    },
+    {
+      "classification": "local-control",
+      "idempotent": true,
+      "inputSchemaDigest": "sha256:4a2066eae9e50400141614a51ca4c28cb31bd4abd7352560e79ed24af3749087",
+      "mutating": true,
+      "name": "shika.v2.pairing.start",
+      "outputSchemaDigest": "sha256:e4895ff1022e0e94ee92e3b59218fc044f6680b0bb3546e1fb5c7ac04aac34ef",
+      "routeIds": [],
+      "transportRetry": "never_after_send"
+    },
+    {
+      "classification": "local-control",
+      "idempotent": true,
       "inputSchemaDigest": "sha256:826604fe71383c9efdc7d03f43ffcb51937eac8853efa957f85e910725238806",
       "mutating": false,
       "name": "status.get",
@@ -1722,13 +1799,13 @@
   "schemaVersion": "loomex.runner.compatibility-manifest/v1",
   "summary": {
     "backendRouteCount": 76,
-    "capabilityCount": 127,
+    "capabilityCount": 134,
     "methodClassifications": {
       "backend-auth": 7,
       "backend-proxy": 55,
       "daemon-lifecycle": 1,
-      "local-control": 36
+      "local-control": 43
     },
-    "methodCount": 99
+    "methodCount": 106
   }
 }
